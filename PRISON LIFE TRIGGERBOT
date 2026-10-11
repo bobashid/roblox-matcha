@@ -1,10 +1,11 @@
 -- ============================================================
--- TRIGGER BOT v14  (Rebind-only keys)
+-- TRIGGER BOT v16  (fast Reload All)
 -- Lock:  closest to mouse cursor, within 100 px
 -- Settle: 0.15 s after a lock/switch before firing
 -- Fire rate: max (every frame)
 -- On screen is ALWAYS required. Own team targetable via toggles.
 -- Rebind: flip the Rebind toggle, then press the key you want.
+-- Reload All: press the bound key to reload every gun slot fast.
 -- STOP:  _G.__TRIGGER_STOP()   (or kill the script)
 -- ============================================================
 local Players    = game:GetService("Players")
@@ -35,7 +36,7 @@ local function shutdown()
     pcall(function() if connBegan  then connBegan:Disconnect()  end end)
     for _, d in ipairs(drawings) do pcall(function() d:Remove() end) end
     pcall(function()
-        for _, code in ipairs({ 49, 50, 51 }) do keyrelease(code) end
+        for _, code in ipairs({ 49, 50, 51, 82 }) do keyrelease(code) end
     end)
 end
 
@@ -53,6 +54,7 @@ local S = {
     autoNext   = false,
     cycle      = true,
     esp        = true,
+    reloadAll  = true,
 }
 
 local LOCK_RADIUS = 100     -- px from cursor, fixed
@@ -60,6 +62,12 @@ local SETTLE      = 0.15    -- seconds after lock/switch before firing, fixed
 local RATE        = 0       -- fire every frame, fixed
 
 local CYCLE_KEYS = { 49, 50, 51 }   -- 1, 2, 3 weapon slots
+local RELOAD_KEY = 82               -- R, the in-game reload
+
+-- reload timing: one frame per step, same cadence as the firing loop
+local RL_TAP     = 0.01     -- key down -> up
+local RL_GAP     = 0.01     -- between the two taps
+local RL_SETTLE  = 0.03     -- after reload tap before next slot
 
 -- ============================================================
 -- TEAMS
@@ -141,11 +149,12 @@ local function keyName(raw)
     return RAW_NAME[raw] or ("0x" .. string.format("%X", raw))
 end
 
-local binds   = { lock = 70, unlock = 71 }
-local ACTIONS = { "lock", "unlock" }
+local binds   = { lock = 70, unlock = 71, reload = 82 }
+local ACTIONS = { "lock", "unlock", "reload" }
 
-local lastUI  = {}
-local capture = nil     -- action currently waiting for a key press
+local lastUI    = {}
+local capture   = nil
+local reloading = false
 
 local function uiGet(id)
     local ok, v = pcall(function() return UI.GetValue(id) end)
@@ -153,7 +162,6 @@ local function uiGet(id)
     return nil
 end
 
--- Sets a bind and logs it. No widget to mirror into anymore.
 local function setBind(act, v, src)
     local raw = parseKey(v)
     if raw then
@@ -166,7 +174,7 @@ local function setBind(act, v, src)
 end
 
 -- ============================================================
--- UI  (Keys section is Rebind-only now)
+-- UI
 -- ============================================================
 UI.AddTab("Trigger", function(tab)
     local ok, err = pcall(function()
@@ -188,10 +196,14 @@ UI.AddTab("Trigger", function(tab)
 
         local k = tab:Section("Keys", "Right")
         k:Text("Flip a Rebind toggle, then press the key you want.")
-        k:Text("The current keys are printed in the log on load and on change.")
+        k:Text("Reload All cycles 1/2/3 and reloads each, fast.")
 
         k:Toggle("rebind_lock", "Rebind: Lock", false, function() end)
         k:Toggle("rebind_unlock", "Rebind: Unlock", false, function() end)
+        k:Toggle("rebind_reload", "Rebind: Reload All", false, function() end)
+
+        k:Spacing()
+        k:Toggle("reload_all", "Reload All enabled", true, function() end)
     end)
     if not ok then log("UI build error: " .. tostring(err)) end
 end)
@@ -200,7 +212,7 @@ end)
 -- UI POLL
 -- ============================================================
 task.spawn(function()
-    local rebind = { lock = "rebind_lock", unlock = "rebind_unlock" }
+    local rebind = { lock = "rebind_lock", unlock = "rebind_unlock", reload = "rebind_reload" }
 
     local function bool(id, field)
         local v = uiGet(id)
@@ -216,8 +228,8 @@ task.spawn(function()
         bool("auto_next", "autoNext")
         bool("cycle", "cycle")
         bool("esp", "esp")
+        bool("reload_all", "reloadAll")
 
-        -- Rebind toggles -> capture mode
         for act, id in pairs(rebind) do
             local v = uiGet(id)
             if type(v) == "boolean" and v ~= lastUI[id] then
@@ -501,6 +513,40 @@ local function doUnlock()
 end
 
 -- ============================================================
+-- RELOAD ALL  (fast - one frame per step, like the fire loop)
+-- ============================================================
+local function tap(code, hold)
+    pcall(function() keypress(code) end)
+    task.wait(hold or RL_TAP)
+    pcall(function() keyrelease(code) end)
+end
+
+local function doReloadAll()
+    if reloading then return end
+    reloading = true
+    pcall(function() notify("Reloading all", "Trigger", 1) end)
+    log("reload all -> fast cycle")
+
+    task.spawn(function()
+        for _, slot in ipairs(CYCLE_KEYS) do
+            tap(slot, RL_TAP)
+            task.wait(RL_GAP)
+            tap(binds.reload, RL_TAP)
+            task.wait(RL_SETTLE)
+        end
+
+        -- back to slot 1 so the trigger bot keeps firing the first gun
+        tap(CYCLE_KEYS[1], RL_TAP)
+
+        -- make sure no reload key is stuck down
+        pcall(function() keyrelease(binds.reload) end)
+
+        reloading = false
+        log("reload all done")
+    end)
+end
+
+-- ============================================================
 -- WALL CHECK LOOP
 -- ============================================================
 task.spawn(function()
@@ -543,6 +589,9 @@ local latch, wasDown, lastFire = {}, {}, {}
 
 local function trigger(action)
     if capture then return end
+    if action == "reload" and not S.reloadAll then return end
+    if reloading and action ~= "reload" then return end
+
     local now = os.clock()
     if lastFire[action] and (now - lastFire[action]) < 0.2 then return end
     lastFire[action] = now
@@ -552,6 +601,8 @@ local function trigger(action)
         applyLock(t, "mouse", d)
     elseif action == "unlock" then
         doUnlock()
+    elseif action == "reload" then
+        doReloadAll()
     end
 end
 
@@ -578,6 +629,8 @@ pcall(function()
             return
         end
 
+        if reloading then return end
+
         for _, act in ipairs(ACTIONS) do
             if binds[act] == code then latch[act] = true end
         end
@@ -587,6 +640,7 @@ end)
 task.spawn(function()
     while running do
         for _, act in ipairs(ACTIONS) do
+            if reloading then break end
             local raw = binds[act]
             local down = pollDown(raw)
             if down and not wasDown[act] then trigger(act) end
@@ -715,6 +769,8 @@ connRender = RunService.RenderStepped:Connect(function()
         end
     end
 
+    if reloading then state = "RELOADING" end
+
     if state == "FIRING" then
         if (now - lastShot) >= RATE then
             lastShot = now
@@ -742,6 +798,9 @@ connRender = RunService.RenderStepped:Connect(function()
     if capture then
         ovText.Color = COL_SETTLE
         setRight(ovText, vpX, y, "REBIND " .. capture:upper() .. ": press a key now")
+    elseif state == "RELOADING" then
+        ovText.Color = COL_SETTLE
+        setRight(ovText, vpX, y, "RELOADING ALL...")
     elseif state == "PAUSED" then
         ovText.Color = COL_PAUSE
         setRight(ovText, vpX, y, "TRIGGER PAUSED  (enable toggle in menu)")
@@ -762,7 +821,7 @@ connRender = RunService.RenderStepped:Connect(function()
     end
     ovText.Visible = true
 
-    if S.esp and t and t.root and not capture then
+    if S.esp and t and t.root and not capture and not reloading then
         local headPart = t.head or t.root
         local okh, hp = pcall(function() return headPart.Position end)
         local okr, rp = pcall(function() return t.root.Position end)
@@ -797,10 +856,11 @@ connRender = RunService.RenderStepped:Connect(function()
     end
 end)
 
-log("v14 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  " .. keyName(binds.unlock) .. "=unlock")
-log("lock radius 100 px | settle 0.15 s | fire rate max")
+log("v16 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  "
+    .. keyName(binds.unlock) .. "=unlock  " .. keyName(binds.reload) .. "=reload all")
+log("lock radius 100 px | settle 0.15 s | fire rate max | reload fast")
 log("teams: " .. table.concat(TEAM_LIST, ", "))
-pcall(function() notify("Trigger v14 ready", "Trigger", 2) end)
+pcall(function() notify("Trigger v16 ready", "Trigger", 2) end)
 
 -- keep-alive (REQUIRED)
 while running do task.wait(1) end
