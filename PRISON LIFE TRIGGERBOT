@@ -1,12 +1,12 @@
 -- ============================================================
--- TRIGGER BOT v20  (0.01 reload timing)
+-- TRIGGER BOT v22  (aim strength default 40)
 -- Lock:  closest to mouse cursor, within 100 px
+-- Aim:   eases the mouse toward the LOCKED target (mousemoverel)
 -- Settle: 0.15 s after a lock/switch before firing
 -- Fire rate: max (every frame)
 -- On screen is ALWAYS required. Own team targetable via toggles.
 -- Rebind: Lock and Unlock only. Reload All is fixed on R.
--- Weapon slots: slider 1-4, controls how many hotbar slots it
---               cycles through when firing and reloading.
+-- Weapon slots: slider 1-4.
 -- Car glass / windows are shot through.
 -- STOP:  _G.__TRIGGER_STOP()   (or kill the script)
 -- ============================================================
@@ -58,6 +58,10 @@ local S = {
     esp        = true,
     reloadAll  = true,
     slotCount  = 3,     -- 1..4, driven by the slider
+    aim        = true,  -- aim assist on the locked target
+    aimStr     = 40,    -- 1..100, % of the gap closed per frame
+    aimIdx     = 0,     -- 0 = head, 1 = chest
+    predict    = false, -- horizontal velocity lead
 }
 
 local LOCK_RADIUS = 100     -- px from cursor, fixed
@@ -67,16 +71,21 @@ local RATE        = 0       -- fire every frame, fixed
 local LOS_INTERVAL = 0.005
 local BLOCK_FRAMES = 2
 
+-- aim tuning
+local AIM_MAX_STEP = 80     -- max pixels the mouse moves per frame
+local AIM_DEADZONE = 1.5    -- stop nudging when this close (px)
+local LEAD_TIME    = 0.06   -- seconds of velocity lead when Prediction is on
+local AIM_PARTS    = { "Head", "Chest" }
+
 -- hotbar slot keys: 1, 2, 3, 4 (raw VK codes)
 local SLOT_KEYS  = { 49, 50, 51, 52 }
 local RELOAD_KEY = 82       -- R, the in-game reload (fixed)
 
--- reload timing: 0.01 across the board
+-- reload timing
 local RL_TAP     = 0.01
 local RL_GAP     = 0.01
 local RL_SETTLE  = 0.01
 
--- the active slot list, rebuilt whenever the slider changes
 local cycleKeys = { 49, 50, 51 }
 
 local function rebuildCycle()
@@ -216,6 +225,13 @@ UI.AddTab("Trigger", function(tab)
         b:SliderInt("slots", "Weapon slots to cycle", 1, 4, S.slotCount, function() end)
         b:Tip("How many hotbar slots to cycle through (1-4).")
 
+        local c = tab:Section("Aim", "Right")
+        c:Toggle("aim", "Aim at locked target", true, function() end)
+        c:SliderInt("aim_str", "Aim strength", 1, 100, S.aimStr, function() end)
+        c:Tip("Higher = snaps faster. Lower = smoother.")
+        c:Combo("aim_part", "Aim part", AIM_PARTS, S.aimIdx, function() end)
+        c:Toggle("aim_pred", "Prediction (lead moving targets)", false, function() end)
+
         local k = tab:Section("Keys", "Right")
         k:Text("Flip a Rebind toggle, then press the key you want.")
         k:Text("Reload All is fixed on R (the in-game reload key).")
@@ -250,6 +266,8 @@ task.spawn(function()
         bool("cycle", "cycle")
         bool("esp", "esp")
         bool("reload_all", "reloadAll")
+        bool("aim", "aim")
+        bool("aim_pred", "predict")
 
         -- weapon slot slider (1..4)
         local sv = uiGet("slots")
@@ -258,6 +276,22 @@ task.spawn(function()
             S.slotCount = math.floor(sv)
             rebuildCycle()
             log("weapon slots -> " .. #cycleKeys)
+        end
+
+        -- aim strength slider (1..100)
+        local av = uiGet("aim_str")
+        if type(av) == "number" and av >= 1 and av ~= lastUI["aim_str"] then
+            lastUI["aim_str"] = av
+            S.aimStr = math.min(100, math.floor(av))
+            log("aim strength -> " .. S.aimStr)
+        end
+
+        -- aim part (0 = head, 1 = chest)
+        local pv = uiGet("aim_part")
+        if type(pv) == "number" and pv >= 0 and pv <= 1 and pv ~= lastUI["aim_part"] then
+            lastUI["aim_part"] = pv
+            S.aimIdx = math.floor(pv)
+            log("aim part -> " .. AIM_PARTS[S.aimIdx + 1])
         end
 
         for act, id in pairs(rebind) do
@@ -601,7 +635,6 @@ local function doReloadAll()
             task.wait(RL_SETTLE)
         end
 
-        -- back to the first slot so the trigger bot keeps firing it
         tap(slots[1], RL_TAP)
         pcall(function() keyrelease(RELOAD_KEY) end)
 
@@ -876,6 +909,47 @@ connRender = RunService.RenderStepped:Connect(function()
         releaseCycle()
     end
 
+    -- --------------------------------------------------------
+    -- AIM ASSIST on the locked target (mouse nudge, not CFrame)
+    -- --------------------------------------------------------
+    if S.aim and t and S.enabled and not reloading and not capture then
+        local active = true
+        pcall(function() active = isrbxactive() end)
+
+        if active then
+            local part = t.root
+            if S.aimIdx == 0 then part = t.head or t.root end
+
+            if part then
+                local okp, pos = pcall(function() return part.Position end)
+                if okp and pos then
+                    if S.predict then
+                        local okv, vel = pcall(function() return part.Velocity end)
+                        if okv and vel then
+                            pos = pos + Vector3.new(vel.X, 0, vel.Z) * LEAD_TIME
+                        end
+                    end
+
+                    local sp, vis = WorldToScreen(pos)
+                    if vis and sp then
+                        local dx, dy = sp.X - mx, sp.Y - my
+                        local dist = math.sqrt(dx * dx + dy * dy)
+                        if dist > AIM_DEADZONE then
+                            local k = (S.aimStr or 40) / 100
+                            local stepX = math.max(-AIM_MAX_STEP, math.min(AIM_MAX_STEP, dx * k))
+                            local stepY = math.max(-AIM_MAX_STEP, math.min(AIM_MAX_STEP, dy * k))
+                            local ix = math.floor(stepX + (stepX >= 0 and 0.5 or -0.5))
+                            local iy = math.floor(stepY + (stepY >= 0 and 0.5 or -0.5))
+                            if ix ~= 0 or iy ~= 0 then
+                                pcall(function() mousemoverel(ix, iy) end)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
     local y = 12
     if capture then
         ovText.Color = COL_SETTLE
@@ -889,6 +963,7 @@ connRender = RunService.RenderStepped:Connect(function()
     elseif lockedUid then
         local dtxt = (t and t.dist < math.huge) and string.format("  %.0f st", t.dist) or ""
         local ttxt = (t and t.team) and ("  [" .. t.team .. "]") or ""
+        local atxt = (S.aim and t) and "  +AIM" or ""
         if state == "FIRING" then
             ovText.Color = COL_FIRE
         elseif state == "SETTLING" then
@@ -896,7 +971,7 @@ connRender = RunService.RenderStepped:Connect(function()
         else
             ovText.Color = COL_WAIT
         end
-        setRight(ovText, vpX, y, "LOCKED: " .. tostring(lockedName) .. dtxt .. ttxt .. "  [" .. state .. "]")
+        setRight(ovText, vpX, y, "LOCKED: " .. tostring(lockedName) .. dtxt .. ttxt .. atxt .. "  [" .. state .. "]")
     else
         ovText.Color = COL_IDLE
         setRight(ovText, vpX, y, "UNLOCKED  " .. #targets .. " targets")
@@ -938,11 +1013,12 @@ connRender = RunService.RenderStepped:Connect(function()
     end
 end)
 
-log("v20 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  "
+log("v22 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  "
     .. keyName(binds.unlock) .. "=unlock  R=reload all (fixed)")
 log("weapon slots: " .. #cycleKeys .. " | lock radius 100 px | settle 0.15 s")
-log("reload timing 0.01 | teams: " .. table.concat(TEAM_LIST, ", "))
-pcall(function() notify("Trigger v20 ready", "Trigger", 2) end)
+log("aim assist: " .. (S.aim and "on" or "off") .. " | strength " .. S.aimStr)
+log("teams: " .. table.concat(TEAM_LIST, ", "))
+pcall(function() notify("Trigger v22 ready", "Trigger", 2) end)
 
 -- keep-alive (REQUIRED)
 while running do task.wait(1) end
