@@ -1,11 +1,13 @@
 -- ============================================================
--- TRIGGER BOT v16  (fast Reload All)
+-- TRIGGER BOT v20  (0.01 reload timing)
 -- Lock:  closest to mouse cursor, within 100 px
 -- Settle: 0.15 s after a lock/switch before firing
 -- Fire rate: max (every frame)
 -- On screen is ALWAYS required. Own team targetable via toggles.
--- Rebind: flip the Rebind toggle, then press the key you want.
--- Reload All: press the bound key to reload every gun slot fast.
+-- Rebind: Lock and Unlock only. Reload All is fixed on R.
+-- Weapon slots: slider 1-4, controls how many hotbar slots it
+--               cycles through when firing and reloading.
+-- Car glass / windows are shot through.
 -- STOP:  _G.__TRIGGER_STOP()   (or kill the script)
 -- ============================================================
 local Players    = game:GetService("Players")
@@ -36,7 +38,7 @@ local function shutdown()
     pcall(function() if connBegan  then connBegan:Disconnect()  end end)
     for _, d in ipairs(drawings) do pcall(function() d:Remove() end) end
     pcall(function()
-        for _, code in ipairs({ 49, 50, 51, 82 }) do keyrelease(code) end
+        for _, code in ipairs({ 49, 50, 51, 52, 82 }) do keyrelease(code) end
     end)
 end
 
@@ -55,19 +57,37 @@ local S = {
     cycle      = true,
     esp        = true,
     reloadAll  = true,
+    slotCount  = 3,     -- 1..4, driven by the slider
 }
 
 local LOCK_RADIUS = 100     -- px from cursor, fixed
 local SETTLE      = 0.15    -- seconds after lock/switch before firing, fixed
 local RATE        = 0       -- fire every frame, fixed
 
-local CYCLE_KEYS = { 49, 50, 51 }   -- 1, 2, 3 weapon slots
-local RELOAD_KEY = 82               -- R, the in-game reload
+local LOS_INTERVAL = 0.005
+local BLOCK_FRAMES = 2
 
--- reload timing: one frame per step, same cadence as the firing loop
-local RL_TAP     = 0.01     -- key down -> up
-local RL_GAP     = 0.01     -- between the two taps
-local RL_SETTLE  = 0.03     -- after reload tap before next slot
+-- hotbar slot keys: 1, 2, 3, 4 (raw VK codes)
+local SLOT_KEYS  = { 49, 50, 51, 52 }
+local RELOAD_KEY = 82       -- R, the in-game reload (fixed)
+
+-- reload timing: 0.01 across the board
+local RL_TAP     = 0.01
+local RL_GAP     = 0.01
+local RL_SETTLE  = 0.01
+
+-- the active slot list, rebuilt whenever the slider changes
+local cycleKeys = { 49, 50, 51 }
+
+local function rebuildCycle()
+    local n = math.floor(S.slotCount or 3)
+    if n < 1 then n = 1 end
+    if n > #SLOT_KEYS then n = #SLOT_KEYS end
+    local out = {}
+    for i = 1, n do out[i] = SLOT_KEYS[i] end
+    cycleKeys = out
+end
+rebuildCycle()
 
 -- ============================================================
 -- TEAMS
@@ -98,7 +118,7 @@ local function isHostile(tName)
 end
 
 -- ============================================================
--- KEY MAP  (raw Windows VK codes - Enum args throw in this VM)
+-- KEY MAP
 -- ============================================================
 local RAW_NAME = {
     [8]="Backspace",[9]="Tab",[13]="Enter",[16]="Shift",[17]="Ctrl",[18]="Alt",
@@ -149,8 +169,8 @@ local function keyName(raw)
     return RAW_NAME[raw] or ("0x" .. string.format("%X", raw))
 end
 
-local binds   = { lock = 70, unlock = 71, reload = 82 }
-local ACTIONS = { "lock", "unlock", "reload" }
+local binds   = { lock = 70, unlock = 71 }
+local ACTIONS = { "lock", "unlock" }
 
 local lastUI    = {}
 local capture   = nil
@@ -191,19 +211,20 @@ UI.AddTab("Trigger", function(tab)
         local b = tab:Section("Combat", "Right")
         b:Toggle("require_los", "Require line of sight", true, function() end)
         b:Toggle("auto_next", "Auto re-lock nearest", false, function() end)
-        b:Toggle("cycle", "Cycle weapons 1/2/3", true, function() end)
+        b:Toggle("cycle", "Cycle weapons", true, function() end)
         b:Toggle("esp", "Box on locked target", true, function() end)
+        b:SliderInt("slots", "Weapon slots to cycle", 1, 4, S.slotCount, function() end)
+        b:Tip("How many hotbar slots to cycle through (1-4).")
 
         local k = tab:Section("Keys", "Right")
         k:Text("Flip a Rebind toggle, then press the key you want.")
-        k:Text("Reload All cycles 1/2/3 and reloads each, fast.")
+        k:Text("Reload All is fixed on R (the in-game reload key).")
 
         k:Toggle("rebind_lock", "Rebind: Lock", false, function() end)
         k:Toggle("rebind_unlock", "Rebind: Unlock", false, function() end)
-        k:Toggle("rebind_reload", "Rebind: Reload All", false, function() end)
 
         k:Spacing()
-        k:Toggle("reload_all", "Reload All enabled", true, function() end)
+        k:Toggle("reload_all", "Reload All enabled (R)", true, function() end)
     end)
     if not ok then log("UI build error: " .. tostring(err)) end
 end)
@@ -212,7 +233,7 @@ end)
 -- UI POLL
 -- ============================================================
 task.spawn(function()
-    local rebind = { lock = "rebind_lock", unlock = "rebind_unlock", reload = "rebind_reload" }
+    local rebind = { lock = "rebind_lock", unlock = "rebind_unlock" }
 
     local function bool(id, field)
         local v = uiGet(id)
@@ -229,6 +250,15 @@ task.spawn(function()
         bool("cycle", "cycle")
         bool("esp", "esp")
         bool("reload_all", "reloadAll")
+
+        -- weapon slot slider (1..4)
+        local sv = uiGet("slots")
+        if type(sv) == "number" and sv >= 1 and sv ~= lastUI["slots"] then
+            lastUI["slots"] = sv
+            S.slotCount = math.floor(sv)
+            rebuildCycle()
+            log("weapon slots -> " .. #cycleKeys)
+        end
 
         for act, id in pairs(rebind) do
             local v = uiGet(id)
@@ -378,7 +408,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- LINE OF SIGHT
+-- LINE OF SIGHT  (glass passthrough)
 -- ============================================================
 local lastBlocker = nil
 local SAMPLE_OFFSETS = {
@@ -389,9 +419,51 @@ local SAMPLE_OFFSETS = {
     Vector3.new(-0.6, 0, 0),
 }
 
+local GLASS_KEYS = {
+    "glass", "window", "windshield", "windscreen", "visor", "transparent",
+}
+
+local function nameLooksGlass(nm)
+    if type(nm) ~= "string" then return false end
+    local s = nm:lower():gsub("%s", "")
+    for _, key in ipairs(GLASS_KEYS) do
+        if s:find(key, 1, true) then return true end
+    end
+    return false
+end
+
+local function isSeeThrough(inst)
+    local tr
+    pcall(function() tr = inst.Transparency end)
+    if type(tr) == "number" and tr >= 0.8 then return true end
+
+    local mat
+    pcall(function() mat = inst.Material end)
+    if mat ~= nil then
+        local ok1, mn = pcall(function() return mat.Name end)
+        if ok1 and type(mn) == "string" and mn:lower():find("glass", 1, true) then
+            return true
+        end
+        local ok2, ts = pcall(function() return tostring(mat) end)
+        if ok2 and type(ts) == "string" and ts:lower():find("glass", 1, true) then
+            return true
+        end
+    end
+
+    local nm
+    pcall(function() nm = inst.Name end)
+    if nameLooksGlass(nm) then return true end
+
+    local cc
+    pcall(function() cc = inst.CanCollide end)
+    if cc == false then return true end
+
+    return false
+end
+
 local function castClear(origin, goal)
     local o = origin
-    for _ = 1, 6 do
+    for _ = 1, 8 do
         local dir = goal - o
         local dist = dir.Magnitude
         if dist < 0.3 then return true end
@@ -404,19 +476,12 @@ local function castClear(origin, goal)
         pcall(function() rd = res.Distance end)
         if type(rd) == "number" and (dist - rd) < 1.0 then return true end
 
-        local pass = false
-        pcall(function()
-            local tr = inst.Transparency
-            if type(tr) == "number" and tr >= 0.8 then pass = true end
-        end)
-        if not pass then
-            pcall(function() if inst.CanCollide == false then pass = true end end)
-        end
-        if not pass then
+        if not isSeeThrough(inst) then
             local okn, nm = pcall(function() return inst:GetFullName() end)
             lastBlocker = okn and nm or "?"
             return false
         end
+
         o = res.Position + dir.Unit * 0.1
     end
     return false
@@ -513,7 +578,7 @@ local function doUnlock()
 end
 
 -- ============================================================
--- RELOAD ALL  (fast - one frame per step, like the fire loop)
+-- RELOAD ALL  (0.01 timing, honors the slot slider)
 -- ============================================================
 local function tap(code, hold)
     pcall(function() keypress(code) end)
@@ -524,22 +589,21 @@ end
 local function doReloadAll()
     if reloading then return end
     reloading = true
+    local slots = cycleKeys
     pcall(function() notify("Reloading all", "Trigger", 1) end)
-    log("reload all -> fast cycle")
+    log("reload all -> slots 1.." .. #slots .. " (0.01)")
 
     task.spawn(function()
-        for _, slot in ipairs(CYCLE_KEYS) do
-            tap(slot, RL_TAP)
+        for i = 1, #slots do
+            tap(slots[i], RL_TAP)
             task.wait(RL_GAP)
-            tap(binds.reload, RL_TAP)
+            tap(RELOAD_KEY, RL_TAP)
             task.wait(RL_SETTLE)
         end
 
-        -- back to slot 1 so the trigger bot keeps firing the first gun
-        tap(CYCLE_KEYS[1], RL_TAP)
-
-        -- make sure no reload key is stuck down
-        pcall(function() keyrelease(binds.reload) end)
+        -- back to the first slot so the trigger bot keeps firing it
+        tap(slots[1], RL_TAP)
+        pcall(function() keyrelease(RELOAD_KEY) end)
 
         reloading = false
         log("reload all done")
@@ -559,6 +623,7 @@ task.spawn(function()
             if uid ~= lastCheckUid then
                 blockStreak = 0
                 lastCheckUid = uid
+                visState.uid, visState.vis = uid, true
             end
             local origins = getOrigins()
             if #origins > 0 then
@@ -569,7 +634,7 @@ task.spawn(function()
                     visState.uid, visState.vis = uid, true
                 else
                     blockStreak = blockStreak + 1
-                    if blockStreak >= 3 then
+                    if blockStreak >= BLOCK_FRAMES then
                         visState.uid, visState.vis = uid, false
                     end
                 end
@@ -578,7 +643,7 @@ task.spawn(function()
             lastCheckUid = uid
             blockStreak = 0
         end
-        task.wait(0.02)
+        task.wait(LOS_INTERVAL)
     end
 end)
 
@@ -631,6 +696,11 @@ pcall(function()
 
         if reloading then return end
 
+        if code == RELOAD_KEY then
+            latch.reload = true
+            return
+        end
+
         for _, act in ipairs(ACTIONS) do
             if binds[act] == code then latch[act] = true end
         end
@@ -639,18 +709,30 @@ end)
 
 task.spawn(function()
     while running do
+        if not reloading then
+            for _, act in ipairs(ACTIONS) do
+                local raw = binds[act]
+                local down = pollDown(raw)
+                if down and not wasDown[act] then trigger(act) end
+                wasDown[act] = down
+            end
+            local rdown = pollDown(RELOAD_KEY)
+            if rdown and not wasDown.reload then trigger("reload") end
+            wasDown.reload = rdown
+        end
+
+        if latch.reload then
+            latch.reload = nil
+            trigger("reload")
+        end
         for _, act in ipairs(ACTIONS) do
-            if reloading then break end
-            local raw = binds[act]
-            local down = pollDown(raw)
-            if down and not wasDown[act] then trigger(act) end
-            wasDown[act] = down
             if latch[act] then
                 latch[act] = nil
                 trigger(act)
             end
         end
-        task.wait(0.01)
+
+        task.wait(0.005)
     end
 end)
 
@@ -686,7 +768,7 @@ local lastShot = 0
 
 local function releaseCycle()
     if cycStage == 1 then
-        local code = CYCLE_KEYS[cycIndex]
+        local code = cycleKeys[cycIndex]
         if code then pcall(function() keyrelease(code) end) end
     end
     cycStage, cycIndex = 0, 1
@@ -775,7 +857,7 @@ connRender = RunService.RenderStepped:Connect(function()
         if (now - lastShot) >= RATE then
             lastShot = now
             if S.cycle then
-                local code = CYCLE_KEYS[cycIndex]
+                local code = cycleKeys[cycIndex]
                 if code then
                     if cycStage == 0 then
                         pcall(function() keypress(code) end)
@@ -784,7 +866,7 @@ connRender = RunService.RenderStepped:Connect(function()
                         pcall(function() keyrelease(code) end)
                         cycStage = 0
                         cycIndex = cycIndex + 1
-                        if cycIndex > #CYCLE_KEYS then cycIndex = 1 end
+                        if cycIndex > #cycleKeys then cycIndex = 1 end
                     end
                 end
             end
@@ -856,11 +938,11 @@ connRender = RunService.RenderStepped:Connect(function()
     end
 end)
 
-log("v16 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  "
-    .. keyName(binds.unlock) .. "=unlock  " .. keyName(binds.reload) .. "=reload all")
-log("lock radius 100 px | settle 0.15 s | fire rate max | reload fast")
-log("teams: " .. table.concat(TEAM_LIST, ", "))
-pcall(function() notify("Trigger v16 ready", "Trigger", 2) end)
+log("v20 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  "
+    .. keyName(binds.unlock) .. "=unlock  R=reload all (fixed)")
+log("weapon slots: " .. #cycleKeys .. " | lock radius 100 px | settle 0.15 s")
+log("reload timing 0.01 | teams: " .. table.concat(TEAM_LIST, ", "))
+pcall(function() notify("Trigger v20 ready", "Trigger", 2) end)
 
 -- keep-alive (REQUIRED)
 while running do task.wait(1) end
