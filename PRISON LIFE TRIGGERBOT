@@ -1,5 +1,5 @@
 -- ============================================================
--- TRIGGER BOT v22  (aim strength default 40)
+-- TRIGGER BOT v37 with Prisoner Agro ESP (IMAGE markers)
 -- Lock:  closest to mouse cursor, within 100 px
 -- Aim:   eases the mouse toward the LOCKED target (mousemoverel)
 -- Settle: 0.15 s after a lock/switch before firing
@@ -8,6 +8,15 @@
 -- Rebind: Lock and Unlock only. Reload All is fixed on R.
 -- Weapon slots: slider 1-4.
 -- Car glass / windows are shot through.
+-- Retarget after death: ON keeps the lock through respawn,
+--                       OFF unlocks as soon as the target dies.
+-- ESP: Box on locked target + ONE image marker per inmate,
+--      scaled by distance from the camera.
+--   Trespassing == true          -> cuffs (arrestable)
+--   Hostile == true (not arrest) -> angry face
+--   neither                      -> nothing
+-- Flags are read by VALUE (GetAttribute), not by name presence.
+-- Drawing.Image decodes GIF only (JPG/WEBP silently drop).
 -- STOP:  _G.__TRIGGER_STOP()   (or kill the script)
 -- ============================================================
 local Players    = game:GetService("Players")
@@ -18,6 +27,33 @@ local Teams      = game:GetService("Teams")
 
 local lp       = Players.LocalPlayer
 local myUserId = lp.UserId
+
+-- ============================================================
+-- MARKER IMAGES
+-- ============================================================
+local IMG_AGGRO_URL  = "https://media1.tenor.com/m/7XkuPqVP5qUAAAAC/sinirli-sigma.gif"
+local IMG_ARREST_URL = "https://media.tenor.com/6Ovy9uqnWpYAAAAi/cuffs.gif"
+
+-- Distance scaling: icon is S.markerSize px when the inmate is
+-- MARKER_REF_DIST studs from your camera. Closer = bigger,
+-- farther = smaller, clamped to these factors of the base size.
+local MARKER_REF_DIST   = 40
+local MARKER_MIN_FACTOR = 0.4
+local MARKER_MAX_FACTOR = 2.5
+
+local DEBUG_TEST_IMAGE = false
+
+-- Prints each inmate's raw Hostile / Trespassing values when they change.
+local DEBUG_FLAGS = false
+
+-- If the cuffs GIF renders blank (bad first frame), set this to
+-- true and the arrest marker becomes a yellow "CUFFS" text label.
+local USE_TEXT_ARREST_FALLBACK = false
+
+local AGGRO_DATA  = ""
+local ARREST_DATA = ""
+pcall(function() AGGRO_DATA  = httpget(IMG_AGGRO_URL)  end)
+pcall(function() ARREST_DATA = httpget(IMG_ARREST_URL) end)
 
 -- ============================================================
 -- LIFECYCLE
@@ -51,37 +87,38 @@ local function log(s) print("[TRIGGER] " .. tostring(s)) end
 -- SETTINGS
 -- ============================================================
 local S = {
-    enabled    = true,
-    requireLOS = true,
-    autoNext   = false,
-    cycle      = true,
-    esp        = true,
-    reloadAll  = true,
-    slotCount  = 3,     -- 1..4, driven by the slider
-    aim        = true,  -- aim assist on the locked target
-    aimStr     = 40,    -- 1..100, % of the gap closed per frame
-    aimIdx     = 0,     -- 0 = head, 1 = chest
-    predict    = false, -- horizontal velocity lead
+    enabled      = true,
+    requireLOS   = true,
+    retarget     = true,   -- keep lock through target death/respawn
+    cycle        = true,
+    esp          = true,
+    reloadAll    = true,
+    slotCount    = 3,
+    aim          = true,
+    aimStr       = 40,
+    aimIdx       = 0,
+    predict      = false,
+    inmateESP    = true,
+    scaleMarkers = true,
+    markerSize   = 30,
 }
 
-local LOCK_RADIUS = 100     -- px from cursor, fixed
-local SETTLE      = 0.15    -- seconds after lock/switch before firing, fixed
-local RATE        = 0       -- fire every frame, fixed
+local LOCK_RADIUS = 100
+local SETTLE      = 0.15
+local RATE        = 0
+local DEATH_GRACE = 0.15   -- seconds before unlocking a dead target (retarget OFF)
 
 local LOS_INTERVAL = 0.005
 local BLOCK_FRAMES = 2
 
--- aim tuning
-local AIM_MAX_STEP = 80     -- max pixels the mouse moves per frame
-local AIM_DEADZONE = 1.5    -- stop nudging when this close (px)
-local LEAD_TIME    = 0.06   -- seconds of velocity lead when Prediction is on
+local AIM_MAX_STEP = 80
+local AIM_DEADZONE = 1.5
+local LEAD_TIME    = 0.06
 local AIM_PARTS    = { "Head", "Chest" }
 
--- hotbar slot keys: 1, 2, 3, 4 (raw VK codes)
 local SLOT_KEYS  = { 49, 50, 51, 52 }
-local RELOAD_KEY = 82       -- R, the in-game reload (fixed)
+local RELOAD_KEY = 82
 
--- reload timing
 local RL_TAP     = 0.01
 local RL_GAP     = 0.01
 local RL_SETTLE  = 0.01
@@ -124,6 +161,51 @@ end
 local function isHostile(tName)
     if tName and TEAM_TARGET[tName] == false then return false end
     return true
+end
+
+-- ============================================================
+-- INMATE FLAG DETECTION  (by VALUE)
+--   GetAttributes() only returns attribute NAMES, so we read the
+--   real value with GetAttribute(name) and require it to be true.
+-- ============================================================
+local FLAG_AGGRO  = { "Hostile" }
+local FLAG_ARREST = { "Trespassing" }
+
+local function readAttr(ch, name)
+    local ok, v = pcall(function() return ch:GetAttribute(name) end)
+    if ok then return v end
+    return nil
+end
+
+local function flagOn(ch, names)
+    for _, n in ipairs(names) do
+        local v = readAttr(ch, n)
+        if v == true then return true end
+        if type(v) == "number" and v > 0 then return true end
+    end
+    return false
+end
+
+local lastDbg = {}
+
+local function detectInmateState(ch, uid, pname)
+    local aggro  = flagOn(ch, FLAG_AGGRO)
+    local arrest = flagOn(ch, FLAG_ARREST)
+
+    if DEBUG_FLAGS then
+        local rawA = readAttr(ch, FLAG_AGGRO[1])
+        local rawT = readAttr(ch, FLAG_ARREST[1])
+        local key = tostring(rawA) .. "|" .. tostring(rawT)
+        if lastDbg[uid] ~= key then
+            lastDbg[uid] = key
+            log(string.format("%s  %s=%s (%s)  %s=%s (%s)",
+                tostring(pname),
+                FLAG_AGGRO[1],  tostring(rawA), typeof(rawA),
+                FLAG_ARREST[1], tostring(rawT), typeof(rawT)))
+        end
+    end
+
+    return aggro, arrest
 end
 
 -- ============================================================
@@ -219,7 +301,8 @@ UI.AddTab("Trigger", function(tab)
 
         local b = tab:Section("Combat", "Right")
         b:Toggle("require_los", "Require line of sight", true, function() end)
-        b:Toggle("auto_next", "Auto re-lock nearest", false, function() end)
+        b:Toggle("retarget", "Retarget after death", true, function() end)
+        b:Tip("ON: lock stays through respawn. OFF: unlocks when the target dies.")
         b:Toggle("cycle", "Cycle weapons", true, function() end)
         b:Toggle("esp", "Box on locked target", true, function() end)
         b:SliderInt("slots", "Weapon slots to cycle", 1, 4, S.slotCount, function() end)
@@ -228,9 +311,15 @@ UI.AddTab("Trigger", function(tab)
         local c = tab:Section("Aim", "Right")
         c:Toggle("aim", "Aim at locked target", true, function() end)
         c:SliderInt("aim_str", "Aim strength", 1, 100, S.aimStr, function() end)
-        c:Tip("Higher = snaps faster. Lower = smoother.")
+        c:Tip("40 = smooth. 70-85 = flick, near-instant lock.")
         c:Combo("aim_part", "Aim part", AIM_PARTS, S.aimIdx, function() end)
         c:Toggle("aim_pred", "Prediction (lead moving targets)", false, function() end)
+
+        local e = tab:Section("Inmate ESP", "Left")
+        e:Toggle("inmate_esp", "Show inmate flags", true, function() end)
+        e:Toggle("scale_markers", "Scale icons by distance", true, function() end)
+        e:SliderInt("marker_size", "Icon size (px @ 40 studs)", 10, 80, S.markerSize, function() end)
+        e:Tip("Angry face = Hostile   Cuffs = Trespassing (arrestable)")
 
         local k = tab:Section("Keys", "Right")
         k:Text("Flip a Rebind toggle, then press the key you want.")
@@ -262,14 +351,15 @@ task.spawn(function()
     while running do
         bool("enabled", "enabled")
         bool("require_los", "requireLOS")
-        bool("auto_next", "autoNext")
+        bool("retarget", "retarget")
         bool("cycle", "cycle")
         bool("esp", "esp")
         bool("reload_all", "reloadAll")
         bool("aim", "aim")
         bool("aim_pred", "predict")
+        bool("inmate_esp", "inmateESP")
+        bool("scale_markers", "scaleMarkers")
 
-        -- weapon slot slider (1..4)
         local sv = uiGet("slots")
         if type(sv) == "number" and sv >= 1 and sv ~= lastUI["slots"] then
             lastUI["slots"] = sv
@@ -278,7 +368,6 @@ task.spawn(function()
             log("weapon slots -> " .. #cycleKeys)
         end
 
-        -- aim strength slider (1..100)
         local av = uiGet("aim_str")
         if type(av) == "number" and av >= 1 and av ~= lastUI["aim_str"] then
             lastUI["aim_str"] = av
@@ -286,12 +375,18 @@ task.spawn(function()
             log("aim strength -> " .. S.aimStr)
         end
 
-        -- aim part (0 = head, 1 = chest)
         local pv = uiGet("aim_part")
         if type(pv) == "number" and pv >= 0 and pv <= 1 and pv ~= lastUI["aim_part"] then
             lastUI["aim_part"] = pv
             S.aimIdx = math.floor(pv)
             log("aim part -> " .. AIM_PARTS[S.aimIdx + 1])
+        end
+
+        local ms = uiGet("marker_size")
+        if type(ms) == "number" and ms >= 1 and ms ~= lastUI["marker_size"] then
+            lastUI["marker_size"] = ms
+            S.markerSize = math.floor(ms)
+            log("icon size -> " .. S.markerSize)
         end
 
         for act, id in pairs(rebind) do
@@ -337,6 +432,7 @@ local PART_CLASS = {
 local targets     = {}
 local targetByUid = {}
 local cache       = {}
+local inmates     = {}
 
 local wallParams = RaycastParams.new()
 pcall(function() wallParams.FilterType = Enum.RaycastFilterType.Exclude end)
@@ -386,6 +482,8 @@ task.spawn(function()
         end
 
         local out, byUid, seen, filter = {}, {}, {}, {}
+        local inmateList = {}
+
         for _, p in ipairs(Players:GetPlayers()) do
             local ch = p.Character
             if ch then filter[#filter + 1] = ch end
@@ -405,6 +503,13 @@ task.spawn(function()
                         TEAM_TARGET[tName] = true
                         log("new team seen: " .. tName)
                     end
+
+                    local aggro, arrest = false, false
+                    if tName == "Inmates" then
+                        aggro, arrest = detectInmateState(ch, uid, p.Name)
+                    end
+                    local hostileInmate = aggro or arrest
+
                     if isHostile(tName) then
                         local addr
                         pcall(function() addr = ch.Address end)
@@ -422,10 +527,30 @@ task.spawn(function()
                             end
                             local t = { uid = uid, name = p.Name, team = tName,
                                         parts = c.parts, los = c.los, root = c.root, head = c.head,
-                                        dist = dist or math.huge }
+                                        dist = dist or math.huge, hostileInmate = hostileInmate }
                             out[#out + 1] = t
                             byUid[uid] = t
                             seen[uid] = true
+                        end
+                    end
+
+                    if tName == "Inmates" then
+                        local addr2
+                        pcall(function() addr2 = ch.Address end)
+                        local c2 = cache[uid]
+                        if not c2 or c2.addr ~= addr2 or (now - c2.t) > 1.5 then
+                            local parts, root, head, losParts = resolveBody(ch)
+                            c2 = { addr = addr2, t = now, parts = parts, root = root, head = head, los = losParts }
+                            cache[uid] = c2
+                        end
+                        if c2.root and c2.head then
+                            inmateList[#inmateList + 1] = {
+                                uid     = uid,
+                                head    = c2.head,
+                                aggro   = aggro,
+                                arrest  = arrest,
+                                hostile = hostileInmate,
+                            }
                         end
                     end
                 end
@@ -435,7 +560,7 @@ task.spawn(function()
             if not seen[uid] then cache[uid] = nil end
         end
 
-        targets, targetByUid = out, byUid
+        targets, targetByUid, inmates = out, byUid, inmateList
         pcall(function() wallParams.FilterDescendantsInstances = filter end)
         task.wait(0.033)
     end
@@ -589,6 +714,7 @@ local function applyLock(t, how, value)
         extra = string.format(" (%.0f px)", value)
     end
     if t.team then extra = extra .. " [" .. t.team .. "]" end
+    if t.hostileInmate then extra = extra .. " [FLAGGED]" end
     log((switched and "Switched -> " or "Locked -> ") .. t.name .. extra)
     pcall(function() notify((switched and "Switched: " or "Locked: ") .. t.name, "Trigger", 1) end)
 end
@@ -612,7 +738,7 @@ local function doUnlock()
 end
 
 -- ============================================================
--- RELOAD ALL  (0.01 timing, honors the slot slider)
+-- RELOAD ALL
 -- ============================================================
 local function tap(code, hold)
     pcall(function() keypress(code) end)
@@ -770,6 +896,41 @@ task.spawn(function()
 end)
 
 -- ============================================================
+-- INMATE IMAGE ESP POOL  (one marker per inmate)
+--   Sizes are set every frame from distance, so the initial
+--   size here doesn't matter.
+-- ============================================================
+local INMATE_POOL = 16
+local inmatePool = {}
+
+for i = 1, INMATE_POOL do
+    local a = Drawing.new("Image")
+    a.Size = Vector2.new(S.markerSize, S.markerSize)
+    a.Visible = false
+    if #AGGRO_DATA > 0 then a.Data = AGGRO_DATA end
+    drawings[#drawings + 1] = a
+
+    local b
+    if USE_TEXT_ARREST_FALLBACK then
+        b = Drawing.new("Text")
+        b.Size = 16
+        b.Center = true
+        b.Outline = true
+        b.Color = Color3.fromRGB(255, 205, 60)
+        b.Text = "CUFFS"
+        b.Visible = false
+    else
+        b = Drawing.new("Image")
+        b.Size = Vector2.new(S.markerSize, S.markerSize)
+        b.Visible = false
+        if #ARREST_DATA > 0 then b.Data = ARREST_DATA end
+    end
+    drawings[#drawings + 1] = b
+
+    inmatePool[i] = { aggro = a, arrest = b }
+end
+
+-- ============================================================
 -- OVERLAY
 -- ============================================================
 local ovText = newDrawing("Text")
@@ -777,6 +938,14 @@ ovText.Size = 14; ovText.Font = 2; ovText.Outline = true; ovText.Visible = true
 
 local box = newDrawing("Square")
 box.Thickness = 1; box.Filled = false; box.Visible = false
+
+local testImg
+if DEBUG_TEST_IMAGE and #AGGRO_DATA > 0 then
+    testImg = newDrawing("Image")
+    testImg.Data = AGGRO_DATA
+    testImg.Size = Vector2.new(96, 96)
+    testImg.Visible = true
+end
 
 local function setRight(obj, vpX, y, str)
     obj.Text = str
@@ -790,11 +959,11 @@ local function setRight(obj, vpX, y, str)
     obj.Position = Vector2.new(vpX - w - 14, y)
 end
 
-local COL_FIRE   = Color3.fromRGB(80, 255, 80)
-local COL_WAIT   = Color3.fromRGB(255, 140, 0)
-local COL_IDLE   = Color3.fromRGB(150, 150, 150)
-local COL_PAUSE  = Color3.fromRGB(255, 70, 70)
-local COL_SETTLE = Color3.fromRGB(120, 180, 255)
+local COL_FIRE    = Color3.fromRGB(80, 255, 80)
+local COL_WAIT    = Color3.fromRGB(255, 140, 0)
+local COL_IDLE    = Color3.fromRGB(150, 150, 150)
+local COL_PAUSE   = Color3.fromRGB(255, 70, 70)
+local COL_SETTLE  = Color3.fromRGB(120, 180, 255)
 
 local cycIndex, cycStage = 1, 0
 local lastShot = 0
@@ -813,6 +982,13 @@ connRender = RunService.RenderStepped:Connect(function()
     local vp = cam.ViewportSize
     local vpX, vpY = vp.X, vp.Y
     local now = os.clock()
+
+    local camPos
+    pcall(function() camPos = cam.CFrame.Position end)
+
+    if testImg and testImg.Visible then
+        testImg.Position = Vector2.new(vpX / 2 - 48, vpY / 2 - 48)
+    end
 
     local mx, my = vpX / 2, vpY / 2
     pcall(function()
@@ -850,10 +1026,11 @@ connRender = RunService.RenderStepped:Connect(function()
 
     local t = lockedUid and targetByUid[lockedUid] or nil
 
+    -- Target gone (died / left / filtered out)
     if lockedUid and not t then
         lostSince = lostSince or now
-        if S.autoNext and (now - lostSince) > 0.6 then
-            doUnlock()
+        if (not S.retarget) and (now - lostSince) > DEATH_GRACE then
+            doUnlock()   -- retarget OFF: drop the lock, don't re-lock on respawn
         end
     elseif t then
         lostSince = nil
@@ -909,9 +1086,7 @@ connRender = RunService.RenderStepped:Connect(function()
         releaseCycle()
     end
 
-    -- --------------------------------------------------------
-    -- AIM ASSIST on the locked target (mouse nudge, not CFrame)
-    -- --------------------------------------------------------
+    -- AIM ASSIST
     if S.aim and t and S.enabled and not reloading and not capture then
         local active = true
         pcall(function() active = isrbxactive() end)
@@ -964,6 +1139,7 @@ connRender = RunService.RenderStepped:Connect(function()
         local dtxt = (t and t.dist < math.huge) and string.format("  %.0f st", t.dist) or ""
         local ttxt = (t and t.team) and ("  [" .. t.team .. "]") or ""
         local atxt = (S.aim and t) and "  +AIM" or ""
+        local htxt = (t and t.hostileInmate) and "  [FLAGGED]" or ""
         if state == "FIRING" then
             ovText.Color = COL_FIRE
         elseif state == "SETTLING" then
@@ -971,13 +1147,14 @@ connRender = RunService.RenderStepped:Connect(function()
         else
             ovText.Color = COL_WAIT
         end
-        setRight(ovText, vpX, y, "LOCKED: " .. tostring(lockedName) .. dtxt .. ttxt .. atxt .. "  [" .. state .. "]")
+        setRight(ovText, vpX, y, "LOCKED: " .. tostring(lockedName) .. dtxt .. ttxt .. atxt .. htxt .. "  [" .. state .. "]")
     else
         ovText.Color = COL_IDLE
         setRight(ovText, vpX, y, "UNLOCKED  " .. #targets .. " targets")
     end
     ovText.Visible = true
 
+    -- LOCKED TARGET BOX
     if S.esp and t and t.root and not capture and not reloading then
         local headPart = t.head or t.root
         local okh, hp = pcall(function() return headPart.Position end)
@@ -1011,14 +1188,84 @@ connRender = RunService.RenderStepped:Connect(function()
     else
         box.Visible = false
     end
+
+    -- ========================================================
+    -- INMATE IMAGE ESP  (EXACTLY ONE icon, or none)
+    --   Trespassing == true          -> cuffs
+    --   Hostile == true (not arrest) -> angry face
+    --   neither                      -> nothing
+    -- Icon size scales with distance from the camera:
+    --   size = base * REF_DIST / distance   (clamped)
+    -- ========================================================
+    local inmateIdx = 0
+    if S.inmateESP and not capture and not reloading then
+        local baseSize = S.markerSize
+        local minSize  = baseSize * MARKER_MIN_FACTOR
+        local maxSize  = baseSize * MARKER_MAX_FACTOR
+
+        for _, inmate in ipairs(inmates) do
+            if inmateIdx >= INMATE_POOL then break end
+
+            local showArrest = inmate.arrest == true
+            local showAggro  = (inmate.aggro == true) and not showArrest
+
+            if inmate.head and (showAggro or showArrest) then
+                local okh2, hp2 = pcall(function() return inmate.head.Position end)
+                if okh2 and hp2 then
+                    local sp, vis = WorldToScreen(hp2 + Vector3.new(0, 2.2, 0))
+                    if vis and sp then
+                        inmateIdx = inmateIdx + 1
+                        local slot = inmatePool[inmateIdx]
+
+                        -- distance-based size
+                        local sz = baseSize
+                        if S.scaleMarkers and camPos then
+                            local d = (hp2 - camPos).Magnitude
+                            sz = baseSize * MARKER_REF_DIST / math.max(d, 1)
+                            sz = math.max(minSize, math.min(maxSize, sz))
+                        end
+                        sz = math.floor(sz + 0.5)
+                        local half = sz / 2
+
+                        if showArrest then
+                            if USE_TEXT_ARREST_FALLBACK then
+                                slot.arrest.Size = math.max(10, math.floor(sz * 0.6))
+                                slot.arrest.Position = Vector2.new(sp.X, sp.Y - sz * 0.3)
+                            else
+                                slot.arrest.Size = Vector2.new(sz, sz)
+                                slot.arrest.Position = Vector2.new(sp.X - half, sp.Y - half)
+                            end
+                            slot.arrest.Visible = true
+                            slot.aggro.Visible  = false
+                        else
+                            slot.aggro.Size = Vector2.new(sz, sz)
+                            slot.aggro.Position = Vector2.new(sp.X - half, sp.Y - half)
+                            slot.aggro.Visible  = true
+                            slot.arrest.Visible = false
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for i = inmateIdx + 1, INMATE_POOL do
+        inmatePool[i].aggro.Visible  = false
+        inmatePool[i].arrest.Visible = false
+    end
 end)
 
-log("v22 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  "
+log("v37 loaded | keys -> " .. keyName(binds.lock) .. "=lock(mouse)  "
     .. keyName(binds.unlock) .. "=unlock  R=reload all (fixed)")
 log("weapon slots: " .. #cycleKeys .. " | lock radius 100 px | settle 0.15 s")
 log("aim assist: " .. (S.aim and "on" or "off") .. " | strength " .. S.aimStr)
+log("markers: aggro bytes=" .. #AGGRO_DATA .. "  arrest bytes=" .. #ARREST_DATA)
+log("icon size " .. S.markerSize .. " px @ " .. MARKER_REF_DIST .. " studs | scaling "
+    .. (S.scaleMarkers and "ON" or "off"))
+log("retarget after death: " .. (S.retarget and "ON" or "off"))
+log("flags by value: " .. FLAG_AGGRO[1] .. "=aggro  " .. FLAG_ARREST[1] .. "=arrest (arrest wins)")
 log("teams: " .. table.concat(TEAM_LIST, ", "))
-pcall(function() notify("Trigger v22 ready", "Trigger", 2) end)
+pcall(function() notify("Trigger v37 ready", "Trigger", 2) end)
 
 -- keep-alive (REQUIRED)
 while running do task.wait(1) end
