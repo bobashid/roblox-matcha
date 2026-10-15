@@ -1,0 +1,634 @@
+--==================================================================
+--  Chop A Forest  |  Auto Pickup + Multi-Chop + Gems + Auto Sell + ESP
+--  Matcha LuaVM  -  built-in Matcha menu tab (UI.AddTab)
+--
+--  CAPACITY LOCK
+--    getMaxCarry() re-reads Up_GearBackpack every tick, but the
+--    effective max is locked to the SMALLEST value ever seen.
+--    Upgrading the backpack mid-session can NOT raise the sell
+--    threshold - the script keeps thinking it is the smaller bag.
+--
+--  TOGGLE SYNC
+--    Config is driven by a poller reading each widget's REAL
+--    ticked state (UI.GetValue). Callback is a fallback only.
+--
+--  AUTO SELL
+--    Sells when CarriedLogs >= locked max, OR when the count
+--    plateaus near the top while pickups are still firing.
+--
+--  MENU: 8 toggles + Set Sell Point button. No keybinds.
+--==================================================================
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+
+local LP = Players.LocalPlayer
+
+local Map        = Workspace:FindFirstChild("Map")
+local LogsFolder = Workspace:WaitForChild("Logs")
+
+local ChopRemotes = game:GetService("ReplicatedStorage")
+    :WaitForChild("Shared")
+    :WaitForChild("Services")
+    :WaitForChild("ChopRemotes")
+local PickUpLog   = ChopRemotes:WaitForChild("PickUpLog")
+local Chop        = ChopRemotes:WaitForChild("Chop")
+local CollectGem  = ChopRemotes:WaitForChild("CollectGem")
+local DepositLogs = ChopRemotes:WaitForChild("DepositLogs")
+
+-- fixed tuning
+local AURA_RADIUS       = 150
+local AIM_HEIGHT        = 0.60
+local MAX_CHOP_TARGETS  = 8
+local MAX_GEM_TARGETS   = 8
+local MAX_LOG_TARGETS   = 8
+
+-- scan rates (butter smooth ESP)
+local SCAN_LOG   = 0.01    -- 100 Hz
+local SCAN_GEM   = 0.01    -- 100 Hz
+local SCAN_TREE  = 0.016   -- ~60 Hz
+local CACHE_TREE = 1.0     -- rebuild tree position cache every 1s
+
+-- sell tuning
+local SELL_COOLDOWN   = 2.0
+local TP_HOVER        = 3
+local PLATEAU_TIME    = 1.5   -- sec of no growth near the top = full
+
+-- backpack capacity per upgrade level (from the game's config)
+local BACKPACK_CAP = { 10, 25, 75, 150 }
+local HAND_BONUS   = 5
+local FALLBACK_MAX = 155
+
+-- fixed aura colors
+local LOG_COLOR  = Color3.fromRGB(255, 205, 110)
+local TREE_COLOR = Color3.fromRGB(120, 220, 140)
+local GEM_COLOR  = Color3.fromRGB(120, 200, 255)
+
+local Config = {
+    AutoPickup = true,
+    AutoChop   = true,
+    AutoGem    = true,
+    AutoSell   = true,
+    SellTP     = true,
+
+    ESPLog  = true,
+    ESPTree = true,
+    ESPGem  = true,
+}
+
+local running = true
+local sellPos = nil
+
+-- shared timing
+local lastPickupFire = 0
+
+-- toggle registry for the poller
+local TOGGLES = {}
+local getterWorks = {}
+
+_G.ChopAForest = { stop = function() running = false end }
+
+--------------------------------------------------------------------
+-- CAPACITY - read live, but locked to the SMALLEST value ever seen.
+-- Upgrading mid-session cannot raise the sell threshold.
+--------------------------------------------------------------------
+local lockedMax = nil
+
+local function rawMaxCarry()
+    local raw = tonumber(LP:GetAttribute("Up_GearBackpack"))
+    if raw == nil then return FALLBACK_MAX end
+    local idx = math.floor(raw)
+    if idx < 1 then idx = 1 end
+    if idx > #BACKPACK_CAP then idx = #BACKPACK_CAP end
+    return BACKPACK_CAP[idx] + HAND_BONUS
+end
+
+local function getMaxCarry()
+    local cur = rawMaxCarry()
+    if lockedMax == nil then
+        lockedMax = cur
+        print("[Chop A Forest] capacity locked at " .. tostring(lockedMax))
+    elseif cur < lockedMax then
+        -- game now reports a smaller bag (respawn/level reset) - follow it down
+        print("[Chop A Forest] capacity lowered to " .. tostring(cur))
+        lockedMax = cur
+    elseif cur > lockedMax then
+        -- an upgrade would raise it - ignore, keep the smaller value
+        print("[Chop A Forest] upgrade detected (" .. tostring(cur)
+            .. ") - keeping smaller capacity " .. tostring(lockedMax))
+    end
+    return lockedMax
+end
+
+--------------------------------------------------------------------
+-- TOGGLE SYNC
+--------------------------------------------------------------------
+local function applyBool(key)
+    return function(...)
+        if getterWorks[key] then return end
+        local n = select("#", ...)
+        for i = 1, n do
+            local v = select(i, ...)
+            if type(v) == "boolean" then
+                Config[key] = v
+                return
+            end
+        end
+    end
+end
+
+local function registerToggle(key, id, name)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name }
+end
+
+local function safeToggle(sec, name, id, default, cb)
+    local v = {
+        function() sec:Toggle(name, id, default, cb) end,
+        function() sec:Toggle(id, name, default, cb) end,
+    }
+    for i = 1, #v do if pcall(v[i]) then return true end end
+    warn("[Chop A Forest] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function safeButton(sec, name, id, cb)
+    local v = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, id, cb) end,
+        function() sec:Button(id, name, cb) end,
+    }
+    for i = 1, #v do if pcall(v[i]) then return true end end
+    warn("[Chop A Forest] Button failed: " .. tostring(name))
+    return false
+end
+
+local function makeSection(tab, name, side)
+    local ok, sec = pcall(function() return tab:Section(name, side) end)
+    if ok and type(sec) == "table" then return sec end
+    ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and type(sec) == "table" then return sec end
+    return nil
+end
+
+local function setSellPoint()
+    local char = LP.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        sellPos = hrp.Position
+        local msg = string.format("Sell point: %.1f, %.1f, %.1f",
+            sellPos.X, sellPos.Y, sellPos.Z)
+        print("[Chop A Forest] " .. msg)
+        pcall(function() notify("Chop A Forest", msg, 3) end)
+    else
+        print("[Chop A Forest] no character to capture")
+        pcall(function() notify("Chop A Forest", "No character to capture", 2) end)
+    end
+end
+
+--------------------------------------------------------------------
+-- Menu
+--------------------------------------------------------------------
+local tabBuilt = false
+
+local function buildTab(tab)
+    if tabBuilt then return end
+    if type(tab) ~= "table" then return end
+    tabBuilt = true
+
+    pcall(function()
+        local secA = makeSection(tab, "Automation", "Left")
+        if secA then
+            if safeToggle(secA, "Auto Log Pickup", "chop_autopickup", true, applyBool("AutoPickup")) then
+                registerToggle("AutoPickup", "chop_autopickup", "Auto Log Pickup")
+            end
+            if safeToggle(secA, "Auto Chop", "chop_autochop", true, applyBool("AutoChop")) then
+                registerToggle("AutoChop", "chop_autochop", "Auto Chop")
+            end
+            if safeToggle(secA, "Auto Gem Pickup", "chop_autogem", true, applyBool("AutoGem")) then
+                registerToggle("AutoGem", "chop_autogem", "Auto Gem Pickup")
+            end
+            if safeToggle(secA, "Auto Sell (when full)", "chop_autosell", true, applyBool("AutoSell")) then
+                registerToggle("AutoSell", "chop_autosell", "Auto Sell (when full)")
+            end
+            if safeToggle(secA, "Sell Teleport", "chop_selltp", true, applyBool("SellTP")) then
+                registerToggle("SellTP", "chop_selltp", "Sell Teleport")
+            end
+        end
+
+        local secE = makeSection(tab, "ESP", "Right")
+        if secE then
+            if safeToggle(secE, "Log ESP", "chop_esp_log", true, applyBool("ESPLog")) then
+                registerToggle("ESPLog", "chop_esp_log", "Log ESP")
+            end
+            if safeToggle(secE, "Tree ESP", "chop_esp_tree", true, applyBool("ESPTree")) then
+                registerToggle("ESPTree", "chop_esp_tree", "Tree ESP")
+            end
+            if safeToggle(secE, "Gem ESP", "chop_esp_gem", true, applyBool("ESPGem")) then
+                registerToggle("ESPGem", "chop_esp_gem", "Gem ESP")
+            end
+        end
+
+        local secB = makeSection(tab, "Sell", "Right")
+        if secB then
+            safeButton(secB, "Set Sell Point", "chop_setsell", function()
+                setSellPoint()
+            end)
+        end
+    end)
+end
+
+pcall(function()
+    UI.AddTab("Chop A Forest", function(tab) buildTab(tab) end)
+end)
+
+--------------------------------------------------------------------
+-- TOGGLE POLLER - single source of truth
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t = TOGGLES[i]
+            local val = nil
+
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == "boolean" then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                if ok2 and type(v2) == "boolean" then val = v2 end
+            end
+
+            if val ~= nil then
+                getterWorks[t.key] = true
+                if Config[t.key] ~= val then
+                    Config[t.key] = val
+                    print("[Chop A Forest] " .. t.key .. " = " .. tostring(val))
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+--------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------
+local function isLog(m)
+    if m.ClassName ~= "Model" then return false end
+    return m:FindFirstChild("Wood") ~= nil
+end
+
+local function isChoppable(m)
+    if m.ClassName ~= "Model" then return false end
+    if m:FindFirstChild("Root") == nil then return false end
+    if m:FindFirstChild("Top") == nil then return false end
+    local ok, hp = pcall(function() return tonumber(m:GetAttribute("HP")) end)
+    if ok and hp ~= nil and hp <= 0 then return false end
+    return true
+end
+
+local function isGem(p)
+    local cn = p.ClassName
+    if cn ~= "Part" and cn ~= "MeshPart" then return false end
+    if p:GetAttribute("Gems") == nil then return false end
+    if p:GetAttribute("CollectedBy") ~= nil then return false end
+    return true
+end
+
+local function playerPos()
+    local char = LP.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    return hrp and hrp.Position or nil
+end
+
+local function playerHRP()
+    local char = LP.Character
+    return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+--------------------------------------------------------------------
+-- TREE POSITION CACHE
+--------------------------------------------------------------------
+local treeCache = {}
+
+task.spawn(function()
+    while running do
+        local trees = Map and Map:FindFirstChild("Trees")
+        if trees then
+            local out = {}
+            local kids = trees:GetChildren()
+            for i = 1, #kids do
+                local m = kids[i]
+                if m.ClassName == "Model" then
+                    local root = m:FindFirstChild("Root")
+                    if root then
+                        local pos = root.Position
+                        local size = root.Size
+                        if pos then
+                            out[#out + 1] = { model = m, pos = pos, sizeY = (size and size.Y) or 8 }
+                        end
+                    end
+                end
+            end
+            treeCache = out
+        end
+        task.wait(CACHE_TREE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- COLLECTORS - fast refresh
+--------------------------------------------------------------------
+local logTargets  = {}
+local treeTargets = {}
+local gemTargets  = {}
+
+task.spawn(function()
+    local auraD2 = AURA_RADIUS * AURA_RADIUS
+    while running do
+        local myPos = playerPos()
+        local out = {}
+        if myPos then
+            local kids = LogsFolder:GetChildren()
+            for i = 1, #kids do
+                local m = kids[i]
+                if isLog(m) then
+                    local wood = m:FindFirstChild("Wood")
+                    if wood then
+                        local pos = wood.Position
+                        local dx, dy, dz = pos.X - myPos.X, pos.Y - myPos.Y, pos.Z - myPos.Z
+                        local d2 = dx*dx + dy*dy + dz*dz
+                        if d2 <= auraD2 then
+                            out[#out + 1] = { model = m, pos = pos, size = wood.Size, d2 = d2 }
+                        end
+                    end
+                end
+            end
+            table.sort(out, function(a, b) return a.d2 < b.d2 end)
+        end
+        logTargets = out
+        task.wait(SCAN_LOG)
+    end
+end)
+
+task.spawn(function()
+    local auraD2 = AURA_RADIUS * AURA_RADIUS
+    while running do
+        local myPos = playerPos()
+        local out = {}
+        if myPos then
+            local folder = Workspace:FindFirstChild("GemDrops")
+            if folder then
+                local kids = folder:GetChildren()
+                for i = 1, #kids do
+                    local p = kids[i]
+                    if isGem(p) then
+                        local pos = p.Position
+                        if pos then
+                            local dx, dy, dz = pos.X - myPos.X, pos.Y - myPos.Y, pos.Z - myPos.Z
+                            local d2 = dx*dx + dy*dy + dz*dz
+                            if d2 <= auraD2 then
+                                out[#out + 1] = {
+                                    model = p, pos = pos,
+                                    size = p.Size or Vector3.new(1, 1, 1), d2 = d2,
+                                }
+                            end
+                        end
+                    end
+                end
+            end
+            table.sort(out, function(a, b) return a.d2 < b.d2 end)
+        end
+        gemTargets = out
+        task.wait(SCAN_GEM)
+    end
+end)
+
+task.spawn(function()
+    local auraD2 = AURA_RADIUS * AURA_RADIUS
+    while running do
+        local myPos = playerPos()
+        local out = {}
+        if myPos and #treeCache > 0 then
+            local cache = treeCache
+            for i = 1, #cache do
+                local t = cache[i]
+                local pos = t.pos
+                local dx, dy, dz = pos.X - myPos.X, pos.Y - myPos.Y, pos.Z - myPos.Z
+                local d2 = dx*dx + dy*dy + dz*dz
+                if d2 <= auraD2 then
+                    if isChoppable(t.model) then
+                        local aim = pos + Vector3.new(0, t.sizeY * AIM_HEIGHT, 0)
+                        out[#out + 1] = { model = t.model, pos = aim, size = Vector3.new(3, t.sizeY, 3), d2 = d2 }
+                    end
+                end
+            end
+            table.sort(out, function(a, b) return a.d2 < b.d2 end)
+        end
+        treeTargets = out
+        task.wait(SCAN_TREE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- DRAWING POOLS
+--------------------------------------------------------------------
+local function makePool(n)
+    local pool = {}
+    for i = 1, n do
+        local box = Drawing.new("Square")
+        box.Thickness = 1
+        box.Filled = false
+        box.Transparency = 1
+        box.Visible = false
+
+        local tag = Drawing.new("Text")
+        tag.Size = 12
+        tag.Center = true
+        tag.Outline = true
+        tag.Visible = false
+
+        pool[i] = { box = box, tag = tag }
+    end
+    return pool
+end
+
+local LOG_POOL  = 64
+local TREE_POOL = 64
+local GEM_POOL  = 48
+local logPool  = makePool(LOG_POOL)
+local treePool = makePool(TREE_POOL)
+local gemPool  = makePool(GEM_POOL)
+
+local function clearPool(pool, cap)
+    for i = 1, cap do
+        pool[i].box.Visible = false
+        pool[i].tag.Visible = false
+    end
+end
+
+local function drawList(list, pool, cap, color, camPos)
+    local n = 0
+    for i = 1, #list do
+        if n >= cap then break end
+        local t = list[i]
+        local top, v1 = WorldToScreen(t.pos + Vector3.new(0, t.size.Y * 0.5, 0))
+        local bot, v2 = WorldToScreen(t.pos - Vector3.new(0, t.size.Y * 0.5, 0))
+        if v1 and v2 then
+            n = n + 1
+            local e = pool[n]
+            local h = bot.Y - top.Y
+            if h < 6 then h = 6 end
+            local w = h * 0.7
+            e.box.Position = Vector2.new(top.X - w * 0.5, top.Y)
+            e.box.Size     = Vector2.new(w, h)
+            e.box.Color    = color
+            e.box.Visible  = true
+            if camPos then
+                local d = (t.pos - camPos).Magnitude
+                e.tag.Text     = string.format("%d", math.floor(d))
+                e.tag.Position = Vector2.new(top.X, top.Y - 14)
+                e.tag.Color    = color
+                e.tag.Visible  = true
+            else
+                e.tag.Visible = false
+            end
+        end
+    end
+    for i = n + 1, cap do
+        pool[i].box.Visible = false
+        pool[i].tag.Visible = false
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    local cam = Workspace.CurrentCamera
+    local camPos = cam and cam.CFrame.Position
+
+    if Config.ESPLog and #logTargets > 0 then
+        drawList(logTargets, logPool, LOG_POOL, LOG_COLOR, camPos)
+    else
+        clearPool(logPool, LOG_POOL)
+    end
+
+    if Config.ESPTree and #treeTargets > 0 then
+        drawList(treeTargets, treePool, TREE_POOL, TREE_COLOR, camPos)
+    else
+        clearPool(treePool, TREE_POOL)
+    end
+
+    if Config.ESPGem and #gemTargets > 0 then
+        drawList(gemTargets, gemPool, GEM_POOL, GEM_COLOR, camPos)
+    else
+        clearPool(gemPool, GEM_POOL)
+    end
+end)
+
+--------------------------------------------------------------------
+-- FIRE LOOP
+--------------------------------------------------------------------
+task.spawn(function()
+    local chopCounter = 0
+    while running do
+        if Config.AutoPickup and #logTargets > 0 then
+            local list = logTargets
+            local n = #list
+            if n > MAX_LOG_TARGETS then n = MAX_LOG_TARGETS end
+            for i = 1, n do
+                local log = list[i].model
+                lastPickupFire = os.clock()
+                pcall(function() PickUpLog:FireServer(log) end)
+            end
+        end
+
+        if Config.AutoChop and #treeTargets > 0 then
+            local list = treeTargets
+            local n = #list
+            if n > MAX_CHOP_TARGETS then n = MAX_CHOP_TARGETS end
+            for i = 1, n do
+                local t = list[i]
+                chopCounter = chopCounter + 1
+                local tree = t.model
+                local hitPos = t.pos
+                pcall(function() Chop:FireServer(tree, hitPos, 1, chopCounter) end)
+            end
+        end
+
+        if Config.AutoGem and #gemTargets > 0 then
+            local list = gemTargets
+            local n = #list
+            if n > MAX_GEM_TARGETS then n = MAX_GEM_TARGETS end
+            for i = 1, n do
+                local gem = list[i].model
+                pcall(function() CollectGem:FireServer(gem) end)
+            end
+        end
+
+        task.wait()
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO SELL
+-- Primary: CarriedLogs >= LOCKED max (smallest ever seen).
+-- Safety : count plateaued near the top while pickups still fire.
+--------------------------------------------------------------------
+local function deposit()
+    pcall(function() DepositLogs:FireServer() end)
+end
+
+task.spawn(function()
+    local lastSell     = 0
+    local stableSince  = os.clock()
+    local lastCarried  = tonumber(LP:GetAttribute("CarriedLogs")) or 0
+
+    while running do
+        if Config.AutoSell then
+            local now      = os.clock()
+            local carried  = tonumber(LP:GetAttribute("CarriedLogs")) or 0
+            local maxCarry = getMaxCarry()   -- re-reads live, clamped to smallest
+
+            if carried ~= lastCarried then
+                lastCarried = carried
+                stableSince = now
+            end
+
+            local fullByCount   = carried >= maxCarry
+            local pickupFlowing = (now - lastPickupFire) < 1.0
+            local fullByPlateau = (now - stableSince) >= PLATEAU_TIME
+                and pickupFlowing
+                and carried >= math.floor(maxCarry * 0.8)
+
+            if (fullByCount or fullByPlateau) and (now - lastSell) >= SELL_COOLDOWN then
+                lastSell = now
+                print("[Chop A Forest] SELL (" .. tostring(carried)
+                    .. "/" .. tostring(maxCarry) .. ")"
+                    .. (fullByCount and " [count]" or " [plateau]"))
+
+                local hrp = playerHRP()
+                if Config.SellTP and sellPos and hrp then
+                    local back = hrp.CFrame
+                    local tx, ty, tz = sellPos.X, sellPos.Y + TP_HOVER, sellPos.Z
+                    pcall(function() hrp.CFrame = CFrame.new(tx, ty, tz) end)
+                    task.wait(0.18)
+                    deposit()
+                    task.wait(0.18)
+                    deposit()
+                    task.wait(0.12)
+                    pcall(function() hrp.CFrame = back end)
+                else
+                    if not sellPos then
+                        print("[Chop A Forest] no sell point set - depositing from range")
+                    end
+                    deposit()
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+--------------------------------------------------------------------
+notify("Chop A Forest", "Loaded - set the sell point from the menu", 4)
+print("[Chop A Forest] loaded | capacity lock active (reads live, keeps smallest)")
+
