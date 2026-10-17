@@ -1,15 +1,17 @@
 -- ============================================================
--- TRIGGER BOT v63-OPT2  (beam follows VGUN when unarmed)
--- Lock:  closest on-screen target to the mouse cursor.
--- FIRE:  one shared shot-check per frame. Casts from the muzzle
---        (or virtual muzzle), HEAD first, then ARMS / HANDS.
--- RELOAD: 1 yield per slot (3 frames for 3 slots).
---         RELOAD_SAME_FRAME removes the yield entirely.
--- VGUN:  anchored to the RIGHT of the head, above the right arm.
--- PERF:  all hot loops per-frame; visibility ~33 Hz.
--- SEE-THROUGH: glass (incl. tinted), windows, invisible walls,
---        AND other players.
--- STOP:  _G.__TRIGGER_STOP()   (or kill the script)
+-- TRIGGER BOT v88  (consistent reload, mousemoveabs aim)
+--   * RELOAD-ALL now consistent: uses the no-arg scheduler yield
+--     (task.wait()) instead of task.wait(0.001), which was being
+--     stretched by the millisecond timer under load. Optional
+--     zero-yield mode via RELOAD_USE_YIELD = false.
+--   * AIM: mousemoveabs onto the chosen dot each frame.
+--     Head dots win outright. aimStr 100 = snap.
+--   * No Spread: own section, sets `SpreadRadius` = 0.
+--     Fallback: _G.__NS = true/false.
+--   * Gun-ray-only detection. Camera never used for detection.
+--   * Fire gate min = 1 green dot (hard-coded).
+--   * Inmate markers always scaled, fixed 30 px.
+-- STOP: _G.__TRIGGER_STOP()
 -- ============================================================
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -20,37 +22,73 @@ local Teams      = game:GetService("Teams")
 local lp       = Players.LocalPlayer
 local myUserId = lp.UserId
 
+-- ---------------- ASSETS ----------------
 local IMG_AGGRO_URL  = "https://media1.tenor.com/m/7XkuPqVP5qUAAAAC/sinirli-sigma.gif"
 local IMG_ARREST_URL = "https://media.tenor.com/6Ovy9uqnWpYAAAAi/cuffs.gif"
+local AGGRO_DATA, ARREST_DATA = "", ""
+pcall(function() AGGRO_DATA  = httpget(IMG_AGGRO_URL)  end)
+pcall(function() ARREST_DATA = httpget(IMG_ARREST_URL) end)
 
+-- fixed
 local MARKER_REF_DIST   = 40
 local MARKER_MIN_FACTOR = 0.4
 local MARKER_MAX_FACTOR = 2.5
+local MARKER_SIZE_FIXED = 30
+local MIN_GREEN_FIXED   = 1
+local AIM_FOV_INTERNAL  = math.huge
 
-local DEBUG_TEST_IMAGE = false
-local DEBUG_FLAGS = false
+local DEBUG_TEST_IMAGE  = false
+local DEBUG_FLAGS       = false
 local USE_TEXT_ARREST_FALLBACK = false
 
-local SHOT_CHECK_CAP = 6
-local LASER_POOL = 10
-local RAY_MAX_BOUNCE = 5
+-- ---------------- TUNING ----------------
+local RATE           = 0
+local DEATH_GRACE    = 0.15
+local VIS_REFRESH    = 0.03
+local COLLECT_WAIT   = 0.012
+local FLAG_REFRESH   = 0.20
+local CACHE_STALE    = 0.75
+
+local RAY_MAX_BOUNCE = 3
 local DESCEND_DEPTH  = 10
-local VISIBLE_CAP    = 8
+local RAY_GAP        = 0.06
 
-local STRICT_PASS = false
+local SAMPLE_INSET   = 0.92
+local DOT_POOL       = 512
+local PARTS_PER_SCAN = 4
 
--- reload tuning
-local RELOAD_SAME_FRAME = false  -- true = no yields at all (may be ignored)
-local RELOAD_LOG        = true   -- print actual elapsed time
+-- Reload: use a plain scheduler yield (task.wait() no-arg, ~16us,
+-- cannot be stretched by the ms timer). Set to false for zero yields
+-- (all key events in a single frame).
+local RELOAD_USE_YIELD = true
+local RELOAD_LOG       = true
 
 local VGUN_RIGHT   = 1.6
 local VGUN_FORWARD = 0.4
 local VGUN_DOWN    = 0.25
 
-local AGGRO_DATA  = ""
-local ARREST_DATA = ""
-pcall(function() AGGRO_DATA  = httpget(IMG_AGGRO_URL)  end)
-pcall(function() ARREST_DATA = httpget(IMG_ARREST_URL) end)
+local SLOT_KEYS  = { 49, 50, 51, 52 }
+local RELOAD_KEY = 82
+local cycleKeys  = { 49, 50, 51 }
+
+-- ---------------- NO SPREAD ----------------
+local SPREAD_ATTRS = {
+    "SpreadRadius",
+    "Spread","spread","BulletSpread","bulletSpread",
+    "GunSpread","gunSpread","WeaponSpread","weaponSpread",
+    "Bloom","bloom","Inaccuracy","inaccuracy",
+    "Dispersion","dispersion","Cone","cone",
+    "MinSpread","minSpread","MaxSpread","maxSpread",
+    "CurrentSpread","currentSpread","Deviation","deviation",
+}
+local SPREAD_SUBSTR   = { "spread","bloom","inacc","dispersion","deviation","cone" }
+local ACCURACY_SUBSTR = { "accuracy","precision" }
+
+-- ---------------- GUN MODS ----------------
+local AR_SET = { ["AK-47"]=true, ["MP5"]=true, ["FAL"]=true, ["M4A1"]=true }
+
+-- ---------------- HEAD DETECTION ----------------
+local HEAD_NAMES = { Head = true, head = true, HEAD = true, ["Head1"] = true }
 
 local running = true
 local connRender, connBegan
@@ -77,101 +115,83 @@ pcall(function() _G.__TRIGGER_STOP = shutdown end)
 
 local function log(s) print("[TRIGGER] " .. tostring(s)) end
 
+local lastBgErr = {}
+local function bgError(where, err)
+    local now = os.clock()
+    if (lastBgErr[where] or 0) + 2 < now then
+        lastBgErr[where] = now
+        log(where .. " error: " .. tostring(err))
+    end
+end
+
+-- ---------------- SETTINGS ----------------
+_G.__NS = nil
+
 local S = {
     enabled=true, retarget=true, cycle=true, esp=true,
-    reloadAll=true, slotCount=3, aim=true, aimStr=40, lockRadius=0,
-    inmateESP=true, scaleMarkers=true, markerSize=30,
+    reloadAll=true, slotCount=3,
+    aim=true, aimStr=100,
+    lockRadius=0,
+    fullScan=true,
+    inmateESP=true,
     showShotLine=true, simGun=true,
+    showDots=true, showDotBeams=true,
+    debugBlockers=false,
+    vgunRight=VGUN_RIGHT, vgunFwd=VGUN_FORWARD, vgunDown=VGUN_DOWN,
+    noSpread=true,
+    gmEnabled=false,
+    instantFire=false, arInstant=false, m9Auto=false, shotgunAuto=false,
+    shieldHide=false,
+    shieldPartName="RiotShieldPart",
 }
 
-local RATE=0
-local DEATH_GRACE=0.15
-local VIS_REFRESH=0.03
-local COLLECT_WAIT=0.012
-local FLAG_REFRESH=0.20        -- was 0.12
-local CACHE_STALE=0.75
-
-local AIM_MAX_STEP=140
-local AIM_DEADZONE=1.0
-local AIM_FAR_PX=250
-local AIM_FAR_BOOST=1.0
-
-local SLOT_KEYS  = { 49, 50, 51, 52 }
-local RELOAD_KEY = 82
-local cycleKeys = { 49, 50, 51 }
-
-local function rebuildCycle()
-    local n = math.floor(S.slotCount or 3)
-    if n < 1 then n = 1 end
-    if n > #SLOT_KEYS then n = #SLOT_KEYS end
-    local out = {}
-    for i = 1, n do out[i] = SLOT_KEYS[i] end
-    cycleKeys = out
-end
-rebuildCycle()
+local lastUI = {}
+local capture = nil
+local reloading = false
+local reloadInFlight = false
+local pendingReload = false
 
 -- ============================================================
--- SHOT PART ALLOWLIST  (head + arms/hands only)
+-- FAST HELPERS (no closures in hot paths)
 -- ============================================================
-local SHOT_NAMES = {
-    Head = true,
-    RightUpperArm = true, LeftUpperArm = true,
-    RightLowerArm = true, LeftLowerArm = true,
-    RightHand = true, LeftHand = true,
-    ["Right Arm"] = true, ["Left Arm"] = true,
-    RightForearm = true, LeftForearm = true,
-    RightForeArm = true, LeftForeArm = true,
-}
-
-local function isShotPart(p)
-    if not p then return false end
-    local nm
-    pcall(function() nm = p.Name end)
-    return nm ~= nil and SHOT_NAMES[nm] == true
+local function readFrame(part)
+    local cf = part.CFrame
+    return cf.Position, cf.RightVector, cf.UpVector, cf.LookVector
 end
 
-local charPartSet = {}
-
-local function rebuildCharPartSet(chars)
-    local s = {}
-    for ch in pairs(chars) do
-        local ok, desc = pcall(function() return ch:GetDescendants() end)
-        if ok and desc then
-            for i = 1, #desc do
-                local d = desc[i]
-                local okB, isB = pcall(function() return d:IsA("BasePart") end)
-                if okB and isB then s[d] = true end
-            end
-        end
-    end
-    return s
-end
-
-local function isOtherPlayerPart(inst)
-    return inst ~= nil and charPartSet[inst] == true
-end
-
--- ============================================================
--- ORIGINS
--- ============================================================
-local MUZZLE_NAMES = { "Muzzle", "MuzzleFlash", "Barrel", "Tip", "FirePoint", "GunTip", "Nozzle" }
+local function readPos(part) return part.Position end
+local function readSize(part) return part.Size end
+local function readParent(inst) return inst.Parent end
+local function readBounds(obj) return obj.TextBounds end
 
 local function partPos(p)
-    local ok, pos = pcall(function() return p.Position end)
+    if not p then return nil end
+    local ok, pos = pcall(readPos, p)
     if ok and pos then return pos end
     return nil
 end
 
--- Walk up from a part to see whether it still lives under the
--- character. An unequipped Tool sits in Backpack, so its Parent
--- is still non-nil and the old "alive" test wrongly passed.
-local function underCharacter(inst, ch)
-    if not inst or not ch then return false end
+local function frameOf(part)
+    if not part then return nil end
+    local ok, pos, R, U, L = pcall(readFrame, part)
+    if ok and pos then return pos, R, U, L end
+    return nil
+end
+
+local function sizeOf(part)
+    if not part then return nil end
+    local ok, s = pcall(readSize, part)
+    if ok and s then return s end
+    return nil
+end
+
+local function isDescendantOf(inst, ancestor)
+    if not inst or not ancestor then return false end
     local cur = inst
     local depth = 0
     while cur and depth < DESCEND_DEPTH do
-        if cur == ch then return true end
-        local ok, p = pcall(function() return cur.Parent end)
+        if cur == ancestor then return true end
+        local ok, p = pcall(readParent, cur)
         if not ok then return false end
         cur = p
         depth = depth + 1
@@ -179,8 +199,180 @@ local function underCharacter(inst, ch)
     return false
 end
 
-local lastGunChar = nil
-local cachedMuzzle = nil
+local function underCharacter(inst, ch) return isDescendantOf(inst, ch) end
+
+local function partIsHead(part, headRef)
+    if not part then return false end
+    if headRef and part == headRef then return true end
+    local nm
+    pcall(function() nm = part.Name end)
+    if type(nm) ~= "string" then return false end
+    return HEAD_NAMES[nm] == true
+end
+
+-- ============================================================
+-- NO SPREAD + GUN MODS
+-- ============================================================
+local equippedTool = nil
+
+local function getEquippedTool()
+    local ch = lp.Character
+    if not ch then return nil end
+    local t = ch:FindFirstChildOfClass("Tool")
+    if t then return t end
+    local ok, kids = pcall(function() return ch:GetChildren() end)
+    if ok and kids then
+        for i = 1, #kids do
+            local c = kids[i]
+            local cls
+            pcall(function() cls = c.ClassName end)
+            if cls == "Tool" then return c end
+        end
+    end
+    return nil
+end
+
+local function applyNoSpread(tool)
+    if not tool then return end
+    for i = 1, #SPREAD_ATTRS do
+        pcall(function() tool:SetAttribute(SPREAD_ATTRS[i], 0) end)
+    end
+    local ok, desc = pcall(function() return tool:GetDescendants() end)
+    if not ok or not desc then return end
+    for i = 1, #desc do
+        local d = desc[i]
+        local cls
+        pcall(function() cls = d.ClassName end)
+        if cls == "NumberValue" or cls == "IntValue" or cls == "FloatValue"
+           or cls == "DoubleValue" then
+            local nm
+            pcall(function() nm = d.Name end)
+            if type(nm) == "string" then
+                local ln = nm:lower()
+                local hit, isAcc = false, false
+                for _, sub in ipairs(SPREAD_SUBSTR) do
+                    if ln:find(sub, 1, true) then hit = true break end
+                end
+                for _, sub in ipairs(ACCURACY_SUBSTR) do
+                    if ln:find(sub, 1, true) then isAcc = true hit = true break end
+                end
+                if hit then
+                    pcall(function() d.Value = isAcc and 1 or 0 end)
+                end
+            end
+        end
+    end
+end
+
+local function applyGunAttrs(tool)
+    if not tool or not S.gmEnabled then return end
+
+    local nm
+    pcall(function() nm = tool.Name end)
+    if type(nm) ~= "string" then return end
+
+    if nm == "Remington 870" then
+        local cur
+        pcall(function() cur = tool:GetAttribute("AutoFire") end)
+        if cur ~= S.shotgunAuto then
+            pcall(function() tool:SetAttribute("AutoFire", S.shotgunAuto) end)
+        end
+    end
+    if S.arInstant and AR_SET[nm] then
+        local cur
+        pcall(function() cur = tool:GetAttribute("FireRate") end)
+        if cur ~= 0.001 then
+            pcall(function() tool:SetAttribute("FireRate", 0.001) end)
+        end
+    end
+    if S.m9Auto and nm == "M9" then
+        local cur
+        pcall(function() cur = tool:GetAttribute("AutoFire") end)
+        if cur ~= true then
+            pcall(function() tool:SetAttribute("AutoFire", true) end)
+        end
+    end
+    if S.instantFire then
+        local cur, exists = nil, false
+        pcall(function() cur = tool:GetAttribute("FireRate"); exists = (cur ~= nil) end)
+        if exists and cur ~= 0.001 then
+            pcall(function() tool:SetAttribute("FireRate", 0.001) end)
+        end
+    end
+end
+
+task.spawn(function()
+    local lastBackpackAt = 0
+    while running do
+        pcall(function()
+            local now = os.clock()
+
+            local ns = S.noSpread
+            if type(_G.__NS) == "boolean" then ns = _G.__NS end
+
+            local tool = getEquippedTool()
+            if tool ~= equippedTool then
+                equippedTool = tool
+                if tool and ns then applyNoSpread(tool) end
+            end
+
+            if ns and equippedTool then applyNoSpread(equippedTool) end
+            if equippedTool then applyGunAttrs(equippedTool) end
+
+            if now - lastBackpackAt > 0.1 then
+                lastBackpackAt = now
+                local bp = lp:FindFirstChild("Backpack")
+                if bp then
+                    local ok, kids = pcall(function() return bp:GetChildren() end)
+                    if ok and kids then
+                        for i = 1, #kids do
+                            local c = kids[i]
+                            local cls
+                            pcall(function() cls = c.ClassName end)
+                            if cls == "Tool" then applyGunAttrs(c) end
+                        end
+                    end
+                end
+            end
+        end)
+        task.wait(0.05)
+    end
+end)
+
+-- ============================================================
+-- RIOT SHIELD HIDER
+-- ============================================================
+task.spawn(function()
+    while running do
+        pcall(function()
+            if S.shieldHide then
+                local partName = S.shieldPartName or "RiotShieldPart"
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= lp and p.Character then
+                        local s = p.Character:FindFirstChild(partName)
+                        if s then
+                            local ok, sz = pcall(function() return s.Size end)
+                            if ok and typeof(sz) == "Vector3" then
+                                if sz.X ~= 0 or sz.Y ~= 0 or sz.Z ~= 0 then
+                                    pcall(function() s.Size = Vector3.new(0, 0, 0) end)
+                                    pcall(function() s.CanCollide = false end)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+        task.wait(0.5)
+    end
+end)
+
+-- ============================================================
+-- ORIGIN / RAYCAST
+-- ============================================================
+local MUZZLE_NAMES = { "Muzzle", "MuzzleFlash", "Barrel", "Tip", "FirePoint", "GunTip", "Nozzle" }
+
+local lastGunChar, cachedMuzzle = nil, nil
 
 local function scanForGunPart(ch)
     local okc, kids = pcall(function() return ch:GetChildren() end)
@@ -211,22 +403,14 @@ end
 
 local function getRealGunOrigin()
     local ch = lp.Character
-    if not ch then
-        lastGunChar, cachedMuzzle = nil, nil
-        return nil
-    end
+    if not ch then lastGunChar, cachedMuzzle = nil, nil return nil end
     if ch ~= lastGunChar then
         lastGunChar = ch
         cachedMuzzle = scanForGunPart(ch)
     end
-
-    -- Cache is only trusted while the tool is actually equipped
-    -- on the character. Unequipped tools live in Backpack.
     if cachedMuzzle and underCharacter(cachedMuzzle, ch) then
         return partPos(cachedMuzzle)
     end
-
-    -- Rescan: picks up a newly equipped gun, returns nil while unarmed.
     cachedMuzzle = scanForGunPart(ch)
     if cachedMuzzle and underCharacter(cachedMuzzle, ch) then
         return partPos(cachedMuzzle)
@@ -235,91 +419,54 @@ local function getRealGunOrigin()
     return nil
 end
 
--- cached by the collector
-local cachedMyRoot, cachedMyHead = nil, nil
+local function getMyRoot()
+    local ch = lp.Character
+    if not ch then return nil end
+    return ch:FindFirstChild("HumanoidRootPart")
+        or ch:FindFirstChild("UpperTorso")
+        or ch:FindFirstChild("Torso")
+        or ch:FindFirstChild("Head")
+end
+
+local function getMyHead()
+    local ch = lp.Character
+    if not ch then return nil end
+    return ch:FindFirstChild("Head")
+end
 
 local function getCharFacing()
-    local root = cachedMyRoot
-    if not root then
-        local ch = lp.Character
-        if ch then
-            root = ch:FindFirstChild("HumanoidRootPart")
-                or ch:FindFirstChild("UpperTorso")
-                or ch:FindFirstChild("Torso")
-        end
-    end
-    if root then
-        local ok, cf = pcall(function() return root.CFrame end)
+    local r = getMyRoot()
+    if r then
+        local ok, cf = pcall(function() return r.CFrame end)
         if ok and cf then return cf.LookVector end
-    end
-    local cam = Workspace.CurrentCamera
-    if cam then
-        local ok, look = pcall(function() return cam.CFrame.LookVector end)
-        if ok and look then return look end
     end
     return Vector3.new(0, 0, -1)
 end
 
-local function getAimDir()
-    local cam = Workspace.CurrentCamera
-    if cam then
-        local ok, look = pcall(function() return cam.CFrame.LookVector end)
-        if ok and look then return look end
-    end
-    return getCharFacing()
-end
-
 local function getCharRight()
-    local root = cachedMyRoot
-    if not root then
-        local ch = lp.Character
-        if ch then
-            root = ch:FindFirstChild("HumanoidRootPart")
-                or ch:FindFirstChild("UpperTorso")
-                or ch:FindFirstChild("Torso")
-                or ch:FindFirstChild("Head")
-        end
-    end
-    if root then
-        local ok, cf = pcall(function() return root.CFrame end)
-        if ok and cf then return cf.RightVector end
-    end
-    local cam = Workspace.CurrentCamera
-    if cam then
-        local ok, cf = pcall(function() return cam.CFrame end)
+    local r = getMyRoot()
+    if r then
+        local ok, cf = pcall(function() return r.CFrame end)
         if ok and cf then return cf.RightVector end
     end
     return Vector3.new(1, 0, 0)
 end
 
 local function getVirtualGunOrigin()
-    local head = cachedMyHead
-    if not head then
-        local ch = lp.Character
-        if ch then head = ch:FindFirstChild("Head") end
-    end
-    local headPos = head and partPos(head) or nil
     local right = getCharRight()
-    local fwd   = getAimDir()
-
+    local fwd   = getCharFacing()
+    local r = S.vgunRight or VGUN_RIGHT
+    local f = S.vgunFwd   or VGUN_FORWARD
+    local d = S.vgunDown  or VGUN_DOWN
+    local head = getMyHead()
+    local headPos = head and partPos(head) or nil
     if headPos then
-        return headPos
-            + right * VGUN_RIGHT
-            + fwd   * VGUN_FORWARD
-            - Vector3.new(0, VGUN_DOWN, 0)
+        return headPos + right * r + fwd * f - Vector3.new(0, d, 0)
     end
-
-    local cam = Workspace.CurrentCamera
-    if cam then
-        local cpos, clook, cright
-        pcall(function() cpos  = cam.CFrame.Position end)
-        pcall(function() clook = cam.CFrame.LookVector end)
-        pcall(function() cright = cam.CFrame.RightVector end)
-        if cpos and clook then
-            cright = cright or Vector3.new(1,0,0)
-            return cpos + cright * VGUN_RIGHT + clook * (VGUN_FORWARD + 0.5)
-                - Vector3.new(0, VGUN_DOWN, 0)
-        end
+    local root = getMyRoot()
+    local rootPos = root and partPos(root) or nil
+    if rootPos then
+        return rootPos + right * r + fwd * f + Vector3.new(0, 1.0 - d, 0)
     end
     return nil
 end
@@ -327,9 +474,7 @@ end
 local function getShotOrigin()
     local real = getRealGunOrigin()
     if real then return real, false end
-    if S.simGun then
-        return getVirtualGunOrigin(), true
-    end
+    if S.simGun then return getVirtualGunOrigin(), true end
     return nil, false
 end
 
@@ -339,8 +484,7 @@ pcall(function() shotParams.IgnoreWater = true end)
 pcall(function() shotParams.RespectCanCollide = false end)
 pcall(function() shotParams.FilterDescendantsInstances = {} end)
 
-local lastSelfChar = nil
-local selfFilter = {}
+local lastSelfChar, selfFilter = nil, {}
 local function updateShotFilter()
     local ch = lp.Character
     if ch ~= lastSelfChar then
@@ -349,35 +493,95 @@ local function updateShotFilter()
         shotParams.FilterDescendantsInstances = selfFilter
     end
 end
+updateShotFilter()
 
-local function isDescendantOf(inst, ancestor)
-    if not inst or not ancestor then return false end
-    local cur = inst
-    local depth = 0
-    while cur and depth < DESCEND_DEPTH do
-        if cur == ancestor then return true end
-        local ok, p = pcall(function() return cur.Parent end)
-        if not ok then return false end
-        cur = p
-        depth = depth + 1
+local function isSeeThrough(inst)
+    if not inst then return true end
+    local tr, ltm, cq, cc, mat, nm
+    pcall(function() tr = inst.Transparency end)
+    pcall(function() ltm = inst.LocalTransparencyModifier end)
+    pcall(function() cq = inst.CanQuery end)
+    pcall(function() cc = inst.CanCollide end)
+    if type(tr) == "number" and tr >= 0.95 then return true end
+    if type(ltm) == "number" and ltm >= 0.8 then return true end
+    if cq == false then return true end
+    if cc == false then return true end
+    pcall(function() nm = inst.Name end)
+    if type(nm) == "string" then
+        local s = nm:lower()
+        if s:find("glass",1,true) or s:find("window",1,true) or s:find("windshield",1,true)
+            or s:find("screen",1,true) or s:find("visor",1,true) then
+            return true
+        end
     end
+    pcall(function() mat = inst.Material end)
+    if mat ~= nil then
+        local ok, mn = pcall(function() return mat.Name end)
+        if ok and type(mn) == "string" and mn:lower():find("glass",1,true) then return true end
+    end
+    if type(tr) == "number" and tr >= 0.8 then return true end
     return false
+end
+
+local charPartSet = {}
+local function rebuildCharPartSet(chars)
+    local s = {}
+    for ch in pairs(chars) do
+        local ok, desc = pcall(function() return ch:GetDescendants() end)
+        if ok and desc then
+            for i = 1, #desc do
+                local d = desc[i]
+                local okB, isB = pcall(function() return d:IsA("BasePart") end)
+                if okB and isB then s[d] = true end
+            end
+        end
+    end
+    return s
+end
+local function isOtherPlayerPart(inst)
+    return inst ~= nil and charPartSet[inst] == true
+end
+
+local function traceRay(origin, goal, targetChar, localChar)
+    if not origin or not goal then return false, goal, nil end
+    local o = origin
+    for _ = 1, RAY_MAX_BOUNCE do
+        local diff = goal - o
+        local dist = diff.Magnitude
+        if dist < RAY_GAP then return true, goal, nil end
+        local dir = diff.Unit
+        local ok, res = pcall(function() return Workspace:Raycast(o, diff, shotParams) end)
+        if not ok then return false, goal, nil end
+        if not res or not res.Instance then return true, goal, nil end
+        local inst = res.Instance
+        local rd = res.Distance or 0
+        if (dist - rd) < RAY_GAP then return true, res.Position, inst end
+
+        if targetChar and isDescendantOf(inst, targetChar) then
+            return true, res.Position, inst
+        elseif localChar and isDescendantOf(inst, localChar) then
+            o = res.Position + dir * RAY_GAP
+        elseif isOtherPlayerPart(inst) then
+            o = res.Position + dir * RAY_GAP
+        elseif isSeeThrough(inst) then
+            o = res.Position + dir * RAY_GAP
+        else
+            return false, res.Position, inst
+        end
+    end
+    return false, goal, nil
 end
 
 -- ============================================================
 -- TEAMS / FLAGS
 -- ============================================================
-local TEAM_LIST   = {}
-local TEAM_TARGET = {}
-local myTeamName  = nil
+local TEAM_LIST, TEAM_TARGET = {}, {}
+local myTeamName = nil
 
 do
     local seen = {}
     local function add(n)
-        if n and n ~= "" and not seen[n] then
-            seen[n] = true
-            TEAM_LIST[#TEAM_LIST + 1] = n
-        end
+        if n and n ~= "" and not seen[n] then seen[n] = true; TEAM_LIST[#TEAM_LIST+1] = n end
     end
     for _, t in ipairs(Teams:GetChildren()) do add(t.Name) end
     for _, p in ipairs(Players:GetPlayers()) do
@@ -392,15 +596,13 @@ local function isHostile(tName)
     return true
 end
 
-local FLAG_AGGRO  = { "Hostile" }
-local FLAG_ARREST = { "Trespassing" }
+local FLAG_AGGRO, FLAG_ARREST = { "Hostile" }, { "Trespassing" }
 
 local function readAttr(ch, name)
     local ok, v = pcall(function() return ch:GetAttribute(name) end)
     if ok then return v end
     return nil
 end
-
 local function flagOn(ch, names)
     for _, n in ipairs(names) do
         local v = readAttr(ch, n)
@@ -409,14 +611,12 @@ local function flagOn(ch, names)
     end
     return false
 end
-
 local function hasArrestHighlight(ch)
     local okd, desc = pcall(function() return ch:GetDescendants() end)
     if not okd or not desc then return false end
     for i = 1, #desc do
         local d = desc[i]
-        local cls
-        pcall(function() cls = d.ClassName end)
+        local cls; pcall(function() cls = d.ClassName end)
         if cls == "Highlight" then
             local nm, en
             pcall(function() nm = d.Name end)
@@ -427,9 +627,7 @@ local function hasArrestHighlight(ch)
     return false
 end
 
-local lastDbg = {}
-local flagCache = {}
-
+local lastDbg, flagCache = {}, {}
 local function detectInmateState(ch, uid, pname, now)
     local fc = flagCache[uid]
     if fc and fc.ch == ch and (now - fc.t) < FLAG_REFRESH then
@@ -440,7 +638,7 @@ local function detectInmateState(ch, uid, pname, now)
     local arrest = viaHL or flagOn(ch, FLAG_ARREST)
     flagCache[uid] = { ch=ch, t=now, aggro=aggro, arrest=arrest, viaHighlight=viaHL }
     if DEBUG_FLAGS then
-        local key = tostring(aggro) .. "|" .. tostring(arrest) .. "|" .. tostring(viaHL)
+        local key = tostring(aggro).."|"..tostring(arrest).."|"..tostring(viaHL)
         if lastDbg[uid] ~= key then
             lastDbg[uid] = key
             log(string.format("%s aggro=%s arrest=%s viaHL=%s",
@@ -462,7 +660,6 @@ local RAW_NAME = {
     [85]="U",[86]="V",[87]="W",[88]="X",[89]="Y",[90]="Z",
 }
 for i = 1, 12 do RAW_NAME[111 + i] = "F" .. i end
-
 local NAME_RAW = {}
 for raw, name in pairs(RAW_NAME) do NAME_RAW[name] = raw end
 
@@ -482,17 +679,13 @@ local function parseKey(v)
         return nil
     elseif t == "userdata" or t == "table" then
         local ok, name = pcall(function() return v.Name end)
-        if ok and type(name) == "string" then
-            local r = parseKey(name); if r then return r end
-        end
+        if ok and type(name) == "string" then local r = parseKey(name); if r then return r end end
         local ok2, val = pcall(function() return v.Value end)
         if ok2 and (type(val) == "number" or type(val) == "string") then
             local r = parseKey(val); if r then return r end
         end
         local ok3, s = pcall(function() return tostring(v) end)
-        if ok3 and s then
-            local r = parseKey(s); if r then return r end
-        end
+        if ok3 and s then local r = parseKey(s); if r then return r end end
     end
     return nil
 end
@@ -502,61 +695,87 @@ local function keyName(raw)
     return RAW_NAME[raw] or ("0x" .. string.format("%X", raw))
 end
 
-local binds   = { lock = 70, unlock = 71 }
+local binds = { lock = 70, unlock = 71 }
 local ACTIONS = { "lock", "unlock" }
-local lastUI    = {}
-local capture   = nil
-local reloading = false
 
 local function uiGet(id)
     local ok, v = pcall(function() return UI.GetValue(id) end)
     if ok then return v end
     return nil
 end
-
+local function uiSet(id, v)
+    pcall(function() UI.SetValue(id, v) end)
+end
 local function setBind(act, v)
     local raw = parseKey(v)
-    if raw then
-        binds[act] = raw
-        log(act .. " key -> " .. keyName(raw))
-    end
+    if raw then binds[act] = raw; log(act .. " key -> " .. keyName(raw)) end
 end
 
+local function rebuildCycle()
+    local n = math.floor(S.slotCount or 3)
+    if n < 1 then n = 1 end
+    if n > #SLOT_KEYS then n = #SLOT_KEYS end
+    local out = {}
+    for i = 1, n do out[i] = SLOT_KEYS[i] end
+    cycleKeys = out
+end
+rebuildCycle()
+
+-- ============================================================
+-- UI  (SINGLE TAB)
+-- ============================================================
 UI.AddTab("Trigger", function(tab)
     local ok, err = pcall(function()
-        local a = tab:Section("Targeting", "Left")
-        a:Toggle("enabled", "Enabled", true, function() end)
-        a:SliderInt("lock_radius", "Lock radius px (0 = unlimited)", 0, 2000, S.lockRadius, function() end)
-        a:Spacing()
+        local ns = tab:Section("No Spread", "Left")
+        ns:Toggle("no_spread", "No spread (SpreadRadius = 0)", true, function() end)
+
+        local trig = tab:Section("Trigger", "Left")
+        trig:Toggle("enabled", "Enabled", true, function() end)
+        trig:SliderInt("lock_radius", "Lock radius px (0 = unlimited)", 0, 2000, S.lockRadius, function() end)
+        trig:Spacing()
+        trig:Toggle("aim", "Aim: lock cursor on target (auto)", true, function() end)
+        trig:SliderInt("aim_str", "Aim strength (100 = snap onto dot)", 1, 100, S.aimStr, function() end)
+        trig:Spacing()
+        trig:Toggle("retarget", "Retarget after death", true, function() end)
+        trig:Toggle("cycle", "Cycle weapons", true, function() end)
+        trig:Toggle("esp", "Box on locked target", true, function() end)
+        trig:SliderInt("slots", "Weapon slots to cycle", 1, 4, S.slotCount, function() end)
+
+        local vis = tab:Section("Vision", "Left")
+        vis:Toggle("show_dots", "Show body dots", true, function() end)
+        vis:Toggle("show_dot_beams", "Beams: gun to dots", true, function() end)
+        vis:Toggle("show_shot_line", "Show shot lasers", true, function() end)
+        vis:Toggle("full_scan", "Full body scan (accurate, heavier)", true, function() end)
+        vis:Toggle("debug_blockers", "Debug: log blockers", false, function() end)
+
+        local vgun = tab:Section("Simulated Gun", "Left")
+        vgun:Toggle("sim_gun", "Use VGUN when unarmed", true, function() end)
+        vgun:SliderFloat("vgun_r", "VGUN right",  -5, 5, S.vgunRight, function() end)
+        vgun:SliderFloat("vgun_f", "VGUN forward", -5, 5, S.vgunFwd,   function() end)
+        vgun:SliderFloat("vgun_d", "VGUN down",     0, 5, S.vgunDown,  function() end)
+
+        local keys = tab:Section("Keys / Teams", "Left")
+        keys:Toggle("rebind_lock", "Rebind: Lock", false, function() end)
+        keys:Toggle("rebind_unlock", "Rebind: Unlock", false, function() end)
+        keys:Toggle("reload_all", "Reload All enabled (R)", true, function() end)
+        keys:Spacing()
         for _, tn in ipairs(TEAM_LIST) do
-            local name = tn
-            a:Toggle("team_" .. name, name, true, function() end)
+            keys:Toggle("team_" .. tn, tn, true, function() end)
         end
 
-        local c = tab:Section("Aim", "Left")
-        c:Toggle("aim", "Aim at locked target", true, function() end)
-        c:SliderInt("aim_str", "Aim strength", 1, 100, S.aimStr, function() end)
+        local gm = tab:Section("Gun Mods", "Right")
+        gm:Toggle("gm_enabled", "Enable gun mods", false, function() end)
+        gm:Spacing()
+        gm:Toggle("gm_instant", "Instant fire rate", false, function() end)
+        gm:Toggle("gm_ar_instant", "AR instant (AK-47 / MP5 / FAL / M4A1)", false, function() end)
+        gm:Toggle("gm_m9_auto", "M9 full auto", false, function() end)
+        gm:Toggle("gm_shotgun_auto", "Remington 870 full auto", false, function() end)
 
-        local e = tab:Section("Inmate ESP", "Left")
-        e:Toggle("inmate_esp", "Show inmate flags", true, function() end)
-        e:Toggle("scale_markers", "Scale icons by distance", true, function() end)
-        e:SliderInt("marker_size", "Icon size (px @ 40 studs)", 10, 80, S.markerSize, function() end)
+        local inmat = tab:Section("Inmate ESP", "Right")
+        inmat:Toggle("inmate_esp", "Show inmate flags", true, function() end)
 
-        local b = tab:Section("Combat", "Right")
-        b:Toggle("retarget", "Retarget after death", true, function() end)
-        b:Toggle("cycle", "Cycle weapons", true, function() end)
-        b:Toggle("esp", "Box on locked target", true, function() end)
-        b:Toggle("sim_gun", "Simulate gun when unarmed", true, function() end)
-        b:SliderInt("slots", "Weapon slots to cycle", 1, 4, S.slotCount, function() end)
-
-        local d = tab:Section("Shot Debug", "Right")
-        d:Toggle("show_shot_line", "Show shot lasers", true, function() end)
-        d:Tip("Beams go to head + arms/hands only.")
-
-        local k = tab:Section("Keys", "Right")
-        k:Toggle("rebind_lock", "Rebind: Lock", false, function() end)
-        k:Toggle("rebind_unlock", "Rebind: Unlock", false, function() end)
-        k:Toggle("reload_all", "Reload All enabled (R)", true, function() end)
+        local misc = tab:Section("Riot Shield", "Right")
+        misc:Toggle("misc_shield", "Hide other players' riot shields", false, function() end)
     end)
     if not ok then log("UI build error: " .. tostring(err)) end
 end)
@@ -565,45 +784,61 @@ task.spawn(function()
     local rebind = { lock = "rebind_lock", unlock = "rebind_unlock" }
     local function bool(id, field)
         local v = uiGet(id)
-        if type(v) == "boolean" and v ~= lastUI[id] then
-            lastUI[id] = v
-            S[field] = v
-        end
+        if type(v) == "boolean" and v ~= lastUI[id] then lastUI[id] = v; S[field] = v end
     end
     local function num(id, field, lo, hi)
         local v = uiGet(id)
         if type(v) == "number" and v >= lo and v ~= lastUI[id] then
             lastUI[id] = v
-            S[field] = math.min(hi, math.floor(v))
+            S[field] = math.min(hi, math.max(lo, v))
+        end
+    end
+    local function numF(id, field, lo, hi)
+        local v = uiGet(id)
+        if type(v) == "number" and v >= lo and v <= hi and v ~= lastUI[id] then
+            lastUI[id] = v; S[field] = v
         end
     end
     while running do
-        bool("enabled","enabled"); bool("retarget","retarget"); bool("cycle","cycle")
-        bool("esp","esp"); bool("reload_all","reloadAll")
-        bool("aim","aim"); bool("inmate_esp","inmateESP")
-        bool("scale_markers","scaleMarkers"); bool("show_shot_line","showShotLine")
-        bool("sim_gun","simGun")
-        num("lock_radius","lockRadius",0,2000)
-        num("aim_str","aimStr",1,100)
-        num("marker_size","markerSize",1,80)
-        local sv = uiGet("slots")
-        if type(sv) == "number" and sv >= 1 and sv ~= lastUI["slots"] then
-            lastUI["slots"] = sv
-            S.slotCount = math.floor(sv)
-            rebuildCycle()
-        end
-        for act, id in pairs(rebind) do
-            local v = uiGet(id)
-            if type(v) == "boolean" and v ~= lastUI[id] then
-                lastUI[id] = v
-                if v then capture = act
-                elseif capture == act then capture = nil end
+        pcall(function()
+            bool("enabled","enabled"); bool("retarget","retarget"); bool("cycle","cycle")
+            bool("esp","esp"); bool("reload_all","reloadAll")
+            bool("aim","aim")
+            bool("inmate_esp","inmateESP")
+            bool("show_shot_line","showShotLine"); bool("sim_gun","simGun")
+            bool("show_dots","showDots"); bool("show_dot_beams","showDotBeams")
+            bool("debug_blockers","debugBlockers"); bool("full_scan","fullScan")
+            bool("no_spread","noSpread")
+            num("lock_radius","lockRadius",0,2000)
+            num("aim_str","aimStr",1,100)
+            numF("vgun_r","vgunRight",-5,5)
+            numF("vgun_f","vgunFwd",-5,5)
+            numF("vgun_d","vgunDown",0,5)
+            bool("gm_enabled","gmEnabled")
+            bool("gm_instant","instantFire")
+            bool("gm_ar_instant","arInstant")
+            bool("gm_m9_auto","m9Auto")
+            bool("gm_shotgun_auto","shotgunAuto")
+            bool("misc_shield","shieldHide")
+            local sv = uiGet("slots")
+            if type(sv) == "number" and sv >= 1 and sv ~= lastUI["slots"] then
+                lastUI["slots"] = sv
+                S.slotCount = math.floor(sv)
+                rebuildCycle()
             end
-        end
-        for _, tn in ipairs(TEAM_LIST) do
-            local v = uiGet("team_" .. tn)
-            if type(v) == "boolean" then TEAM_TARGET[tn] = v end
-        end
+            for act, id in pairs(rebind) do
+                local v = uiGet(id)
+                if type(v) == "boolean" and v ~= lastUI[id] then
+                    lastUI[id] = v
+                    if v then capture = act
+                    elseif capture == act then capture = nil end
+                end
+            end
+            for _, tn in ipairs(TEAM_LIST) do
+                local v = uiGet("team_" .. tn)
+                if type(v) == "boolean" then TEAM_TARGET[tn] = v end
+            end
+        end)
         task.wait(0.1)
     end
 end)
@@ -626,12 +861,6 @@ local PART_CLASS = {
 
 local targets, targetByUid, cache, inmates = {}, {}, {}, {}
 
-local wallParams = RaycastParams.new()
-pcall(function() wallParams.FilterType = Enum.RaycastFilterType.Exclude end)
-pcall(function() wallParams.IgnoreWater = true end)
-pcall(function() wallParams.RespectCanCollide = false end)
-pcall(function() wallParams.FilterDescendantsInstances = {} end)
-
 local function resolveBody(ch)
     local parts = {}
     for _, nm in ipairs(AIM_NAMES) do
@@ -653,254 +882,213 @@ local function resolveBody(ch)
 end
 
 task.spawn(function()
-    local lastCharCount = -1
-    local lastPartSetAt = 0
+    local lastCharCount, lastPartSetAt = -1, 0
     while running do
-        local now = os.clock()
-        pcall(function() myTeamName = (lp.Team and lp.Team.Name) or nil end)
-        local myPos
-        local myChar = lp.Character
-        cachedMyRoot, cachedMyHead = nil, nil
-        if myChar then
-            for _, nm in ipairs(ROOT_NAMES) do
-                local r = myChar:FindFirstChild(nm)
-                if r then
-                    cachedMyRoot = r
-                    pcall(function() myPos = r.Position end)
-                    break
+        pcall(function()
+            local now = os.clock()
+            pcall(function() myTeamName = (lp.Team and lp.Team.Name) or nil end)
+            local myPos
+            local myChar = lp.Character
+            if myChar then
+                for _, nm in ipairs(ROOT_NAMES) do
+                    local r = myChar:FindFirstChild(nm)
+                    if r then
+                        pcall(function() myPos = r.Position end)
+                        break
+                    end
                 end
             end
-            cachedMyHead = myChar:FindFirstChild("Head")
-        end
 
-        local out, byUid, seen, filter = {}, {}, {}, {}
-        local inmateList = {}
-        local newChars = {}
-        local charCount = 0
+            local out, byUid, seen = {}, {}, {}
+            local inmateList, newChars, charCount = {}, {}, 0
 
-        for _, p in ipairs(Players:GetPlayers()) do
-            local ch = p.Character
-            if ch then
-                filter[#filter + 1] = ch
-                newChars[ch] = true
-                charCount = charCount + 1
-            end
-            local uid = p.UserId
-            if uid ~= myUserId and ch then
-                local hum = ch:FindFirstChildOfClass("Humanoid")
-                local alive = false
-                if hum then
-                    local okh, hp = pcall(function() return hum.Health end)
-                    alive = okh and type(hp) == "number" and hp > 0
+            for _, p in ipairs(Players:GetPlayers()) do
+                local ch = p.Character
+                if ch then
+                    newChars[ch] = true
+                    charCount = charCount + 1
                 end
-                if alive then
-                    local tName
-                    pcall(function() tName = (p.Team and p.Team.Name) or nil end)
-                    if tName and TEAM_TARGET[tName] == nil then
-                        TEAM_TARGET[tName] = true
-                        log("new team seen: " .. tName)
+                local uid = p.UserId
+                if uid ~= myUserId and ch then
+                    local hum = ch:FindFirstChildOfClass("Humanoid")
+                    local alive = false
+                    if hum then
+                        local okh, hp = pcall(function() return hum.Health end)
+                        alive = okh and type(hp) == "number" and hp > 0
                     end
-                    local aggro, arrest, viaHL = false, false, false
-                    if tName == "Inmates" then
-                        aggro, arrest, viaHL = detectInmateState(ch, uid, p.Name, now)
-                    end
-                    local hostileInmate = aggro or arrest
-                    local addr
-                    pcall(function() addr = ch.Address end)
-                    local c = cache[uid]
-                    if not c or c.addr ~= addr or (now - c.t) > CACHE_STALE then
-                        local parts, root, head = resolveBody(ch)
-                        c = { addr=addr, t=now, parts=parts, root=root, head=head }
-                        cache[uid] = c
-                    end
-                    if isHostile(tName) and c.root and #c.parts > 0 then
-                        local dist
-                        if myPos then
-                            local ok2, rp = pcall(function() return c.root.Position end)
-                            if ok2 and rp then dist = (rp - myPos).Magnitude end
+                    if alive then
+                        local tName
+                        pcall(function() tName = (p.Team and p.Team.Name) or nil end)
+                        if tName and TEAM_TARGET[tName] == nil then
+                            TEAM_TARGET[tName] = true
+                            log("new team seen: " .. tName)
                         end
-                        local t = { uid=uid, name=p.Name, team=tName, char=ch,
-                                    parts=c.parts, root=c.root, head=c.head,
-                                    dist=dist or math.huge, hostileInmate=hostileInmate }
-                        out[#out + 1] = t
-                        byUid[uid] = t
-                        seen[uid] = true
-                    end
-                    if tName == "Inmates" and c.root and c.head then
-                        seen[uid] = true
-                        inmateList[#inmateList + 1] = {
-                            uid=uid, head=c.head, aggro=aggro, arrest=arrest,
-                            hostile=hostileInmate, viaHighlight=viaHL,
-                        }
+                        local aggro, arrest, viaHL = false, false, false
+                        if tName == "Inmates" then
+                            aggro, arrest, viaHL = detectInmateState(ch, uid, p.Name, now)
+                        end
+                        local hostileInmate = aggro or arrest
+                        local addr
+                        pcall(function() addr = ch.Address end)
+                        local c = cache[uid]
+                        if not c or c.addr ~= addr or (now - c.t) > CACHE_STALE then
+                            local parts, root, head = resolveBody(ch)
+                            c = { addr=addr, t=now, parts=parts, root=root, head=head }
+                            cache[uid] = c
+                        end
+                        if isHostile(tName) and c.root and #c.parts > 0 then
+                            local dist
+                            if myPos then
+                                local ok2, rp = pcall(function() return c.root.Position end)
+                                if ok2 and rp then dist = (rp - myPos).Magnitude end
+                            end
+                            local t = { uid=uid, name=p.Name, team=tName, char=ch,
+                                        parts=c.parts, root=c.root, head=c.head,
+                                        dist=dist or math.huge, hostileInmate=hostileInmate }
+                            out[#out + 1] = t
+                            byUid[uid] = t
+                            seen[uid] = true
+                        end
+                        if tName == "Inmates" and c.root and c.head then
+                            seen[uid] = true
+                            inmateList[#inmateList + 1] = {
+                                uid=uid, head=c.head, aggro=aggro, arrest=arrest,
+                                hostile=hostileInmate, viaHighlight=viaHL,
+                            }
+                        end
                     end
                 end
             end
-        end
-        for uid in pairs(cache) do
-            if not seen[uid] then cache[uid] = nil end
-        end
+            for uid in pairs(cache) do
+                if not seen[uid] then cache[uid] = nil end
+            end
 
-        -- OPT: rebuild charPartSet only when the character set changes,
-        -- otherwise refresh every 0.5s. Was: every collector tick.
-        if charCount ~= lastCharCount or (now - lastPartSetAt) > 0.5 then
-            lastCharCount = charCount
-            lastPartSetAt = now
-            charPartSet = rebuildCharPartSet(newChars)
-        end
+            if charCount ~= lastCharCount or (now - lastPartSetAt) > 0.5 then
+                lastCharCount = charCount
+                lastPartSetAt = now
+                charPartSet = rebuildCharPartSet(newChars)
+            end
 
-        targets, targetByUid, inmates = out, byUid, inmateList
-        pcall(function() wallParams.FilterDescendantsInstances = filter end)
+            targets, targetByUid, inmates = out, byUid, inmateList
+        end)
         task.wait(COLLECT_WAIT)
     end
 end)
 
 -- ============================================================
--- SEE-THROUGH FILTER
+-- DOT ENGINE
 -- ============================================================
-local lastBlocker = nil
-local HEAD_OFFSETS = { Vector3.new(0,0,0), Vector3.new(0,0.5,0) }
-local GLASS_KEYS = {
-    "glass","window","windshield","windscreen","visor","transparent",
-    "wind","shield","screen","pane","tint","carwin","carwindow",
-    "vehiclewindow","vehicle_glass","autoglass","clear",
-}
-
-local function nameLooksGlass(nm)
-    if type(nm) ~= "string" then return false end
-    local s = nm:lower():gsub("%s", "")
-    for _, key in ipairs(GLASS_KEYS) do
-        if s:find(key, 1, true) then return true end
-    end
-    return false
+local offsetCache = {}
+local function offsetsFor(sx, sy, sz)
+    local key = math.floor(sx*10+0.5) .. "_" .. math.floor(sy*10+0.5) .. "_" .. math.floor(sz*10+0.5)
+    local c = offsetCache[key]
+    if c then return c end
+    local hx, hy, hz = sx*0.5*SAMPLE_INSET, sy*0.5*SAMPLE_INSET, sz*0.5*SAMPLE_INSET
+    c = {
+        { hx,  hy,  hz}, { hx,  hy, -hz},
+        { hx, -hy,  hz}, { hx, -hy, -hz},
+        {-hx,  hy,  hz}, {-hx,  hy, -hz},
+        {-hx, -hy,  hz}, {-hx, -hy, -hz},
+        { hx, 0, 0}, {-hx, 0, 0},
+        { 0,  hy, 0}, { 0, -hy, 0},
+        { 0, 0,  hz}, { 0, 0, -hz},
+    }
+    offsetCache[key] = c
+    return c
 end
 
-local function isSeeThrough(inst)
-    if not inst then return true end
+local samples = {}
+local samplesChar = nil
+local scanCursor = 0
 
-    local tr
-    pcall(function() tr = inst.Transparency end)
-    if type(tr) == "number" and tr >= 0.95 then return true end
-
-    local ltm
-    pcall(function() ltm = inst.LocalTransparencyModifier end)
-    if type(ltm) == "number" and ltm >= 0.8 then return true end
-
-    local cq
-    pcall(function() cq = inst.CanQuery end)
-    if cq == false then return true end
-
-    local cc
-    pcall(function() cc = inst.CanCollide end)
-    if cc == false then return true end
-
-    local mat
-    pcall(function() mat = inst.Material end)
-    local isGlassMat = false
-    if mat ~= nil then
-        local ok1, mn = pcall(function() return mat.Name end)
-        if ok1 and type(mn) == "string" and mn:lower():find("glass",1,true) then
-            isGlassMat = true
-        end
-        if not isGlassMat then
-            local ok2, ts = pcall(function() return tostring(mat) end)
-            if ok2 and type(ts) == "string" and ts:lower():find("glass",1,true) then
-                isGlassMat = true
-            end
-        end
-        if not isGlassMat then
-            pcall(function() isGlassMat = (mat == Enum.Material.Glass) end)
-        end
-    end
-
-    local nm
-    pcall(function() nm = inst.Name end)
-    local isGlassName = nameLooksGlass(nm)
-
-    if isGlassMat or isGlassName then
-        if STRICT_PASS then
-            if type(tr) == "number" and tr >= 0.5 then return true end
-            if type(ltm) == "number" and ltm >= 0.5 then return true end
-        else
-            if type(tr) == "number" and tr >= 0.15 then return true end
-            if type(ltm) == "number" and ltm >= 0.15 then return true end
-            return true
-        end
-    end
-
-    if type(tr) == "number" and tr >= 0.8 then return true end
-    return false
-end
-
-local function traceRay(origin, goal, targetChar)
-    local o = origin
-    for _ = 1, RAY_MAX_BOUNCE do
-        local dir = goal - o
-        local dist = dir.Magnitude
-        if dist < 0.3 then return true, goal, nil end
-        local ok, res = pcall(function() return Workspace:Raycast(o, dir, shotParams) end)
-        if not ok or not res then return true, goal, nil end
-        local inst = res.Instance
-        if not inst then return true, goal, nil end
-        local rd = res.Distance or 0
-        if (dist - rd) < 0.5 then return true, goal, nil end
-
-        if targetChar and isDescendantOf(inst, targetChar) then
-            return true, res.Position, inst
-        end
-        if isOtherPlayerPart(inst) then
-            o = res.Position + dir.Unit * 0.1
-        elseif isSeeThrough(inst) then
-            o = res.Position + dir.Unit * 0.1
-        else
-            return false, res.Position, inst
-        end
-    end
-    return false, goal, nil
-end
-
-local function computeVisible(t, origin)
-    local visible = {}
-    if not t or not t.parts or not origin then return visible end
-    local head = t.head or t.root
-
-    if head and isShotPart(head) then
-        local ok, base = pcall(function() return head.Position end)
-        if ok and base then
-            for _, off in ipairs(HEAD_OFFSETS) do
-                if traceRay(origin, base + off, t.char) then
-                    visible[#visible + 1] = head
-                    break
+local function buildSamples(t)
+    local fresh = {}
+    if t and t.parts then
+        for _, part in ipairs(t.parts) do
+            local size = sizeOf(part)
+            if size then
+                local offs = offsetsFor(size.X, size.Y, size.Z)
+                local vis, world = {}, {}
+                for k = 1, #offs do
+                    vis[k] = false
+                    world[k] = Vector3.new(0, 0, 0)
                 end
+                fresh[#fresh + 1] = { part = part, offs = offs, vis = vis, world = world, anyVis = false }
             end
         end
     end
+    samples = fresh
+    samplesChar = t and t.char or nil
+    scanCursor = 0
+end
 
-    local parts = t.parts
-    for i = 1, #parts do
-        if #visible >= VISIBLE_CAP then break end
-        local p = parts[i]
-        if p ~= head and isShotPart(p) then
-            local ok, base = pcall(function() return p.Position end)
-            if ok and base then
-                if traceRay(origin, base, t.char) then
-                    visible[#visible + 1] = p
+local function scanSome(origin, targetChar, localChar)
+    if not origin then return end
+    local list = samples
+    local n = #list
+    if n == 0 then return end
+
+    local limit
+    if S.fullScan then limit = n
+    else limit = math.min(PARTS_PER_SCAN, n) end
+
+    for _ = 1, limit do
+        if list ~= samples then return end
+        scanCursor = scanCursor + 1
+        if scanCursor > n then scanCursor = 1 end
+        local s = list[scanCursor]
+        if s and s.part then
+            local pos, R, U, L = frameOf(s.part)
+            if pos then
+                local offs = s.offs
+                local odx, ody, odz = origin.X - pos.X, origin.Y - pos.Y, origin.Z - pos.Z
+                local any = false
+                for k = 1, #offs do
+                    local o = offs[k]
+                    local wx = R.X*o[1] + U.X*o[2] + L.X*o[3]
+                    local wy = R.Y*o[1] + U.Y*o[2] + L.Y*o[3]
+                    local wz = R.Z*o[1] + U.Z*o[2] + L.Z*o[3]
+                    if (odx*wx + ody*wy + odz*wz) <= 0 then
+                        s.vis[k] = false
+                    else
+                        local goal = Vector3.new(pos.X + wx, pos.Y + wy, pos.Z + wz)
+                        local reached = traceRay(origin, goal, targetChar, localChar)
+                        s.vis[k] = reached
+                        if reached then any = true end
+                    end
                 end
+                s.anyVis = any
+            else
+                s.anyVis = false
             end
         end
     end
-    return visible
 end
 
-local function pickFromVisible(t, visible)
-    local head = t.head or t.root
-    if not visible or #visible == 0 then return head end
-    for i = 1, #visible do
-        if visible[i] == head then return head end
-    end
-    return visible[1]
-end
-
+-- ============================================================
+-- LOCK
+-- ============================================================
 local curMX, curMY, curVX, curVY = 0, 0, 1920, 1080
+local lockedUid, lockedName = nil, nil
+local lostSince = nil
+local lastVirtual = false
+
+local function applyLock(t, how, value)
+    if not t then
+        pcall(function() notify("No valid target", "Trigger", 1) end)
+        return
+    end
+    if lockedUid == t.uid then return end
+    local switched = lockedUid ~= nil
+    lockedUid, lockedName, lostSince = t.uid, t.name, nil
+    buildSamples(t)
+    local extra = ""
+    if how == "mouse" and value then extra = string.format(" (%.0f px)", value) end
+    if t.team then extra = extra .. " [" .. t.team .. "]" end
+    if t.hostileInmate then extra = extra .. " [FLAGGED]" end
+    log((switched and "Switched -> " or "Locked -> ") .. t.name .. extra)
+    pcall(function() notify((switched and "Switched: " or "Locked: ") .. t.name, "Trigger", 1) end)
+end
 
 local function screenInfo(t)
     local bestD, onScr = math.huge, false
@@ -922,30 +1110,6 @@ local function screenInfo(t)
     return bestD, onScr
 end
 
-local lockedUid, lockedName = nil, nil
-local lostSince = nil
-local visState = { uid=nil, vis=false, part=nil, visible=nil, gunOrigin=nil, virtual=false }
-local lastLockAt = 0
-
-local function applyLock(t, how, value)
-    if not t then
-        pcall(function() notify("No valid target", "Trigger", 1) end)
-        return
-    end
-    if lockedUid == t.uid then return end
-    local switched = lockedUid ~= nil
-    lockedUid, lockedName, lostSince = t.uid, t.name, nil
-    visState.uid, visState.vis = nil, false
-    visState.part, visState.visible = nil, nil
-    lastLockAt = os.clock()
-    local extra = ""
-    if how == "mouse" and value then extra = string.format(" (%.0f px)", value) end
-    if t.team then extra = extra .. " [" .. t.team .. "]" end
-    if t.hostileInmate then extra = extra .. " [FLAGGED]" end
-    log((switched and "Switched -> " or "Locked -> ") .. t.name .. extra)
-    pcall(function() notify((switched and "Switched: " or "Locked: ") .. t.name, "Trigger", 1) end)
-end
-
 local function pickByMouse()
     local best, bestD = nil, math.huge
     for _, t in ipairs(targets) do
@@ -962,84 +1126,87 @@ local function doUnlock()
         pcall(function() notify("Unlocked", "Trigger", 1) end)
     end
     lockedUid, lockedName, lostSince = nil, nil, nil
-    visState.part, visState.visible = nil, nil
+    buildSamples(nil)
 end
 
 -- ============================================================
--- RELOAD ALL  (1 yield per slot; ~3 frames for 3 slots)
+-- FAST, CONSISTENT RELOAD ALL
+--   Sequence per slot: select slot -> tap R -> next.
+--   Between actions we use task.wait() with NO argument, which is
+--   a plain scheduler yield (~16us), NOT the ms timer. The ms
+--   timer (task.wait(0.001)) is what was stretching under load
+--   and making the sequence feel slow and inconsistent.
+--   Set RELOAD_USE_YIELD = false to fire every key in one frame.
 -- ============================================================
 local function doReloadAll()
-    if reloading then return end
+    if reloadInFlight then return end
+    reloadInFlight = true
     reloading = true
     local slots = cycleKeys
     local n = #slots
     pcall(function() notify("Reloading all", "Trigger", 1) end)
-
     task.spawn(function()
         local t0 = os.clock()
-        if n < 1 then reloading = false; return end
+        local ok, err = pcall(function()
+            if n < 1 then return end
+            for i = 1, n do
+                local code = slots[i]
+                pcall(function() keypress(code) end)
+                pcall(function() keyrelease(code) end)
+                if RELOAD_USE_YIELD then task.wait() end
 
-        for i = 1, n do
-            local code = slots[i]
-            pcall(function() keypress(code) end)
-            pcall(function() keyrelease(code) end)
-
-            if not RELOAD_SAME_FRAME then
-                task.wait(0.02)
+                pcall(function() keypress(RELOAD_KEY) end)
+                pcall(function() keyrelease(RELOAD_KEY) end)
+                if RELOAD_USE_YIELD then task.wait() end
             end
-
-            pcall(function() keypress(RELOAD_KEY) end)
-            pcall(function() keyrelease(RELOAD_KEY) end)
-        end
-
-        pcall(function() keypress(slots[1]) end)
-        pcall(function() keyrelease(slots[1]) end)
-        pcall(function() keyrelease(RELOAD_KEY) end)
-
+            -- ensure we end on slot 1
+            pcall(function() keypress(slots[1]) end)
+            pcall(function() keyrelease(slots[1]) end)
+        end)
+        local total = os.clock() - t0
         reloading = false
-        if RELOAD_LOG then
-            log(string.format("reload all: %d slots in %.3fs", n, os.clock() - t0))
+        reloadInFlight = false
+        if not ok then log("reload error: " .. tostring(err)) end
+        if RELOAD_LOG and n >= 1 then
+            log(string.format("reload all: %d slots in %.3fs (%.2fms/slot)",
+                n, total, (total / n) * 1000))
         end
     end)
 end
 
+task.spawn(function()
+    while running do
+        if pendingReload and not reloadInFlight then
+            pendingReload = false
+            doReloadAll()
+        end
+        task.wait(0.01)
+    end
+end)
+
 -- ============================================================
--- VISIBILITY LOOP
+-- VISIBILITY THREAD (gun ray only)
 -- ============================================================
 task.spawn(function()
     local lastVisAt = 0
     while running do
-        local uid = lockedUid
-        local t = uid and targetByUid[uid]
-        if t then
-            local now = os.clock()
-            if visState.uid ~= uid then
-                visState.uid = uid
-                visState.vis = false
-                visState.part, visState.visible = nil, nil
-                lastVisAt = 0
-            end
-            if (now - lastVisAt) > VIS_REFRESH then
-                lastVisAt = now
-                local origin, isVirtual = getShotOrigin()
-                visState.gunOrigin = origin
-                visState.virtual = isVirtual
-                if origin then
-                    lastBlocker = nil
-                    local visible = computeVisible(t, origin)
-                    visState.visible = visible
-                    visState.vis = #visible > 0
-                    visState.part = pickFromVisible(t, visible)
-                else
-                    visState.visible = nil
-                    visState.vis = false
+        pcall(function()
+            local uid = lockedUid
+            local t = uid and targetByUid[uid]
+            if t then
+                local now = os.clock()
+                if t.char ~= samplesChar then buildSamples(t) end
+                if (now - lastVisAt) > VIS_REFRESH then
+                    lastVisAt = now
+                    local gunOrigin, isVirtual = getShotOrigin()
+                    lastVirtual = isVirtual
+                    if gunOrigin then scanSome(gunOrigin, t.char, lp.Character) end
                 end
+            else
+                if samplesChar ~= nil then buildSamples(nil) end
             end
-        else
-            visState.visible = nil
-            visState.vis = false
-        end
-        task.wait(0.01)
+        end)
+        task.wait(VIS_REFRESH)
     end
 end)
 
@@ -1050,8 +1217,12 @@ local latch, wasDown, lastFire = {}, {}, {}
 
 local function trigger(action)
     if capture then return end
-    if action == "reload" and not S.reloadAll then return end
-    if reloading and action ~= "reload" then return end
+    if action == "reload" then
+        if not S.reloadAll then return end
+        pendingReload = true
+        return
+    end
+    if reloading then return end
     local now = os.clock()
     if lastFire[action] and (now - lastFire[action]) < 0.2 then return end
     lastFire[action] = now
@@ -1060,8 +1231,6 @@ local function trigger(action)
         applyLock(t, "mouse", d)
     elseif action == "unlock" then
         doUnlock()
-    elseif action == "reload" then
-        doReloadAll()
     end
 end
 
@@ -1082,12 +1251,12 @@ pcall(function()
         if capture then
             local act = capture
             capture = nil
-            pcall(function() UI.SetValue("rebind_" .. act, false) end)
+            uiSet("rebind_" .. act, false)
             setBind(act, code)
             return
         end
+        if code == RELOAD_KEY then latch.reload = true; return end
         if reloading then return end
-        if code == RELOAD_KEY then latch.reload = true return end
         for _, act in ipairs(ACTIONS) do
             if binds[act] == code then latch[act] = true end
         end
@@ -1096,21 +1265,27 @@ end)
 
 task.spawn(function()
     while running do
-        if not reloading then
+        pcall(function()
             for _, act in ipairs(ACTIONS) do
                 local raw = binds[act]
                 local down = pollDown(raw)
-                if down and not wasDown[act] then trigger(act) end
+                if down and not wasDown[act] then
+                    if not reloading then trigger(act) end
+                end
                 wasDown[act] = down
             end
             local rdown = pollDown(RELOAD_KEY)
             if rdown and not wasDown.reload then trigger("reload") end
             wasDown.reload = rdown
-        end
-        if latch.reload then latch.reload = nil; trigger("reload") end
-        for _, act in ipairs(ACTIONS) do
-            if latch[act] then latch[act] = nil; trigger(act) end
-        end
+
+            if latch.reload then latch.reload = nil; trigger("reload") end
+            for _, act in ipairs(ACTIONS) do
+                if latch[act] then
+                    latch[act] = nil
+                    if not reloading then trigger(act) end
+                end
+            end
+        end)
         task.wait(0.02)
     end
 end)
@@ -1122,7 +1297,7 @@ local INMATE_POOL = 16
 local inmatePool = {}
 for i = 1, INMATE_POOL do
     local a = Drawing.new("Image")
-    a.Size = Vector2.new(S.markerSize, S.markerSize)
+    a.Size = Vector2.new(MARKER_SIZE_FIXED, MARKER_SIZE_FIXED)
     a.Visible = false
     if #AGGRO_DATA > 0 then a.Data = AGGRO_DATA end
     drawings[#drawings + 1] = a
@@ -1130,11 +1305,10 @@ for i = 1, INMATE_POOL do
     if USE_TEXT_ARREST_FALLBACK then
         b = Drawing.new("Text")
         b.Size = 16; b.Center = true; b.Outline = true
-        b.Color = Color3.fromRGB(255, 205, 60)
-        b.Text = "CUFFS"; b.Visible = false
+        b.Color = Color3.fromRGB(255, 205, 60); b.Text = "CUFFS"; b.Visible = false
     else
         b = Drawing.new("Image")
-        b.Size = Vector2.new(S.markerSize, S.markerSize)
+        b.Size = Vector2.new(MARKER_SIZE_FIXED, MARKER_SIZE_FIXED)
         b.Visible = false
         if #ARREST_DATA > 0 then b.Data = ARREST_DATA end
     end
@@ -1142,17 +1316,29 @@ for i = 1, INMATE_POOL do
     inmatePool[i] = { aggro = a, arrest = b }
 end
 
+local LASER_POOL = 10
 local laserPool = {}
 for i = 1, LASER_POOL do
-    local line = Drawing.new("Line")
-    line.Thickness = 2
-    line.Visible = false
+    local line = Drawing.new("Line"); line.Thickness = 2; line.Visible = false
     drawings[#drawings + 1] = line
     local dot = Drawing.new("Circle")
-    dot.Radius = 4; dot.NumSides = 12; dot.Thickness = 2; dot.Filled = false
-    dot.Visible = false
+    dot.Radius = 4; dot.NumSides = 12; dot.Thickness = 2; dot.Filled = false; dot.Visible = false
     drawings[#drawings + 1] = dot
     laserPool[i] = { line = line, dot = dot }
+end
+
+local dotPool = {}
+for i = 1, DOT_POOL do
+    local c = newDrawing("Circle")
+    c.Radius = 2; c.NumSides = 6; c.Thickness = 1; c.Filled = false; c.Visible = false
+    dotPool[i] = c
+end
+
+local beamPool = {}
+for i = 1, DOT_POOL do
+    local ln = newDrawing("Line")
+    ln.Thickness = 1; ln.Transparency = 0.55; ln.Visible = false
+    beamPool[i] = ln
 end
 
 local ovText = newDrawing("Text")
@@ -1163,16 +1349,14 @@ box.Thickness = 1; box.Filled = false; box.Visible = false
 
 local testImg
 if DEBUG_TEST_IMAGE and #AGGRO_DATA > 0 then
-    testImg = newDrawing("Image")
-    testImg.Data = AGGRO_DATA
-    testImg.Size = Vector2.new(96, 96)
-    testImg.Visible = true
+    testImg = newDrawing("Image"); testImg.Data = AGGRO_DATA
+    testImg.Size = Vector2.new(96, 96); testImg.Visible = true
 end
 
 local function setRight(obj, vpX, y, str)
     obj.Text = str
     local w
-    local ok, b = pcall(function() return obj.TextBounds end)
+    local ok, b = pcall(readBounds, obj)
     if ok and b then
         local okx, bx = pcall(function() return b.X end)
         if okx and type(bx) == "number" and bx > 0 then w = bx end
@@ -1181,19 +1365,18 @@ local function setRight(obj, vpX, y, str)
     obj.Position = Vector2.new(vpX - w - 14, y)
 end
 
-local COL_FIRE    = Color3.fromRGB(80, 255, 80)
-local COL_WAIT    = Color3.fromRGB(255, 140, 0)
-local COL_IDLE    = Color3.fromRGB(150, 150, 150)
-local COL_PAUSE   = Color3.fromRGB(255, 70, 70)
-local COL_SETTLE  = Color3.fromRGB(120, 180, 255)
-local COL_LINE_OK = Color3.fromRGB(80, 255, 80)
-local COL_LINE_BAD= Color3.fromRGB(255, 70, 70)
-local COL_DOT_OK  = Color3.fromRGB(80, 255, 80)
-local COL_DOT_BAD = Color3.fromRGB(255, 70, 70)
+local COL_FIRE     = Color3.fromRGB(80, 255, 80)
+local COL_WAIT     = Color3.fromRGB(255, 140, 0)
+local COL_IDLE     = Color3.fromRGB(150, 150, 150)
+local COL_PAUSE    = Color3.fromRGB(255, 70, 70)
+local COL_SETTLE   = Color3.fromRGB(120, 180, 255)
+local COL_LINE_OK  = Color3.fromRGB(80, 255, 80)
+local COL_DOT_OK   = Color3.fromRGB(0, 255, 0)
+local COL_DOT_BAD  = Color3.fromRGB(255, 0, 0)
+local COL_BEAM_OK  = Color3.fromRGB(0, 255, 0)
+local COL_BEAM_BAD = Color3.fromRGB(200, 60, 60)
 
-local cycIndex, cycStage = 1, 0
-local lastShot = 0
-
+local cycIndex, cycStage, lastShot = 1, 0, 0
 local function releaseCycle()
     if cycStage == 1 then
         local code = cycleKeys[cycIndex]
@@ -1202,66 +1385,23 @@ local function releaseCycle()
     cycStage, cycIndex = 0, 1
 end
 
-local scOrdered = {}
-local scSeenP   = {}
-local shotChecks = {}
-local shotCheckN = 0
+local HAS_MOUSEMOVEABS = (type(mousemoveabs) == "function")
 
-local function buildShotChecks(t, origin)
-    shotCheckN = 0
-    if not t or not origin then return end
-
-    for i = 1, #scOrdered do scOrdered[i] = nil end
-    for k in pairs(scSeenP) do scSeenP[k] = nil end
-
-    local head = t.head or t.root
-    if head and isShotPart(head) then
-        scOrdered[#scOrdered + 1] = head
-        scSeenP[head] = true
-    end
-    local vis = visState.visible
-    if vis then
-        for i = 1, #vis do
-            local p = vis[i]
-            if not scSeenP[p] and isShotPart(p) then
-                scOrdered[#scOrdered + 1] = p
-                scSeenP[p] = true
-            end
-        end
-    end
-
-    updateShotFilter()
-    local limit = #scOrdered
-    if limit > SHOT_CHECK_CAP then limit = SHOT_CHECK_CAP end
-    for i = 1, limit do
-        local p = scOrdered[i]
-        local okp, pos = pcall(function() return p.Position end)
-        if okp and pos then
-            local reached, endPos, endInst = traceRay(origin, pos, t.char)
-            local lands = reached
-            if not lands and endInst then
-                lands = isDescendantOf(endInst, t.char)
-            end
-            shotCheckN = shotCheckN + 1
-            local e = shotChecks[shotCheckN]
-            if not e then e = {}; shotChecks[shotCheckN] = e end
-            e.part = p
-            e.endPoint = endPos or pos
-            e.lands = lands
-            e.isHead = (p == head)
-        end
-    end
-end
-
-connRender = RunService.RenderStepped:Connect(function()
+-- ============================================================
+-- RENDER FRAME
+-- ============================================================
+local function renderFrame()
     local cam = Workspace.CurrentCamera
     if not cam then return end
     local vp = cam.ViewportSize
     local vpX, vpY = vp.X, vp.Y
     local now = os.clock()
 
-    local camPos
-    pcall(function() camPos = cam.CFrame.Position end)
+    local myRootP = nil
+    do
+        local r = getMyRoot()
+        if r then myRootP = partPos(r) end
+    end
 
     if testImg and testImg.Visible then
         testImg.Position = Vector2.new(vpX / 2 - 48, vpY / 2 - 48)
@@ -1288,49 +1428,123 @@ connRender = RunService.RenderStepped:Connect(function()
         lostSince = nil
     end
 
-    local targetOnScreen = false
-    if t then
-        if t.head then
-            local ok, wp = pcall(function() return t.head.Position end)
-            if ok and wp then
-                local sp, vis = WorldToScreen(wp)
-                if vis and sp and sp.X >= 0 and sp.X <= vpX and sp.Y >= 0 and sp.Y <= vpY then
-                    targetOnScreen = true
+    local dotsDrawn = 0
+    local greenTotal = 0
+    local headAim, headAimD = nil, math.huge
+    local bodyAim, bodyAimD = nil, math.huge
+    local headRef = t and t.head or nil
+
+    local shotOrigin, isVirtual = getShotOrigin()
+    local beamOriginS, beamOriginV = nil, false
+    if shotOrigin then beamOriginS, beamOriginV = WorldToScreen(shotOrigin) end
+
+    local list = samples
+    local sn = #list
+
+    local wantAim = S.aim and S.enabled
+    local needDots = (S.showDots and t) or (wantAim and t)
+
+    if needDots and sn > 0 and not capture and not reloading then
+        for i = 1, sn do
+            if dotsDrawn >= DOT_POOL then break end
+            local s = list[i]
+            if s and s.part then
+                local pos, R, U, L = frameOf(s.part)
+                if pos then
+                    local offs = s.offs
+                    local isHeadPart = partIsHead(s.part, headRef)
+                    for k = 1, #offs do
+                        if dotsDrawn >= DOT_POOL then break end
+                        local o = offs[k]
+                        local wx = R.X*o[1] + U.X*o[2] + L.X*o[3]
+                        local wy = R.Y*o[1] + U.Y*o[2] + L.Y*o[3]
+                        local wz = R.Z*o[1] + U.Z*o[2] + L.Z*o[3]
+                        local world = Vector3.new(pos.X + wx, pos.Y + wy, pos.Z + wz)
+                        s.world[k] = world
+                        dotsDrawn = dotsDrawn + 1
+                        local d = dotPool[dotsDrawn]
+                        local beam = beamPool[dotsDrawn]
+                        local vis = s.vis[k]
+
+                        if vis then greenTotal = greenTotal + 1 end
+
+                        local sp, on = WorldToScreen(world)
+                        if on and sp then
+                            if S.showDots then
+                                d.Position = Vector2.new(sp.X, sp.Y)
+                                d.Color = vis and COL_DOT_OK or COL_DOT_BAD
+                                d.Visible = true
+                                if S.showDotBeams and beamOriginV and beam then
+                                    beam.From = Vector2.new(beamOriginS.X, beamOriginS.Y)
+                                    beam.To   = Vector2.new(sp.X, sp.Y)
+                                    beam.Color = vis and COL_BEAM_OK or COL_BEAM_BAD
+                                    beam.Visible = true
+                                elseif beam then
+                                    beam.Visible = false
+                                end
+                            else
+                                d.Visible = false
+                                if beam then beam.Visible = false end
+                            end
+
+                            if wantAim and vis and not capture and not reloading then
+                                local dx, dy = sp.X - mx, sp.Y - my
+                                local dist = math.sqrt(dx*dx + dy*dy)
+                                if dist <= AIM_FOV_INTERNAL then
+                                    if isHeadPart then
+                                        if dist < headAimD then
+                                            headAimD = dist
+                                            headAim = sp
+                                        end
+                                    else
+                                        if dist < bodyAimD then
+                                            bodyAimD = dist
+                                            bodyAim = sp
+                                        end
+                                    end
+                                end
+                            end
+                        else
+                            d.Visible = false
+                            if beam then beam.Visible = false end
+                        end
+                    end
                 end
             end
         end
-        if not targetOnScreen and t.root then
-            local ok, wp = pcall(function() return t.root.Position end)
-            if ok and wp then
-                local sp, vis = WorldToScreen(wp)
-                if vis and sp and sp.X >= 0 and sp.X <= vpX and sp.Y >= 0 and sp.Y <= vpY then
-                    targetOnScreen = true
+    end
+    for i = dotsDrawn + 1, DOT_POOL do
+        dotPool[i].Visible = false
+        beamPool[i].Visible = false
+    end
+
+    if not needDots and t then
+        for i = 1, sn do
+            local s = list[i]
+            if s then
+                local vis = s.vis
+                for k = 1, #vis do
+                    if vis[k] then greenTotal = greenTotal + 1 end
                 end
             end
         end
     end
 
-    local onScreen = targetOnScreen
-    local los = false
-    if t and visState.uid == lockedUid then los = visState.vis end
+    local aimDot = headAim or bodyAim
+
+    local fireOk = false
+    if t and S.enabled and not reloading and not capture then
+        if greenTotal >= MIN_GREEN_FIXED then fireOk = true end
+    end
 
     local state = "IDLE"
     if not S.enabled then state = "PAUSED"
     elseif lockedUid and not t then state = "LOST"
     elseif t then
-        if not onScreen then state = "OFF SCREEN"
-        elseif not los then state = "NO LOS"
+        if greenTotal == 0 then state = "NO LOS"
         else state = "FIRING" end
     end
     if reloading then state = "RELOADING" end
-
-    local shotOrigin, isVirtual = getShotOrigin()
-
-    local fireOk = false
-    buildShotChecks(t, shotOrigin)
-    for i = 1, shotCheckN do
-        if shotChecks[i].lands then fireOk = true; break end
-    end
 
     if fireOk then
         if (now - lastShot) >= RATE then
@@ -1355,54 +1569,58 @@ connRender = RunService.RenderStepped:Connect(function()
         releaseCycle()
     end
 
-    if S.aim and t and S.enabled and not reloading and not capture then
-        local active = true
-        pcall(function() active = isrbxactive() end)
-        if active then
-            local part = visState.part or t.head or t.root
-            if part then
-                local okp, pos = pcall(function() return part.Position end)
-                if okp and pos then
-                    local sp, vis = WorldToScreen(pos)
-                    if vis and sp then
-                        local dx, dy = sp.X - mx, sp.Y - my
-                        local dist = math.sqrt(dx*dx + dy*dy)
-                        if dist > AIM_DEADZONE then
-                            local gain = (S.aimStr or 40) / 100
-                            gain = gain * (1 + math.min(dist / AIM_FAR_PX, 1) * AIM_FAR_BOOST)
-                            if gain > 1 then gain = 1 end
-                            local stepX = math.max(-AIM_MAX_STEP, math.min(AIM_MAX_STEP, dx * gain))
-                            local stepY = math.max(-AIM_MAX_STEP, math.min(AIM_MAX_STEP, dy * gain))
-                            local ix = math.floor(stepX + (stepX >= 0 and 0.5 or -0.5))
-                            local iy = math.floor(stepY + (stepY >= 0 and 0.5 or -0.5))
-                            if ix ~= 0 or iy ~= 0 then
-                                pcall(function() mousemoverel(ix, iy) end)
-                            end
-                        end
-                    end
+    -- ============================================================
+    -- AIM: cursor lock via mousemoveabs (fallback mousemoverel)
+    -- ============================================================
+    if wantAim and t and not reloading and not capture and aimDot then
+        local tx, ty = aimDot.X, aimDot.Y
+        local strength = S.aimStr or 100
+        if strength < 100 then
+            local f = strength / 100
+            tx = mx + (tx - mx) * f
+            ty = my + (ty - my) * f
+        end
+        tx = math.floor(tx + 0.5)
+        ty = math.floor(ty + 0.5)
+        if HAS_MOUSEMOVEABS then
+            local ok = pcall(mousemoveabs, tx, ty)
+            if not ok then
+                local ddx = math.floor(tx - mx + 0.5)
+                local ddy = math.floor(ty - my + 0.5)
+                if ddx ~= 0 or ddy ~= 0 then
+                    pcall(mousemoverel, ddx, ddy)
                 end
+            end
+        else
+            local ddx = math.floor(tx - mx + 0.5)
+            local ddy = math.floor(ty - my + 0.5)
+            if ddx ~= 0 or ddy ~= 0 then
+                pcall(mousemoverel, ddx, ddy)
             end
         end
     end
 
     local lasersDrawn = 0
-    if S.showShotLine and t and shotOrigin and not capture and not reloading then
-        local oS, oV = WorldToScreen(shotOrigin)
-        if oV and oS then
-            for i = 1, shotCheckN do
-                if lasersDrawn >= LASER_POOL then break end
-                local c = shotChecks[i]
-                local eS, eV = WorldToScreen(c.endPoint)
-                if eV and eS then
-                    lasersDrawn = lasersDrawn + 1
-                    local L = laserPool[lasersDrawn]
-                    L.line.From = Vector2.new(oS.X, oS.Y)
-                    L.line.To   = Vector2.new(eS.X, eS.Y)
-                    L.line.Color = c.lands and COL_LINE_OK or COL_LINE_BAD
-                    L.line.Visible = true
-                    L.dot.Position = Vector2.new(eS.X, eS.Y)
-                    L.dot.Color = c.lands and COL_DOT_OK or COL_DOT_BAD
-                    L.dot.Visible = true
+    if S.showShotLine and t and shotOrigin and not capture and not reloading and beamOriginV then
+        local l2 = samples
+        for i = 1, #l2 do
+            if lasersDrawn >= LASER_POOL then break end
+            local s = l2[i]
+            if s and s.anyVis and s.part then
+                local pos = partPos(s.part)
+                if pos then
+                    local eS, eV = WorldToScreen(pos)
+                    if eV and eS then
+                        lasersDrawn = lasersDrawn + 1
+                        local Lp = laserPool[lasersDrawn]
+                        Lp.line.From = Vector2.new(beamOriginS.X, beamOriginS.Y)
+                        Lp.line.To   = Vector2.new(eS.X, eS.Y)
+                        Lp.line.Color = COL_LINE_OK
+                        Lp.line.Visible = true
+                        Lp.dot.Position = Vector2.new(eS.X, eS.Y)
+                        Lp.dot.Color = COL_DOT_OK
+                        Lp.dot.Visible = true
+                    end
                 end
             end
         end
@@ -1410,6 +1628,28 @@ connRender = RunService.RenderStepped:Connect(function()
     for i = lasersDrawn + 1, LASER_POOL do
         laserPool[i].line.Visible = false
         laserPool[i].dot.Visible = false
+    end
+
+    local nsOn = S.noSpread
+    if type(_G.__NS) == "boolean" then nsOn = _G.__NS end
+    local nsTxt = ""
+    if nsOn and equippedTool then
+        nsTxt = "  NS:" .. tostring(equippedTool.Name)
+    elseif nsOn then
+        nsTxt = "  NS:unarmed"
+    else
+        nsTxt = "  NS:off"
+    end
+
+    local shTxt = S.shieldHide and "  [SHIELD]" or ""
+    local gmTxt = S.gmEnabled and "  [GMODS]" or ""
+    local hpTxt = ""
+    if S.aim and t then
+        if headAim then
+            hpTxt = "  AIM:HEAD"
+        elseif bodyAim then
+            hpTxt = "  AIM:BODY"
+        end
     end
 
     local y = 12
@@ -1425,19 +1665,21 @@ connRender = RunService.RenderStepped:Connect(function()
     elseif lockedUid then
         local dtxt = (t and t.dist < math.huge) and string.format("  %.0f st", t.dist) or ""
         local ttxt = (t and t.team) and ("  [" .. t.team .. "]") or ""
-        local atxt = (S.aim and t) and "  +AIM" or ""
         local htxt = (t and t.hostileInmate) and "  [FLAGGED]" or ""
-        local onTgt = fireOk and "  LINE-CLEAR" or ""
         local vtxt = isVirtual and "  (VGUN)" or ""
+        local gtxt = string.format("  green %d", greenTotal)
         ovText.Color = (state == "FIRING") and COL_FIRE or COL_WAIT
-        setRight(ovText, vpX, y, "LOCKED: " .. tostring(lockedName) .. dtxt .. ttxt .. atxt .. htxt .. onTgt .. vtxt .. "  [" .. state .. "]")
+        setRight(ovText, vpX, y,
+            "LOCKED: " .. tostring(lockedName) .. dtxt .. ttxt .. htxt .. vtxt
+            .. gtxt .. "  [GUN-LOS]  [" .. state .. "]" .. hpTxt .. nsTxt .. shTxt .. gmTxt)
     else
         ovText.Color = COL_IDLE
-        setRight(ovText, vpX, y, "UNLOCKED  " .. #targets .. " targets")
+        setRight(ovText, vpX, y,
+            "UNLOCKED  " .. #targets .. " targets  [GUN-LOS]" .. nsTxt .. shTxt .. gmTxt)
     end
     ovText.Visible = true
 
-    local bodyShown = false
+    local boxOn = false
     local boxColor = fireOk and COL_FIRE or COL_WAIT
     if S.esp and t and t.head and t.root and not capture and not reloading then
         local okh, hp = pcall(function() return t.head.Position end)
@@ -1453,53 +1695,57 @@ connRender = RunService.RenderStepped:Connect(function()
                     box.Size = Vector2.new(w, h)
                     box.Color = boxColor
                     box.Visible = true
-                    bodyShown = true
+                    boxOn = true
                 end
             end
         end
     end
-    if not bodyShown then box.Visible = false end
+    if not boxOn then box.Visible = false end
 
     local inmateIdx = 0
     if S.inmateESP and not capture and not reloading then
-        local baseSize = S.markerSize
+        local baseSize = MARKER_SIZE_FIXED
         local minSize  = baseSize * MARKER_MIN_FACTOR
         local maxSize  = baseSize * MARKER_MAX_FACTOR
         for i = 1, #inmates do
             if inmateIdx >= INMATE_POOL then break end
             local inmate = inmates[i]
-            local showArrest = inmate.arrest == true
-            local showAggro  = (inmate.aggro == true) and not showArrest
-            if inmate.head and (showAggro or showArrest) then
-                local okh2, hp2 = pcall(function() return inmate.head.Position end)
-                if okh2 and hp2 then
-                    local sp, vis = WorldToScreen(hp2 + Vector3.new(0, 2.2, 0))
-                    if vis and sp then
-                        inmateIdx = inmateIdx + 1
-                        local slot = inmatePool[inmateIdx]
-                        local sz = baseSize
-                        if S.scaleMarkers and camPos then
-                            local d = (hp2 - camPos).Magnitude
-                            sz = baseSize * MARKER_REF_DIST / math.max(d, 1)
-                            sz = math.max(minSize, math.min(maxSize, sz))
-                        end
-                        sz = math.floor(sz + 0.5)
-                        local half = sz / 2
-                        if showArrest then
-                            if USE_TEXT_ARREST_FALLBACK then
-                                slot.arrest.Size = math.max(10, math.floor(sz * 0.6))
-                                slot.arrest.Position = Vector2.new(sp.X, sp.Y - sz * 0.3)
-                            else
-                                slot.arrest.Size = Vector2.new(sz, sz)
-                                slot.arrest.Position = Vector2.new(sp.X - half, sp.Y - half)
+            if inmate then
+                local showAggro  = inmate.aggro == true
+                local showArrest = (inmate.arrest == true) and not showAggro
+
+                if inmate.head and (showAggro or showArrest) then
+                    local okh2, hp2 = pcall(function() return inmate.head.Position end)
+                    if okh2 and hp2 then
+                        local sp, vis = WorldToScreen(hp2 + Vector3.new(0, 2.2, 0))
+                        if vis and sp then
+                            inmateIdx = inmateIdx + 1
+                            local slot = inmatePool[inmateIdx]
+                            local sz = baseSize
+                            if myRootP then
+                                local d = (hp2 - myRootP).Magnitude
+                                sz = baseSize * MARKER_REF_DIST / math.max(d, 1)
+                                sz = math.max(minSize, math.min(maxSize, sz))
                             end
-                            slot.arrest.Visible = true
-                            slot.aggro.Visible  = false
-                        else
-                            slot.aggro.Size = Vector2.new(sz, sz)
-                            slot.aggro.Position = Vector2.new(sp.X - half, sp.Y - half)
-                            slot.aggro.Visible  = true
-                            slot.arrest.Visible = false
+                            sz = math.floor(sz + 0.5)
+                            local half = sz / 2
+
+                            if showAggro then
+                                slot.aggro.Size = Vector2.new(sz, sz)
+                                slot.aggro.Position = Vector2.new(sp.X - half, sp.Y - half)
+                                slot.aggro.Visible  = true
+                                slot.arrest.Visible = false
+                            else
+                                if USE_TEXT_ARREST_FALLBACK then
+                                    slot.arrest.Size = math.max(10, math.floor(sz * 0.6))
+                                    slot.arrest.Position = Vector2.new(sp.X, sp.Y - sz * 0.3)
+                                else
+                                    slot.arrest.Size = Vector2.new(sz, sz)
+                                    slot.arrest.Position = Vector2.new(sp.X - half, sp.Y - half)
+                                end
+                                slot.arrest.Visible = true
+                                slot.aggro.Visible  = false
+                            end
                         end
                     end
                 end
@@ -1507,19 +1753,27 @@ connRender = RunService.RenderStepped:Connect(function()
         end
     end
     for i = inmateIdx + 1, INMATE_POOL do
-        inmatePool[i].aggro.Visible  = false
+        inmatePool[i].aggro.Visible = false
         inmatePool[i].arrest.Visible = false
     end
+end
+
+connRender = RunService.RenderStepped:Connect(function()
+    local ok, err = pcall(renderFrame)
+    if not ok then bgError("render", err) end
 end)
 
-log("v63-OPT2 loaded | keys -> " .. keyName(binds.lock) .. "=lock  "
-    .. keyName(binds.unlock) .. "=unlock  R=reload all")
-log("beam: real muzzle when equipped, VGUN when unarmed")
-log("reload: 1 yield per slot | same-frame mode " ..
-    (RELOAD_SAME_FRAME and "ON" or "off"))
-log("reactivity: vis " .. VIS_REFRESH .. "s | collect " .. COLLECT_WAIT .. "s")
+log("v88 (consistent reload) loaded")
+log("keys -> " .. keyName(binds.lock) .. "=lock  " .. keyName(binds.unlock) .. "=unlock  R=reload all")
+log("RELOAD ALL now uses task.wait() (no arg) between actions.")
+log("  That is a plain scheduler yield, NOT the ms timer, so it can't stretch under load.")
+log("  Set RELOAD_USE_YIELD = false near the top to fire every key in a single frame.")
+log("AIM: mousemoveabs onto the chosen dot each frame. aimStr 100 = snap.")
+log("No spread lives in its OWN section ('No Spread'). Fallback: _G.__NS = true/false.")
+log("DETECTION = gun ray only. Camera is NEVER read for detection.")
+log("Fire gate: min 1 green dot (hard-coded)")
 log("teams: " .. table.concat(TEAM_LIST, ", "))
-pcall(function() notify("Trigger v63-OPT2 ready", "Trigger", 2) end)
+pcall(function() notify("Trigger v88 ready", "Trigger", 2) end)
 
 while running do task.wait(1) end
 
