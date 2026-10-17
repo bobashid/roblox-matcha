@@ -1,11 +1,11 @@
--- Prison Life HvH v3
+-- Prison Life HvH v5
 -- place 135564683255158
 -- gun mods / auto kill / targeted arrest / auto grab weapon
--- controls live in a Matcha menu tab named HvH
+-- all controls in one Matcha menu tab: HvH
 -- Matcha LuauVM: no Instance.new, no hooks, no getconnections.
 
 local NAME    = 'PLHvH'
-local VERSION = 'v3'
+local VERSION = 'v5'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -33,6 +33,7 @@ local lastAction = 0
 local busy       = false
 local wantGrab   = false
 local wantArrest = false
+local built      = false
 
 local cfg = {
     gunMods    = false,
@@ -51,11 +52,25 @@ local function track(c)
     return c
 end
 
+local function setBool(key, v)
+    if cfg[key] ~= v then
+        cfg[key] = v
+        print('[PLHvH] ' .. key .. ' = ' .. tostring(v))
+    end
+end
+
+local function setNum(key, v)
+    if cfg[key] ~= v then
+        cfg[key] = v
+        print('[PLHvH] ' .. key .. ' = ' .. tostring(v))
+    end
+end
+
 local rp = RaycastParams.new()
 rp.FilterType  = Enum.RaycastFilterType.Exclude
 rp.IgnoreWater = true
 
--- target collection -------------------------------------------------
+-- targets ------------------------------------------------------------
 
 local function enemyList()
     local out = {}
@@ -171,7 +186,7 @@ task.spawn(function()
     end
 end)
 
--- actions -----------------------------------------------------------
+-- actions ------------------------------------------------------------
 
 local RACK_NAMES = { 'Gun racks', 'SWAT gun rack', 'Gunstore_Display' }
 
@@ -266,49 +281,91 @@ task.spawn(function()
     end
 end)
 
--- menu --------------------------------------------------------------
+-- menu ---------------------------------------------------------------
+-- Live facts on this build:
+--   * the AddTab callback DOES fire (logs: 'tab opened - building widgets')
+--   * tab:Section(name) alone returns a non-table value and the widgets
+--     vanish; tab:Section(name, 'Left') returns a usable handle.
+--   * never test type(sec) == 'table', only sec ~= nil.
+--   * UI.GetValue returned nil in every probe, so the widget callback is
+--     the primary source of truth; poll only when the getter answers.
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
-local built   = false
-local widgets = {}
 
-local function mkSection(tab, name)
-    local ok, sec = pcall(function() return tab:Section(name) end)
-    if ok and type(sec) == 'table' then return sec end
-    print('[PLHvH] section failed: ' .. tostring(name))
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
     return nil
 end
 
-local function mkToggle(sec, name, id, default)
-    local tries = {
-        function() sec:Toggle(name, id, default, function() end) end,
-        function() sec:Toggle(id, name, default, function() end) end,
-        function() sec:Toggle(name, default, function() end) end,
-    }
-    for _, fn in ipairs(tries) do
-        if pcall(fn) then return true end
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
     end
-    print('[PLHvH] toggle failed: ' .. name)
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then
+            print('[PLHvH] section ' .. name .. ' (' .. sides[i] .. ') -> ' .. type(sec))
+            return sec
+        end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then
+        print('[PLHvH] section ' .. name .. ' (no side) -> ' .. type(sec))
+        return sec
+    end
+    warn('[PLHvH] section ' .. name .. ' FAILED')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[PLHvH] toggle failed: ' .. label)
     return false
 end
 
-local function mkSlider(sec, name, id, min, max, default)
-    local tries = {
-        function() sec:SliderInt(name, id, min, max, default, function() end) end,
-        function() sec:SliderInt(id, name, min, max, default, function() end) end,
-        function() sec:SliderInt(name, min, max, default, function() end) end,
-    }
-    for _, fn in ipairs(tries) do
-        if pcall(fn) then return true end
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
     end
-    print('[PLHvH] slider failed: ' .. name)
+    local tries = {
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[PLHvH] slider failed: ' .. label)
     return false
 end
 
-local function mkButton(sec, name, cb)
-    if pcall(function() sec:Button(name, cb) end) then return true end
-    if pcall(function() sec:Button(name, name .. '_btn', cb) end) then return true end
-    print('[PLHvH] button failed: ' .. name)
+-- Button must be tried as (name, cb) FIRST: (name, id, cb) succeeds but
+-- never wires the callback.
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[PLHvH] button failed: ' .. label)
     return false
 end
 
@@ -316,62 +373,61 @@ local function buildTab(tab)
     if built then return end
     built = true
 
-    local gun = mkSection(tab, 'Gun')
-    if gun then
-        mkToggle(gun, 'Gun Mods', 'pl_gunmods', false)
-        mkToggle(gun, 'Auto Kill', 'pl_autokill', false)
-        mkToggle(gun, 'Wall Check', 'pl_wallcheck', false)
-        mkToggle(gun, 'Same Team', 'pl_sameteam', false)
-        mkSlider(gun, 'Max Distance', 'pl_maxdist', 0, 1000, 500)
-        mkSlider(gun, 'Fire Rate ms', 'pl_rate', 20, 500, 80)
-    end
+    local ok, err = pcall(function()
+        local gun = mkSection(tab, 'Gun')
+        if gun then
+            mkToggle(gun, 'Gun Mods', 'pl_gunmods', false, function(v) setBool('gunMods', v) end)
+            mkToggle(gun, 'Auto Kill', 'pl_autokill', false, function(v) setBool('autoKill', v) end)
+            mkToggle(gun, 'Wall Check', 'pl_wallcheck', false, function(v) setBool('wallCheck', v) end)
+            mkToggle(gun, 'Same Team', 'pl_sameteam', false, function(v) setBool('sameTeam', v) end)
+            mkSlider(gun, 'Max Distance', 'pl_maxdist', 0, 1000, 500, function(v) setNum('maxDist', v) end)
+            mkSlider(gun, 'Fire Rate ms', 'pl_rate', 20, 500, 80, function(v) setNum('rateMs', v) end)
+        end
 
-    local act = mkSection(tab, 'Actions')
-    if act then
-        mkToggle(act, 'Auto Arrest', 'pl_autoarrest', false)
-        mkToggle(act, 'Auto Grab Weapon', 'pl_autograb', false)
-        mkSlider(act, 'Action Cooldown s', 'pl_actioncd', 1, 30, 5)
-        mkButton(act, 'Arrest Now', function() wantArrest = true end)
-        mkButton(act, 'Grab Now', function() wantGrab = true end)
-    end
+        local act = mkSection(tab, 'Actions')
+        if act then
+            mkToggle(act, 'Auto Arrest', 'pl_autoarrest', false, function(v) setBool('autoArrest', v) end)
+            mkToggle(act, 'Auto Grab Weapon', 'pl_autograb', false, function(v) setBool('autoGrab', v) end)
+            mkSlider(act, 'Action Cooldown s', 'pl_actioncd', 1, 30, 5, function(v) setNum('actionCd', v) end)
+            mkButton(act, 'Arrest Now', function()
+                wantArrest = true
+                print('[PLHvH] Arrest Now pressed')
+            end)
+            mkButton(act, 'Grab Now', function()
+                wantGrab = true
+                print('[PLHvH] Grab Now pressed')
+            end)
+        end
+    end)
 
+    if not ok then
+        warn('[PLHvH] build error: ' .. tostring(err))
+    end
     print('[PLHvH] tab widgets built')
 end
 
 if HAS_UI then
     local ok, err = pcall(function()
         UI.AddTab('HvH', function(tab)
-            if not built then
-                print('[PLHvH] tab opened - building widgets')
-            end
+            if built then return end
+            print('[PLHvH] tab opened - building widgets')
             pcall(buildTab, tab)
         end)
     end)
     if not ok then
-        print('[PLHvH] UI.AddTab failed: ' .. tostring(err))
+        warn('[PLHvH] UI.AddTab failed: ' .. tostring(err))
         HAS_UI = false
     end
 end
 
--- config read-back: the toggle callback argument is unreliable on this
--- build, so poll UI.GetValue by id, then by name, and keep last value.
-local function readVal(id, name)
+-- fallback read-back: only applied when the getter actually answers ------
+
+local function readVal(id, label)
     local ok, v = pcall(function() return UI.GetValue(id) end)
     if ok and v ~= nil then return v end
-    ok, v = pcall(function() return UI.GetValue(name) end)
+    ok, v = pcall(function() return UI.GetValue(label) end)
     if ok and v ~= nil then return v end
     return nil
-end
-
-local function asBool(v, fallback)
-    if type(v) == 'boolean' then return v end
-    if type(v) == 'number' then return v ~= 0 end
-    return fallback
-end
-
-local function asNum(v, fallback)
-    if type(v) == 'number' then return v end
-    return fallback
 end
 
 local POLL = {
@@ -388,16 +444,15 @@ local POLL = {
 
 task.spawn(function()
     while running do
-        task.wait(0.1)
-        if HAS_UI then
+        task.wait(0.15)
+        if HAS_UI and built then
             for _, w in ipairs(POLL) do
                 local v = readVal(w[1], w[2])
                 if v ~= nil then
-                    local key = w[3]
                     if w[4] == 'bool' then
-                        cfg[key] = asBool(v, cfg[key])
-                    else
-                        cfg[key] = asNum(v, cfg[key])
+                        if type(v) == 'boolean' then setBool(w[3], v) end
+                    elseif type(v) == 'number' then
+                        setNum(w[3], v)
                     end
                 end
             end
@@ -405,15 +460,16 @@ task.spawn(function()
     end
 end)
 
--- keyboard fallback if the menu is unavailable
+-- keyboard fallback ---------------------------------------------------
+
 if not HAS_UI then
     print('[PLHvH] menu unavailable - using keys X Z H G')
     track(UIS.InputBegan:Connect(function(input)
         local k = input.KeyCode
         if k == Enum.KeyCode.X then
-            cfg.gunMods = not cfg.gunMods
+            setBool('gunMods', not cfg.gunMods)
         elseif k == Enum.KeyCode.Z then
-            cfg.autoKill = not cfg.autoKill
+            setBool('autoKill', not cfg.autoKill)
         elseif k == Enum.KeyCode.H then
             wantGrab = true
         elseif k == Enum.KeyCode.G then
