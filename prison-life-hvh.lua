@@ -1,11 +1,11 @@
--- Prison Life HvH v2
+-- Prison Life HvH v3
 -- place 135564683255158
 -- gun mods / auto kill / targeted arrest / auto grab weapon
--- all controls live in one Matcha tab: HvH
+-- controls live in a Matcha menu tab named HvH
 -- Matcha LuauVM: no Instance.new, no hooks, no getconnections.
 
 local NAME    = 'PLHvH'
-local VERSION = 'v2'
+local VERSION = 'v3'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -14,6 +14,7 @@ end
 local Players    = game:GetService('Players')
 local RS         = game:GetService('ReplicatedStorage')
 local RunService = game:GetService('RunService')
+local UIS        = game:GetService('UserInputService')
 
 local lp = Players.LocalPlayer
 
@@ -39,9 +40,9 @@ local cfg = {
     wallCheck  = false,
     sameTeam   = false,
     maxDist    = 500,
-    rate       = 0.08,
-    autoGrab   = false,
+    rateMs     = 80,
     autoArrest = false,
+    autoGrab   = false,
     actionCd   = 5,
 }
 
@@ -53,6 +54,8 @@ end
 local rp = RaycastParams.new()
 rp.FilterType  = Enum.RaycastFilterType.Exclude
 rp.IgnoreWater = true
+
+-- target collection -------------------------------------------------
 
 local function enemyList()
     local out = {}
@@ -114,7 +117,7 @@ end
 local function fireAt(origin, e)
     if not shootEvent or not e then return false end
     local now = tick()
-    if now - lastFire < cfg.rate then return false end
+    if now - lastFire < cfg.rateMs / 1000 then return false end
     if cfg.maxDist > 0 and (e.head.Position - origin).Magnitude > cfg.maxDist then
         return false
     end
@@ -124,7 +127,6 @@ local function fireAt(origin, e)
     return true
 end
 
--- collector: 4 Hz, does the expensive lookups
 task.spawn(function()
     while running do
         targets = enemyList()
@@ -132,7 +134,6 @@ task.spawn(function()
     end
 end)
 
--- renderer: crosshair target only, reads the table
 track(RunService.RenderStepped:Connect(function()
     local cam = workspace.CurrentCamera
     if not cam then aimTarget = nil return end
@@ -150,7 +151,6 @@ track(RunService.RenderStepped:Connect(function()
     aimTarget = best
 end))
 
--- gun loop
 task.spawn(function()
     while running do
         task.wait(0.02)
@@ -171,7 +171,8 @@ task.spawn(function()
     end
 end)
 
--- actions
+-- actions -----------------------------------------------------------
+
 local RACK_NAMES = { 'Gun racks', 'SWAT gun rack', 'Gunstore_Display' }
 
 local function firstPart(model)
@@ -225,7 +226,7 @@ local function doArrest()
     my.CFrame = t.root.CFrame * CFrame.new(0, 0, -3)
     task.wait(0.2)
     -- UNVERIFIED: ArrestPlayer argument shape. If nothing happens,
-    -- change t.plr to t.char on the next line and re-exec.
+    -- change t.plr to t.char on the next line.
     local ok, err = pcall(function()
         return arrestFn:InvokeServer(t.plr)
     end)
@@ -235,7 +236,6 @@ local function doArrest()
     print('[PLHvH] arrest ' .. t.plr.Name .. (ok and ' ok' or (' err ' .. tostring(err))))
 end
 
--- action loop
 task.spawn(function()
     while running do
         task.wait(0.2)
@@ -266,56 +266,101 @@ task.spawn(function()
     end
 end)
 
--- UI: widget signatures differ between builds, so every widget is built
--- through a variant-trying helper and read back with UI.GetValue.
-local built = false
+-- menu --------------------------------------------------------------
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built   = false
+local widgets = {}
+
+local function mkSection(tab, name)
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and type(sec) == 'table' then return sec end
+    print('[PLHvH] section failed: ' .. tostring(name))
+    return nil
+end
 
 local function mkToggle(sec, name, id, default)
-    local ok = pcall(function() sec:Toggle(name, id, default, function() end) end)
-    if ok then return end
-    ok = pcall(function() sec:Toggle(id, name, default, function() end) end)
-    if ok then return end
-    pcall(function() sec:Toggle(name, default, function() end) end)
+    local tries = {
+        function() sec:Toggle(name, id, default, function() end) end,
+        function() sec:Toggle(id, name, default, function() end) end,
+        function() sec:Toggle(name, default, function() end) end,
+    }
+    for _, fn in ipairs(tries) do
+        if pcall(fn) then return true end
+    end
+    print('[PLHvH] toggle failed: ' .. name)
+    return false
 end
 
 local function mkSlider(sec, name, id, min, max, default)
-    local ok = pcall(function() sec:SliderInt(name, id, min, max, default, function() end) end)
-    if ok then return end
-    pcall(function() sec:SliderInt(name, min, max, default, function() end) end)
+    local tries = {
+        function() sec:SliderInt(name, id, min, max, default, function() end) end,
+        function() sec:SliderInt(id, name, min, max, default, function() end) end,
+        function() sec:SliderInt(name, min, max, default, function() end) end,
+    }
+    for _, fn in ipairs(tries) do
+        if pcall(fn) then return true end
+    end
+    print('[PLHvH] slider failed: ' .. name)
+    return false
 end
 
 local function mkButton(sec, name, cb)
-    local ok = pcall(function() sec:Button(name, cb) end)
-    if ok then return end
-    pcall(function() sec:Button(name, name .. '_btn', cb) end)
+    if pcall(function() sec:Button(name, cb) end) then return true end
+    if pcall(function() sec:Button(name, name .. '_btn', cb) end) then return true end
+    print('[PLHvH] button failed: ' .. name)
+    return false
 end
 
-UI.AddTab('HvH', function(tab)
+local function buildTab(tab)
     if built then return end
     built = true
-    pcall(function()
-        local gun = tab:Section('Gun')
+
+    local gun = mkSection(tab, 'Gun')
+    if gun then
         mkToggle(gun, 'Gun Mods', 'pl_gunmods', false)
         mkToggle(gun, 'Auto Kill', 'pl_autokill', false)
         mkToggle(gun, 'Wall Check', 'pl_wallcheck', false)
         mkToggle(gun, 'Same Team', 'pl_sameteam', false)
         mkSlider(gun, 'Max Distance', 'pl_maxdist', 0, 1000, 500)
         mkSlider(gun, 'Fire Rate ms', 'pl_rate', 20, 500, 80)
+    end
 
-        local act = tab:Section('Actions')
+    local act = mkSection(tab, 'Actions')
+    if act then
         mkToggle(act, 'Auto Arrest', 'pl_autoarrest', false)
         mkToggle(act, 'Auto Grab Weapon', 'pl_autograb', false)
         mkSlider(act, 'Action Cooldown s', 'pl_actioncd', 1, 30, 5)
         mkButton(act, 'Arrest Now', function() wantArrest = true end)
         mkButton(act, 'Grab Now', function() wantGrab = true end)
-    end)
-end)
+    end
 
-local function readVal(id, name, fallback)
-    local v = UI.GetValue(id)
-    if v == nil then v = UI.GetValue(name) end
-    if v == nil then return fallback end
-    return v
+    print('[PLHvH] tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('HvH', function(tab)
+            if not built then
+                print('[PLHvH] tab opened - building widgets')
+            end
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        print('[PLHvH] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+end
+
+-- config read-back: the toggle callback argument is unreliable on this
+-- build, so poll UI.GetValue by id, then by name, and keep last value.
+local function readVal(id, name)
+    local ok, v = pcall(function() return UI.GetValue(id) end)
+    if ok and v ~= nil then return v end
+    ok, v = pcall(function() return UI.GetValue(name) end)
+    if ok and v ~= nil then return v end
+    return nil
 end
 
 local function asBool(v, fallback)
@@ -329,20 +374,53 @@ local function asNum(v, fallback)
     return fallback
 end
 
+local POLL = {
+    { 'pl_gunmods',    'Gun Mods',          'gunMods',    'bool' },
+    { 'pl_autokill',   'Auto Kill',         'autoKill',   'bool' },
+    { 'pl_wallcheck',  'Wall Check',        'wallCheck',  'bool' },
+    { 'pl_sameteam',   'Same Team',         'sameTeam',   'bool' },
+    { 'pl_maxdist',    'Max Distance',      'maxDist',    'num'  },
+    { 'pl_rate',       'Fire Rate ms',      'rateMs',     'num'  },
+    { 'pl_autoarrest', 'Auto Arrest',       'autoArrest', 'bool' },
+    { 'pl_autograb',   'Auto Grab Weapon',  'autoGrab',   'bool' },
+    { 'pl_actioncd',   'Action Cooldown s', 'actionCd',   'num'  },
+}
+
 task.spawn(function()
     while running do
         task.wait(0.1)
-        cfg.gunMods    = asBool(readVal('pl_gunmods', 'Gun Mods', cfg.gunMods), cfg.gunMods)
-        cfg.autoKill   = asBool(readVal('pl_autokill', 'Auto Kill', cfg.autoKill), cfg.autoKill)
-        cfg.wallCheck  = asBool(readVal('pl_wallcheck', 'Wall Check', cfg.wallCheck), cfg.wallCheck)
-        cfg.sameTeam   = asBool(readVal('pl_sameteam', 'Same Team', cfg.sameTeam), cfg.sameTeam)
-        cfg.maxDist    = asNum(readVal('pl_maxdist', 'Max Distance', cfg.maxDist), cfg.maxDist)
-        cfg.rate       = asNum(readVal('pl_rate', 'Fire Rate ms', cfg.rate * 1000), cfg.rate * 1000) / 1000
-        cfg.autoArrest = asBool(readVal('pl_autoarrest', 'Auto Arrest', cfg.autoArrest), cfg.autoArrest)
-        cfg.autoGrab   = asBool(readVal('pl_autograb', 'Auto Grab Weapon', cfg.autoGrab), cfg.autoGrab)
-        cfg.actionCd   = asNum(readVal('pl_actioncd', 'Action Cooldown s', cfg.actionCd), cfg.actionCd)
+        if HAS_UI then
+            for _, w in ipairs(POLL) do
+                local v = readVal(w[1], w[2])
+                if v ~= nil then
+                    local key = w[3]
+                    if w[4] == 'bool' then
+                        cfg[key] = asBool(v, cfg[key])
+                    else
+                        cfg[key] = asNum(v, cfg[key])
+                    end
+                end
+            end
+        end
     end
 end)
+
+-- keyboard fallback if the menu is unavailable
+if not HAS_UI then
+    print('[PLHvH] menu unavailable - using keys X Z H G')
+    track(UIS.InputBegan:Connect(function(input)
+        local k = input.KeyCode
+        if k == Enum.KeyCode.X then
+            cfg.gunMods = not cfg.gunMods
+        elseif k == Enum.KeyCode.Z then
+            cfg.autoKill = not cfg.autoKill
+        elseif k == Enum.KeyCode.H then
+            wantGrab = true
+        elseif k == Enum.KeyCode.G then
+            wantArrest = true
+        end
+    end))
+end
 
 local function stop()
     running = false
@@ -350,10 +428,12 @@ local function stop()
         pcall(function() c:Disconnect() end)
     end
     conns = {}
-    pcall(function() UI.RemoveTab('HvH') end)
+    if HAS_UI then
+        pcall(function() UI.RemoveTab('HvH') end)
+    end
     _G[NAME] = nil
     print('[PLHvH] stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[PLHvH] ' .. VERSION .. ' loaded - open the HvH tab')
+print('[PLHvH] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - open the HvH tab once')
