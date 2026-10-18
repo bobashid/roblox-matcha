@@ -1,24 +1,19 @@
--- Build and Kill Zombies - Inf Fuel only - Matcha LuauVM - v4
+-- Build and Kill Zombies - Inf Fuel - Matcha LuauVM - v5
 -- place 105011592530400
--- one Matcha menu tab: Mods, one section: Fuel, one toggle.
--- No getgc at load, no prescan, no cache, no weapon mods.
--- Nothing runs until you flip the toggle.
+-- one tab, one section, one toggle. no sliders, no buttons, no weapon mods.
+-- No getgc at load. The scan runs only after you turn the toggle on.
 --
--- Probed facts for this place:
---   HUD %      PlayerGui.MainGui.HUD.Vehicle.DrivePanel.Fuel.Status.Text
+-- What the probes actually found for this place:
+--   HUD %      PlayerGui.MainGui.HUD.Vehicle.DrivePanel.Fuel.Status.Text  (reads, e.g. 93%)
 --   ride flag  LocalPlayer:GetAttribute('VehicleRideId')
---   gc keys    numeric Fuel / FuelCapacity / FuelDrain exist (FuelDrain 6)
---   absent     no Fuel instance, no fuel ValueObject in Workspace or
---              ReplicatedStorage, no *Fuel* RemoteEvent
---   decompile  VehicleController only writes ThrottleFloat/SteerFloat, no fuel code
--- Fuel is likely server-owned, so treat this as best effort, not a guarantee.
---
--- How it works: setgc writes by key name, so no scan and no cache is needed.
--- A pass is 6 short setgc calls. Passes are bounded and spaced apart because
--- the cost of setgc on this build is unknown and could be as heavy as getgc.
+--   seat       Humanoid.SeatPart returns nil, so the car cannot be found that way
+--   no fuel    no Fuel instance, no fuel ValueObject, no *Fuel* RemoteEvent,
+--              no Workspace attribute matching the ride id
+--   gc keys    Fuel / FuelCapacity / FuelDrain show up as numeric keys
+-- Fuel looks server-owned, so this is best effort, not a guarantee.
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v4'
+local VERSION = 'v5'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -28,18 +23,19 @@ print('[' .. NAME .. '] ' .. VERSION)
 local Players = game:GetService('Players')
 local lp = Players.LocalPlayer
 
-local running = true
-local built   = false
-local busy    = false
-
-local cfg = {
-    fuel    = false,
-    fuelVal = 1000,
-    passes  = 3,
-    gap     = 2,
+local FUEL_KEYS = {
+    'Fuel', 'CurrentFuel', 'FuelLevel', 'FuelAmount', 'FuelValue',
+    'MaxFuel', 'FuelCapacity', 'FuelDrain',
 }
 
-local FUEL_KEYS = { 'Fuel', 'FuelLevel', 'FuelAmount', 'CurrentFuel' }
+local VALUE = 9999
+
+local alive    = true
+local running  = false
+local built    = false
+local scanning = false
+local cache    = nil
+local lastScan = 0
 
 local function hudFuelText()
     local pg  = lp:FindFirstChild('PlayerGui')
@@ -52,38 +48,52 @@ local function hudFuelText()
     return st and st.Text or 'no hud'
 end
 
-local function riding()
-    return lp:GetAttribute('VehicleRideId') ~= nil
+local function scan()
+    if scanning then return end
+    scanning = true
+    lastScan = tick()
+    print('[' .. NAME .. '] scanning for fuel keys, this takes 10-20s')
+
+    local ok, res = pcall(getgc, FUEL_KEYS)
+    if ok and type(res) == 'table' then
+        local out = {}
+        for _, e in ipairs(res) do
+            if e.type == 'number' then
+                out[#out + 1] = e
+            end
+        end
+        cache = out
+        print('[' .. NAME .. '] scan done: ' .. #out .. ' numeric keys, hud=' .. hudFuelText())
+    else
+        print('[' .. NAME .. '] scan failed: ' .. tostring(res))
+    end
+
+    scanning = false
 end
 
-local function pass(n)
+local function apply()
+    if not cache then return end
     for _, k in ipairs(FUEL_KEYS) do
-        pcall(setgc, k, cfg.fuelVal)
+        pcall(applygc, cache, k, VALUE)
     end
-    pcall(setgc, 'MaxFuel', cfg.fuelVal)
-    pcall(setgc, 'FuelDrain', 0)
-    print('[' .. NAME .. '] pass ' .. n .. ' hud=' .. hudFuelText() ..
-          ' riding=' .. tostring(riding()))
+    pcall(applygc, cache, 'FuelDrain', 0)
 end
 
-local function runPasses()
-    if busy then return end
-    busy = true
-    for i = 1, cfg.passes do
-        if not running or not cfg.fuel then break end
-        pass(i)
-        task.wait(cfg.gap)
+-- apply loop: the only thing that runs in the background
+
+task.spawn(function()
+    while alive do
+        if running then
+            if not cache and not scanning and (tick() - lastScan) > 15 then
+                scan()
+            end
+            apply()
+        end
+        task.wait(0.5)
     end
-    busy = false
-    print('[' .. NAME .. '] done, hud=' .. hudFuelText())
-    if not riding() then
-        pcall(notify, 'Mods', 'fuel write sent - sit in a vehicle to check the HUD', 4)
-    end
-end
+end)
 
 -- menu ---------------------------------------------------------------
--- tab:Section(name, 'Left') returns a usable handle, plain name does not.
--- Toggle / SliderInt / Button each get an argument-order retry.
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -91,14 +101,6 @@ local function firstBool(...)
     for i = 1, select('#', ...) do
         local v = select(i, ...)
         if type(v) == 'boolean' then return v end
-    end
-    return nil
-end
-
-local function firstNumber(...)
-    for i = 1, select('#', ...) do
-        local v = select(i, ...)
-        if type(v) == 'number' then return v end
     end
     return nil
 end
@@ -115,10 +117,10 @@ local function mkSection(tab, name)
     return nil
 end
 
-local function mkToggle(sec, label, id, default, apply)
+local function mkToggle(sec, label, id, default, apply_fn)
     local cb = function(...)
         local v = firstBool(...)
-        if v ~= nil then apply(v) end
+        if v ~= nil then apply_fn(v) end
     end
     local tries = {
         function() sec:Toggle(label, id, default, cb) end,
@@ -132,30 +134,6 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
-local function mkSlider(sec, label, id, min, max, default, apply)
-    local cb = function(...)
-        local v = firstNumber(...)
-        if v ~= nil then apply(v) end
-    end
-    local tries = {
-        function() sec:SliderInt(label, id, min, max, default, cb) end,
-        function() sec:SliderInt(id, label, min, max, default, cb) end,
-        function() sec:SliderInt(label, min, max, default, cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    warn('[' .. NAME .. '] slider failed: ' .. label)
-    return false
-end
-
-local function mkButton(sec, label, cb)
-    if pcall(function() sec:Button(label, cb) end) then return true end
-    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
-    warn('[' .. NAME .. '] button failed: ' .. label)
-    return false
-end
-
 local function buildTab(tab)
     if built then return end
     built = true
@@ -165,35 +143,22 @@ local function buildTab(tab)
         if not fuel then return end
 
         mkToggle(fuel, 'Inf Fuel', 'mm_fuel', false, function(v)
-            cfg.fuel = v
-            print('[' .. NAME .. '] inf fuel = ' .. tostring(v) ..
-                  ' hud=' .. hudFuelText() .. ' riding=' .. tostring(riding()))
-            if v then task.spawn(runPasses) end
-        end)
-
-        mkSlider(fuel, 'Fuel Value', 'mm_fuelval', 100, 100000, 1000, function(v)
-            cfg.fuelVal = v
-            print('[' .. NAME .. '] fuel value = ' .. tostring(v))
-        end)
-
-        mkButton(fuel, 'Reapply', function()
-            print('[' .. NAME .. '] reapply, hud=' .. hudFuelText() ..
-                  ' riding=' .. tostring(riding()))
-            task.spawn(runPasses)
+            running = v
+            print('[' .. NAME .. '] inf fuel = ' .. tostring(v) .. ' hud=' .. hudFuelText())
+            if v and not cache then task.spawn(scan) end
         end)
     end)
 
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
     end
-    print('[' .. NAME .. '] tab widgets built')
+    print('[' .. NAME .. '] tab built')
 end
 
 if HAS_UI then
     local ok, err = pcall(function()
         UI.AddTab('Mods', function(tab)
             if built then return end
-            print('[' .. NAME .. '] tab opened - building widgets')
             pcall(buildTab, tab)
         end)
     end)
@@ -208,8 +173,8 @@ end
 -- stop ----------------------------------------------------------------
 
 local function stop()
+    alive = false
     running = false
-    cfg.fuel = false
     if HAS_UI then
         pcall(function() UI.RemoveTab('Mods') end)
     end
@@ -217,5 +182,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, reapply = runPasses, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - open the Mods tab, Fuel section')
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - Mods tab, Inf Fuel')
