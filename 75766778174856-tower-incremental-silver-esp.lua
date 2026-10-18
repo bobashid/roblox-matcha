@@ -1,14 +1,14 @@
--- Tower Incremental - Ore ESP
+-- Tower Incremental - Ore + Mine ESP
 -- place 75766778174856
--- v4: true 3D wireframe boxes. Each ore block is projected corner by corner
---     and drawn as its 12 edges, so it reads as a box in the world instead of
---     a flat rectangle on screen. Hover highlights the box you point at, even
---     through walls.
+-- v5: true 3D wireframe boxes for every ore AND the plain mine stone blocks.
+--     The v4 hover highlight is gone.
+--     Corners come from each block's CFrame, so rotated blocks line up.
+--     Edge thickness scales with distance so near boxes stay crisp.
 -- Matcha LuauVM: no Instance.new, no hooks, no Highlight/SelectionBox.
 -- All overlay goes through Drawing.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v4'
+local VERSION = 'v5'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -26,19 +26,21 @@ local built   = false
 
 local cfg = {
     enabled    = true,
+    oreESP     = true,   -- Silver / Iron / any *Ore model
+    stoneESP   = true,   -- plain mineable Stone blocks
     showNames  = true,
-    nameNear   = 6,     -- names only on the N closest boxes
-    hoverGlow  = true,
+    nameNear   = 6,      -- names only on the N closest boxes
     maxDist    = 500,
-    maxBoxes   = 32,
+    maxBoxes   = 40,
     fade       = true,
     thickness  = 1,
+    scaleThick = true,   -- thicker edges when close, thin when far
     silver     = Color3.fromRGB(220, 225, 240),
     iron       = Color3.fromRGB(215, 150, 110),
-    hoverColor = Color3.fromRGB(255, 255, 255),
+    stone      = Color3.fromRGB(150, 160, 175),
 }
 
-local POOL = 48
+local POOL = 64
 
 -- corner id 1..8: bit0 = X, bit1 = Y, bit2 = Z, 0 = -half, 1 = +half.
 -- These 12 pairs are the edges of a cube.
@@ -58,6 +60,7 @@ end
 
 local function colorFor(kind)
     if kind == 'Iron' then return cfg.iron end
+    if kind == 'Stone' then return cfg.stone end
     return cfg.silver
 end
 
@@ -78,15 +81,7 @@ for i = 1, POOL do
     tag.Size = 13
     tag.Color = cfg.silver
     tag.Visible = false
-    pool[i] = {
-        lines = lines,
-        tag   = tag,
-        on    = false,
-        thick = cfg.thickness,
-        kind  = '',
-        dist  = 0,
-        tagPos = Vector2.new(0, 0),
-    }
+    pool[i] = { lines = lines, tag = tag, on = false, thick = -1, kind = '' }
 end
 
 local function hideAll()
@@ -117,19 +112,27 @@ task.spawn(function()
             for i = 1, #kids do
                 local m = kids[i]
                 local n = m.Name
-                -- any model whose name ends in Ore counts
+                local kind, want, part = nil, false, nil
                 if string.sub(n, -3) == 'Ore' then
-                    local stone = m:FindFirstChild('Stone')
-                    if stone then
-                        local p = stone.Position
-                        local d = origin and (p - origin).Magnitude or 0
-                        out[#out + 1] = {
-                            pos  = p,
-                            size = stone.Size,
-                            dist = d,
-                            kind = string.sub(n, 1, #n - 3),
-                        }
-                    end
+                    -- model named SilverOre / IronOre / ... , box lives on its Stone part
+                    kind = string.sub(n, 1, #n - 3)
+                    want = cfg.oreESP
+                    part = m:FindFirstChild('Stone')
+                elseif n == 'Stone' then
+                    -- these are the parts themselves, not models
+                    kind = 'Stone'
+                    want = cfg.stoneESP
+                    part = m
+                end
+                if want and part then
+                    local cf = part.CFrame
+                    local d = origin and (cf.Position - origin).Magnitude or 0
+                    out[#out + 1] = {
+                        cframe = cf,
+                        size   = part.Size,
+                        dist   = d,
+                        kind   = kind,
+                    }
                 end
             end
         end
@@ -142,24 +145,10 @@ end)
 
 -- renderer ------------------------------------------------------------
 
-local mouse = nil
-do
-    local ok, m = pcall(function() return lp:GetMouse() end)
-    if ok then mouse = m end
-end
-
 track(RunService.RenderStepped:Connect(function()
     if not cfg.enabled then
         hideAll()
         return
-    end
-
-    local mx, my = -1, -1
-    if mouse then
-        local okx, x = pcall(function() return mouse.X end)
-        local oky, y = pcall(function() return mouse.Y end)
-        if okx and type(x) == 'number' then mx = x end
-        if oky and type(y) == 'number' then my = y end
     end
 
     local char   = lp.Character
@@ -171,14 +160,12 @@ track(RunService.RenderStepped:Connect(function()
     local list   = targets
     local n      = 0
 
-    local hoverSlot, hoverDist = nil, nil
-
     for i = 1, #list do
         if n >= cap then break end
         local t = list[i]
-        local p = t.pos
-        local s = t.size
-        local dist = origin and (p - origin).Magnitude or t.dist
+        local cf = t.cframe
+        local s  = t.size
+        local dist = origin and (cf.Position - origin).Magnitude or t.dist
 
         if not origin or dist * dist <= maxSq then
             local hx, hy, hz = s.X * 0.5, s.Y * 0.5, s.Z * 0.5
@@ -186,12 +173,13 @@ track(RunService.RenderStepped:Connect(function()
             local seen = false
             local minX, minY, maxX, maxY
 
-            -- project all 8 corners of the block
+            -- project all 8 corners in the block's own orientation
             for c = 0, 7 do
                 local sx = (c % 2 == 0) and -hx or hx
                 local sy = (math.floor(c / 2) % 2 == 0) and -hy or hy
                 local sz = (math.floor(c / 4) % 2 == 0) and -hz or hz
-                local v, vis = WorldToScreen(p + Vector3.new(sx, sy, sz))
+                local world = cf:PointToWorldSpace(Vector3.new(sx, sy, sz))
+                local v, vis = WorldToScreen(world)
                 local id = c + 1
                 sp[id] = v
                 ok[id] = vis
@@ -220,12 +208,18 @@ track(RunService.RenderStepped:Connect(function()
                     tr = 0.1 + 0.65 * f
                 end
 
-                if e.thick ~= cfg.thickness then
-                    for k = 1, 12 do e.lines[k].Thickness = cfg.thickness end
-                    e.thick = cfg.thickness
+                -- near boxes get thicker edges, far ones thin down to 1px
+                local th = cfg.thickness
+                if cfg.scaleThick then
+                    th = math.floor(cfg.thickness * 150 / math.max(dist, 40))
+                    if th < 1 then th = 1 elseif th > 5 then th = 5 end
+                end
+                if e.thick ~= th then
+                    for k = 1, 12 do e.lines[k].Thickness = th end
+                    e.thick = th
                 end
 
-                -- draw the 12 edges, skipping any whose endpoint is behind us
+                -- draw the 12 edges, dropping any whose endpoint is behind us
                 for k = 1, 12 do
                     local ed = EDGES[k]
                     local ln = e.lines[k]
@@ -240,28 +234,17 @@ track(RunService.RenderStepped:Connect(function()
                     end
                 end
 
-                e.tagPos = Vector2.new((minX + maxX) * 0.5, minY - 16)
-
                 if cfg.showNames and n <= cfg.nameNear then
                     e.tag.Text = t.kind
                     e.tag.Color = col
-                    e.tag.Position = e.tagPos
+                    e.tag.Position = Vector2.new((minX + maxX) * 0.5, minY - 16)
                     e.tag.Visible = true
                 elseif e.tag.Visible then
                     e.tag.Visible = false
                 end
 
                 e.kind = t.kind
-                e.dist = dist
                 e.on = true
-
-                if cfg.hoverGlow and mx >= minX and mx <= maxX
-                    and my >= minY and my <= maxY then
-                    if not hoverDist or dist < hoverDist then
-                        hoverDist = dist
-                        hoverSlot = n
-                    end
-                end
             end
         end
     end
@@ -275,23 +258,6 @@ track(RunService.RenderStepped:Connect(function()
             e.tag.Visible = false
             e.on = false
         end
-    end
-
-    -- hover pass: brighten + thicken the box under the mouse, name it
-    if hoverSlot then
-        local e = pool[hoverSlot]
-        for k = 1, 12 do
-            local ln = e.lines[k]
-            if ln.Visible then
-                ln.Color = cfg.hoverColor
-                ln.Thickness = cfg.thickness + 1
-            end
-        end
-        e.thick = -1
-        e.tag.Text = e.kind
-        e.tag.Color = cfg.hoverColor
-        e.tag.Position = e.tagPos
-        e.tag.Visible = true
     end
 end))
 
@@ -362,7 +328,7 @@ end
 
 local SILVER_ID = 'ti_silver'
 local IRON_ID   = 'ti_iron'
-local HOVER_ID  = 'ti_hover'
+local STONE_ID  = 'ti_stone'
 
 local function readColor(id, current)
     local ok, r, g, b = pcall(function() return UI.GetValue(id) end)
@@ -378,27 +344,27 @@ end
 local function buildTab(tab)
     if built then return end
     built = true
-    local sec = mkSection(tab, 'Ore ESP')
+    local sec = mkSection(tab, 'Mine ESP')
     if not sec then return end
     mkToggle(sec, 'Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
-    mkToggle(sec, 'Hover Highlight', 'ti_hoveron', cfg.hoverGlow, function(v) cfg.hoverGlow = v end)
+    mkToggle(sec, 'Ore ESP', 'ti_ore', cfg.oreESP, function(v) cfg.oreESP = v end)
+    mkToggle(sec, 'Stone ESP', 'ti_stoneon', cfg.stoneESP, function(v) cfg.stoneESP = v end)
     mkToggle(sec, 'Show Names', 'ti_label', cfg.showNames, function(v) cfg.showNames = v end)
     mkSlider(sec, 'Names On Nearest', 'ti_labelnear', 0, 30, cfg.nameNear, function(v) cfg.nameNear = v end)
     mkSlider(sec, 'Max Distance', 'ti_maxdist', 50, 2000, cfg.maxDist, function(v) cfg.maxDist = v end)
-    mkSlider(sec, 'Max Boxes', 'ti_maxboxes', 5, 48, cfg.maxBoxes, function(v) cfg.maxBoxes = v end)
+    mkSlider(sec, 'Max Boxes', 'ti_maxboxes', 5, 64, cfg.maxBoxes, function(v) cfg.maxBoxes = v end)
     mkToggle(sec, 'Distance Fade', 'ti_fade', cfg.fade, function(v) cfg.fade = v end)
-    mkSlider(sec, 'Line Thickness', 'ti_thick', 1, 4, cfg.thickness, function(v)
-        cfg.thickness = v
-    end)
+    mkSlider(sec, 'Line Thickness', 'ti_thick', 1, 4, cfg.thickness, function(v) cfg.thickness = v end)
+    mkToggle(sec, 'Thickness Scales With Distance', 'ti_scalethick', cfg.scaleThick, function(v) cfg.scaleThick = v end)
     pcall(function() sec:ColorPicker('Silver Color', cfg.silver.R, cfg.silver.G, cfg.silver.B, 1) end)
     pcall(function() sec:ColorPicker('Iron Color', cfg.iron.R, cfg.iron.G, cfg.iron.B, 1) end)
-    pcall(function() sec:ColorPicker('Hover Color', cfg.hoverColor.R, cfg.hoverColor.G, cfg.hoverColor.B, 1) end)
+    pcall(function() sec:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
     print('[TI] menu built')
 end
 
 if HAS_UI then
     local ok, err = pcall(function()
-        UI.AddTab('Ore ESP', function(tab)
+        UI.AddTab('Mine ESP', function(tab)
             pcall(buildTab, tab)
         end)
     end)
@@ -409,7 +375,7 @@ if HAS_UI then
 end
 
 task.spawn(function()
-    local lastS, lastI, lastH = cfg.silver, cfg.iron, cfg.hoverColor
+    local lastS, lastI, lastT = cfg.silver, cfg.iron, cfg.stone
     while running do
         task.wait(1)
         if HAS_UI then
@@ -421,9 +387,9 @@ task.spawn(function()
             if ir.R ~= lastI.R or ir.G ~= lastI.G or ir.B ~= lastI.B then
                 cfg.iron, lastI = ir, ir
             end
-            local hv = readColor(HOVER_ID, cfg.hoverColor)
-            if hv.R ~= lastH.R or hv.G ~= lastH.G or hv.B ~= lastH.B then
-                cfg.hoverColor, lastH = hv, hv
+            local st = readColor(STONE_ID, cfg.stone)
+            if st.R ~= lastT.R or st.G ~= lastT.G or st.B ~= lastT.B then
+                cfg.stone, lastT = st, st
             end
         end
     end
@@ -439,9 +405,12 @@ track(UIS.InputBegan:Connect(function(input)
     elseif k == Enum.KeyCode.L then
         cfg.showNames = not cfg.showNames
         print('[TI] names ' .. tostring(cfg.showNames))
-    elseif k == Enum.KeyCode.H then
-        cfg.hoverGlow = not cfg.hoverGlow
-        print('[TI] hover ' .. tostring(cfg.hoverGlow))
+    elseif k == Enum.KeyCode.O then
+        cfg.oreESP = not cfg.oreESP
+        print('[TI] ore ' .. tostring(cfg.oreESP))
+    elseif k == Enum.KeyCode.M then
+        cfg.stoneESP = not cfg.stoneESP
+        print('[TI] stone ' .. tostring(cfg.stoneESP))
     end
 end))
 
@@ -464,9 +433,9 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - K esp, L names, H hover')
+print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - K esp, L names, O ore, M stone')
 
 task.spawn(function()
     task.wait(0.8)
-    if running then print('[TI] ores tracked: ' .. #targets) end
+    if running then print('[TI] blocks tracked: ' .. #targets) end
 end)
