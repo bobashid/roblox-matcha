@@ -1,4 +1,4 @@
--- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v11
+-- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v11.1
 -- place 105011592530400
 -- one tab (Mods), one toggle: Freeze Enemies.
 -- Nothing runs until the toggle is on. Once it is on, the target list is
@@ -14,13 +14,13 @@
 --   enemy-named models and walks 6 levels with a visit cap.
 --
 -- Writable set used (Matcha has no Anchored and no WalkSpeed):
---   Humanoid.WalkToPoint        stop it pathing
---   root.Velocity               kill momentum
---   root.AssemblyLinearVelocity same, for the assembly
---   root.CFrame                 only for targets with no Humanoid
+--   Humanoid.WalkToPoint         stop it pathing
+--   root.Velocity                kill momentum
+--   root.AssemblyLinearVelocity  same, for the assembly
+--   root.CFrame                  only for targets with no Humanoid
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v11'
+local VERSION = 'v11.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -226,7 +226,7 @@ local function buildTab(tab)
                 collect()
                 print('[' .. NAME .. '] freeze on, targets = ' .. nTargets)
                 if nTargets == 0 then
-                    pcall(notify, 'Mods', 'ing - zombies are picked up as they spawn', 4)
+                    pcall(notify, 'Mods', 'freeze on - searching, zombies are picked up as they spawn', 4)
                 end
             else
                 print('[' .. NAME .. '] freeze off')
