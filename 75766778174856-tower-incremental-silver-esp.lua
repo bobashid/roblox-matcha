@@ -1,23 +1,19 @@
 -- Tower Incremental - Mine ESP + Ore Aura
 -- place 75766778174856
--- v7: 3D ESP (ore + stone, CFrame corners, no hover) plus a mine aura.
+-- v8: everything is a menu toggle (no keybinds). Per-ore ESP toggles.
+--     The aura only mines ore types whose ESP is on.
+--     Aura now holds on a block (repeated fires over the progress window)
+--     instead of one shot, matching what the game's own hold-to-mine does.
 --
 -- CONFIRMED from decompiling ReplicatedStorage.Client.MineClient:
---   the game does  Remotes.MineBlock:FireServer(block)
---   where `block` is the TOP-LEVEL child of workspace.Mine.MineBlocks:
---   a Stone Part, or a SilverOre / IronOre Model. NOT the Stone part inside
---   an ore model. The server also gates mining on distance (MineConfig.REACH),
---   which is why a live test fire at range did nothing.
+--   Remotes.MineBlock:FireServer(block), block = top-level child of
+--   workspace.Mine.MineBlocks (Stone Part or Silver/Iron Ore Model).
+--   Mining is gated by MineConfig.REACH and a hold-to-mine progress bar.
 --
--- Because REACH and the server's hold-time check are not readable from here,
--- the aura still starts with Dry Run ON. It now also watches each fired block
--- and prints whether the server actually removed it.
---
--- Matcha LuauVM: no Instance.new, no hooks, no Highlight/SelectionBox.
--- All overlay goes through Drawing.
+-- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v7'
+local VERSION = 'v8'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -26,7 +22,6 @@ end
 local Players    = game:GetService('Players')
 local RS         = game:GetService('ReplicatedStorage')
 local RunService = game:GetService('RunService')
-local UIS        = game:GetService('UserInputService')
 
 local lp = Players.LocalPlayer
 
@@ -37,10 +32,17 @@ local running = true
 local conns   = {}
 local built   = false
 
+-- cfg ---------------------------------------------------------------
+
 local cfg = {
     enabled    = true,
-    oreESP     = true,
-    stoneESP   = true,
+
+    -- per-type ESP
+    espSilver  = true,
+    espIron    = true,
+    espStone   = false,
+
+    -- shared ESP look
     showNames  = true,
     nameNear   = 6,
     maxDist    = 500,
@@ -56,14 +58,31 @@ local cfg = {
     aura       = false,
     dryRun     = true,
     auraRadius = 20,
-    auraMs     = 150,
-    retrySec   = 6,
-    auraOre    = true,
-    auraStone  = true,
+    auraMs     = 120,
+    holdSec    = 1.2,
+    retrySec   = 5,
 }
 
-local POOL = 64
+-- per-type helpers --------------------------------------------------
 
+local TYPES = { 'Silver', 'Iron', 'Stone' }
+
+local function espOn(kind)
+    if kind == 'Silver' then return cfg.espSilver end
+    if kind == 'Iron'   then return cfg.espIron end
+    if kind == 'Stone'  then return cfg.espStone end
+    return false
+end
+
+local function colorFor(kind)
+    if kind == 'Iron'  then return cfg.iron end
+    if kind == 'Stone' then return cfg.stone end
+    return cfg.silver
+end
+
+-- drawing pool ------------------------------------------------------
+
+local POOL = 64
 local EDGES = {
     {1,2},{3,4},{5,6},{7,8},
     {1,3},{2,4},{5,7},{6,8},
@@ -77,14 +96,6 @@ local function track(c)
     conns[#conns + 1] = c
     return c
 end
-
-local function colorFor(kind)
-    if kind == 'Iron' then return cfg.iron end
-    if kind == 'Stone' then return cfg.stone end
-    return cfg.silver
-end
-
--- drawing pool --------------------------------------------------------
 
 for i = 1, POOL do
     local lines = {}
@@ -117,7 +128,7 @@ local function hideAll()
     end
 end
 
--- collector: nearest first, keeps the instance the game would send --
+-- collector ---------------------------------------------------------
 
 task.spawn(function()
     while running do
@@ -132,17 +143,15 @@ task.spawn(function()
             for i = 1, #kids do
                 local m = kids[i]
                 local n = m.Name
-                local kind, want, boxPart, top = nil, false, nil, m
+                local kind, boxPart = nil, nil
                 if string.sub(n, -3) == 'Ore' then
                     kind    = string.sub(n, 1, #n - 3)
-                    want    = cfg.oreESP
                     boxPart = m:FindFirstChild('Stone')
                 elseif n == 'Stone' then
                     kind    = 'Stone'
-                    want    = cfg.stoneESP
                     boxPart = m
                 end
-                if want and boxPart then
+                if kind and boxPart and espOn(kind) then
                     local cf = boxPart.CFrame
                     local d = origin and (cf.Position - origin).Magnitude or 0
                     out[#out + 1] = {
@@ -151,7 +160,7 @@ task.spawn(function()
                         dist   = d,
                         kind   = kind,
                         box    = boxPart,
-                        top    = top,      -- exactly what the game passes to FireServer
+                        top    = m,
                     }
                 end
             end
@@ -163,7 +172,7 @@ task.spawn(function()
     end
 end)
 
--- renderer ------------------------------------------------------------
+-- renderer ----------------------------------------------------------
 
 track(RunService.RenderStepped:Connect(function()
     if not cfg.enabled then
@@ -278,14 +287,13 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- aura ----------------------------------------------------------------
--- Sends the SAME argument the game sends: the top-level MineBlocks child.
--- Dry Run ON  -> prints the intended call, fires nothing.
--- Every fired block is watched: if the server deletes it, that is a success.
+-- aura ---------------------------------------------------------------
+-- Holds on one block: fires it repeatedly for holdSec, then moves on.
+-- Only blocks whose ESP toggle is on are considered.
 
 local recent  = {}
-local pending = {}
-local statOK, statFail = 0, 0
+local holding = nil      -- { top, addr, kind, started, lastFire }
+local statOK, statFail, statFire = 0, 0, 0
 
 local function addrOf(inst)
     local ok, a = pcall(function() return inst.Address end)
@@ -303,57 +311,76 @@ task.spawn(function()
                 if now - ts > cfg.retrySec then recent[a] = nil end
             end
 
-            -- did the server actually mine what we fired at?
-            for a, p in pairs(pending) do
-                if not p.inst or p.inst.Parent == nil then
-                    statOK = statOK + 1
-                    print('[aura] OK ' .. p.kind .. ' mined (ok=' .. statOK .. ' fail=' .. statFail .. ')')
-                    pending[a] = nil
-                elseif now - p.at > 2.5 then
-                    statFail = statFail + 1
-                    print('[aura] NO EFFECT ' .. p.kind .. ' - server rejected (reach / hold time)')
-                    pending[a] = nil
-                end
-            end
-
-            if cfg.aura and mineEvt then
+            if not cfg.aura or not mineEvt then
+                holding = nil
+            else
                 local char = lp.Character
                 local root = char and char:FindFirstChild('HumanoidRootPart')
-                if root then
-                    local best, bestD = nil, nil
-                    local list = targets
-                    for i = 1, #list do
-                        local t = list[i]
-                        local kindOK = (t.kind == 'Stone') and cfg.auraStone or cfg.auraOre
-                        if kindOK and t.top and t.top.Parent then
-                            local d = (t.cframe.Position - root.Position).Magnitude
-                            if d <= cfg.auraRadius then
-                                local a = addrOf(t.top)
-                                if a and not recent[a] then
-                                    if not bestD or d < bestD then
-                                        best, bestD = t, d
+                if not root then
+                    holding = nil
+                else
+                    -- drop the hold if the block is gone
+                    if holding and (not holding.top or holding.top.Parent == nil) then
+                        statOK = statOK + 1
+                        print('[aura] OK ' .. holding.kind .. ' (ok=' .. statOK .. ' fail=' .. statFail .. ')')
+                        holding = nil
+                    end
+
+                    -- give up if the hold window expired with no result
+                    if holding and now - holding.started > cfg.holdSec + 0.8 then
+                        statFail = statFail + 1
+                        print('[aura] NO EFFECT ' .. holding.kind .. ' (ok=' .. statOK .. ' fail=' .. statFail .. ')')
+                        recent[holding.addr] = now
+                        holding = nil
+                    end
+
+                    -- start a new hold if idle
+                    if not holding then
+                        local best, bestD = nil, nil
+                        local list = targets
+                        for i = 1, #list do
+                            local t = list[i]
+                            if t.top and t.top.Parent and espOn(t.kind) then
+                                local d = (t.cframe.Position - root.Position).Magnitude
+                                if d <= cfg.auraRadius then
+                                    local a = addrOf(t.top)
+                                    if a and not recent[a] then
+                                        if not bestD or d < bestD then
+                                            best, bestD = t, d
+                                        end
                                     end
                                 end
                             end
                         end
+                        if best then
+                            local a = addrOf(best.top)
+                            holding = {
+                                top = best.top,
+                                addr = a or 0,
+                                kind = best.kind,
+                                started = now,
+                                lastFire = 0,
+                                dist = bestD,
+                            }
+                            if cfg.dryRun then
+                                print(string.format('[aura] dry %s %.1fm -> %s',
+                                    best.kind, bestD, best.top.ClassName))
+                            end
+                        end
                     end
 
-                    if best then
-                        local a = addrOf(best.top)
-                        if a then recent[a] = now end
-                        if cfg.dryRun then
-                            print(string.format('[aura] dry %s %.1fm -> %s',
-                                best.kind, bestD, best.top.ClassName))
-                        else
+                    -- fire repeatedly at the held block
+                    if holding and not cfg.dryRun then
+                        if now - holding.lastFire >= (cfg.auraMs / 1000) then
+                            holding.lastFire = now
                             local ok, err = pcall(function()
-                                mineEvt:FireServer(best.top)
+                                mineEvt:FireServer(holding.top)
                             end)
                             if ok then
-                                if a then
-                                    pending[a] = { inst = best.top, at = now, kind = best.kind }
-                                end
+                                statFire = statFire + 1
                             else
                                 print('[aura] fire error ' .. tostring(err))
+                                holding = nil
                             end
                         end
                     end
@@ -363,7 +390,7 @@ task.spawn(function()
     end
 end)
 
--- menu ----------------------------------------------------------------
+-- menu ---------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -454,36 +481,48 @@ local function buildTab(tab)
     if built then return end
     built = true
 
+    -- 1. master + ore types
     local sec = mkSection(tab, 'Mine ESP')
     if sec then
-        mkToggle(sec, 'Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
-        mkToggle(sec, 'Ore ESP', 'ti_ore', cfg.oreESP, function(v) cfg.oreESP = v end)
-        mkToggle(sec, 'Stone ESP', 'ti_stoneon', cfg.stoneESP, function(v) cfg.stoneESP = v end)
-        mkToggle(sec, 'Show Names', 'ti_label', cfg.showNames, function(v) cfg.showNames = v end)
-        mkSlider(sec, 'Names On Nearest', 'ti_labelnear', 0, 30, cfg.nameNear, function(v) cfg.nameNear = v end)
-        mkSlider(sec, 'Max Distance', 'ti_maxdist', 50, 2000, cfg.maxDist, function(v) cfg.maxDist = v end)
-        mkSlider(sec, 'Max Boxes', 'ti_maxboxes', 5, 64, cfg.maxBoxes, function(v) cfg.maxBoxes = v end)
-        mkToggle(sec, 'Distance Fade', 'ti_fade', cfg.fade, function(v) cfg.fade = v end)
-        mkSlider(sec, 'Line Thickness', 'ti_thick', 1, 4, cfg.thickness, function(v) cfg.thickness = v end)
-        mkToggle(sec, 'Thickness Scales', 'ti_scalethick', cfg.scaleThick, function(v) cfg.scaleThick = v end)
-        pcall(function() sec:ColorPicker('Silver Color', cfg.silver.R, cfg.silver.G, cfg.silver.B, 1) end)
-        pcall(function() sec:ColorPicker('Iron Color', cfg.iron.R, cfg.iron.G, cfg.iron.B, 1) end)
-        pcall(function() sec:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
+        mkToggle(sec, 'ESP Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
+        mkToggle(sec, 'Silver Ore', 'ti_esp_silver', cfg.espSilver, function(v) cfg.espSilver = v end)
+        mkToggle(sec, 'Iron Ore', 'ti_esp_iron', cfg.espIron, function(v) cfg.espIron = v end)
+        mkToggle(sec, 'Stone Blocks', 'ti_esp_stone', cfg.espStone, function(v) cfg.espStone = v end)
     end
 
+    -- 2. look
+    local look = mkSection(tab, 'ESP Style')
+    if look then
+        mkToggle(look, 'Show Names', 'ti_label', cfg.showNames, function(v) cfg.showNames = v end)
+        mkSlider(look, 'Names On Nearest', 'ti_labelnear', 0, 30, cfg.nameNear, function(v) cfg.nameNear = v end)
+        mkSlider(look, 'Max Distance', 'ti_maxdist', 50, 2000, cfg.maxDist, function(v) cfg.maxDist = v end)
+        mkSlider(look, 'Max Boxes', 'ti_maxboxes', 5, 64, cfg.maxBoxes, function(v) cfg.maxBoxes = v end)
+        mkToggle(look, 'Distance Fade', 'ti_fade', cfg.fade, function(v) cfg.fade = v end)
+        mkSlider(look, 'Line Thickness', 'ti_thick', 1, 4, cfg.thickness, function(v) cfg.thickness = v end)
+        mkToggle(look, 'Thickness Scales', 'ti_scalethick', cfg.scaleThick, function(v) cfg.scaleThick = v end)
+        pcall(function() look:ColorPicker('Silver Color', cfg.silver.R, cfg.silver.G, cfg.silver.B, 1) end)
+        pcall(function() look:ColorPicker('Iron Color', cfg.iron.R, cfg.iron.G, cfg.iron.B, 1) end)
+        pcall(function() look:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
+    end
+
+    -- 3. aura
     local au = mkSection(tab, 'Ore Aura')
     if au then
         mkToggle(au, 'Aura Enabled', 'ti_aura', cfg.aura, function(v) cfg.aura = v end)
         mkToggle(au, 'Dry Run (log only)', 'ti_dry', cfg.dryRun, function(v) cfg.dryRun = v end)
         mkSlider(au, 'Radius', 'ti_radius', 5, 120, cfg.auraRadius, function(v) cfg.auraRadius = v end)
-        mkSlider(au, 'Interval ms', 'ti_aura_ms', 60, 800, cfg.auraMs, function(v) cfg.auraMs = v end)
+        mkSlider(au, 'Fire Every ms', 'ti_aura_ms', 40, 500, cfg.auraMs, function(v) cfg.auraMs = v end)
+        mkSlider(au, 'Hold Seconds', 'ti_hold', 1, 10, math.floor(cfg.holdSec * 10), function(v)
+            cfg.holdSec = v / 10
+        end)
         mkSlider(au, 'Retry Seconds', 'ti_retry', 2, 20, cfg.retrySec, function(v) cfg.retrySec = v end)
-        mkToggle(au, 'Mine Ore', 'ti_aura_ore', cfg.auraOre, function(v) cfg.auraOre = v end)
-        mkToggle(au, 'Mine Stone', 'ti_aura_stone', cfg.auraStone, function(v) cfg.auraStone = v end)
         mkButton(au, 'Reset Recent Blocks', function()
             recent = {}
-            pending = {}
-            print('[aura] recent + pending cleared')
+            holding = nil
+            print('[aura] recent + hold cleared')
+        end)
+        mkButton(au, 'Aura Stats', function()
+            print('[aura] fired=' .. statFire .. ' ok=' .. statOK .. ' fail=' .. statFail)
         end)
     end
 end
@@ -499,6 +538,8 @@ if HAS_UI then
         HAS_UI = false
     end
 end
+
+-- color polling -------------------------------------------------------
 
 task.spawn(function()
     local lastS, lastI, lastT = cfg.silver, cfg.iron, cfg.stone
@@ -521,35 +562,11 @@ task.spawn(function()
     end
 end)
 
--- keys ----------------------------------------------------------------
-
-track(UIS.InputBegan:Connect(function(input)
-    local k = input and input.KeyCode
-    if k == Enum.KeyCode.K then
-        cfg.enabled = not cfg.enabled
-        print('[TI] esp ' .. tostring(cfg.enabled))
-    elseif k == Enum.KeyCode.L then
-        cfg.showNames = not cfg.showNames
-        print('[TI] names ' .. tostring(cfg.showNames))
-    elseif k == Enum.KeyCode.O then
-        cfg.oreESP = not cfg.oreESP
-        print('[TI] ore ' .. tostring(cfg.oreESP))
-    elseif k == Enum.KeyCode.M then
-        cfg.stoneESP = not cfg.stoneESP
-        print('[TI] stone ' .. tostring(cfg.stoneESP))
-    elseif k == Enum.KeyCode.J then
-        cfg.aura = not cfg.aura
-        print('[TI] aura ' .. tostring(cfg.aura) .. ' dry=' .. tostring(cfg.dryRun))
-    elseif k == Enum.KeyCode.N then
-        cfg.dryRun = not cfg.dryRun
-        print('[TI] dryrun ' .. tostring(cfg.dryRun))
-    end
-end))
-
 -- stop ----------------------------------------------------------------
 
 local function stop()
     running = false
+    holding = nil
     for i = 1, #conns do
         pcall(function() conns[i]:Disconnect() end)
     end
@@ -566,7 +583,7 @@ end
 
 _G[NAME] = { stop = stop, version = VERSION }
 print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ', MineBlock=' .. tostring(mineEvt ~= nil))
-print('[TI] aura off, dryRun on. J = aura, N = dry run, K = esp')
+print('[TI] no keybinds - use the Mine ESP tab')
 
 task.spawn(function()
     task.wait(0.8)
