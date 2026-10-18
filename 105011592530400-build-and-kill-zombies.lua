@@ -1,23 +1,24 @@
--- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v9
+-- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v10
 -- place 105011592530400
 -- one tab (Mods), one toggle: Freeze Enemies.
 -- Nothing runs until the toggle is on. No getgc, no prescan, no cache.
 --
--- v9 fixes v8. Measured on a live workspace.Zombie this session:
---   idle drift                      0.09 studs in 1s
---   velocity lock at 20Hz           0.00 studs drift
---   CFrame lock at 20Hz             0.00 studs drift
--- v8 ran the same writes at 5Hz, so the zombie walked between passes. The pass
--- now runs at 20Hz. Velocity-only was enough, so there are no CFrame writes and
--- none of the per-assignment physics cost that comes with them.
+-- v9 turned the toggle on fine and printed targets=0 every time. A clean probe
+-- with the same logic returned 0 NPC humanoids in Workspace, so the collection
+-- was the bug, not the freeze. v9 only walked Workspace children and their
+-- direct children. v10 walks 4 container levels, skips player characters by
+-- name, and accepts UpperTorso / Torso / PrimaryPart / first BasePart when a
+-- model has no HumanoidRootPart. The walk is capped at 4000 visits so a deep
+-- tree cannot stall the loop.
 --
 -- Writable set used (Matcha has no Anchored and no WalkSpeed):
 --   Humanoid.WalkToPoint                    stop it pathing
---   HumanoidRootPart.Velocity               kill momentum
---   HumanoidRootPart.AssemblyLinearVelocity same, for the assembly
+--   root.Velocity                           kill momentum
+--   root.AssemblyLinearVelocity             same, for the assembly
+-- Root is HumanoidRootPart when present, otherwise the torso or primary part.
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v9'
+local VERSION = 'v10'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -28,45 +29,74 @@ local Players = game:GetService('Players')
 local ws = game:GetService('Workspace')
 
 local MAX_TARGETS = 30
+local MAX_VISITS  = 4000
 
-local alive     = true
-local built     = false
-local frozen    = false
-local targets   = {}
-local nTargets  = 0
+local alive    = true
+local built    = false
+local frozen   = false
+local targets  = {}
+local nTargets = 0
 
 local ZERO = Vector3.new(0, 0, 0)
 
--- collector: 2 Hz, rebuilds the target list ---------------------------
+-- target helpers ------------------------------------------------------
 
-local function addModel(m, out)
-    local hum  = m:FindFirstChildOfClass('Humanoid')
-    local root = m:FindFirstChild('HumanoidRootPart')
-    if hum and root then
-        out[#out + 1] = { root = root, hum = hum, pos = root.Position }
-    end
+local function isPart(inst)
+    local cn = inst.ClassName
+    return cn == 'Part' or cn == 'MeshPart' or cn == 'UnionOperation'
+        or cn == 'WedgePart' or cn == 'TrussPart' or cn == 'CornerWedgePart'
 end
 
+local function rootOf(model)
+    local r = model:FindFirstChild('HumanoidRootPart')
+    if r then return r end
+    r = model:FindFirstChild('UpperTorso')
+    if r then return r end
+    r = model:FindFirstChild('Torso')
+    if r then return r end
+    r = model.PrimaryPart
+    if r then return r end
+    for _, c in ipairs(model:GetChildren()) do
+        if isPart(c) then return c end
+    end
+    return nil
+end
+
+-- collector: 2 Hz, walks 4 container levels ---------------------------
+
 local function collect()
-    local names = {}
+    local pnames = {}
     for _, p in ipairs(Players:GetPlayers()) do
-        names[p.Name] = true
+        pnames[p.Name] = true
     end
 
-    local out = {}
-    for _, m in ipairs(ws:GetChildren()) do
-        if #out >= MAX_TARGETS then break end
-        if not names[m.Name] then
-            if m:FindFirstChildOfClass('Humanoid') then
-                addModel(m, out)
-            else
-                for _, c in ipairs(m:GetChildren()) do
-                    if #out >= MAX_TARGETS then break end
-                    if not names[c.Name] then addModel(c, out) end
+    local out    = {}
+    local visits = 0
+
+    local function walk(node, depth)
+        if #out >= MAX_TARGETS or visits >= MAX_VISITS then return end
+        for _, c in ipairs(node:GetChildren()) do
+            if #out >= MAX_TARGETS or visits >= MAX_VISITS then return end
+            visits = visits + 1
+
+            if not pnames[c.Name] then
+                local hum = c:FindFirstChildOfClass('Humanoid')
+                if hum then
+                    local root = rootOf(c)
+                    if root then
+                        out[#out + 1] = { root = root, hum = hum, pos = root.Position }
+                    end
+                elseif depth < 4 then
+                    local cn = c.ClassName
+                    if cn == 'Model' or cn == 'Folder' then
+                        walk(c, depth + 1)
+                    end
                 end
             end
         end
     end
+
+    walk(ws, 0)
 
     targets  = out
     nTargets = #out
@@ -152,6 +182,9 @@ local function buildTab(tab)
             frozen = v
             if v then collect() end
             print('[' .. NAME .. '] freeze = ' .. tostring(v) .. ' targets=' .. nTargets)
+            if v and nTargets == 0 then
+                pcall(notify, 'Mods', 'freeze on but no NPC humanoids found in Workspace', 4)
+            end
         end)
     end)
 
