@@ -1,24 +1,23 @@
--- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v8
+-- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v9
 -- place 105011592530400
 -- one tab (Mods), one toggle: Freeze Enemies.
 -- Nothing runs until the toggle is on. No getgc, no prescan, no cache.
 --
--- Why fuel and the weapon mods are gone:
---   CmdrClient.Commands.UnlimitedFuel decompiles to { Args = { {} } } with no Run
---   findgc on live Fuel+FuelCapacity and Fuel+FuelDrain pairs returned 0, twice
---   no Fuel instance, ValueObject, attribute or RemoteEvent exists on the client
---   VehicleController only writes ThrottleFloat / SteerFloat
---   the 440 gc hits were Assets.CarParts stat definitions, not runtime values
--- None of that is reachable from the client, so the menu no longer offers it.
+-- v9 fixes v8. Measured on a live workspace.Zombie this session:
+--   idle drift                      0.09 studs in 1s
+--   velocity lock at 20Hz           0.00 studs drift
+--   CFrame lock at 20Hz             0.00 studs drift
+-- v8 ran the same writes at 5Hz, so the zombie walked between passes. The pass
+-- now runs at 20Hz. Velocity-only was enough, so there are no CFrame writes and
+-- none of the per-assignment physics cost that comes with them.
 --
--- How freeze works with Matcha's writable set (no Anchored, no WalkSpeed):
---   Humanoid.WalkToPoint = the NPC's own position stops it pathing
---   HumanoidRootPart.Velocity and .AssemblyLinearVelocity zeroed kill momentum
--- Both are writes, which are the expensive ones, so the pass is throttled to
--- 5 Hz over a cached target list, and the list refreshes at 2 Hz.
+-- Writable set used (Matcha has no Anchored and no WalkSpeed):
+--   Humanoid.WalkToPoint                    stop it pathing
+--   HumanoidRootPart.Velocity               kill momentum
+--   HumanoidRootPart.AssemblyLinearVelocity same, for the assembly
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v8'
+local VERSION = 'v9'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -26,24 +25,25 @@ end
 print('[' .. NAME .. '] ' .. VERSION)
 
 local Players = game:GetService('Players')
-local lp = Players.LocalPlayer
 local ws = game:GetService('Workspace')
 
-local alive   = true
-local built   = false
-local frozen  = false
-local targets = {}
-local nTargets = 0
+local MAX_TARGETS = 30
+
+local alive     = true
+local built     = false
+local frozen    = false
+local targets   = {}
+local nTargets  = 0
 
 local ZERO = Vector3.new(0, 0, 0)
 
 -- collector: 2 Hz, rebuilds the target list ---------------------------
 
-local function scanModel(m, out)
+local function addModel(m, out)
     local hum  = m:FindFirstChildOfClass('Humanoid')
     local root = m:FindFirstChild('HumanoidRootPart')
     if hum and root then
-        out[#out + 1] = { root = root, hum = hum }
+        out[#out + 1] = { root = root, hum = hum, pos = root.Position }
     end
 end
 
@@ -55,13 +55,14 @@ local function collect()
 
     local out = {}
     for _, m in ipairs(ws:GetChildren()) do
+        if #out >= MAX_TARGETS then break end
         if not names[m.Name] then
-            local hum = m:FindFirstChildOfClass('Humanoid')
-            if hum then
-                scanModel(m, out)
+            if m:FindFirstChildOfClass('Humanoid') then
+                addModel(m, out)
             else
                 for _, c in ipairs(m:GetChildren()) do
-                    if not names[c.Name] then scanModel(c, out) end
+                    if #out >= MAX_TARGETS then break end
+                    if not names[c.Name] then addModel(c, out) end
                 end
             end
         end
@@ -71,13 +72,13 @@ local function collect()
     nTargets = #out
 end
 
--- freeze pass: 5 Hz, writes only -------------------------------------
+-- freeze pass: 20 Hz, writes only ------------------------------------
 
 local function freeze()
     for _, t in ipairs(targets) do
         pcall(function()
-            t.hum.WalkToPoint          = t.root.Position
-            t.root.Velocity            = ZERO
+            t.hum.WalkToPoint             = t.pos
+            t.root.Velocity               = ZERO
             t.root.AssemblyLinearVelocity = ZERO
         end)
     end
@@ -87,21 +88,15 @@ end
 
 task.spawn(function()
     while alive do
-        if frozen then
-            collect()
-        else
-            targets, nTargets = {}, 0
-        end
+        if frozen then collect() else targets, nTargets = {}, 0 end
         task.wait(0.5)
     end
 end)
 
 task.spawn(function()
     while alive do
-        if frozen and nTargets > 0 then
-            freeze()
-        end
-        task.wait(0.2)
+        if frozen and nTargets > 0 then freeze() end
+        task.wait(0.05)
     end
 end)
 
@@ -155,6 +150,7 @@ local function buildTab(tab)
         if not sec then return end
         mkToggle(sec, 'Freeze Enemies', 'mm_freeze', false, function(v)
             frozen = v
+            if v then collect() end
             print('[' .. NAME .. '] freeze = ' .. tostring(v) .. ' targets=' .. nTargets)
         end)
     end)
