@@ -1,21 +1,24 @@
--- Build and Kill Zombies - Inf Fuel + Fire Rate + Gun Range - Matcha LuauVM - v6
+-- Build and Kill Zombies - Inf Fuel + Fire Rate + Gun Range - Matcha LuauVM - v7
 -- place 105011592530400
 -- one tab (Mods), two sections: Fuel and Weapon. toggles + values only.
--- No getgc at load and no prescan. A scan only runs when you turn a toggle on,
--- and a writable key cache is reused after that.
+-- No getgc at load and no prescan. A scan runs only when you turn a toggle on,
+-- and the filtered key cache is reused after that.
 --
--- Confirmed on this place this session:
---   weapon keys   getgc FireRate 14 / Range 9 / MaxRange 9 / Damage 12 /
---                 Cooldown 5 / FireDelay 3 numeric hits -> client-side, writable
---   fuel keys     Fuel / FuelCapacity / FuelDrain exist as numeric keys, but
---                 findgc Fuel+FuelCapacity and Fuel+FuelDrain both returned 0
---                 and there is no Fuel instance, ValueObject or RemoteEvent.
---   HUD           PlayerGui.MainGui.HUD.Vehicle.DrivePanel.Fuel.Status.Text
+-- Measured on this place this session, one getgc over the whole key list:
+--   440 numeric hits in 14.2s
+--   FireRate 22, Range 45, Damage 137, Cooldown 8, MaxRange 2
+--   FuelDrain 19, Fuel 4, FuelCapacity 1
+-- So the weapon keys are plentiful and client-side. Fuel keys exist but are few,
+-- findgc Fuel+FuelCapacity and findgc Fuel+FuelDrain both returned 0, and there is
+-- no Fuel instance, ValueObject or RemoteEvent. The tank looks server-owned.
 -- Weapon writes are expected to work. Fuel is best effort: if the HUD keeps
--- draining, the tank is server-owned and no client script can hold it.
+-- draining, no client script can hold it.
+--
+-- v7: the scan now keeps only the keys this script writes. Unfiltered, the cache
+-- was 440 entries and the apply loop walked all of them twice a second.
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v6'
+local VERSION = 'v7'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -34,6 +37,11 @@ local FUEL_KEYS = {
     'Fuel', 'CurrentFuel', 'FuelLevel', 'FuelAmount', 'FuelValue',
     'MaxFuel', 'FuelCapacity', 'FuelDrain',
 }
+
+-- keys the apply loop actually writes: the scan keeps only these
+local WANT = {}
+for _, k in ipairs(WEAPON_KEYS) do WANT[k] = true end
+for _, k in ipairs(FUEL_KEYS)   do WANT[k] = true end
 
 local cfg = {
     fuel     = false,
@@ -75,10 +83,12 @@ local function scan()
     if ok and type(res) == 'table' then
         local out = {}
         for _, e in ipairs(res) do
-            if e.type == 'number' then out[#out + 1] = e end
+            if e.type == 'number' and WANT[e.key] then
+                out[#out + 1] = e
+            end
         end
         cache = out
-        print('[' .. NAME .. '] scan done: ' .. #out .. ' numeric keys, hud=' .. hudFuelText())
+        print('[' .. NAME .. '] scan done: ' .. #out .. ' keys, hud=' .. hudFuelText())
     else
         print('[' .. NAME .. '] scan failed: ' .. tostring(res))
     end
@@ -90,7 +100,7 @@ local function needsScan()
     return not cache and not scanning and (tick() - lastScan) > 15
 end
 
-local function writeAll(key, value)
+local function write(key, value)
     if not cache then return end
     pcall(applygc, cache, key, value)
 end
@@ -105,21 +115,22 @@ task.spawn(function()
 
         if cache then
             if cfg.fuel then
-                writeAll('Fuel', cfg.fuelVal)
-                writeAll('FuelCapacity', cfg.fuelVal)
-                writeAll('MaxFuel', cfg.fuelVal)
-                writeAll('FuelDrain', 0)
+                write('Fuel', cfg.fuelVal)
+                write('CurrentFuel', cfg.fuelVal)
+                write('FuelCapacity', cfg.fuelVal)
+                write('MaxFuel', cfg.fuelVal)
+                write('FuelDrain', 0)
             end
             if cfg.rapid then
-                writeAll('FireRate', cfg.rateVal)
-                writeAll('FireDelay', 0)
-                writeAll('Cooldown', 0)
-                writeAll('FireInterval', cfg.rateVal)
+                write('FireRate', cfg.rateVal)
+                write('FireDelay', 0)
+                write('Cooldown', 0)
+                write('FireInterval', cfg.rateVal)
             end
             if cfg.range then
-                writeAll('Range', cfg.rangeVal)
-                writeAll('MaxRange', cfg.rangeVal)
-                writeAll('BulletRange', cfg.rangeVal)
+                write('Range', cfg.rangeVal)
+                write('MaxRange', cfg.rangeVal)
+                write('BulletRange', cfg.rangeVal)
             end
         end
 
