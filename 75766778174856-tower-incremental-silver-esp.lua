@@ -1,24 +1,31 @@
--- Tower Incremental - Ore + Mine ESP
+-- Tower Incremental - Mine ESP + Ore Aura
 -- place 75766778174856
--- v5: true 3D wireframe boxes for every ore AND the plain mine stone blocks.
---     The v4 hover highlight is gone.
---     Corners come from each block's CFrame, so rotated blocks line up.
---     Edge thickness scales with distance so near boxes stay crisp.
+-- v6: v5 3D ESP (ore + stone, CFrame corners, no hover) plus a mine aura that
+--     fires ReplicatedStorage.Remotes.MineBlock at nearby blocks.
+--
+-- IMPORTANT: the MineBlock argument shape is not confirmed. The aura therefore
+-- starts with Dry Run ON and only prints what it would fire. Set Dry Run off in
+-- the menu (or press J) once you have seen the log lines and are happy.
+--
 -- Matcha LuauVM: no Instance.new, no hooks, no Highlight/SelectionBox.
 -- All overlay goes through Drawing.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v5'
+local VERSION = 'v6'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 
 local Players    = game:GetService('Players')
+local RS         = game:GetService('ReplicatedStorage')
 local RunService = game:GetService('RunService')
 local UIS        = game:GetService('UserInputService')
 
 local lp = Players.LocalPlayer
+
+local remotes  = RS:FindFirstChild('Remotes')
+local mineEvt  = remotes and remotes:FindFirstChild('MineBlock')
 
 local running = true
 local conns   = {}
@@ -26,28 +33,35 @@ local built   = false
 
 local cfg = {
     enabled    = true,
-    oreESP     = true,   -- Silver / Iron / any *Ore model
-    stoneESP   = true,   -- plain mineable Stone blocks
+    oreESP     = true,
+    stoneESP   = true,
     showNames  = true,
-    nameNear   = 6,      -- names only on the N closest boxes
+    nameNear   = 6,
     maxDist    = 500,
     maxBoxes   = 40,
     fade       = true,
     thickness  = 1,
-    scaleThick = true,   -- thicker edges when close, thin when far
+    scaleThick = true,
     silver     = Color3.fromRGB(220, 225, 240),
     iron       = Color3.fromRGB(215, 150, 110),
     stone      = Color3.fromRGB(150, 160, 175),
+
+    -- aura
+    aura       = false,
+    dryRun     = true,
+    auraRadius = 25,
+    auraMs     = 150,
+    auraOre    = true,
+    auraStone  = true,
+    argMode    = 'part',   -- 'part' or 'model'
 }
 
 local POOL = 64
 
--- corner id 1..8: bit0 = X, bit1 = Y, bit2 = Z, 0 = -half, 1 = +half.
--- These 12 pairs are the edges of a cube.
 local EDGES = {
-    {1,2},{3,4},{5,6},{7,8},   -- along X
-    {1,3},{2,4},{5,7},{6,8},   -- along Y
-    {1,5},{2,6},{3,7},{4,8},   -- along Z
+    {1,2},{3,4},{5,6},{7,8},
+    {1,3},{2,4},{5,7},{6,8},
+    {1,5},{2,6},{3,7},{4,8},
 }
 
 local pool    = {}
@@ -64,7 +78,7 @@ local function colorFor(kind)
     return cfg.silver
 end
 
--- drawing pool: 12 lines per box --------------------------------------
+-- drawing pool --------------------------------------------------------
 
 for i = 1, POOL do
     local lines = {}
@@ -97,7 +111,7 @@ local function hideAll()
     end
 end
 
--- collector: tree lookups at 2 Hz, nearest first ----------------------
+-- collector -----------------------------------------------------------
 
 task.spawn(function()
     while running do
@@ -112,14 +126,13 @@ task.spawn(function()
             for i = 1, #kids do
                 local m = kids[i]
                 local n = m.Name
-                local kind, want, part = nil, false, nil
+                local kind, want, part, owner = nil, false, nil, nil
                 if string.sub(n, -3) == 'Ore' then
-                    -- model named SilverOre / IronOre / ... , box lives on its Stone part
-                    kind = string.sub(n, 1, #n - 3)
-                    want = cfg.oreESP
-                    part = m:FindFirstChild('Stone')
+                    kind  = string.sub(n, 1, #n - 3)
+                    want  = cfg.oreESP
+                    part  = m:FindFirstChild('Stone')
+                    owner = m
                 elseif n == 'Stone' then
-                    -- these are the parts themselves, not models
                     kind = 'Stone'
                     want = cfg.stoneESP
                     part = m
@@ -132,6 +145,8 @@ task.spawn(function()
                         size   = part.Size,
                         dist   = d,
                         kind   = kind,
+                        part   = part,
+                        owner  = owner,
                     }
                 end
             end
@@ -162,7 +177,7 @@ track(RunService.RenderStepped:Connect(function()
 
     for i = 1, #list do
         if n >= cap then break end
-        local t = list[i]
+        local t  = list[i]
         local cf = t.cframe
         local s  = t.size
         local dist = origin and (cf.Position - origin).Magnitude or t.dist
@@ -173,7 +188,6 @@ track(RunService.RenderStepped:Connect(function()
             local seen = false
             local minX, minY, maxX, maxY
 
-            -- project all 8 corners in the block's own orientation
             for c = 0, 7 do
                 local sx = (c % 2 == 0) and -hx or hx
                 local sy = (math.floor(c / 2) % 2 == 0) and -hy or hy
@@ -208,7 +222,6 @@ track(RunService.RenderStepped:Connect(function()
                     tr = 0.1 + 0.65 * f
                 end
 
-                -- near boxes get thicker edges, far ones thin down to 1px
                 local th = cfg.thickness
                 if cfg.scaleThick then
                     th = math.floor(cfg.thickness * 150 / math.max(dist, 40))
@@ -219,7 +232,6 @@ track(RunService.RenderStepped:Connect(function()
                     e.thick = th
                 end
 
-                -- draw the 12 edges, dropping any whose endpoint is behind us
                 for k = 1, 12 do
                     local ed = EDGES[k]
                     local ln = e.lines[k]
@@ -260,6 +272,73 @@ track(RunService.RenderStepped:Connect(function()
         end
     end
 end))
+
+-- aura ----------------------------------------------------------------
+-- Fires Remotes.MineBlock at the closest block inside auraRadius.
+-- Dry Run ON  -> prints the exact call, fires nothing.
+-- Dry Run OFF -> actually fires, one block per interval.
+-- The argument shape is not confirmed; argMode picks the Part or its parent Model.
+
+local recent = {}
+local firedCount = 0
+
+local function pruneRecent(now)
+    for addr, t in pairs(recent) do
+        if now - t > 4 then recent[addr] = nil end
+    end
+end
+
+local function auraArg(t)
+    if cfg.argMode == 'model' and t.owner then return t.owner end
+    return t.part
+end
+
+task.spawn(function()
+    while running do
+        task.wait(cfg.auraMs / 1000)
+        if running and cfg.aura and mineEvt then
+            local char = lp.Character
+            local root = char and char:FindFirstChild('HumanoidRootPart')
+            if root then
+                local now = tick()
+                pruneRecent(now)
+                local best, bestD = nil, nil
+                local list = targets
+                for i = 1, #list do
+                    local t = list[i]
+                    local kindOK = (t.kind == 'Stone') and cfg.auraStone or cfg.auraOre
+                    if kindOK then
+                        local d = (t.cframe.Position - root.Position).Magnitude
+                        if d <= cfg.auraRadius then
+                            local addr = t.part.Address
+                            if not recent[addr] then
+                                if not bestD or d < bestD then
+                                    best, bestD = t, d
+                                end
+                            end
+                        end
+                    end
+                end
+                if best then
+                    local arg = auraArg(best)
+                    recent[best.part.Address] = now
+                    if cfg.dryRun then
+                        print(string.format('[aura] dry %s %.1fm arg=%s',
+                            best.kind, bestD, tostring(arg ~= nil)))
+                    else
+                        local ok, err = pcall(function()
+                            mineEvt:FireServer(arg)
+                        end)
+                        firedCount = firedCount + 1
+                        print(string.format('[aura] %s %s %.1fm #%d',
+                            best.kind, ok and 'fired' or ('err ' .. tostring(err)),
+                            bestD, firedCount))
+                    end
+                end
+            end
+        end
+    end
+end)
 
 -- menu ----------------------------------------------------------------
 
@@ -344,22 +423,40 @@ end
 local function buildTab(tab)
     if built then return end
     built = true
+
     local sec = mkSection(tab, 'Mine ESP')
-    if not sec then return end
-    mkToggle(sec, 'Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
-    mkToggle(sec, 'Ore ESP', 'ti_ore', cfg.oreESP, function(v) cfg.oreESP = v end)
-    mkToggle(sec, 'Stone ESP', 'ti_stoneon', cfg.stoneESP, function(v) cfg.stoneESP = v end)
-    mkToggle(sec, 'Show Names', 'ti_label', cfg.showNames, function(v) cfg.showNames = v end)
-    mkSlider(sec, 'Names On Nearest', 'ti_labelnear', 0, 30, cfg.nameNear, function(v) cfg.nameNear = v end)
-    mkSlider(sec, 'Max Distance', 'ti_maxdist', 50, 2000, cfg.maxDist, function(v) cfg.maxDist = v end)
-    mkSlider(sec, 'Max Boxes', 'ti_maxboxes', 5, 64, cfg.maxBoxes, function(v) cfg.maxBoxes = v end)
-    mkToggle(sec, 'Distance Fade', 'ti_fade', cfg.fade, function(v) cfg.fade = v end)
-    mkSlider(sec, 'Line Thickness', 'ti_thick', 1, 4, cfg.thickness, function(v) cfg.thickness = v end)
-    mkToggle(sec, 'Thickness Scales With Distance', 'ti_scalethick', cfg.scaleThick, function(v) cfg.scaleThick = v end)
-    pcall(function() sec:ColorPicker('Silver Color', cfg.silver.R, cfg.silver.G, cfg.silver.B, 1) end)
-    pcall(function() sec:ColorPicker('Iron Color', cfg.iron.R, cfg.iron.G, cfg.iron.B, 1) end)
-    pcall(function() sec:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
-    print('[TI] menu built')
+    if sec then
+        mkToggle(sec, 'Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
+        mkToggle(sec, 'Ore ESP', 'ti_ore', cfg.oreESP, function(v) cfg.oreESP = v end)
+        mkToggle(sec, 'Stone ESP', 'ti_stoneon', cfg.stoneESP, function(v) cfg.stoneESP = v end)
+        mkToggle(sec, 'Show Names', 'ti_label', cfg.showNames, function(v) cfg.showNames = v end)
+        mkSlider(sec, 'Names On Nearest', 'ti_labelnear', 0, 30, cfg.nameNear, function(v) cfg.nameNear = v end)
+        mkSlider(sec, 'Max Distance', 'ti_maxdist', 50, 2000, cfg.maxDist, function(v) cfg.maxDist = v end)
+        mkSlider(sec, 'Max Boxes', 'ti_maxboxes', 5, 64, cfg.maxBoxes, function(v) cfg.maxBoxes = v end)
+        mkToggle(sec, 'Distance Fade', 'ti_fade', cfg.fade, function(v) cfg.fade = v end)
+        mkSlider(sec, 'Line Thickness', 'ti_thick', 1, 4, cfg.thickness, function(v) cfg.thickness = v end)
+        mkToggle(sec, 'Thickness Scales', 'ti_scalethick', cfg.scaleThick, function(v) cfg.scaleThick = v end)
+        pcall(function() sec:ColorPicker('Silver Color', cfg.silver.R, cfg.silver.G, cfg.silver.B, 1) end)
+        pcall(function() sec:ColorPicker('Iron Color', cfg.iron.R, cfg.iron.G, cfg.iron.B, 1) end)
+        pcall(function() sec:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
+    end
+
+    local au = mkSection(tab, 'Ore Aura')
+    if au then
+        mkToggle(au, 'Aura Enabled', 'ti_aura', cfg.aura, function(v) cfg.aura = v end)
+        mkToggle(au, 'Dry Run (log only)', 'ti_dry', cfg.dryRun, function(v) cfg.dryRun = v end)
+        mkSlider(au, 'Radius', 'ti_radius', 5, 120, cfg.auraRadius, function(v) cfg.auraRadius = v end)
+        mkSlider(au, 'Interval ms', 'ti_aura_ms', 60, 800, cfg.auraMs, function(v) cfg.auraMs = v end)
+        mkToggle(au, 'Mine Ore', 'ti_aura_ore', cfg.auraOre, function(v) cfg.auraOre = v end)
+        mkToggle(au, 'Mine Stone', 'ti_aura_stone', cfg.auraStone, function(v) cfg.auraStone = v end)
+        mkToggle(au, 'Arg = Model (off = Part)', 'ti_argmode', cfg.argMode == 'model', function(v)
+            cfg.argMode = v and 'model' or 'part'
+        end)
+        mkButton(au, 'Reset Recent Blocks', function()
+            recent = {}
+            print('[aura] recent cleared')
+        end)
+    end
 end
 
 if HAS_UI then
@@ -395,7 +492,7 @@ task.spawn(function()
     end
 end)
 
--- keybind fallback ----------------------------------------------------
+-- keys ----------------------------------------------------------------
 
 track(UIS.InputBegan:Connect(function(input)
     local k = input and input.KeyCode
@@ -411,6 +508,12 @@ track(UIS.InputBegan:Connect(function(input)
     elseif k == Enum.KeyCode.M then
         cfg.stoneESP = not cfg.stoneESP
         print('[TI] stone ' .. tostring(cfg.stoneESP))
+    elseif k == Enum.KeyCode.J then
+        cfg.aura = not cfg.aura
+        print('[TI] aura ' .. tostring(cfg.aura) .. ' dry=' .. tostring(cfg.dryRun))
+    elseif k == Enum.KeyCode.N then
+        cfg.dryRun = not cfg.dryRun
+        print('[TI] dryrun ' .. tostring(cfg.dryRun))
     end
 end))
 
@@ -433,7 +536,8 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - K esp, L names, O ore, M stone')
+print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ', MineBlock=' .. tostring(mineEvt ~= nil))
+print('[TI] aura off, dryRun on. J = aura, N = dry run, K = esp')
 
 task.spawn(function()
     task.wait(0.8)
