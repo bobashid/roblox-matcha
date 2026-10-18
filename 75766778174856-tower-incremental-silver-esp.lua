@@ -1,18 +1,18 @@
--- Tower Incremental - Mine ESP + Auto Mine
+-- Tower Incremental - Mine ESP + Hold-to-Aura
 -- place 75766778174856
--- v14: Auto Mine no longer fires MineBlock. It drives the game's OWN mining:
---      moves the cursor onto the ore's screen position, holds mouse1 for the
---      hold duration, releases, next block. The game's progress bar runs, the
---      block breaks, and the game fires MineBlock itself - which the server
---      accepts because it is the real client doing the real hold.
+-- v15: the aura only runs WHILE YOU HOLD E. Release E and it stops instantly,
+--      releases the mouse and puts your cursor back where it was.
+--      You stay in control; nothing moves unless you are holding the key.
 --
--- Why v13 failed: your logs showed the MineBlock fires landing and every cell
--- rejected at 10m and 25m. The server wants the hold, not the report.
+-- Why it is not fully silent: your v11-v13 logs proved the server rejects
+-- MineBlock fired without a real hold (every cell rejected at 10m and 25m).
+-- The only thing the server accepts is the game's own progress bar, so the
+-- click has to happen for real. This makes that happen only on your command.
 --
 -- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v14'
+local VERSION = 'v15'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -46,10 +46,13 @@ local cfg = {
     iron       = Color3.fromRGB(215, 150, 110),
     stone      = Color3.fromRGB(150, 160, 175),
 
-    autoMine   = false,   -- input-based, off until you enable it
-    holdSec    = 2.5,     -- how long mouse1 stays down per block
-    gapSec     = 0.3,     -- pause between blocks
-    rearmSec   = 20,      -- ignore a cell we already mined for this long
+    -- hold-to-aura: only acts while the key is down
+    auraKey    = Enum.KeyCode.E,
+    auraOn     = true,
+    holdSec    = 2.5,
+    gapSec     = 0.3,
+    rearmSec   = 20,
+    restore    = true,
 }
 
 local function espOn(kind)
@@ -254,7 +257,6 @@ track(RunService.RenderStepped:Connect(function()
                     e.tag.Visible = false
                 end
 
-                -- screen centre of the block, for the input driver
                 t.sx = (minX + maxX) * 0.5
                 t.sy = (minY + maxY) * 0.5
                 t.sAt = stamp
@@ -277,7 +279,7 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- auto mine: drive the game's own input -----------------------------
+-- hold-to-aura ------------------------------------------------------
 
 local done      = {}
 local holding   = false
@@ -285,11 +287,26 @@ local holdStart = 0
 local holdTgt   = nil
 local lastEnd   = 0
 local minedN    = 0
+local saveX, saveY = 0, 0
 
-local function releaseMouse()
+local function cursorPos()
+    local ok, m = pcall(function() return lp:GetMouse() end)
+    if ok and m then
+        local okx, x = pcall(function() return m.X end)
+        local oky, y = pcall(function() return m.Y end)
+        if okx and type(x) == 'number' then return x end
+        if oky and type(y) == 'number' then return y end
+    end
+    return nil
+end
+
+local function releaseMouse(restore)
     if holding then
         pcall(function() mouse1release() end)
         holding = false
+        if restore and cfg.restore then
+            pcall(function() mousemoveabs(saveX, saveY) end)
+        end
     end
 end
 
@@ -299,10 +316,9 @@ local function pickTarget(rp)
     for i = 1, #targets do
         local t = targets[i]
         if t.sx and t.sAt and now - t.sAt < 0.5 and t.top and t.top.Parent then
-            local cell = t.cell
             local skip = false
-            if type(cell) == 'number' then
-                local last = done[cell]
+            if type(t.cell) == 'number' then
+                local last = done[t.cell]
                 if last and now - last < cfg.rearmSec then skip = true end
             end
             if not skip then
@@ -330,13 +346,23 @@ task.spawn(function()
     while running do
         task.wait(0.1)
         if running then
-            if not cfg.autoMine then
-                releaseMouse()
-                holdTgt = nil
+            local keyDown = false
+            if cfg.auraOn then
+                local ok, down = pcall(function() return iskeypressed(cfg.auraKey) end)
+                if ok then keyDown = down == true end
+            end
+
+            if not keyDown then
+                -- you let go: stop immediately, give the mouse back
+                if holding then
+                    releaseMouse(true)
+                    holdTgt = nil
+                    lastEnd = tick()
+                end
             elseif holding then
                 local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
                 if gone or tick() - holdStart > cfg.holdSec then
-                    releaseMouse()
+                    releaseMouse(true)
                     if holdTgt and type(holdTgt.cell) == 'number' then
                         done[holdTgt.cell] = tick()
                     end
@@ -350,6 +376,12 @@ task.spawn(function()
                 if root then
                     local best = pickTarget(root.Position)
                     if best then
+                        local cx, cy = cursorPos()
+                        if cx then
+                            saveX, saveY = cx, cy
+                        else
+                            saveX, saveY = best.sx, best.sy
+                        end
                         pcall(function() mousemoveabs(math.floor(best.sx), math.floor(best.sy)) end)
                         task.wait(0.05)
                         pcall(function() mouse1press() end)
@@ -476,12 +508,13 @@ local function buildTab(tab)
         pcall(function() look:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
     end
 
-    local au = mkSection(tab, 'Auto Mine')
+    local au = mkSection(tab, 'Hold Aura')
     if au then
-        mkToggle(au, 'Auto Mine (holds click on the ore)', 'ti_automine', cfg.autoMine, function(v)
-            cfg.autoMine = v
-            if not v then releaseMouse() end
+        mkToggle(au, 'Aura While Holding E', 'ti_auraon', cfg.auraOn, function(v)
+            cfg.auraOn = v
+            if not v then releaseMouse(true) end
         end)
+        mkToggle(au, 'Put Cursor Back', 'ti_restore', cfg.restore, function(v) cfg.restore = v end)
         mkSlider(au, 'Hold Seconds x10', 'ti_hold', 5, 80, math.floor(cfg.holdSec * 10), function(v)
             cfg.holdSec = v / 10
         end)
@@ -534,7 +567,7 @@ end)
 
 local function stop()
     running = false
-    releaseMouse()
+    releaseMouse(true)
     for i = 1, #conns do
         pcall(function() conns[i]:Disconnect() end)
     end
@@ -550,4 +583,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded - Auto Mine drives your real mouse, off by default')
+print('[TI] ' .. VERSION .. ' loaded - hold E to mine, release to stop')
