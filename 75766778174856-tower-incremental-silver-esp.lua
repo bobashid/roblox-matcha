@@ -1,14 +1,12 @@
 -- Tower Incremental - Mine ESP + Auto Mine
 -- place 75766778174856
--- v12: one Auto Mine toggle. Mines whatever ESP toggle is on.
---      Fires each cell ONCE per cycle instead of spamming it - the server was
---      rejecting the spam (your v11 log: every cell 'ignored by server').
+-- v13: same ESP, aura changed to ONE fire per full mine duration instead of a
+--      burst. Your v12 log fired 5 cells in 2 seconds and all were rejected;
+--      the game's own client fires MineBlock once, after its progress bar
+--      finishes, so the server almost certainly rate-gates it.
 --
--- Known limit, stated plainly: your log proved the fires reach the server and
--- the server rejects them. The client mines through a hold-to-mine progress
--- bar, so the server wants real hold timing per block. This does the closest
--- thing a loop can do (one clean fire per block, slow) but it is not a
--- guarantee.
+-- If this still does nothing, the answer is in the test button: press
+-- "Fire Closest Once" and watch whether that single block breaks.
 --
 -- Confirmed call: Remotes.MineBlock:FireServer(<Cell number>)
 -- Pick limits from decompile: ore 22 level / 30 above, stone 18 / 24.
@@ -16,7 +14,7 @@
 -- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v12'
+local VERSION = 'v13'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -54,8 +52,9 @@ local cfg = {
     stone      = Color3.fromRGB(150, 160, 175),
 
     autoMine   = true,
-    mineMs     = 400,
-    rearmSec   = 20,
+    mineSec    = 2.5,   -- wait a full mine duration between fires
+    rearmSec   = 30,    -- don't retry the same cell for this long
+    maxTries   = 2,     -- give up on a cell after this many fires
 }
 
 local function espOn(kind)
@@ -277,75 +276,74 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- auto mine: one clean fire per block ------------------------------
+-- auto mine: one fire per full mine duration ------------------------
 
 local firedAt  = {}
+local tries    = {}
 local firedN   = 0
-local reported = {}
+local lastFire = 0
+local skipped  = 0
+
+local function eligible(t, rp)
+    local cell = t.cell
+    if type(cell) ~= 'number' then return nil end
+    if (tries[cell] or 0) >= cfg.maxTries then return nil end
+    local last = firedAt[cell]
+    if last and tick() - last < cfg.rearmSec then return nil end
+    local isOre = t.kind ~= 'Stone'
+    local above = t.pos.Y > rp.Y + 4
+    local lim
+    if isOre then
+        lim = above and 30 or 22
+    else
+        lim = above and 24 or 18
+    end
+    if (t.pos - rp).Magnitude > lim then return nil end
+    return cell
+end
 
 task.spawn(function()
     while running do
-        task.wait(cfg.mineMs / 1000)
+        task.wait(0.2)
         if running and cfg.autoMine and mineEvt then
-            local char = lp.Character
-            local root = char and char:FindFirstChild('HumanoidRootPart')
-            if root then
-                local now = tick()
-                local rp  = root.Position
-                local best, bestCell, bestD = nil, nil, nil
-                local list = targets
-
-                for i = 1, #list do
-                    local t = list[i]
-                    if t.top and t.top.Parent and espOn(t.kind) then
-                        local cell = t.cell
-                        if type(cell) == 'number' then
-                            local isOre = t.kind ~= 'Stone'
-                            local above = t.pos.Y > rp.Y + 4
-                            local lim
-                            if isOre then
-                                lim = above and 30 or 22
-                            else
-                                lim = above and 24 or 18
-                            end
-                            local d = (t.pos - rp).Magnitude
-                            if d <= lim then
-                                local last = firedAt[cell]
-                                if not last or now - last > cfg.rearmSec then
-                                    if not bestD or d < bestD then
-                                        best, bestCell, bestD = t, cell, d
-                                    end
+            local now = tick()
+            if now - lastFire >= cfg.mineSec then
+                local char = lp.Character
+                local root = char and char:FindFirstChild('HumanoidRootPart')
+                if root then
+                    local rp = root.Position
+                    local best, bestCell, bestD = nil, nil, nil
+                    local list = targets
+                    for i = 1, #list do
+                        local t = list[i]
+                        if t.top and t.top.Parent and espOn(t.kind) then
+                            local cell = eligible(t, rp)
+                            if cell then
+                                local d = (t.pos - rp).Magnitude
+                                if not bestD or d < bestD then
+                                    best, bestCell, bestD = t, cell, d
                                 end
                             end
                         end
                     end
-                end
-
-                if best then
-                    firedAt[bestCell] = now
-                    local ok, err = pcall(function()
-                        mineEvt:FireServer(bestCell)
-                    end)
-                    if ok then
-                        firedN = firedN + 1
-                        if firedN <= 8 then
-                            print('[TI] mine cell=' .. tostring(bestCell) .. ' ' .. best.kind .. ' ' .. math.floor(bestD) .. 'm')
+                    if best then
+                        firedAt[bestCell] = now
+                        tries[bestCell] = (tries[bestCell] or 0) + 1
+                        lastFire = now
+                        local ok, err = pcall(function()
+                            mineEvt:FireServer(bestCell)
+                        end)
+                        if ok then
+                            firedN = firedN + 1
+                            if firedN <= 6 then
+                                print('[TI] mine cell=' .. tostring(bestCell) .. ' ' .. best.kind ..
+                                    ' ' .. math.floor(bestD) .. 'm try=' .. tries[bestCell])
+                            end
+                        else
+                            print('[TI] fire error ' .. tostring(err))
                         end
                     else
-                        print('[TI] fire error ' .. tostring(err))
-                    end
-                end
-
-                -- if the block is still there after a full rearm, say so once
-                for i = 1, math.min(#list, 40) do
-                    local t = list[i]
-                    local cell = t.cell
-                    if type(cell) == 'number' and not reported[cell] then
-                        local last = firedAt[cell]
-                        if last and now - last > cfg.rearmSec then
-                            reported[cell] = true
-                            print('[TI] cell ' .. cell .. ' rejected (needs real hold time)')
-                        end
+                        skipped = skipped + 1
                     end
                 end
             end
@@ -389,13 +387,13 @@ local function mkToggle(sec, label, id, default, apply)
         local v = firstBool(...)
         if v ~= nil then apply(v) end
     end
-    local tries = {
+    local triesList = {
         function() sec:Toggle(label, id, default, cb) end,
         function() sec:Toggle(id, label, default, cb) end,
         function() sec:Toggle(label, default, cb) end,
     }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
+    for i = 1, #triesList do
+        if pcall(triesList[i]) then return true end
     end
     warn('[TI] toggle failed: ' .. label)
     return false
@@ -406,13 +404,13 @@ local function mkSlider(sec, label, id, min, max, default, apply)
         local v = firstNumber(...)
         if v ~= nil then apply(v) end
     end
-    local tries = {
+    local triesList = {
         function() sec:SliderInt(label, id, min, max, default, cb) end,
         function() sec:SliderInt(id, label, min, max, default, cb) end,
         function() sec:SliderInt(label, min, max, default, cb) end,
     }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
+    for i = 1, #triesList do
+        if pcall(triesList[i]) then return true end
     end
     warn('[TI] slider failed: ' .. label)
     return false
@@ -438,6 +436,39 @@ local function readColor(id, current)
         if r[1] ~= nil then return Color3.new(r[1], r[2] or 1, r[3] or 1) end
     end
     return current
+end
+
+local function fireClosestOnce()
+    if not mineEvt then
+        print('[TI] MineBlock remote missing')
+        return
+    end
+    local char = lp.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if not root then
+        print('[TI] no character')
+        return
+    end
+    local rp = root.Position
+    local best, bestCell, bestD
+    for i = 1, #targets do
+        local t = targets[i]
+        if t.top and t.top.Parent and type(t.cell) == 'number' then
+            local d = (t.pos - rp).Magnitude
+            if not bestD or d < bestD then
+                best, bestCell, bestD = t, t.cell, d
+            end
+        end
+    end
+    if not bestCell then
+        print('[TI] nothing tracked')
+        return
+    end
+    local ok, err = pcall(function() mineEvt:FireServer(bestCell) end)
+    print('[TI] once cell=' .. tostring(bestCell) .. ' ' .. tostring(best.kind) ..
+        ' ' .. math.floor(bestD) .. 'm ok=' .. tostring(ok) .. ' ' .. tostring(err))
+    firedAt[bestCell] = tick()
+    tries[bestCell] = (tries[bestCell] or 0) + 1
 end
 
 local function buildTab(tab)
@@ -469,10 +500,19 @@ local function buildTab(tab)
     local au = mkSection(tab, 'Auto Mine')
     if au then
         mkToggle(au, 'Auto Mine (mines what ESP shows)', 'ti_automine', cfg.autoMine, function(v) cfg.autoMine = v end)
-        mkSlider(au, 'Mine Rate ms', 'ti_minems', 150, 1500, cfg.mineMs, function(v) cfg.mineMs = v end)
-        mkSlider(au, 'Retry Same Block Sec', 'ti_rearm', 5, 60, cfg.rearmSec, function(v) cfg.rearmSec = v end)
+        mkSlider(au, 'Seconds Between Mines x10', 'ti_minesec', 5, 100, math.floor(cfg.mineSec * 10), function(v)
+            cfg.mineSec = v / 10
+        end)
+        mkSlider(au, 'Retry Same Block Sec', 'ti_rearm', 5, 90, cfg.rearmSec, function(v) cfg.rearmSec = v end)
+        mkSlider(au, 'Max Tries Per Block', 'ti_maxtries', 1, 5, cfg.maxTries, function(v) cfg.maxTries = v end)
+        mkButton(au, 'Fire Closest Once', fireClosestOnce)
+        mkButton(au, 'Clear History', function()
+            firedAt = {}
+            tries = {}
+            print('[TI] history cleared')
+        end)
         mkButton(au, 'Stats', function()
-            print('[TI] fired=' .. firedN .. ' tracked=' .. #targets)
+            print('[TI] fired=' .. firedN .. ' skipped=' .. skipped .. ' tracked=' .. #targets)
         end)
     end
 end
@@ -527,4 +567,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded, autoMine=' .. tostring(cfg.autoMine) .. ', MineBlock=' .. tostring(mineEvt ~= nil))
+print('[TI] ' .. VERSION .. ' loaded, autoMine=' .. tostring(cfg.autoMine) ..
+    ', MineBlock=' .. tostring(mineEvt ~= nil) .. ', ' .. cfg.mineSec .. 's between mines')
