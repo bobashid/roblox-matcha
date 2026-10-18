@@ -1,20 +1,18 @@
 -- Tower Incremental - Mine ESP + Auto Mine
 -- place 75766778174856
--- v13: same ESP, aura changed to ONE fire per full mine duration instead of a
---      burst. Your v12 log fired 5 cells in 2 seconds and all were rejected;
---      the game's own client fires MineBlock once, after its progress bar
---      finishes, so the server almost certainly rate-gates it.
+-- v14: Auto Mine no longer fires MineBlock. It drives the game's OWN mining:
+--      moves the cursor onto the ore's screen position, holds mouse1 for the
+--      hold duration, releases, next block. The game's progress bar runs, the
+--      block breaks, and the game fires MineBlock itself - which the server
+--      accepts because it is the real client doing the real hold.
 --
--- If this still does nothing, the answer is in the test button: press
--- "Fire Closest Once" and watch whether that single block breaks.
---
--- Confirmed call: Remotes.MineBlock:FireServer(<Cell number>)
--- Pick limits from decompile: ore 22 level / 30 above, stone 18 / 24.
+-- Why v13 failed: your logs showed the MineBlock fires landing and every cell
+-- rejected at 10m and 25m. The server wants the hold, not the report.
 --
 -- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v13'
+local VERSION = 'v14'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -25,9 +23,6 @@ local RS         = game:GetService('ReplicatedStorage')
 local RunService = game:GetService('RunService')
 
 local lp = Players.LocalPlayer
-
-local remotes  = RS:FindFirstChild('Remotes')
-local mineEvt  = remotes and remotes:FindFirstChild('MineBlock')
 
 local running = true
 local conns   = {}
@@ -51,10 +46,10 @@ local cfg = {
     iron       = Color3.fromRGB(215, 150, 110),
     stone      = Color3.fromRGB(150, 160, 175),
 
-    autoMine   = true,
-    mineSec    = 2.5,   -- wait a full mine duration between fires
-    rearmSec   = 30,    -- don't retry the same cell for this long
-    maxTries   = 2,     -- give up on a cell after this many fires
+    autoMine   = false,   -- input-based, off until you enable it
+    holdSec    = 2.5,     -- how long mouse1 stays down per block
+    gapSec     = 0.3,     -- pause between blocks
+    rearmSec   = 20,      -- ignore a cell we already mined for this long
 }
 
 local function espOn(kind)
@@ -177,6 +172,7 @@ track(RunService.RenderStepped:Connect(function()
     local cap    = math.min(cfg.maxBoxes, POOL)
     local list   = targets
     local n      = 0
+    local stamp  = tick()
 
     for i = 1, #list do
         if n >= cap then break end
@@ -258,6 +254,11 @@ track(RunService.RenderStepped:Connect(function()
                     e.tag.Visible = false
                 end
 
+                -- screen centre of the block, for the input driver
+                t.sx = (minX + maxX) * 0.5
+                t.sy = (minY + maxY) * 0.5
+                t.sAt = stamp
+
                 e.kind = t.kind
                 e.on = true
             end
@@ -276,74 +277,85 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- auto mine: one fire per full mine duration ------------------------
+-- auto mine: drive the game's own input -----------------------------
 
-local firedAt  = {}
-local tries    = {}
-local firedN   = 0
-local lastFire = 0
-local skipped  = 0
+local done      = {}
+local holding   = false
+local holdStart = 0
+local holdTgt   = nil
+local lastEnd   = 0
+local minedN    = 0
 
-local function eligible(t, rp)
-    local cell = t.cell
-    if type(cell) ~= 'number' then return nil end
-    if (tries[cell] or 0) >= cfg.maxTries then return nil end
-    local last = firedAt[cell]
-    if last and tick() - last < cfg.rearmSec then return nil end
-    local isOre = t.kind ~= 'Stone'
-    local above = t.pos.Y > rp.Y + 4
-    local lim
-    if isOre then
-        lim = above and 30 or 22
-    else
-        lim = above and 24 or 18
+local function releaseMouse()
+    if holding then
+        pcall(function() mouse1release() end)
+        holding = false
     end
-    if (t.pos - rp).Magnitude > lim then return nil end
-    return cell
+end
+
+local function pickTarget(rp)
+    local best, bestD
+    local now = tick()
+    for i = 1, #targets do
+        local t = targets[i]
+        if t.sx and t.sAt and now - t.sAt < 0.5 and t.top and t.top.Parent then
+            local cell = t.cell
+            local skip = false
+            if type(cell) == 'number' then
+                local last = done[cell]
+                if last and now - last < cfg.rearmSec then skip = true end
+            end
+            if not skip then
+                local isOre = t.kind ~= 'Stone'
+                local above = t.pos.Y > rp.Y + 4
+                local lim
+                if isOre then
+                    lim = above and 30 or 22
+                else
+                    lim = above and 24 or 18
+                end
+                local d = (t.pos - rp).Magnitude
+                if d <= lim then
+                    if not bestD or d < bestD then
+                        best, bestD = t, d
+                    end
+                end
+            end
+        end
+    end
+    return best
 end
 
 task.spawn(function()
     while running do
-        task.wait(0.2)
-        if running and cfg.autoMine and mineEvt then
-            local now = tick()
-            if now - lastFire >= cfg.mineSec then
+        task.wait(0.1)
+        if running then
+            if not cfg.autoMine then
+                releaseMouse()
+                holdTgt = nil
+            elseif holding then
+                local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
+                if gone or tick() - holdStart > cfg.holdSec then
+                    releaseMouse()
+                    if holdTgt and type(holdTgt.cell) == 'number' then
+                        done[holdTgt.cell] = tick()
+                    end
+                    if gone then minedN = minedN + 1 end
+                    holdTgt = nil
+                    lastEnd = tick()
+                end
+            elseif tick() - lastEnd >= cfg.gapSec then
                 local char = lp.Character
                 local root = char and char:FindFirstChild('HumanoidRootPart')
                 if root then
-                    local rp = root.Position
-                    local best, bestCell, bestD = nil, nil, nil
-                    local list = targets
-                    for i = 1, #list do
-                        local t = list[i]
-                        if t.top and t.top.Parent and espOn(t.kind) then
-                            local cell = eligible(t, rp)
-                            if cell then
-                                local d = (t.pos - rp).Magnitude
-                                if not bestD or d < bestD then
-                                    best, bestCell, bestD = t, cell, d
-                                end
-                            end
-                        end
-                    end
+                    local best = pickTarget(root.Position)
                     if best then
-                        firedAt[bestCell] = now
-                        tries[bestCell] = (tries[bestCell] or 0) + 1
-                        lastFire = now
-                        local ok, err = pcall(function()
-                            mineEvt:FireServer(bestCell)
-                        end)
-                        if ok then
-                            firedN = firedN + 1
-                            if firedN <= 6 then
-                                print('[TI] mine cell=' .. tostring(bestCell) .. ' ' .. best.kind ..
-                                    ' ' .. math.floor(bestD) .. 'm try=' .. tries[bestCell])
-                            end
-                        else
-                            print('[TI] fire error ' .. tostring(err))
-                        end
-                    else
-                        skipped = skipped + 1
+                        pcall(function() mousemoveabs(math.floor(best.sx), math.floor(best.sy)) end)
+                        task.wait(0.05)
+                        pcall(function() mouse1press() end)
+                        holding   = true
+                        holdStart = tick()
+                        holdTgt   = best
                     end
                 end
             end
@@ -438,39 +450,6 @@ local function readColor(id, current)
     return current
 end
 
-local function fireClosestOnce()
-    if not mineEvt then
-        print('[TI] MineBlock remote missing')
-        return
-    end
-    local char = lp.Character
-    local root = char and char:FindFirstChild('HumanoidRootPart')
-    if not root then
-        print('[TI] no character')
-        return
-    end
-    local rp = root.Position
-    local best, bestCell, bestD
-    for i = 1, #targets do
-        local t = targets[i]
-        if t.top and t.top.Parent and type(t.cell) == 'number' then
-            local d = (t.pos - rp).Magnitude
-            if not bestD or d < bestD then
-                best, bestCell, bestD = t, t.cell, d
-            end
-        end
-    end
-    if not bestCell then
-        print('[TI] nothing tracked')
-        return
-    end
-    local ok, err = pcall(function() mineEvt:FireServer(bestCell) end)
-    print('[TI] once cell=' .. tostring(bestCell) .. ' ' .. tostring(best.kind) ..
-        ' ' .. math.floor(bestD) .. 'm ok=' .. tostring(ok) .. ' ' .. tostring(err))
-    firedAt[bestCell] = tick()
-    tries[bestCell] = (tries[bestCell] or 0) + 1
-end
-
 local function buildTab(tab)
     if built then return end
     built = true
@@ -499,20 +478,23 @@ local function buildTab(tab)
 
     local au = mkSection(tab, 'Auto Mine')
     if au then
-        mkToggle(au, 'Auto Mine (mines what ESP shows)', 'ti_automine', cfg.autoMine, function(v) cfg.autoMine = v end)
-        mkSlider(au, 'Seconds Between Mines x10', 'ti_minesec', 5, 100, math.floor(cfg.mineSec * 10), function(v)
-            cfg.mineSec = v / 10
+        mkToggle(au, 'Auto Mine (holds click on the ore)', 'ti_automine', cfg.autoMine, function(v)
+            cfg.autoMine = v
+            if not v then releaseMouse() end
         end)
-        mkSlider(au, 'Retry Same Block Sec', 'ti_rearm', 5, 90, cfg.rearmSec, function(v) cfg.rearmSec = v end)
-        mkSlider(au, 'Max Tries Per Block', 'ti_maxtries', 1, 5, cfg.maxTries, function(v) cfg.maxTries = v end)
-        mkButton(au, 'Fire Closest Once', fireClosestOnce)
-        mkButton(au, 'Clear History', function()
-            firedAt = {}
-            tries = {}
-            print('[TI] history cleared')
+        mkSlider(au, 'Hold Seconds x10', 'ti_hold', 5, 80, math.floor(cfg.holdSec * 10), function(v)
+            cfg.holdSec = v / 10
         end)
+        mkSlider(au, 'Gap Seconds x10', 'ti_gap', 0, 30, math.floor(cfg.gapSec * 10), function(v)
+            cfg.gapSec = v / 10
+        end)
+        mkSlider(au, 'Ignore Block Sec', 'ti_rearm', 5, 90, cfg.rearmSec, function(v) cfg.rearmSec = v end)
         mkButton(au, 'Stats', function()
-            print('[TI] fired=' .. firedN .. ' skipped=' .. skipped .. ' tracked=' .. #targets)
+            print('[TI] mined=' .. minedN .. ' tracked=' .. #targets .. ' holding=' .. tostring(holding))
+        end)
+        mkButton(au, 'Clear Ignore List', function()
+            done = {}
+            print('[TI] ignore list cleared')
         end)
     end
 end
@@ -552,6 +534,7 @@ end)
 
 local function stop()
     running = false
+    releaseMouse()
     for i = 1, #conns do
         pcall(function() conns[i]:Disconnect() end)
     end
@@ -567,5 +550,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded, autoMine=' .. tostring(cfg.autoMine) ..
-    ', MineBlock=' .. tostring(mineEvt ~= nil) .. ', ' .. cfg.mineSec .. 's between mines')
+print('[TI] ' .. VERSION .. ' loaded - Auto Mine drives your real mouse, off by default')
