@@ -1,17 +1,22 @@
 -- Tower Incremental - Mine ESP + Auto Mine
 -- place 75766778174856
--- v11: ONE toggle. Auto Mine mines every block whose ESP toggle is on.
---      No dry run, no hold state, no radius guess - it uses the game's own
---      pick limits taken from MineClient.
+-- v12: one Auto Mine toggle. Mines whatever ESP toggle is on.
+--      Fires each cell ONCE per cycle instead of spamming it - the server was
+--      rejecting the spam (your v11 log: every cell 'ignored by server').
+--
+-- Known limit, stated plainly: your log proved the fires reach the server and
+-- the server rejects them. The client mines through a hold-to-mine progress
+-- bar, so the server wants real hold timing per block. This does the closest
+-- thing a loop can do (one clean fire per block, slow) but it is not a
+-- guarantee.
 --
 -- Confirmed call: Remotes.MineBlock:FireServer(<Cell number>)
--- Pick limits from the decompile: ore 22 level / 30 above,
---                                  stone 18 level / 24 above.
+-- Pick limits from decompile: ore 22 level / 30 above, stone 18 / 24.
 --
 -- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v11'
+local VERSION = 'v12'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -49,7 +54,8 @@ local cfg = {
     stone      = Color3.fromRGB(150, 160, 175),
 
     autoMine   = true,
-    mineMs     = 120,
+    mineMs     = 400,
+    rearmSec   = 20,
 }
 
 local function espOn(kind)
@@ -271,11 +277,11 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- auto mine: fires the Cell number of anything ESP is showing ------–
+-- auto mine: one clean fire per block ------------------------------
 
-local lastFired = {}
-local firedCount = 0
-local warned = {}
+local firedAt  = {}
+local firedN   = 0
+local reported = {}
 
 task.spawn(function()
     while running do
@@ -285,7 +291,7 @@ task.spawn(function()
             local root = char and char:FindFirstChild('HumanoidRootPart')
             if root then
                 local now = tick()
-                local rp = root.Position
+                local rp  = root.Position
                 local best, bestCell, bestD = nil, nil, nil
                 local list = targets
 
@@ -293,10 +299,6 @@ task.spawn(function()
                     local t = list[i]
                     if t.top and t.top.Parent and espOn(t.kind) then
                         local cell = t.cell
-                        if type(cell) ~= 'number' then
-                            local ok, v = pcall(function() return t.top:GetAttribute('Cell') end)
-                            if ok and type(v) == 'number' then cell = v end
-                        end
                         if type(cell) == 'number' then
                             local isOre = t.kind ~= 'Stone'
                             local above = t.pos.Y > rp.Y + 4
@@ -308,8 +310,8 @@ task.spawn(function()
                             end
                             local d = (t.pos - rp).Magnitude
                             if d <= lim then
-                                local last = lastFired[cell]
-                                if not last or now - last > 1.0 then
+                                local last = firedAt[cell]
+                                if not last or now - last > cfg.rearmSec then
                                     if not bestD or d < bestD then
                                         best, bestCell, bestD = t, cell, d
                                     end
@@ -320,29 +322,29 @@ task.spawn(function()
                 end
 
                 if best then
-                    lastFired[bestCell] = now
+                    firedAt[bestCell] = now
                     local ok, err = pcall(function()
                         mineEvt:FireServer(bestCell)
                     end)
                     if ok then
-                        firedCount = firedCount + 1
-                        if firedCount <= 5 then
-                            print('[TI] fire cell=' .. tostring(bestCell) .. ' ' .. best.kind .. ' ' .. math.floor(bestD) .. 'm')
+                        firedN = firedN + 1
+                        if firedN <= 8 then
+                            print('[TI] mine cell=' .. tostring(bestCell) .. ' ' .. best.kind .. ' ' .. math.floor(bestD) .. 'm')
                         end
                     else
                         print('[TI] fire error ' .. tostring(err))
                     end
                 end
 
-                -- report cells that keep surviving
-                for i = 1, math.min(#list, 30) do
+                -- if the block is still there after a full rearm, say so once
+                for i = 1, math.min(#list, 40) do
                     local t = list[i]
                     local cell = t.cell
-                    if type(cell) == 'number' and not warned[cell] then
-                        local last = lastFired[cell]
-                        if last and now - last > 3 then
-                            warned[cell] = true
-                            print('[TI] cell ' .. cell .. ' ignored by server')
+                    if type(cell) == 'number' and not reported[cell] then
+                        local last = firedAt[cell]
+                        if last and now - last > cfg.rearmSec then
+                            reported[cell] = true
+                            print('[TI] cell ' .. cell .. ' rejected (needs real hold time)')
                         end
                     end
                 end
@@ -467,9 +469,10 @@ local function buildTab(tab)
     local au = mkSection(tab, 'Auto Mine')
     if au then
         mkToggle(au, 'Auto Mine (mines what ESP shows)', 'ti_automine', cfg.autoMine, function(v) cfg.autoMine = v end)
-        mkSlider(au, 'Mine Rate ms', 'ti_minems', 40, 500, cfg.mineMs, function(v) cfg.mineMs = v end)
+        mkSlider(au, 'Mine Rate ms', 'ti_minems', 150, 1500, cfg.mineMs, function(v) cfg.mineMs = v end)
+        mkSlider(au, 'Retry Same Block Sec', 'ti_rearm', 5, 60, cfg.rearmSec, function(v) cfg.rearmSec = v end)
         mkButton(au, 'Stats', function()
-            print('[TI] fired=' .. firedCount .. ' tracked=' .. #targets)
+            print('[TI] fired=' .. firedN .. ' tracked=' .. #targets)
         end)
     end
 end
@@ -525,14 +528,3 @@ end
 
 _G[NAME] = { stop = stop, version = VERSION }
 print('[TI] ' .. VERSION .. ' loaded, autoMine=' .. tostring(cfg.autoMine) .. ', MineBlock=' .. tostring(mineEvt ~= nil))
-
-task.spawn(function()
-    task.wait(1)
-    if running then
-        local c = 0
-        for i = 1, #targets do
-            if type(targets[i].cell) == 'number' then c = c + 1 end
-        end
-        print('[TI] tracked=' .. #targets .. ' withCell=' .. c)
-    end
-end)
