@@ -1,24 +1,26 @@
--- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v10
+-- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v11
 -- place 105011592530400
 -- one tab (Mods), one toggle: Freeze Enemies.
--- Nothing runs until the toggle is on. No getgc, no prescan, no cache.
+-- Nothing runs until the toggle is on. Once it is on, the target list is
+-- rebuilt every 0.5s for as long as the toggle stays on, so zombies that spawn
+-- or respawn after build mode are picked up on their own. You do not need to
+-- turn it off and on again.
 --
--- v9 turned the toggle on fine and printed targets=0 every time. A clean probe
--- with the same logic returned 0 NPC humanoids in Workspace, so the collection
--- was the bug, not the freeze. v9 only walked Workspace children and their
--- direct children. v10 walks 4 container levels, skips player characters by
--- name, and accepts UpperTorso / Torso / PrimaryPart / first BasePart when a
--- model has no HumanoidRootPart. The walk is capped at 4000 visits so a deep
--- tree cannot stall the loop.
+-- Why v9/v10 printed targets=0 while you could see zombies:
+--   the walk only accepted a model that had a Humanoid AND a direct
+--   HumanoidRootPart, and it only looked 4 container levels deep. A zombie
+--   driven by an Animator, a zombie nested deeper, or a zombie whose root is
+--   named something else was skipped. v11 drops the Humanoid requirement for
+--   enemy-named models and walks 6 levels with a visit cap.
 --
 -- Writable set used (Matcha has no Anchored and no WalkSpeed):
---   Humanoid.WalkToPoint                    stop it pathing
---   root.Velocity                           kill momentum
---   root.AssemblyLinearVelocity             same, for the assembly
--- Root is HumanoidRootPart when present, otherwise the torso or primary part.
+--   Humanoid.WalkToPoint        stop it pathing
+--   root.Velocity               kill momentum
+--   root.AssemblyLinearVelocity same, for the assembly
+--   root.CFrame                 only for targets with no Humanoid
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v10'
+local VERSION = 'v11'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -28,8 +30,9 @@ print('[' .. NAME .. '] ' .. VERSION)
 local Players = game:GetService('Players')
 local ws = game:GetService('Workspace')
 
-local MAX_TARGETS = 30
-local MAX_VISITS  = 4000
+local MAX_TARGETS = 40
+local MAX_VISITS  = 6000
+local MAX_DEPTH   = 6
 
 local alive    = true
 local built    = false
@@ -39,7 +42,15 @@ local nTargets = 0
 
 local ZERO = Vector3.new(0, 0, 0)
 
--- target helpers ------------------------------------------------------
+local PATTERNS = { 'zombie', 'enemy', 'monster', 'undead', 'walker', 'npc', 'mob' }
+
+local function enemyName(n)
+    local l = string.lower(n)
+    for _, p in ipairs(PATTERNS) do
+        if string.find(l, p, 1, true) then return true end
+    end
+    return false
+end
 
 local function isPart(inst)
     local cn = inst.ClassName
@@ -62,7 +73,7 @@ local function rootOf(model)
     return nil
 end
 
--- collector: 2 Hz, walks 4 container levels ---------------------------
+-- collector: 2 Hz, walks 6 levels, no Humanoid requirement ------------
 
 local function collect()
     local pnames = {}
@@ -80,15 +91,23 @@ local function collect()
             visits = visits + 1
 
             if not pnames[c.Name] then
-                local hum = c:FindFirstChildOfClass('Humanoid')
+                local hum  = c:FindFirstChildOfClass('Humanoid')
+                local root = nil
+                local take = false
+
                 if hum then
-                    local root = rootOf(c)
-                    if root then
-                        out[#out + 1] = { root = root, hum = hum, pos = root.Position }
-                    end
-                elseif depth < 4 then
+                    root = rootOf(c)
+                    take = root ~= nil
+                elseif enemyName(c.Name) then
+                    root = rootOf(c)
+                    take = root ~= nil
+                end
+
+                if take then
+                    out[#out + 1] = { root = root, hum = hum, pos = root.Position }
+                elseif depth < MAX_DEPTH then
                     local cn = c.ClassName
-                    if cn == 'Model' or cn == 'Folder' then
+                    if cn == 'Model' or cn == 'Folder' or cn == 'Workspace' then
                         walk(c, depth + 1)
                     end
                 end
@@ -104,25 +123,48 @@ end
 
 -- freeze pass: 20 Hz, writes only ------------------------------------
 
+local function freezeOne(t)
+    if t.hum then
+        t.hum.WalkToPoint             = t.pos
+        t.root.Velocity               = ZERO
+        t.root.AssemblyLinearVelocity = ZERO
+    else
+        t.root.CFrame                 = CFrame.new(t.pos)
+        t.root.Velocity               = ZERO
+        t.root.AssemblyLinearVelocity = ZERO
+    end
+end
+
 local function freeze()
     for _, t in ipairs(targets) do
-        pcall(function()
-            t.hum.WalkToPoint             = t.pos
-            t.root.Velocity               = ZERO
-            t.root.AssemblyLinearVelocity = ZERO
-        end)
+        pcall(freezeOne, t)
     end
 end
 
 -- loops ---------------------------------------------------------------
 
+local lastN = -1
+
+-- collector: keeps running while the toggle is on, so respawns are caught
 task.spawn(function()
     while alive do
-        if frozen then collect() else targets, nTargets = {}, 0 end
+        if frozen then
+            collect()
+            if nTargets ~= lastN then
+                lastN = nTargets
+                print('[' .. NAME .. '] targets = ' .. nTargets)
+                if nTargets > 0 and targets[1] then
+                    print('[' .. NAME .. '] first = ' .. targets[1].root:GetFullName())
+                end
+            end
+        else
+            targets, nTargets, lastN = {}, 0, -1
+        end
         task.wait(0.5)
     end
 end)
 
+-- freeze: 20 Hz, skips silently when the list is empty
 task.spawn(function()
     while alive do
         if frozen and nTargets > 0 then freeze() end
@@ -180,10 +222,14 @@ local function buildTab(tab)
         if not sec then return end
         mkToggle(sec, 'Freeze Enemies', 'mm_freeze', false, function(v)
             frozen = v
-            if v then collect() end
-            print('[' .. NAME .. '] freeze = ' .. tostring(v) .. ' targets=' .. nTargets)
-            if v and nTargets == 0 then
-                pcall(notify, 'Mods', 'freeze on but no NPC humanoids found in Workspace', 4)
+            if v then
+                collect()
+                print('[' .. NAME .. '] freeze on, targets = ' .. nTargets)
+                if nTargets == 0 then
+                    pcall(notify, 'Mods', 'ing - zombies are picked up as they spawn', 4)
+                end
+            else
+                print('[' .. NAME .. '] freeze off')
             end
         end)
     end)
@@ -222,5 +268,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, version = VERSION }
+_G[NAME] = { stop = stop, collect = collect, version = VERSION }
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - Mods tab, Freeze Enemies')
