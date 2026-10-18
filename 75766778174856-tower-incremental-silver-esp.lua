@@ -1,22 +1,17 @@
--- Tower Incremental - Mine ESP + Ore Aura
+-- Tower Incremental - Mine ESP + Auto Mine
 -- place 75766778174856
--- v10: aura is ON and Dry Run is OFF by default, so loading the script starts
---      mining immediately. Menu toggles still there if you want to change it.
+-- v11: ONE toggle. Auto Mine mines every block whose ESP toggle is on.
+--      No dry run, no hold state, no radius guess - it uses the game's own
+--      pick limits taken from MineClient.
 --
--- Confirmed working call (user verified in game):
---   game.ReplicatedStorage.Remotes.MineBlock:FireServer(74)
---   i.e. the argument is the block's Cell attribute NUMBER, not the instance.
---
--- From decompiling ReplicatedStorage.Client.MineClient:
---   local cell = block:GetAttribute("Cell")
---   table.insert(queue, cell)
---   ... Remotes.MineBlock:FireServer(cell)
---   Pick range: ore 30 above / 22 level, stone 24 above / 18 level.
+-- Confirmed call: Remotes.MineBlock:FireServer(<Cell number>)
+-- Pick limits from the decompile: ore 22 level / 30 above,
+--                                  stone 18 level / 24 above.
 --
 -- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v10'
+local VERSION = 'v11'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -53,13 +48,8 @@ local cfg = {
     iron       = Color3.fromRGB(215, 150, 110),
     stone      = Color3.fromRGB(150, 160, 175),
 
-    -- aura: on and actually firing by default
-    aura       = true,
-    dryRun     = false,
-    auraRadius = 24,
-    auraMs     = 100,
-    holdSec    = 0.6,
-    retrySec   = 4,
+    autoMine   = true,
+    mineMs     = 120,
 }
 
 local function espOn(kind)
@@ -149,6 +139,7 @@ task.spawn(function()
                     local d = origin and (cf.Position - origin).Magnitude or 0
                     out[#out + 1] = {
                         cframe = cf,
+                        pos    = cf.Position,
                         size   = boxPart.Size,
                         dist   = d,
                         kind   = kind,
@@ -161,7 +152,7 @@ task.spawn(function()
         table.sort(out, function(a, b) return a.dist < b.dist end)
         while #out > POOL do out[#out] = nil end
         targets = out
-        task.wait(0.5)
+        task.wait(0.4)
     end
 end)
 
@@ -280,97 +271,78 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- aura: fires the Cell number ----------------------------------------
+-- auto mine: fires the Cell number of anything ESP is showing ------–
 
-local recent  = {}
-local holding = nil
-local statOK, statFail, statFire = 0, 0, 0
-
-local function cellOf(inst)
-    local ok, v = pcall(function() return inst:GetAttribute('Cell') end)
-    if ok and type(v) == 'number' then return v end
-    return nil
-end
+local lastFired = {}
+local firedCount = 0
+local warned = {}
 
 task.spawn(function()
     while running do
-        task.wait(cfg.auraMs / 1000)
-        if running then
-            local now = tick()
+        task.wait(cfg.mineMs / 1000)
+        if running and cfg.autoMine and mineEvt then
+            local char = lp.Character
+            local root = char and char:FindFirstChild('HumanoidRootPart')
+            if root then
+                local now = tick()
+                local rp = root.Position
+                local best, bestCell, bestD = nil, nil, nil
+                local list = targets
 
-            for a, ts in pairs(recent) do
-                if now - ts > cfg.retrySec then recent[a] = nil end
-            end
-
-            if not cfg.aura or not mineEvt then
-                holding = nil
-            else
-                local char = lp.Character
-                local root = char and char:FindFirstChild('HumanoidRootPart')
-                if not root then
-                    holding = nil
-                else
-                    if holding and (not holding.top or holding.top.Parent == nil) then
-                        statOK = statOK + 1
-                        holding = nil
-                    end
-
-                    if holding and now - holding.started > cfg.holdSec + 1.2 then
-                        statFail = statFail + 1
-                        recent[holding.key] = now
-                        holding = nil
-                    end
-
-                    if not holding then
-                        local best, bestD = nil, nil
-                        local list = targets
-                        for i = 1, #list do
-                            local t = list[i]
-                            if t.top and t.top.Parent and espOn(t.kind) then
-                                local cell = t.cell
-                                if cell == nil then cell = cellOf(t.top) end
-                                if type(cell) == 'number' then
-                                    local d = (t.cframe.Position - root.Position).Magnitude
-                                    if d <= cfg.auraRadius and not recent[cell] then
-                                        if not bestD or d < bestD then
-                                            best, bestD = t, d
-                                            best.cell = cell
-                                        end
+                for i = 1, #list do
+                    local t = list[i]
+                    if t.top and t.top.Parent and espOn(t.kind) then
+                        local cell = t.cell
+                        if type(cell) ~= 'number' then
+                            local ok, v = pcall(function() return t.top:GetAttribute('Cell') end)
+                            if ok and type(v) == 'number' then cell = v end
+                        end
+                        if type(cell) == 'number' then
+                            local isOre = t.kind ~= 'Stone'
+                            local above = t.pos.Y > rp.Y + 4
+                            local lim
+                            if isOre then
+                                lim = above and 30 or 22
+                            else
+                                lim = above and 24 or 18
+                            end
+                            local d = (t.pos - rp).Magnitude
+                            if d <= lim then
+                                local last = lastFired[cell]
+                                if not last or now - last > 1.0 then
+                                    if not bestD or d < bestD then
+                                        best, bestCell, bestD = t, cell, d
                                     end
                                 end
                             end
                         end
-                        if best then
-                            holding = {
-                                top = best.top,
-                                key = best.cell,
-                                cell = best.cell,
-                                kind = best.kind,
-                                started = now,
-                                lastFire = 0,
-                            }
-                            if cfg.dryRun then
-                                print(string.format('[aura] dry %s %.1fm cell=%d',
-                                    best.kind, bestD, best.cell))
-                            end
-                        end
                     end
+                end
 
-                    if holding and not cfg.dryRun then
-                        if now - holding.lastFire >= (cfg.auraMs / 1000) then
-                            holding.lastFire = now
-                            local cell = holding.cell
-                            local ok, err = pcall(function()
-                                mineEvt:FireServer(cell)
-                            end)
-                            if ok then
-                                statFire = statFire + 1
-                                if statFire <= 5 then
-                                    print('[aura] fired cell=' .. tostring(cell) .. ' ' .. holding.kind)
-                                end
-                            else
-                                print('[aura] fire error ' .. tostring(err))
-                            end
+                if best then
+                    lastFired[bestCell] = now
+                    local ok, err = pcall(function()
+                        mineEvt:FireServer(bestCell)
+                    end)
+                    if ok then
+                        firedCount = firedCount + 1
+                        if firedCount <= 5 then
+                            print('[TI] fire cell=' .. tostring(bestCell) .. ' ' .. best.kind .. ' ' .. math.floor(bestD) .. 'm')
+                        end
+                    else
+                        print('[TI] fire error ' .. tostring(err))
+                    end
+                end
+
+                -- report cells that keep surviving
+                for i = 1, math.min(#list, 30) do
+                    local t = list[i]
+                    local cell = t.cell
+                    if type(cell) == 'number' and not warned[cell] then
+                        local last = lastFired[cell]
+                        if last and now - last > 3 then
+                            warned[cell] = true
+                            print('[TI] cell ' .. cell .. ' ignored by server')
                         end
                     end
                 end
@@ -492,23 +464,12 @@ local function buildTab(tab)
         pcall(function() look:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
     end
 
-    local au = mkSection(tab, 'Ore Aura')
+    local au = mkSection(tab, 'Auto Mine')
     if au then
-        mkToggle(au, 'Aura Enabled', 'ti_aura', cfg.aura, function(v) cfg.aura = v end)
-        mkToggle(au, 'Dry Run (log only)', 'ti_dry', cfg.dryRun, function(v) cfg.dryRun = v end)
-        mkSlider(au, 'Radius', 'ti_radius', 5, 120, cfg.auraRadius, function(v) cfg.auraRadius = v end)
-        mkSlider(au, 'Fire Every ms', 'ti_aura_ms', 40, 500, cfg.auraMs, function(v) cfg.auraMs = v end)
-        mkSlider(au, 'Hold Seconds x10', 'ti_hold', 1, 30, math.floor(cfg.holdSec * 10), function(v)
-            cfg.holdSec = v / 10
-        end)
-        mkSlider(au, 'Retry Seconds', 'ti_retry', 2, 20, cfg.retrySec, function(v) cfg.retrySec = v end)
-        mkButton(au, 'Reset Recent Blocks', function()
-            recent = {}
-            holding = nil
-            print('[aura] reset')
-        end)
-        mkButton(au, 'Aura Stats', function()
-            print('[aura] fired=' .. statFire .. ' ok=' .. statOK .. ' fail=' .. statFail)
+        mkToggle(au, 'Auto Mine (mines what ESP shows)', 'ti_automine', cfg.autoMine, function(v) cfg.autoMine = v end)
+        mkSlider(au, 'Mine Rate ms', 'ti_minems', 40, 500, cfg.mineMs, function(v) cfg.mineMs = v end)
+        mkButton(au, 'Stats', function()
+            print('[TI] fired=' .. firedCount .. ' tracked=' .. #targets)
         end)
     end
 end
@@ -548,7 +509,6 @@ end)
 
 local function stop()
     running = false
-    holding = nil
     for i = 1, #conns do
         pcall(function() conns[i]:Disconnect() end)
     end
@@ -564,15 +524,15 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded, MineBlock=' .. tostring(mineEvt ~= nil) .. ', aura=' .. tostring(cfg.aura) .. ', dryRun=' .. tostring(cfg.dryRun))
-print('[TI] mining ore within ' .. cfg.auraRadius .. ' studs - Silver/Iron on, Stone off')
+print('[TI] ' .. VERSION .. ' loaded, autoMine=' .. tostring(cfg.autoMine) .. ', MineBlock=' .. tostring(mineEvt ~= nil))
 
 task.spawn(function()
-    task.wait(0.8)
+    task.wait(1)
     if running then
-        print('[TI] blocks tracked: ' .. #targets)
         local c = 0
-        for i = 1, #targets do if type(targets[i].cell) == 'number' then c = c + 1 end end
-        print('[TI] with Cell attr: ' .. c)
+        for i = 1, #targets do
+            if type(targets[i].cell) == 'number' then c = c + 1 end
+        end
+        print('[TI] tracked=' .. #targets .. ' withCell=' .. c)
     end
 end)
