@@ -1,24 +1,24 @@
--- Build and Kill Zombies - Inf Fuel + Fire Rate + Gun Range - Matcha LuauVM - v7
+-- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v8
 -- place 105011592530400
--- one tab (Mods), two sections: Fuel and Weapon. toggles + values only.
--- No getgc at load and no prescan. A scan runs only when you turn a toggle on,
--- and the filtered key cache is reused after that.
+-- one tab (Mods), one toggle: Freeze Enemies.
+-- Nothing runs until the toggle is on. No getgc, no prescan, no cache.
 --
--- Measured on this place this session, one getgc over the whole key list:
---   440 numeric hits in 14.2s
---   FireRate 22, Range 45, Damage 137, Cooldown 8, MaxRange 2
---   FuelDrain 19, Fuel 4, FuelCapacity 1
--- So the weapon keys are plentiful and client-side. Fuel keys exist but are few,
--- findgc Fuel+FuelCapacity and findgc Fuel+FuelDrain both returned 0, and there is
--- no Fuel instance, ValueObject or RemoteEvent. The tank looks server-owned.
--- Weapon writes are expected to work. Fuel is best effort: if the HUD keeps
--- draining, no client script can hold it.
+-- Why fuel and the weapon mods are gone:
+--   CmdrClient.Commands.UnlimitedFuel decompiles to { Args = { {} } } with no Run
+--   findgc on live Fuel+FuelCapacity and Fuel+FuelDrain pairs returned 0, twice
+--   no Fuel instance, ValueObject, attribute or RemoteEvent exists on the client
+--   VehicleController only writes ThrottleFloat / SteerFloat
+--   the 440 gc hits were Assets.CarParts stat definitions, not runtime values
+-- None of that is reachable from the client, so the menu no longer offers it.
 --
--- v7: the scan now keeps only the keys this script writes. Unfiltered, the cache
--- was 440 entries and the apply loop walked all of them twice a second.
+-- How freeze works with Matcha's writable set (no Anchored, no WalkSpeed):
+--   Humanoid.WalkToPoint = the NPC's own position stops it pathing
+--   HumanoidRootPart.Velocity and .AssemblyLinearVelocity zeroed kill momentum
+-- Both are writes, which are the expensive ones, so the pass is throttled to
+-- 5 Hz over a cached target list, and the list refreshes at 2 Hz.
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v7'
+local VERSION = 'v8'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -27,118 +27,85 @@ print('[' .. NAME .. '] ' .. VERSION)
 
 local Players = game:GetService('Players')
 local lp = Players.LocalPlayer
+local ws = game:GetService('Workspace')
 
-local WEAPON_KEYS = {
-    'FireRate', 'FireDelay', 'Cooldown', 'FireInterval',
-    'Range', 'MaxRange', 'BulletRange',
-}
+local alive   = true
+local built   = false
+local frozen  = false
+local targets = {}
+local nTargets = 0
 
-local FUEL_KEYS = {
-    'Fuel', 'CurrentFuel', 'FuelLevel', 'FuelAmount', 'FuelValue',
-    'MaxFuel', 'FuelCapacity', 'FuelDrain',
-}
+local ZERO = Vector3.new(0, 0, 0)
 
--- keys the apply loop actually writes: the scan keeps only these
-local WANT = {}
-for _, k in ipairs(WEAPON_KEYS) do WANT[k] = true end
-for _, k in ipairs(FUEL_KEYS)   do WANT[k] = true end
+-- collector: 2 Hz, rebuilds the target list ---------------------------
 
-local cfg = {
-    fuel     = false,
-    rapid    = false,
-    range    = false,
-    fuelVal  = 9999,
-    rateVal  = 0.02,
-    rangeVal = 2000,
-}
-
-local alive    = true
-local built    = false
-local scanning = false
-local cache    = nil
-local lastScan = 0
-
-local function hudFuelText()
-    local pg  = lp:FindFirstChild('PlayerGui')
-    local mg  = pg and pg:FindFirstChild('MainGui')
-    local hud = mg and mg:FindFirstChild('HUD')
-    local veh = hud and hud:FindFirstChild('Vehicle')
-    local dp  = veh and veh:FindFirstChild('DrivePanel')
-    local fu  = dp and dp:FindFirstChild('Fuel')
-    local st  = fu and fu:FindFirstChild('Status')
-    return st and st.Text or 'no hud'
+local function scanModel(m, out)
+    local hum  = m:FindFirstChildOfClass('Humanoid')
+    local root = m:FindFirstChild('HumanoidRootPart')
+    if hum and root then
+        out[#out + 1] = { root = root, hum = hum }
+    end
 end
 
-local function scan()
-    if scanning then return end
-    scanning = true
-    lastScan = tick()
-    print('[' .. NAME .. '] scanning, this takes 10-20s')
-
-    local keys = {}
-    for _, k in ipairs(WEAPON_KEYS) do keys[#keys + 1] = k end
-    for _, k in ipairs(FUEL_KEYS)    do keys[#keys + 1] = k end
-
-    local ok, res = pcall(getgc, keys)
-    if ok and type(res) == 'table' then
-        local out = {}
-        for _, e in ipairs(res) do
-            if e.type == 'number' and WANT[e.key] then
-                out[#out + 1] = e
-            end
-        end
-        cache = out
-        print('[' .. NAME .. '] scan done: ' .. #out .. ' keys, hud=' .. hudFuelText())
-    else
-        print('[' .. NAME .. '] scan failed: ' .. tostring(res))
+local function collect()
+    local names = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        names[p.Name] = true
     end
 
-    scanning = false
+    local out = {}
+    for _, m in ipairs(ws:GetChildren()) do
+        if not names[m.Name] then
+            local hum = m:FindFirstChildOfClass('Humanoid')
+            if hum then
+                scanModel(m, out)
+            else
+                for _, c in ipairs(m:GetChildren()) do
+                    if not names[c.Name] then scanModel(c, out) end
+                end
+            end
+        end
+    end
+
+    targets  = out
+    nTargets = #out
 end
 
-local function needsScan()
-    return not cache and not scanning and (tick() - lastScan) > 15
+-- freeze pass: 5 Hz, writes only -------------------------------------
+
+local function freeze()
+    for _, t in ipairs(targets) do
+        pcall(function()
+            t.hum.WalkToPoint          = t.root.Position
+            t.root.Velocity            = ZERO
+            t.root.AssemblyLinearVelocity = ZERO
+        end)
+    end
 end
 
-local function write(key, value)
-    if not cache then return end
-    pcall(applygc, cache, key, value)
-end
-
--- apply loop ---------------------------------------------------------
+-- loops ---------------------------------------------------------------
 
 task.spawn(function()
     while alive do
-        if (cfg.fuel or cfg.rapid or cfg.range) and needsScan() then
-            scan()
+        if frozen then
+            collect()
+        else
+            targets, nTargets = {}, 0
         end
-
-        if cache then
-            if cfg.fuel then
-                write('Fuel', cfg.fuelVal)
-                write('CurrentFuel', cfg.fuelVal)
-                write('FuelCapacity', cfg.fuelVal)
-                write('MaxFuel', cfg.fuelVal)
-                write('FuelDrain', 0)
-            end
-            if cfg.rapid then
-                write('FireRate', cfg.rateVal)
-                write('FireDelay', 0)
-                write('Cooldown', 0)
-                write('FireInterval', cfg.rateVal)
-            end
-            if cfg.range then
-                write('Range', cfg.rangeVal)
-                write('MaxRange', cfg.rangeVal)
-                write('BulletRange', cfg.rangeVal)
-            end
-        end
-
         task.wait(0.5)
     end
 end)
 
--- menu ---------------------------------------------------------------
+task.spawn(function()
+    while alive do
+        if frozen and nTargets > 0 then
+            freeze()
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- menu ----------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -146,14 +113,6 @@ local function firstBool(...)
     for i = 1, select('#', ...) do
         local v = select(i, ...)
         if type(v) == 'boolean' then return v end
-    end
-    return nil
-end
-
-local function firstNumber(...)
-    for i = 1, select('#', ...) do
-        local v = select(i, ...)
-        if type(v) == 'number' then return v end
     end
     return nil
 end
@@ -187,56 +146,17 @@ local function mkToggle(sec, label, id, default, fn)
     return false
 end
 
-local function mkSlider(sec, label, id, min, max, default, fn)
-    local cb = function(...)
-        local v = firstNumber(...)
-        if v ~= nil then fn(v) end
-    end
-    local tries = {
-        function() sec:SliderInt(label, id, min, max, default, cb) end,
-        function() sec:SliderInt(id, label, min, max, default, cb) end,
-        function() sec:SliderInt(label, min, max, default, cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    warn('[' .. NAME .. '] slider failed: ' .. label)
-    return false
-end
-
 local function buildTab(tab)
     if built then return end
     built = true
 
     local ok, err = pcall(function()
-        local fuel = mkSection(tab, 'Fuel')
-        if fuel then
-            mkToggle(fuel, 'Inf Fuel', 'mm_fuel', false, function(v)
-                cfg.fuel = v
-                print('[' .. NAME .. '] inf fuel = ' .. tostring(v) .. ' hud=' .. hudFuelText())
-            end)
-            mkSlider(fuel, 'Fuel Value', 'mm_fuelval', 100, 100000, 9999, function(v)
-                cfg.fuelVal = v
-            end)
-        end
-
-        local gun = mkSection(tab, 'Weapon')
-        if gun then
-            mkToggle(gun, 'Rapid Fire', 'mm_rapid', false, function(v)
-                cfg.rapid = v
-                print('[' .. NAME .. '] rapid fire = ' .. tostring(v))
-            end)
-            mkSlider(gun, 'Fire Rate', 'mm_rate', 1, 100, 2, function(v)
-                cfg.rateVal = v / 100
-            end)
-            mkToggle(gun, 'Gun Range', 'mm_range', false, function(v)
-                cfg.range = v
-                print('[' .. NAME .. '] gun range = ' .. tostring(v))
-            end)
-            mkSlider(gun, 'Range Value', 'mm_rangeval', 100, 10000, 2000, function(v)
-                cfg.rangeVal = v
-            end)
-        end
+        local sec = mkSection(tab, 'Enemies')
+        if not sec then return end
+        mkToggle(sec, 'Freeze Enemies', 'mm_freeze', false, function(v)
+            frozen = v
+            print('[' .. NAME .. '] freeze = ' .. tostring(v) .. ' targets=' .. nTargets)
+        end)
     end)
 
     if not ok then
@@ -263,8 +183,9 @@ end
 -- stop ----------------------------------------------------------------
 
 local function stop()
-    alive = false
-    cfg.fuel, cfg.rapid, cfg.range = false, false, false
+    alive  = false
+    frozen = false
+    targets, nTargets = {}, 0
     if HAS_UI then
         pcall(function() UI.RemoveTab('Mods') end)
     end
@@ -272,5 +193,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, scan = scan, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - Mods tab')
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - Mods tab, Freeze Enemies')
