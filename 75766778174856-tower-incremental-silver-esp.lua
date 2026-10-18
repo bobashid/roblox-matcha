@@ -1,19 +1,19 @@
 -- Tower Incremental - Mine ESP + Ore Aura
 -- place 75766778174856
--- v8: everything is a menu toggle (no keybinds). Per-ore ESP toggles.
---     The aura only mines ore types whose ESP is on.
---     Aura now holds on a block (repeated fires over the progress window)
---     instead of one shot, matching what the game's own hold-to-mine does.
+-- v9: aura sends the Cell attribute number, which is what MineClient actually
+--     queues and fires. v8 sent the block instance, which the server ignored.
+--     Everything is a menu toggle, no keybinds.
 --
--- CONFIRMED from decompiling ReplicatedStorage.Client.MineClient:
---   Remotes.MineBlock:FireServer(block), block = top-level child of
---   workspace.Mine.MineBlocks (Stone Part or Silver/Iron Ore Model).
---   Mining is gated by MineConfig.REACH and a hold-to-mine progress bar.
+-- From decompiling ReplicatedStorage.Client.MineClient:
+--   local cell = block:GetAttribute("Cell")
+--   table.insert(queue, cell)
+--   ... Remotes.MineBlock:FireServer(cell)
+--   Pick range: ore 30 above / 22 level, stone 24 above / 18 level.
 --
 -- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v8'
+local VERSION = 'v9'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -32,17 +32,13 @@ local running = true
 local conns   = {}
 local built   = false
 
--- cfg ---------------------------------------------------------------
-
 local cfg = {
     enabled    = true,
 
-    -- per-type ESP
     espSilver  = true,
     espIron    = true,
     espStone   = false,
 
-    -- shared ESP look
     showNames  = true,
     nameNear   = 6,
     maxDist    = 500,
@@ -54,18 +50,13 @@ local cfg = {
     iron       = Color3.fromRGB(215, 150, 110),
     stone      = Color3.fromRGB(150, 160, 175),
 
-    -- aura
     aura       = false,
     dryRun     = true,
-    auraRadius = 20,
+    auraRadius = 22,
     auraMs     = 120,
     holdSec    = 1.2,
     retrySec   = 5,
 }
-
--- per-type helpers --------------------------------------------------
-
-local TYPES = { 'Silver', 'Iron', 'Stone' }
 
 local function espOn(kind)
     if kind == 'Silver' then return cfg.espSilver end
@@ -79,8 +70,6 @@ local function colorFor(kind)
     if kind == 'Stone' then return cfg.stone end
     return cfg.silver
 end
-
--- drawing pool ------------------------------------------------------
 
 local POOL = 64
 local EDGES = {
@@ -159,8 +148,8 @@ task.spawn(function()
                         size   = boxPart.Size,
                         dist   = d,
                         kind   = kind,
-                        box    = boxPart,
                         top    = m,
+                        cell   = m:GetAttribute('Cell'),
                     }
                 end
             end
@@ -287,19 +276,11 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- aura ---------------------------------------------------------------
--- Holds on one block: fires it repeatedly for holdSec, then moves on.
--- Only blocks whose ESP toggle is on are considered.
+-- aura: fires the Cell number, not the instance ---------------------
 
 local recent  = {}
-local holding = nil      -- { top, addr, kind, started, lastFire }
+local holding = nil
 local statOK, statFail, statFire = 0, 0, 0
-
-local function addrOf(inst)
-    local ok, a = pcall(function() return inst.Address end)
-    if ok and type(a) == 'number' then return a end
-    return nil
-end
 
 task.spawn(function()
     while running do
@@ -319,32 +300,29 @@ task.spawn(function()
                 if not root then
                     holding = nil
                 else
-                    -- drop the hold if the block is gone
                     if holding and (not holding.top or holding.top.Parent == nil) then
                         statOK = statOK + 1
                         print('[aura] OK ' .. holding.kind .. ' (ok=' .. statOK .. ' fail=' .. statFail .. ')')
                         holding = nil
                     end
 
-                    -- give up if the hold window expired with no result
                     if holding and now - holding.started > cfg.holdSec + 0.8 then
                         statFail = statFail + 1
-                        print('[aura] NO EFFECT ' .. holding.kind .. ' (ok=' .. statOK .. ' fail=' .. statFail .. ')')
-                        recent[holding.addr] = now
+                        print('[aura] NO EFFECT ' .. holding.kind .. ' cell=' .. tostring(holding.cell))
+                        recent[holding.key] = now
                         holding = nil
                     end
 
-                    -- start a new hold if idle
                     if not holding then
                         local best, bestD = nil, nil
                         local list = targets
                         for i = 1, #list do
                             local t = list[i]
                             if t.top and t.top.Parent and espOn(t.kind) then
-                                local d = (t.cframe.Position - root.Position).Magnitude
-                                if d <= cfg.auraRadius then
-                                    local a = addrOf(t.top)
-                                    if a and not recent[a] then
+                                local cell = t.cell
+                                if type(cell) == 'number' then
+                                    local d = (t.cframe.Position - root.Position).Magnitude
+                                    if d <= cfg.auraRadius and not recent[cell] then
                                         if not bestD or d < bestD then
                                             best, bestD = t, d
                                         end
@@ -353,28 +331,26 @@ task.spawn(function()
                             end
                         end
                         if best then
-                            local a = addrOf(best.top)
                             holding = {
                                 top = best.top,
-                                addr = a or 0,
+                                key = best.cell,
+                                cell = best.cell,
                                 kind = best.kind,
                                 started = now,
                                 lastFire = 0,
-                                dist = bestD,
                             }
                             if cfg.dryRun then
-                                print(string.format('[aura] dry %s %.1fm -> %s',
-                                    best.kind, bestD, best.top.ClassName))
+                                print(string.format('[aura] dry %s %.1fm cell=%d',
+                                    best.kind, bestD, best.cell))
                             end
                         end
                     end
 
-                    -- fire repeatedly at the held block
                     if holding and not cfg.dryRun then
                         if now - holding.lastFire >= (cfg.auraMs / 1000) then
                             holding.lastFire = now
                             local ok, err = pcall(function()
-                                mineEvt:FireServer(holding.top)
+                                mineEvt:FireServer(holding.cell)
                             end)
                             if ok then
                                 statFire = statFire + 1
@@ -481,7 +457,6 @@ local function buildTab(tab)
     if built then return end
     built = true
 
-    -- 1. master + ore types
     local sec = mkSection(tab, 'Mine ESP')
     if sec then
         mkToggle(sec, 'ESP Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
@@ -490,7 +465,6 @@ local function buildTab(tab)
         mkToggle(sec, 'Stone Blocks', 'ti_esp_stone', cfg.espStone, function(v) cfg.espStone = v end)
     end
 
-    -- 2. look
     local look = mkSection(tab, 'ESP Style')
     if look then
         mkToggle(look, 'Show Names', 'ti_label', cfg.showNames, function(v) cfg.showNames = v end)
@@ -505,7 +479,6 @@ local function buildTab(tab)
         pcall(function() look:ColorPicker('Stone Color', cfg.stone.R, cfg.stone.G, cfg.stone.B, 1) end)
     end
 
-    -- 3. aura
     local au = mkSection(tab, 'Ore Aura')
     if au then
         mkToggle(au, 'Aura Enabled', 'ti_aura', cfg.aura, function(v) cfg.aura = v end)
@@ -539,8 +512,6 @@ if HAS_UI then
     end
 end
 
--- color polling -------------------------------------------------------
-
 task.spawn(function()
     local lastS, lastI, lastT = cfg.silver, cfg.iron, cfg.stone
     while running do
@@ -561,8 +532,6 @@ task.spawn(function()
         end
     end
 end)
-
--- stop ----------------------------------------------------------------
 
 local function stop()
     running = false
