@@ -1,11 +1,17 @@
--- Dogs (place 94009908234110) - Weapon Mods + Inf Stamina - Matcha LuauVM - v1
+-- Weapon Mods + Inf Stamina + Inf Fuel - Matcha LuauVM - v2
 -- one Matcha menu tab: Mods (toggles + sliders, no keybinds)
 -- no Instance.new, no hooks, no getconnections.
 -- getgc on this build costs 10-20s: it runs ONCE in the background and
 -- again only when you press Rescan. Never inside a loop.
+--
+-- NOTE on Inf Fuel: probed place 105011592530400 (Build and Kill Zombies) and
+-- found no client-visible fuel value - no Instance named Fuel, and getgc('Fuel')
+-- returned booleans/strings plus four unrelated numbers. The toggle is wired to
+-- a candidate key list and only does something if the game really holds one.
+-- Drive or refuel, then press Rescan and check the print line.
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v1'
+local VERSION = 'v2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -18,6 +24,7 @@ local cache    = nil
 local scanning = false
 local nWeapon  = 0
 local nStam    = 0
+local nFuel    = 0
 
 local cfg = {
     infammo  = false,
@@ -26,9 +33,11 @@ local cfg = {
     rapid    = false,
     nospread = false,
     stamina  = false,
+    fuel     = false,
     dmgVal   = 100,
     rateVal  = 0.02,
     stamVal  = 100,
+    fuelVal  = 100,
 }
 
 local WEAPON_KEYS = {
@@ -40,6 +49,16 @@ local WEAPON_KEYS = {
 local STAMINA_KEYS = {
     'Stamina', 'CurrentStamina', 'MaxStamina', 'StaminaValue', 'Energy',
 }
+
+local FUEL_KEYS = {
+    'Fuel', 'CurrentFuel', 'FuelLevel', 'FuelAmount', 'FuelValue',
+    'MaxFuel', 'FuelCapacity', 'Gas', 'Gasoline', 'Petrol', 'Tank',
+}
+
+-- stamina + fuel in ONE getgc call: a scan is the expensive part, not the keys.
+local RESOURCE_KEYS = {}
+for _, k in ipairs(STAMINA_KEYS) do RESOURCE_KEYS[#RESOURCE_KEYS + 1] = k end
+for _, k in ipairs(FUEL_KEYS)    do RESOURCE_KEYS[#RESOURCE_KEYS + 1] = k end
 
 local APPLY = {
     infammo  = { Ammo = 999, Clip = 999, Magazine = 999, ReserveAmmo = 999, CurrentAmmo = 999 },
@@ -66,7 +85,7 @@ end
 local function scan()
     if scanning then return end
     scanning = true
-    nWeapon, nStam = 0, 0
+    nWeapon, nStam, nFuel = 0, 0, 0
 
     local ok, res = pcall(getgc, WEAPON_KEYS)
     if ok and type(res) == 'table' and #res > 0 then
@@ -74,18 +93,32 @@ local function scan()
         nWeapon = #res
     end
 
-    local ok2, res2 = pcall(getgc, STAMINA_KEYS)
+    local ok2, res2 = pcall(getgc, RESOURCE_KEYS)
     if ok2 and type(res2) == 'table' and #res2 > 0 then
         cache = cache or {}
+        local stamSet, fuelSet = {}, {}
+        for _, k in ipairs(STAMINA_KEYS) do stamSet[k] = true end
+        for _, k in ipairs(FUEL_KEYS)    do fuelSet[k] = true end
         for _, e in ipairs(res2) do
-            cache[#cache + 1] = e
+            -- only numeric entries are safe to write
+            if e.type == 'number' then
+                if stamSet[e.key] then
+                    cache[#cache + 1] = e
+                    nStam = nStam + 1
+                elseif fuelSet[e.key] then
+                    cache[#cache + 1] = e
+                    nFuel = nFuel + 1
+                end
+            end
         end
-        nStam = #res2
     end
 
-    print('[' .. NAME .. '] scan: weapon hits ' .. nWeapon .. ', stamina hits ' .. nStam)
+    print('[' .. NAME .. '] scan: weapon ' .. nWeapon .. ', stamina ' .. nStam .. ', fuel ' .. nFuel)
     if nStam == 0 then
         pcall(notify, 'Mods', 'no stamina keys - press Rescan while the bar drains', 3)
+    end
+    if nFuel == 0 then
+        pcall(notify, 'Mods', 'no fuel keys - press Rescan while fuel drains', 3)
     end
     scanning = false
 end
@@ -121,6 +154,11 @@ task.spawn(function()
             if cfg.stamina then
                 for _, k in ipairs(STAMINA_KEYS) do
                     pcall(applygc, cache, k, cfg.stamVal)
+                end
+            end
+            if cfg.fuel then
+                for _, k in ipairs(FUEL_KEYS) do
+                    pcall(applygc, cache, k, cfg.fuelVal)
                 end
             end
         end
@@ -222,16 +260,29 @@ local function buildTab(tab)
             mkToggle(gun, 'Rapid Fire', 'mm_rapid',    false, function(v) setBool('rapid', v) end)
             mkSlider(gun, 'Damage Value', 'mm_dmgval', 1, 1000, 100, function(v) setNum('dmgVal', v) end)
             mkSlider(gun, 'Fire Rate',    'mm_rate',   1, 100, 2,   function(v) setNum('rateVal', v / 100) end)
-            mkButton(gun, 'Rescan', function()
-                print('[' .. NAME .. '] rescan pressed')
-                task.spawn(scan)
-            end)
         end
 
         local stam = mkSection(tab, 'Stamina')
         if stam then
             mkToggle(stam, 'Inf Stamina', 'mm_stamina', false, function(v) setBool('stamina', v) end)
             mkSlider(stam, 'Stamina Value', 'mm_stamval', 100, 1000, 100, function(v) setNum('stamVal', v) end)
+        end
+
+        local fuel = mkSection(tab, 'Fuel')
+        if fuel then
+            mkToggle(fuel, 'Inf Fuel', 'mm_fuel', false, function(v) setBool('fuel', v) end)
+            mkSlider(fuel, 'Fuel Value', 'mm_fuelval', 100, 100000, 100, function(v) setNum('fuelVal', v) end)
+            mkButton(fuel, 'Rescan', function()
+                print('[' .. NAME .. '] rescan pressed')
+                task.spawn(scan)
+            end)
+        end
+
+        if gun then
+            mkButton(gun, 'Rescan', function()
+                print('[' .. NAME .. '] rescan pressed')
+                task.spawn(scan)
+            end)
         end
     end)
 
