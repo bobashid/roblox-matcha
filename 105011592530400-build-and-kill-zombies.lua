@@ -1,19 +1,24 @@
--- Build and Kill Zombies - Mods Menu - Matcha LuauVM - v3
+-- Build and Kill Zombies - Inf Fuel only - Matcha LuauVM - v4
 -- place 105011592530400
--- one Matcha menu tab: Mods (Weapon / Stamina / Fuel)
--- no Instance.new, no hooks, no getconnections.
--- getgc on this build takes 10-20s per scan: it runs in the background,
--- never inside the apply loop.
+-- one Matcha menu tab: Mods, one section: Fuel, one toggle.
+-- No getgc at load, no prescan, no cache, no weapon mods.
+-- Nothing runs until you flip the toggle.
 --
 -- Probed facts for this place:
 --   HUD %      PlayerGui.MainGui.HUD.Vehicle.DrivePanel.Fuel.Status.Text
 --   ride flag  LocalPlayer:GetAttribute('VehicleRideId')
---   gc keys    Fuel, FuelCapacity, FuelDrain (numeric; FuelDrain = 6 on one table)
---   absent     no Fuel instance, no fuel attribute, no *Fuel* RemoteEvent
--- Auto-rescan fires only while riding and only if the cache has no fuel keys.
+--   gc keys    numeric Fuel / FuelCapacity / FuelDrain exist (FuelDrain 6)
+--   absent     no Fuel instance, no fuel ValueObject in Workspace or
+--              ReplicatedStorage, no *Fuel* RemoteEvent
+--   decompile  VehicleController only writes ThrottleFloat/SteerFloat, no fuel code
+-- Fuel is likely server-owned, so treat this as best effort, not a guarantee.
+--
+-- How it works: setgc writes by key name, so no scan and no cache is needed.
+-- A pass is 6 short setgc calls. Passes are bounded and spaced apart because
+-- the cost of setgc on this build is unknown and could be as heavy as getgc.
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v3'
+local VERSION = 'v4'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -23,71 +28,18 @@ print('[' .. NAME .. '] ' .. VERSION)
 local Players = game:GetService('Players')
 local lp = Players.LocalPlayer
 
-local running  = true
-local built    = false
-local cache    = nil
-local scanning = false
-local nWeapon  = 0
-local nFuel    = 0
-local lastScan = 0
-local autoScan = 0
+local running = true
+local built   = false
+local busy    = false
 
 local cfg = {
-    infammo  = false,
-    norecoil = false,
-    damage   = false,
-    rapid    = false,
-    nospread = false,
-    stamina  = false,
-    fuel     = false,
-    drain    = false,
-    dmgVal   = 100,
-    rateVal  = 0.02,
-    stamVal  = 100,
-    fuelVal  = 1000,
+    fuel    = false,
+    fuelVal = 1000,
+    passes  = 3,
+    gap     = 2,
 }
 
-local WEAPON_KEYS = {
-    'Ammo', 'Clip', 'Magazine', 'ReserveAmmo', 'CurrentAmmo',
-    'Damage', 'BaseDamage', 'FireRate', 'FireDelay',
-    'Recoil', 'RecoilAmount', 'Spread', 'BulletSpread', 'Inaccuracy',
-}
-
-local STAMINA_KEYS = {
-    'Stamina', 'CurrentStamina', 'MaxStamina', 'StaminaValue', 'Energy',
-}
-
-local FUEL_KEYS = {
-    'Fuel', 'CurrentFuel', 'FuelLevel', 'FuelAmount', 'FuelValue',
-    'MaxFuel', 'FuelCapacity', 'FuelDrain', 'Gas', 'Gasoline', 'Tank',
-}
-
-local RESOURCE_KEYS = {}
-for _, k in ipairs(STAMINA_KEYS) do RESOURCE_KEYS[#RESOURCE_KEYS + 1] = k end
-for _, k in ipairs(FUEL_KEYS)    do RESOURCE_KEYS[#RESOURCE_KEYS + 1] = k end
-
-local FUEL_SET = {}
-for _, k in ipairs(FUEL_KEYS) do FUEL_SET[k] = true end
-
-local APPLY = {
-    infammo  = { Ammo = 999, Clip = 999, Magazine = 999, ReserveAmmo = 999, CurrentAmmo = 999 },
-    norecoil = { Recoil = 0, RecoilAmount = 0, CameraRecoil = 0, Kick = 0 },
-    nospread = { Spread = 0, BulletSpread = 0, Inaccuracy = 0, Sway = 0 },
-}
-
-local function setBool(key, v)
-    if cfg[key] ~= v then
-        cfg[key] = v
-        print('[' .. NAME .. '] ' .. key .. ' = ' .. tostring(v))
-    end
-end
-
-local function setNum(key, v)
-    if cfg[key] ~= v then
-        cfg[key] = v
-        print('[' .. NAME .. '] ' .. key .. ' = ' .. tostring(v))
-    end
-end
+local FUEL_KEYS = { 'Fuel', 'FuelLevel', 'FuelAmount', 'CurrentFuel' }
 
 local function hudFuelText()
     local pg  = lp:FindFirstChild('PlayerGui')
@@ -104,100 +56,30 @@ local function riding()
     return lp:GetAttribute('VehicleRideId') ~= nil
 end
 
--- scan ---------------------------------------------------------------
-
-local function scanKeys(keys)
-    local ok, res = pcall(getgc, keys)
-    if ok and type(res) == 'table' then return res end
-    return {}
+local function pass(n)
+    for _, k in ipairs(FUEL_KEYS) do
+        pcall(setgc, k, cfg.fuelVal)
+    end
+    pcall(setgc, 'MaxFuel', cfg.fuelVal)
+    pcall(setgc, 'FuelDrain', 0)
+    print('[' .. NAME .. '] pass ' .. n .. ' hud=' .. hudFuelText() ..
+          ' riding=' .. tostring(riding()))
 end
 
-local function scan()
-    if scanning then return end
-    scanning = true
-    lastScan = tick()
-    print('[' .. NAME .. '] scan started, this takes 10-20s')
-
-    local w = scanKeys(WEAPON_KEYS)
-    local r = scanKeys(RESOURCE_KEYS)
-
-    local out = {}
-    nWeapon, nFuel = 0, 0
-    for _, e in ipairs(w) do
-        out[#out + 1] = e
-        nWeapon = nWeapon + 1
+local function runPasses()
+    if busy then return end
+    busy = true
+    for i = 1, cfg.passes do
+        if not running or not cfg.fuel then break end
+        pass(i)
+        task.wait(cfg.gap)
     end
-    for _, e in ipairs(r) do
-        if e.type == 'number' then
-            out[#out + 1] = e
-            if FUEL_SET[e.key] then nFuel = nFuel + 1 end
-        end
+    busy = false
+    print('[' .. NAME .. '] done, hud=' .. hudFuelText())
+    if not riding() then
+        pcall(notify, 'Mods', 'fuel write sent - sit in a vehicle to check the HUD', 4)
     end
-
-    cache = out
-    print('[' .. NAME .. '] scan done: weapon ' .. nWeapon ..
-          ', fuel ' .. nFuel .. ', hud ' .. hudFuelText() ..
-          ', riding ' .. tostring(riding()))
-    if nFuel == 0 then
-        pcall(notify, 'Mods', 'no fuel keys yet - sit in a vehicle and press Rescan', 3)
-    end
-    scanning = false
 end
-
--- apply loop ---------------------------------------------------------
-
-task.spawn(function()
-    while running do
-        if cache then
-            if cfg.infammo then
-                for k, v in pairs(APPLY.infammo) do
-                    pcall(applygc, cache, k, v)
-                end
-            end
-            if cfg.norecoil then
-                for k, v in pairs(APPLY.norecoil) do
-                    pcall(applygc, cache, k, v)
-                end
-            end
-            if cfg.nospread then
-                for k, v in pairs(APPLY.nospread) do
-                    pcall(applygc, cache, k, v)
-                end
-            end
-            if cfg.damage then
-                pcall(applygc, cache, 'Damage', cfg.dmgVal)
-                pcall(applygc, cache, 'BaseDamage', cfg.dmgVal)
-            end
-            if cfg.rapid then
-                pcall(applygc, cache, 'FireRate', cfg.rateVal)
-                pcall(applygc, cache, 'FireDelay', 0)
-            end
-            if cfg.stamina then
-                for _, k in ipairs(STAMINA_KEYS) do
-                    pcall(applygc, cache, k, cfg.stamVal)
-                end
-            end
-            if cfg.drain then
-                pcall(applygc, cache, 'FuelDrain', 0)
-            end
-            if cfg.fuel then
-                pcall(applygc, cache, 'Fuel', cfg.fuelVal)
-                pcall(applygc, cache, 'CurrentFuel', cfg.fuelVal)
-                pcall(applygc, cache, 'FuelCapacity', cfg.fuelVal)
-            end
-        end
-
-        -- one lazy rescan when riding with an empty fuel cache, max 3 times
-        if cfg.fuel and nFuel == 0 and not scanning and autoScan < 3
-           and (tick() - lastScan) > 20 and riding() then
-            autoScan = autoScan + 1
-            print('[' .. NAME .. '] auto rescan ' .. autoScan .. ' (riding, no fuel keys cached)')
-            task.spawn(scan)
-        end
-
-        task.wait(0.25)
-    end
-end)
 
 -- menu ---------------------------------------------------------------
 -- tab:Section(name, 'Left') returns a usable handle, plain name does not.
@@ -279,44 +161,26 @@ local function buildTab(tab)
     built = true
 
     local ok, err = pcall(function()
-        local gun = mkSection(tab, 'Weapon')
-        if gun then
-            mkToggle(gun, 'Inf Ammo',   'mm_infammo',  false, function(v) setBool('infammo', v) end)
-            mkToggle(gun, 'No Recoil',  'mm_norecoil', false, function(v) setBool('norecoil', v) end)
-            mkToggle(gun, 'No Spread',  'mm_nospread', false, function(v) setBool('nospread', v) end)
-            mkToggle(gun, 'Damage Mod', 'mm_damage',   false, function(v) setBool('damage', v) end)
-            mkToggle(gun, 'Rapid Fire', 'mm_rapid',    false, function(v) setBool('rapid', v) end)
-            mkSlider(gun, 'Damage Value', 'mm_dmgval', 1, 1000, 100, function(v) setNum('dmgVal', v) end)
-            mkSlider(gun, 'Fire Rate',    'mm_rate',   1, 100, 2,   function(v) setNum('rateVal', v / 100) end)
-            mkButton(gun, 'Rescan', function()
-                print('[' .. NAME .. '] rescan pressed')
-                task.spawn(scan)
-            end)
-        end
-
-        local stam = mkSection(tab, 'Stamina')
-        if stam then
-            mkToggle(stam, 'Inf Stamina', 'mm_stamina', false, function(v) setBool('stamina', v) end)
-            mkSlider(stam, 'Stamina Value', 'mm_stamval', 100, 1000, 100, function(v) setNum('stamVal', v) end)
-        end
-
         local fuel = mkSection(tab, 'Fuel')
-        if fuel then
-            mkToggle(fuel, 'Inf Fuel', 'mm_fuel', false, function(v)
-                setBool('fuel', v)
-                print('[' .. NAME .. '] fuel=' .. tostring(v) ..
-                      ' cache=' .. tostring(cache and #cache or 0) ..
-                      ' fuelKeys=' .. nFuel ..
-                      ' hud=' .. hudFuelText() ..
-                      ' riding=' .. tostring(riding()))
-            end)
-            mkSlider(fuel, 'Fuel Value', 'mm_fuelval', 100, 100000, 1000, function(v) setNum('fuelVal', v) end)
-            mkToggle(fuel, 'Stop Drain', 'mm_drain', false, function(v) setBool('drain', v) end)
-            mkButton(fuel, 'Rescan', function()
-                print('[' .. NAME .. '] rescan pressed, hud=' .. hudFuelText() .. ', riding=' .. tostring(riding()))
-                task.spawn(scan)
-            end)
-        end
+        if not fuel then return end
+
+        mkToggle(fuel, 'Inf Fuel', 'mm_fuel', false, function(v)
+            cfg.fuel = v
+            print('[' .. NAME .. '] inf fuel = ' .. tostring(v) ..
+                  ' hud=' .. hudFuelText() .. ' riding=' .. tostring(riding()))
+            if v then task.spawn(runPasses) end
+        end)
+
+        mkSlider(fuel, 'Fuel Value', 'mm_fuelval', 100, 100000, 1000, function(v)
+            cfg.fuelVal = v
+            print('[' .. NAME .. '] fuel value = ' .. tostring(v))
+        end)
+
+        mkButton(fuel, 'Reapply', function()
+            print('[' .. NAME .. '] reapply, hud=' .. hudFuelText() ..
+                  ' riding=' .. tostring(riding()))
+            task.spawn(runPasses)
+        end)
     end)
 
     if not ok then
@@ -341,12 +205,11 @@ else
     warn('[' .. NAME .. '] no UI table - menu unavailable')
 end
 
--- boot ---------------------------------------------------------------
-
-task.spawn(scan)
+-- stop ----------------------------------------------------------------
 
 local function stop()
     running = false
+    cfg.fuel = false
     if HAS_UI then
         pcall(function() UI.RemoveTab('Mods') end)
     end
@@ -354,5 +217,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, rescan = scan, version = VERSION }
+_G[NAME] = { stop = stop, reapply = runPasses, version = VERSION }
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - open the Mods tab, Fuel section')
