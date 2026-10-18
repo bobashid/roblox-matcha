@@ -1,8 +1,11 @@
 -- Tower Incremental - Mine ESP + Ore Aura
 -- place 75766778174856
--- v9: aura sends the Cell attribute number, which is what MineClient actually
---     queues and fires. v8 sent the block instance, which the server ignored.
---     Everything is a menu toggle, no keybinds.
+-- v10: aura is ON and Dry Run is OFF by default, so loading the script starts
+--      mining immediately. Menu toggles still there if you want to change it.
+--
+-- Confirmed working call (user verified in game):
+--   game.ReplicatedStorage.Remotes.MineBlock:FireServer(74)
+--   i.e. the argument is the block's Cell attribute NUMBER, not the instance.
 --
 -- From decompiling ReplicatedStorage.Client.MineClient:
 --   local cell = block:GetAttribute("Cell")
@@ -13,7 +16,7 @@
 -- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v9'
+local VERSION = 'v10'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -50,12 +53,13 @@ local cfg = {
     iron       = Color3.fromRGB(215, 150, 110),
     stone      = Color3.fromRGB(150, 160, 175),
 
-    aura       = false,
-    dryRun     = true,
-    auraRadius = 22,
-    auraMs     = 120,
-    holdSec    = 1.2,
-    retrySec   = 5,
+    -- aura: on and actually firing by default
+    aura       = true,
+    dryRun     = false,
+    auraRadius = 24,
+    auraMs     = 100,
+    holdSec    = 0.6,
+    retrySec   = 4,
 }
 
 local function espOn(kind)
@@ -276,11 +280,17 @@ track(RunService.RenderStepped:Connect(function()
     end
 end))
 
--- aura: fires the Cell number, not the instance ---------------------
+-- aura: fires the Cell number ----------------------------------------
 
 local recent  = {}
 local holding = nil
 local statOK, statFail, statFire = 0, 0, 0
+
+local function cellOf(inst)
+    local ok, v = pcall(function() return inst:GetAttribute('Cell') end)
+    if ok and type(v) == 'number' then return v end
+    return nil
+end
 
 task.spawn(function()
     while running do
@@ -302,13 +312,11 @@ task.spawn(function()
                 else
                     if holding and (not holding.top or holding.top.Parent == nil) then
                         statOK = statOK + 1
-                        print('[aura] OK ' .. holding.kind .. ' (ok=' .. statOK .. ' fail=' .. statFail .. ')')
                         holding = nil
                     end
 
-                    if holding and now - holding.started > cfg.holdSec + 0.8 then
+                    if holding and now - holding.started > cfg.holdSec + 1.2 then
                         statFail = statFail + 1
-                        print('[aura] NO EFFECT ' .. holding.kind .. ' cell=' .. tostring(holding.cell))
                         recent[holding.key] = now
                         holding = nil
                     end
@@ -320,11 +328,13 @@ task.spawn(function()
                             local t = list[i]
                             if t.top and t.top.Parent and espOn(t.kind) then
                                 local cell = t.cell
+                                if cell == nil then cell = cellOf(t.top) end
                                 if type(cell) == 'number' then
                                     local d = (t.cframe.Position - root.Position).Magnitude
                                     if d <= cfg.auraRadius and not recent[cell] then
                                         if not bestD or d < bestD then
                                             best, bestD = t, d
+                                            best.cell = cell
                                         end
                                     end
                                 end
@@ -349,14 +359,17 @@ task.spawn(function()
                     if holding and not cfg.dryRun then
                         if now - holding.lastFire >= (cfg.auraMs / 1000) then
                             holding.lastFire = now
+                            local cell = holding.cell
                             local ok, err = pcall(function()
-                                mineEvt:FireServer(holding.cell)
+                                mineEvt:FireServer(cell)
                             end)
                             if ok then
                                 statFire = statFire + 1
+                                if statFire <= 5 then
+                                    print('[aura] fired cell=' .. tostring(cell) .. ' ' .. holding.kind)
+                                end
                             else
                                 print('[aura] fire error ' .. tostring(err))
-                                holding = nil
                             end
                         end
                     end
@@ -485,14 +498,14 @@ local function buildTab(tab)
         mkToggle(au, 'Dry Run (log only)', 'ti_dry', cfg.dryRun, function(v) cfg.dryRun = v end)
         mkSlider(au, 'Radius', 'ti_radius', 5, 120, cfg.auraRadius, function(v) cfg.auraRadius = v end)
         mkSlider(au, 'Fire Every ms', 'ti_aura_ms', 40, 500, cfg.auraMs, function(v) cfg.auraMs = v end)
-        mkSlider(au, 'Hold Seconds', 'ti_hold', 1, 10, math.floor(cfg.holdSec * 10), function(v)
+        mkSlider(au, 'Hold Seconds x10', 'ti_hold', 1, 30, math.floor(cfg.holdSec * 10), function(v)
             cfg.holdSec = v / 10
         end)
         mkSlider(au, 'Retry Seconds', 'ti_retry', 2, 20, cfg.retrySec, function(v) cfg.retrySec = v end)
         mkButton(au, 'Reset Recent Blocks', function()
             recent = {}
             holding = nil
-            print('[aura] recent + hold cleared')
+            print('[aura] reset')
         end)
         mkButton(au, 'Aura Stats', function()
             print('[aura] fired=' .. statFire .. ' ok=' .. statOK .. ' fail=' .. statFail)
@@ -551,10 +564,15 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ', MineBlock=' .. tostring(mineEvt ~= nil))
-print('[TI] no keybinds - use the Mine ESP tab')
+print('[TI] ' .. VERSION .. ' loaded, MineBlock=' .. tostring(mineEvt ~= nil) .. ', aura=' .. tostring(cfg.aura) .. ', dryRun=' .. tostring(cfg.dryRun))
+print('[TI] mining ore within ' .. cfg.auraRadius .. ' studs - Silver/Iron on, Stone off')
 
 task.spawn(function()
     task.wait(0.8)
-    if running then print('[TI] blocks tracked: ' .. #targets) end
+    if running then
+        print('[TI] blocks tracked: ' .. #targets)
+        local c = 0
+        for i = 1, #targets do if type(targets[i].cell) == 'number' then c = c + 1 end end
+        print('[TI] with Cell attr: ' .. c)
+    end
 end)
