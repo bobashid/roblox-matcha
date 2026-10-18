@@ -1,11 +1,10 @@
 -- Tower Incremental - Silver Ore ESP
 -- place 75766778174856
--- Draws a 3D block box around every SilverOre under workspace.Mine.MineBlocks.
--- Probe facts: 97 SilverOre Models, each with a 'Stone' Part (~10x10x10) and a 'Veins' union.
+-- v2: nearest-first, capped box count, distance fade, labels only on the closest few.
 -- Matcha LuauVM: no Instance.new, no hooks. All overlay goes through Drawing.
 
 local NAME    = 'TISilverESP'
-local VERSION = 'v1'
+local VERSION = 'v2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -22,11 +21,15 @@ local conns   = {}
 local built   = false
 
 local cfg = {
-    enabled  = true,
-    showName = true,
-    showDist = true,
-    maxDist  = 2000,
-    color    = Color3.fromRGB(220, 220, 235),
+    enabled   = true,
+    showLabel = true,
+    labelNear = 3,      -- labels only on the N closest ores
+    showDist  = true,
+    maxDist   = 400,
+    maxBoxes  = 40,
+    fade      = true,
+    thickness = 1,
+    color     = Color3.fromRGB(220, 220, 235),
 }
 
 local POOL    = 128
@@ -43,7 +46,7 @@ end
 for i = 1, POOL do
     local box = Drawing.new('Square')
     box.Filled = false
-    box.Thickness = 1
+    box.Thickness = cfg.thickness
     box.Color = cfg.color
     box.Visible = false
     local tag = Drawing.new('Text')
@@ -62,6 +65,12 @@ local function applyColor()
     end
 end
 
+local function applyThickness()
+    for i = 1, POOL do
+        pool[i].box.Thickness = cfg.thickness
+    end
+end
+
 local function hideAll()
     for i = 1, POOL do
         local e = pool[i]
@@ -73,13 +82,16 @@ local function hideAll()
     end
 end
 
--- collector: slow, does the tree lookups ------------------------------
+-- collector: slow, does the tree lookups, sorts nearest first ---------
 
 task.spawn(function()
     while running do
         local out = {}
         local mine = workspace:FindFirstChild('Mine')
         local blocks = mine and mine:FindFirstChild('MineBlocks')
+        local char = lp.Character
+        local root = char and char:FindFirstChild('HumanoidRootPart')
+        local origin = root and root.Position
         if blocks then
             local kids = blocks:GetChildren()
             for i = 1, #kids do
@@ -87,11 +99,15 @@ task.spawn(function()
                 if m.Name == 'SilverOre' then
                     local stone = m:FindFirstChild('Stone')
                     if stone then
-                        out[#out + 1] = { pos = stone.Position, size = stone.Size }
+                        local p = stone.Position
+                        local d = origin and (p - origin).Magnitude or 0
+                        out[#out + 1] = { pos = p, size = stone.Size, dist = d }
                     end
                 end
             end
         end
+        table.sort(out, function(a, b) return a.dist < b.dist end)
+        while #out > POOL do out[#out] = nil end
         targets = out
         task.wait(0.5)
     end
@@ -108,16 +124,18 @@ track(RunService.RenderStepped:Connect(function()
     local char   = lp.Character
     local root   = char and char:FindFirstChild('HumanoidRootPart')
     local origin = root and root.Position
-    local maxSq  = cfg.maxDist * cfg.maxDist
+    local maxD   = cfg.maxDist
+    local maxSq  = maxD * maxD
+    local cap    = math.min(cfg.maxBoxes, POOL)
     local list   = targets
     local n      = 0
 
     for i = 1, #list do
-        if n >= POOL then break end
+        if n >= cap then break end
         local t = list[i]
         local p = t.pos
         local s = t.size
-        local dist = origin and (p - origin).Magnitude or 0
+        local dist = origin and (p - origin).Magnitude or t.dist
         if not origin or dist * dist <= maxSq then
             local hx, hy, hz = s.X * 0.5, s.Y * 0.5, s.Z * 0.5
             local minX, minY, maxX, maxY, seen
@@ -144,12 +162,20 @@ track(RunService.RenderStepped:Connect(function()
                 local e = pool[n]
                 e.box.Position = Vector2.new(minX, minY)
                 e.box.Size = Vector2.new(maxX - minX, maxY - minY)
+                -- far ores fade out so the near ones read clearly
+                if cfg.fade and maxD > 0 then
+                    local f = dist / maxD
+                    if f > 1 then f = 1 end
+                    e.box.Transparency = 0.15 + 0.75 * f
+                else
+                    e.box.Transparency = 0
+                end
                 e.box.Visible = true
 
-                local parts = {}
-                if cfg.showName then parts[#parts + 1] = 'Silver' end
-                if cfg.showDist then parts[#parts + 1] = math.floor(dist) .. 'm' end
-                if #parts > 0 then
+                if cfg.showLabel and n <= cfg.labelNear then
+                    local parts = {}
+                    if cfg.showDist then parts[#parts + 1] = math.floor(dist) .. 'm' end
+                    parts[#parts + 1] = 'Silver'
                     e.tag.Text = table.concat(parts, ' ')
                     e.tag.Position = Vector2.new((minX + maxX) * 0.5, minY - 16)
                     e.tag.Visible = true
@@ -255,9 +281,16 @@ local function buildTab(tab)
     local sec = mkSection(tab, 'Silver ESP')
     if not sec then return end
     mkToggle(sec, 'Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
-    mkToggle(sec, 'Show Label', 'ti_name', cfg.showName, function(v) cfg.showName = v end)
+    mkSlider(sec, 'Max Distance', 'ti_maxdist', 50, 2000, cfg.maxDist, function(v) cfg.maxDist = v end)
+    mkSlider(sec, 'Max Boxes', 'ti_maxboxes', 5, 128, cfg.maxBoxes, function(v) cfg.maxBoxes = v end)
+    mkToggle(sec, 'Distance Fade', 'ti_fade', cfg.fade, function(v) cfg.fade = v end)
+    mkToggle(sec, 'Show Labels', 'ti_label', cfg.showLabel, function(v) cfg.showLabel = v end)
+    mkSlider(sec, 'Labels On Nearest', 'ti_labelnear', 0, 20, cfg.labelNear, function(v) cfg.labelNear = v end)
     mkToggle(sec, 'Show Distance', 'ti_dist', cfg.showDist, function(v) cfg.showDist = v end)
-    mkSlider(sec, 'Max Distance', 'ti_maxdist', 50, 5000, cfg.maxDist, function(v) cfg.maxDist = v end)
+    mkSlider(sec, 'Line Thickness', 'ti_thick', 1, 4, cfg.thickness, function(v)
+        cfg.thickness = v
+        applyThickness()
+    end)
     pcall(function()
         sec:ColorPicker('Box Color', cfg.color.R, cfg.color.G, cfg.color.B, 1)
     end)
@@ -298,6 +331,9 @@ track(UIS.InputBegan:Connect(function(input)
     if k == Enum.KeyCode.K then
         cfg.enabled = not cfg.enabled
         print('[TI] esp ' .. tostring(cfg.enabled))
+    elseif k == Enum.KeyCode.L then
+        cfg.showLabel = not cfg.showLabel
+        print('[TI] labels ' .. tostring(cfg.showLabel))
     end
 end))
 
@@ -318,7 +354,7 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - K toggles')
+print('[TI] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - K esp, L labels')
 
 task.spawn(function()
     task.wait(0.8)
