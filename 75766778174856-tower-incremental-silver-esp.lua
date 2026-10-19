@@ -1,12 +1,18 @@
 -- Tower Incremental - Auto Mine + ESP
 -- place 75766778174856
--- Toggle: F (one button in the menu cycles the key)
+-- Toggle: F (menu button cycles it)
 -- Matcha LuauVM: no Instance.new, no hooks
+--
+-- Hotkey fix: Matcha's InputBegan hands you a TABLE whose KeyCode is an
+-- INTEGER, not an EnumItem. Comparing it to Enum.KeyCode.F is always false,
+-- which is why the earlier bind never toggled. v20 matches the integer, the
+-- EnumItem, or the name, and also polls iskeypressed with edge detection so
+-- the toggle fires either way.
 --
 -- Auto Mine: walks to ore it cannot mine yet, mines everything it can.
 --   * nothing mineable in reach  -> walk to the nearest ore
 --   * ore in reach but blocked   -> still walk, which usually unblocks it
---   * stuck against geometry     -> skip that block for 15s and pick another
+--   * stuck against geometry     -> skip that block for 15s
 --
 -- First person: camera is turned onto the ore before the click and held there.
 -- Third person: cursor is moved onto the ore's screen position instead.
@@ -15,7 +21,7 @@
 --   ore 22 level / 30 above, stone 18 level / 24.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v19'
+local VERSION = 'v20'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
@@ -39,6 +45,7 @@ local REARM_SEC  = 15
 local WALK_RANGE = 140
 local STUCK_SEC  = 2.5
 local FP_NEAR    = 2.0
+local TOG_DEBOUNCE = 0.35
 
 -- config -------------------------------------------------------------
 
@@ -85,6 +92,35 @@ end
 
 local function keyLabel(k)
     return KEY_NAMES[k] or tostring(k):gsub('Enum.KeyCode.', '')
+end
+
+-- key match that survives Matcha handing us an integer -----------------
+
+local function keyMatches(k)
+    if k == nil then return false end
+    local want = curKey()
+    if k == want then return true end
+    local ok, v = pcall(function() return want.Value end)
+    if ok and type(v) == 'number' and k == v then return true end
+    if type(k) == 'number' then
+        local ok2, n = pcall(function() return want.Name end)
+        if ok2 and type(n) == 'string' then
+            local ok3, v2 = pcall(function()
+                local t = {}
+                for code, _ in pairs(KEY_NAMES) do
+                    local okc, cv = pcall(function() return code.Value end)
+                    if okc and cv == k then t[#t + 1] = code end
+                end
+                return t[1]
+            end)
+            if ok3 and v2 == want then return true end
+        end
+    end
+    local s = tostring(k)
+    if type(s) == 'string' and string.find(s, keyLabel(want), 1, true) then
+        return true
+    end
+    return false
 end
 
 local CONFIG_FILE = 'towerincremental.cfg'
@@ -158,6 +194,36 @@ local function reachFor(kind, above)
     local base = ore and 22 or 18
     local up   = ore and 30 or 24
     return above and up or base
+end
+
+-- state shared with the toggle ---------------------------------------
+
+local holding   = false
+local walking   = false
+local holdTgt   = nil
+local lastToggle = 0
+
+local function releaseMouse(restore)
+    if holding then
+        pcall(function() mouse1release() end)
+        holding = false
+    end
+end
+
+local function stopWalk()
+    walking = false
+end
+
+local function toggleAuto()
+    local now = tick()
+    if now - lastToggle < TOG_DEBOUNCE then return end
+    lastToggle = now
+    cfg.enabled = not cfg.enabled
+    if not cfg.enabled then
+        releaseMouse(true)
+        stopWalk()
+    end
+    log('auto mine ' .. (cfg.enabled and 'ON' or 'off'))
 end
 
 -- drawing pool -------------------------------------------------------
@@ -395,19 +461,37 @@ track(RunService.RenderStepped:Connect(function()
     hud.Visible = true
 end))
 
--- keybind ------------------------------------------------------------
+-- hotkey: poll iskeypressed with edge detection ----------------------
+
+task.spawn(function()
+    local wasDown = false
+    while running do
+        task.wait(0.05)
+        local ok, down = pcall(function() return iskeypressed(curKey()) end)
+        if ok and down == true then
+            if not wasDown then
+                wasDown = true
+                toggleAuto()
+            end
+        else
+            wasDown = false
+        end
+    end
+end)
+
+-- hotkey: InputBegan with a match that handles an integer KeyCode -----
 
 track(UIS.InputBegan:Connect(function(input)
-    local k = input and input.KeyCode
-    if not k then return end
-    if k == curKey() then
-        cfg.enabled = not cfg.enabled
-        if not cfg.enabled then
-            pcall(function() mouse1release() end)
-            holding = false
-            walking = false
-        end
-        log('auto mine ' .. (cfg.enabled and 'ON' or 'off'))
+    local k = nil
+    if type(input) == 'table' then
+        k = input.KeyCode
+    else
+        local ok, v = pcall(function() return input.KeyCode end)
+        if ok then k = v end
+    end
+    if k == nil then return end
+    if keyMatches(k) then
+        toggleAuto()
     end
 end))
 
@@ -441,12 +525,9 @@ local function clearShot(t)
 end
 
 local done      = {}
-local holding   = false
 local holdStart = 0
-local holdTgt   = nil
 local lastEnd   = 0
 local saveX, saveY = 0, 0
-local walking   = false
 local walkCell  = nil
 local walkPos   = nil
 local walkMove  = 0
@@ -465,29 +546,6 @@ local function cursorPos()
     return nil
 end
 
-local function releaseMouse(restore)
-    if holding then
-        pcall(function() mouse1release() end)
-        holding = false
-        if restore and not fpMode then
-            pcall(function() mousemoveabs(math.floor(saveX), math.floor(saveY)) end)
-        end
-    end
-end
-
-local function stopWalk(hum, root)
-    if walking and hum and root then
-        pcall(function() hum.WalkToPoint = root.Position end)
-    end
-    walking  = false
-    walkCell = nil
-end
-
-local function skipCell(cell)
-    if type(cell) == 'number' then done[cell] = tick() end
-end
-
--- closest ore we can actually mine right now
 local function pickTarget()
     local best, bestD
     local now = tick()
@@ -509,7 +567,6 @@ local function pickTarget()
     return best
 end
 
--- closest ore to walk toward when nothing is mineable
 local function pickWalkTarget()
     local best, bestD
     local now = tick()
@@ -531,7 +588,6 @@ local function pickWalkTarget()
     return best
 end
 
--- first person: hold the camera on the ore while the click is down
 track(RunService.RenderStepped:Connect(function()
     if not holding or not fpMode or not holdTgt then return end
     local cam = workspace.CurrentCamera
@@ -559,7 +615,7 @@ task.spawn(function()
         elseif not cfg.enabled then
             releaseMouse(true)
             holdTgt = nil
-            stopWalk(hum, root)
+            walking = false
         elseif holding then
             local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
             if gone or now - holdStart > HOLD_SEC then
@@ -576,7 +632,7 @@ task.spawn(function()
             if now - lastEnd >= GAP_SEC then best = pickTarget() end
 
             if best then
-                stopWalk(hum, root)
+                walking = false
                 if fpMode then
                     local cam = workspace.CurrentCamera
                     if cam then
@@ -596,7 +652,6 @@ task.spawn(function()
                 holdStart = now
                 holdTgt   = best
             else
-                -- nothing mineable: walk to the nearest ore
                 local near = pickWalkTarget()
                 if near then
                     pcall(function() hum.WalkToPoint = near.pos end)
@@ -612,14 +667,14 @@ task.spawn(function()
                             walkPos  = root.Position
                             walkMove = now
                         elseif now - walkMove > STUCK_SEC then
-                            skipCell(near.cell)
+                            if type(near.cell) == 'number' then done[near.cell] = now end
                             walkCell = nil
                             walkMove = now
                             log('skipped blocked block ' .. tostring(near.cell))
                         end
                     end
                 else
-                    stopWalk(hum, root)
+                    walking = false
                 end
             end
         end
@@ -674,8 +729,7 @@ if HAS_UI then
             mkToggle(sec, 'Auto Mine (walk + mine)', 'ti_enabled', cfg.enabled, function(v)
                 cfg.enabled = v
                 if not v then
-                    pcall(function() mouse1release() end)
-                    holding = false
+                    releaseMouse(true)
                     walking = false
                 end
             end)
@@ -720,6 +774,7 @@ end
 local function stop()
     running = false
     releaseMouse(true)
+    walking = false
     for i = 1, #conns do
         pcall(function() conns[i]:Disconnect() end)
     end
