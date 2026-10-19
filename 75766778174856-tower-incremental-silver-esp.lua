@@ -1,32 +1,25 @@
 -- Tower Incremental - Auto Mine + ESP
 -- place 75766778174856
--- Toggle: press Set Key, then press the key you want
 -- Matcha LuauVM: no Instance.new, no hooks
 --
--- Remap flow (what this file does):
---   click "Set Key (F)" in the menu  ->  it prints "press any key to bind..."
---   press any key  ->  that key is bound, saved to towerincremental.cfg
---   press the bound key in game  ->  Auto Mine flips on/off
+-- v22:
+--   * ESP transparency slider (0 = solid, 100 = invisible)
+--   * first person auto mine MOVES THE MOUSE onto the ore with mousemoverel,
+--     and only falls back to pointing the camera if the mouse does not
+--     converge within a few frames
+--   * walks to ore that is out of reach, mines whatever is in reach
+--   * Set Key binds the next key you press, saved to towerincremental.cfg
 --
--- Why earlier binds failed: Matcha's UserInputService.InputBegan hands you a
--- TABLE whose KeyCode is an INTEGER, not an EnumItem. Comparing it to
--- Enum.KeyCode.F is always false. v21 compares the integer against each
--- EnumItem's .Value, and also polls iskeypressed with both the enum and the
--- raw integer, so the toggle fires whichever path works.
---
--- Auto Mine: walks to ore it cannot mine yet, mines everything it can.
---   * nothing mineable in reach  -> walk to the nearest ore
---   * ore in reach but blocked   -> still walk, which usually unblocks it
---   * stuck against geometry     -> skip that block for 15s
---
--- First person: camera is turned onto the ore before the click and held there.
--- Third person: cursor is moved onto the ore's screen position instead.
+-- Why keybinds failed before v21: Matcha's UserInputService.InputBegan hands
+-- you a TABLE whose KeyCode is an INTEGER, not an EnumItem. Comparing it to
+-- Enum.KeyCode.F is always false. This matches the integer, the EnumItem and
+-- the name, and also polls iskeypressed with both forms.
 --
 -- Reach numbers are the game's own, from MineClient:
 --   ore 22 level / 30 above, stone 18 level / 24.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v21'
+local VERSION = 'v22'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
@@ -39,7 +32,7 @@ local lp = Players.LocalPlayer
 local running = true
 local conns   = {}
 
--- fixed numbers (no sliders) -----------------------------------------
+-- fixed numbers -------------------------------------------------------
 
 local MAX_DIST     = 600
 local MAX_BOXES    = 48
@@ -51,8 +44,19 @@ local WALK_RANGE   = 140
 local STUCK_SEC    = 2.5
 local FP_NEAR      = 2.0
 local TOG_DEBOUNCE = 0.35
+local AIM_TRIES    = 6
+local AIM_TOL      = 16
 
--- config -------------------------------------------------------------
+-- state (declared early, the renderer reads these) --------------------
+
+local holding    = false
+local walking    = false
+local holdTgt    = nil
+local lastToggle = 0
+local listening  = false
+local statusText = 'idle'
+
+-- config --------------------------------------------------------------
 
 local cfg = {
     enabled  = false,
@@ -60,8 +64,9 @@ local cfg = {
     iron     = true,
     stone    = false,
     names    = true,
-    keyCode  = Enum.KeyCode.F,   -- EnumItem, used for iskeypressed
-    keyVal   = nil,              -- integer value, used for InputBegan
+    trans    = 0.15,             -- 0 solid .. 1 invisible
+    keyCode  = Enum.KeyCode.F,
+    keyVal   = nil,
     keyName  = 'F',
 }
 
@@ -94,8 +99,6 @@ local function codeName(code)
     return s
 end
 
--- bind whatever the game handed us -----------------------------------
-
 local function bindKey(k)
     if k == nil then return false end
     local asNum = (type(k) == 'number') and k or codeValue(k)
@@ -115,7 +118,6 @@ local function bindKey(k)
             return true
         end
     end
-    -- outside the whitelist: bind the raw code, InputBegan only
     if asNum ~= nil then
         cfg.keyCode = nil
         cfg.keyVal  = asNum
@@ -145,7 +147,7 @@ local function keyIsDown()
     return false
 end
 
--- persistence --------------------------------------------------------
+-- persistence ---------------------------------------------------------
 
 local CONFIG_FILE = 'towerincremental.cfg'
 
@@ -157,6 +159,7 @@ local function saveCfg()
         'iron=' .. tostring(cfg.iron),
         'stone=' .. tostring(cfg.stone),
         'names=' .. tostring(cfg.names),
+        'trans=' .. tostring(cfg.trans),
     }
     pcall(function() writefile(CONFIG_FILE, table.concat(lines, '\n')) end)
 end
@@ -179,6 +182,9 @@ local function loadCfg()
             cfg.stone = v == 'true'
         elseif k == 'names' then
             cfg.names = v == 'true'
+        elseif k == 'trans' then
+            local n = tonumber(v)
+            if n then cfg.trans = math.clamp(n, 0, 1) end
         end
     end
     if wantName then
@@ -218,7 +224,7 @@ local function espOn(kind)
     return false
 end
 
--- colours ------------------------------------------------------------
+-- colours -------------------------------------------------------------
 
 local COL_SILVER = Color3.fromRGB(220, 225, 240)
 local COL_IRON   = Color3.fromRGB(215, 150, 110)
@@ -236,13 +242,6 @@ local function reachFor(kind, above)
     local up   = ore and 30 or 24
     return above and up or base
 end
-
--- shared state -------------------------------------------------------
-
-local holding    = false
-local walking    = false
-local holdTgt    = nil
-local lastToggle = 0
 
 local function releaseMouse()
     if holding then
@@ -263,7 +262,7 @@ local function toggleAuto()
     log('auto mine ' .. (cfg.enabled and 'ON' or 'off'))
 end
 
--- drawing pool -------------------------------------------------------
+-- drawing pool --------------------------------------------------------
 
 local POOL = 64
 local EDGES = {
@@ -315,7 +314,7 @@ local function hideAll()
     end
 end
 
--- first person -------------------------------------------------------
+-- first person --------------------------------------------------------
 
 local function firstPerson(char)
     local cam = workspace.CurrentCamera
@@ -328,7 +327,40 @@ local function firstPerson(char)
     return false
 end
 
--- collector ----------------------------------------------------------
+-- move the real mouse onto the ore; camera lookAt only as a fallback --
+
+local function aimFirstPerson(t)
+    local cam = workspace.CurrentCamera
+    if not cam then return false end
+    local vp = cam.ViewportSize
+    if not vp then return false end
+    local cx, cy = vp.X * 0.5, vp.Y * 0.5
+
+    for _ = 1, AIM_TRIES do
+        local sx, sy = t.sx, t.sy
+        if not sx or not sy then break end
+        local dx = sx - cx
+        local dy = sy - cy
+        if math.abs(dx) <= AIM_TOL and math.abs(dy) <= AIM_TOL then
+            return true
+        end
+        pcall(function()
+            mousemoverel(math.floor(dx * 0.85), math.floor(dy * 0.85))
+        end)
+        task.wait(0.04)
+    end
+
+    -- mouse did not converge (cursor locked, weird aspect): point the camera
+    if t.pos then
+        pcall(function()
+            cam.CFrame = CFrame.lookAt(cam.CFrame.Position, t.pos)
+        end)
+        task.wait(0.03)
+    end
+    return true
+end
+
+-- collector -----------------------------------------------------------
 
 task.spawn(function()
     while running do
@@ -380,7 +412,7 @@ task.spawn(function()
     end
 end)
 
--- renderer -----------------------------------------------------------
+-- renderer ------------------------------------------------------------
 
 track(RunService.RenderStepped:Connect(function()
     local char   = lp.Character
@@ -391,6 +423,7 @@ track(RunService.RenderStepped:Connect(function()
     local list   = targets
     local n      = 0
     local stamp  = tick()
+    local userTr = math.clamp(cfg.trans, 0, 1)
 
     for i = 1, #list do
         if n >= cap then break end
@@ -432,10 +465,13 @@ track(RunService.RenderStepped:Connect(function()
                 local e = pool[n]
                 local col = colorFor(t.kind)
 
+                -- distance fade, then the user's transparency on top
                 local f = dist / MAX_DIST
                 if f > 1 then f = 1 end
                 local tr = 0.1 + 0.65 * f
-                if not t.inReach then tr = tr + 0.45 end
+                if not t.inReach then tr = tr + 0.2 end
+                tr = tr + userTr * (1 - tr)
+                if tr > 1 then tr = 1 elseif tr < 0 then tr = 0 end
 
                 local th = math.floor(150 / math.max(dist, 40))
                 if th < 1 then th = 1 elseif th > 5 then th = 5 end
@@ -490,7 +526,7 @@ track(RunService.RenderStepped:Connect(function()
 
     local txt = string.format('auto %s [%s] | tracked %d | reach %d | %s',
         cfg.enabled and 'ON' or 'off', cfg.keyName, #targets, reachN,
-        listening and 'press a key' or (walking and 'walking' or (holding and 'mining' or 'idle')))
+        listening and 'press a key' or statusText)
     if hudLast ~= txt then
         hud.Text = txt
         hudLast = txt
@@ -499,9 +535,6 @@ track(RunService.RenderStepped:Connect(function()
 end))
 
 -- remap listener -----------------------------------------------------
--- Set Key sets listening=true, the next keypress binds and saves.
-
-local listening = false
 
 local function startListen()
     listening = true
@@ -511,11 +544,7 @@ end
 local function readKeyCode(input)
     if input == nil then return nil end
     if type(input) == 'table' then
-        local k = input.KeyCode
-        if k ~= nil then return k end
-        local ok, v = pcall(function() return input.KeyCode end)
-        if ok then return v end
-        return nil
+        return input.KeyCode
     end
     local ok, v = pcall(function() return input.KeyCode end)
     if ok and v ~= nil then return v end
@@ -542,8 +571,6 @@ track(UIS.InputBegan:Connect(function(input)
     end
 end))
 
--- poll fallback: fires even if InputBegan plumbing changes -----------
-
 task.spawn(function()
     local wasDown = false
     while running do
@@ -563,7 +590,7 @@ task.spawn(function()
     end
 end)
 
--- mining -------------------------------------------------------------
+-- mining --------------------------------------------------------------
 
 local rp = RaycastParams.new()
 rp.FilterType = Enum.RaycastFilterType.Exclude
@@ -656,15 +683,20 @@ local function pickWalkTarget()
     return best
 end
 
+-- first person: keep nudging the mouse so the ore stays under the crosshair
 track(RunService.RenderStepped:Connect(function()
     if not holding or not fpMode or not holdTgt then return end
     local cam = workspace.CurrentCamera
     if not cam then return end
-    local p = holdTgt.pos
-    if not p then return end
-    pcall(function()
-        cam.CFrame = CFrame.lookAt(cam.CFrame.Position, p)
-    end)
+    local vp = cam.ViewportSize
+    if not vp or not holdTgt.sx then return end
+    local dx = holdTgt.sx - vp.X * 0.5
+    local dy = holdTgt.sy - vp.Y * 0.5
+    if math.abs(dx) > AIM_TOL or math.abs(dy) > AIM_TOL then
+        pcall(function()
+            mousemoverel(math.floor(dx * 0.5), math.floor(dy * 0.5))
+        end)
+    end
 end))
 
 task.spawn(function()
@@ -680,11 +712,14 @@ task.spawn(function()
             releaseMouse()
             holdTgt = nil
             walking = false
+            statusText = 'no character'
         elseif not cfg.enabled then
             releaseMouse()
             holdTgt = nil
             walking = false
+            statusText = 'idle'
         elseif holding then
+            statusText = fpMode and 'mining (fp)' or 'mining'
             local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
             if gone or now - holdStart > HOLD_SEC then
                 releaseMouse()
@@ -702,28 +737,25 @@ task.spawn(function()
             if best then
                 walking = false
                 if fpMode then
-                    local cam = workspace.CurrentCamera
-                    if cam then
-                        pcall(function()
-                            cam.CFrame = CFrame.lookAt(cam.CFrame.Position, best.pos)
-                        end)
-                    end
-                    task.wait(0.03)
+                    aimFirstPerson(best)
+                    pcall(function() mouse1press() end)
                 else
                     local cx, cy = cursorPos()
                     if cx then saveX, saveY = cx, cy else saveX, saveY = best.sx, best.sy end
                     pcall(function() mousemoveabs(math.floor(best.sx), math.floor(best.sy)) end)
                     task.wait(0.05)
+                    pcall(function() mouse1press() end)
                 end
-                pcall(function() mouse1press() end)
                 holding   = true
                 holdStart = now
                 holdTgt   = best
+                statusText = fpMode and 'mining (fp)' or 'mining'
             else
                 local near = pickWalkTarget()
                 if near then
                     pcall(function() hum.WalkToPoint = near.pos end)
                     walking = true
+                    statusText = 'walking'
 
                     if walkCell ~= near.cell then
                         walkCell = near.cell
@@ -743,13 +775,14 @@ task.spawn(function()
                     end
                 else
                     walking = false
+                    statusText = 'no ore'
                 end
             end
         end
     end
 end)
 
--- menu ---------------------------------------------------------------
+-- menu ----------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -783,6 +816,26 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = nil
+        for i = 1, select('#', ...) do
+            local x = select(i, ...)
+            if type(x) == 'number' then v = x break end
+        end
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    return false
+end
+
 local function mkButton(sec, label, cb)
     if pcall(function() sec:Button(label, cb) end) then return true end
     if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
@@ -794,6 +847,7 @@ if HAS_UI then
         UI.AddTab('Mine', function(tab)
             local sec = mkSection(tab, 'Mine')
             if not sec then return end
+
             mkToggle(sec, 'Auto Mine (walk + mine)', 'ti_enabled', cfg.enabled, function(v)
                 cfg.enabled = v
                 if not v then
@@ -801,7 +855,15 @@ if HAS_UI then
                     walking = false
                 end
             end)
+
             mkButton(sec, 'Set Key (' .. cfg.keyName .. ')', startListen)
+
+            mkSlider(sec, 'ESP Transparency', 'ti_trans', 0, 100,
+                math.floor(cfg.trans * 100), function(v)
+                    cfg.trans = math.clamp(v / 100, 0, 1)
+                    saveCfg()
+                end)
+
             mkToggle(sec, 'Silver Ore', 'ti_silver', cfg.silver, function(v)
                 cfg.silver = v; saveCfg()
             end)
@@ -818,6 +880,7 @@ if HAS_UI then
                 log('mined=' .. minedN .. ' tracked=' .. #targets ..
                     ' reach=' .. reachN .. ' fp=' .. tostring(fpMode) ..
                     ' walking=' .. tostring(walking) ..
+                    ' trans=' .. string.format('%.2f', cfg.trans) ..
                     ' key=' .. cfg.keyName .. ' val=' .. tostring(cfg.keyVal))
             end)
             mkButton(sec, 'Clear Ignore List', function()
@@ -832,7 +895,7 @@ if HAS_UI then
     end
 end
 
--- stop ---------------------------------------------------------------
+-- stop ----------------------------------------------------------------
 
 local function stop()
     running = false
@@ -854,4 +917,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - key ' .. cfg.keyName .. '. Press Set Key in the menu to rebind.')
+log(VERSION .. ' loaded - key ' .. cfg.keyName .. ', trans ' ..
+    string.format('%.0f%%', cfg.trans * 100))
