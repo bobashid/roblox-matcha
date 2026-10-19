@@ -1,25 +1,22 @@
--- Tower Incremental - Mine ESP + Auto Mine
+-- Tower Incremental - Auto Mine + ESP
 -- place 75766778174856
--- v17: first person support, ONE Auto Mine toggle, ONE remappable key.
---      No sliders anywhere - every number is a fixed constant below.
+-- Toggle: F (remappable - press Set Key then any key)
+-- Matcha LuauVM: no Instance.new, no hooks
 --
--- First person: the game raycasts from the camera centre, so the camera is
--- turned onto the ore before the click (and held there while mining).
--- Third person: the cursor is moved onto the ore's screen position instead.
+-- Same shape as Chop A Forest: small cfg table, key whitelist, Set Key binds
+-- the next key you press, bind saved to a file so it survives a reload.
 --
--- Auto Mine walks to ore that is out of reach, mines what is in reach.
+-- Auto Mine: walks to ore that is out of reach, mines what is in reach.
+-- First person: camera is turned onto the ore before the click and held there.
+-- Third person: cursor is moved onto the ore's screen position instead.
 --
 -- Reach numbers are the game's own, from MineClient:
 --   ore 22 level / 30 above, stone 18 level / 24.
---
--- Matcha LuauVM: no Instance.new, no hooks. Overlay via Drawing only.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v17'
+local VERSION = 'v18'
 
-if _G[NAME] and _G[NAME].stop then
-    pcall(_G[NAME].stop)
-end
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
 local Players    = game:GetService('Players')
 local RunService = game:GetService('RunService')
@@ -29,48 +26,107 @@ local lp = Players.LocalPlayer
 
 local running = true
 local conns   = {}
-local built   = false
 
--- fixed values (no sliders) -----------------------------------------
+-- fixed numbers (no sliders) -----------------------------------------
 
 local MAX_DIST   = 600
 local MAX_BOXES  = 48
-local NAME_NEAR  = 8
-local THICKNESS  = 1
+local NAME_NEAR  = 6
 local HOLD_SEC   = 2.5
 local GAP_SEC    = 0.2
 local REARM_SEC  = 15
 local WALK_RANGE = 140
-local REACH_PAD  = 0
-local FP_NEAR    = 2.0   -- camera this close to the head means first person
+local FP_NEAR    = 2.0
 
-local KEY_LIST = {
-    Enum.KeyCode.F, Enum.KeyCode.G, Enum.KeyCode.H, Enum.KeyCode.J,
-    Enum.KeyCode.K, Enum.KeyCode.Q, Enum.KeyCode.E, Enum.KeyCode.R,
-    Enum.KeyCode.T, Enum.KeyCode.V, Enum.KeyCode.B, Enum.KeyCode.C,
-}
+-- config -------------------------------------------------------------
 
 local cfg = {
-    enabled   = true,
-    espSilver = true,
-    espIron   = true,
-    espStone  = false,
-    showNames = true,
-    showHud   = true,
-    autoMine  = false,
+    enabled  = false,
+    key      = Enum.KeyCode.F,
+    silver   = true,
+    iron     = true,
+    stone    = false,
+    names    = true,
 }
 
-local keyIdx = 1
-local function keyName()
-    return tostring(KEY_LIST[keyIdx]):gsub('Enum.KeyCode.', '')
+local KEY_NAMES = {
+    [Enum.KeyCode.RightShift] = 'Right Shift',
+    [Enum.KeyCode.LeftShift]  = 'Left Shift',
+    [Enum.KeyCode.F]          = 'F',
+    [Enum.KeyCode.G]          = 'G',
+    [Enum.KeyCode.H]          = 'H',
+    [Enum.KeyCode.J]          = 'J',
+    [Enum.KeyCode.K]          = 'K',
+    [Enum.KeyCode.E]          = 'E',
+    [Enum.KeyCode.Q]          = 'Q',
+    [Enum.KeyCode.R]          = 'R',
+    [Enum.KeyCode.T]          = 'T',
+    [Enum.KeyCode.V]          = 'V',
+    [Enum.KeyCode.B]          = 'B',
+    [Enum.KeyCode.C]          = 'C',
+    [Enum.KeyCode.X]          = 'X',
+    [Enum.KeyCode.Z]          = 'Z',
+}
+
+local function keyLabel(k)
+    return KEY_NAMES[k] or tostring(k):gsub('Enum.KeyCode.', '')
+end
+
+local CONFIG_FILE = 'towerincremental.cfg'
+
+local function saveCfg()
+    local lines = {
+        'key=' .. tostring(cfg.key):gsub('Enum.KeyCode.', ''),
+        'silver=' .. tostring(cfg.silver),
+        'iron=' .. tostring(cfg.iron),
+        'stone=' .. tostring(cfg.stone),
+        'names=' .. tostring(cfg.names),
+    }
+    pcall(function() writefile(CONFIG_FILE, table.concat(lines, '\n')) end)
+end
+
+local function loadCfg()
+    local ok, data = pcall(function() return readfile(CONFIG_FILE) end)
+    if not ok or not data then return end
+    for line in string.gmatch(data, '[^\n]+') do
+        local k, v = string.match(line, '^(%w+)=(.*)$')
+        if k == 'key' and v then
+            for code, _ in pairs(KEY_NAMES) do
+                if tostring(code):gsub('Enum.KeyCode.', '') == v then
+                    cfg.key = code
+                end
+            end
+        elseif k == 'silver' then
+            cfg.silver = v == 'true'
+        elseif k == 'iron' then
+            cfg.iron = v == 'true'
+        elseif k == 'stone' then
+            cfg.stone = v == 'true'
+        elseif k == 'names' then
+            cfg.names = v == 'true'
+        end
+    end
+end
+
+loadCfg()
+
+local function log(msg)
+    print('[' .. NAME .. '] ' .. msg)
+end
+
+local function track(c)
+    conns[#conns + 1] = c
+    return c
 end
 
 local function espOn(kind)
-    if kind == 'Silver' then return cfg.espSilver end
-    if kind == 'Iron'   then return cfg.espIron end
-    if kind == 'Stone'  then return cfg.espStone end
+    if kind == 'Silver' then return cfg.silver end
+    if kind == 'Iron'   then return cfg.iron end
+    if kind == 'Stone'  then return cfg.stone end
     return false
 end
+
+-- colours ------------------------------------------------------------
 
 local COL_SILVER = Color3.fromRGB(220, 225, 240)
 local COL_IRON   = Color3.fromRGB(215, 150, 110)
@@ -86,10 +142,10 @@ local function reachFor(kind, above)
     local ore = kind ~= 'Stone'
     local base = ore and 22 or 18
     local up   = ore and 30 or 24
-    return (above and up or base) + REACH_PAD
+    return above and up or base
 end
 
--- drawing pool ------------------------------------------------------
+-- drawing pool -------------------------------------------------------
 
 local POOL = 64
 local EDGES = {
@@ -100,19 +156,13 @@ local EDGES = {
 
 local pool    = {}
 local targets = {}
-local timerText = nil
 local reachN  = 0
-
-local function track(c)
-    conns[#conns + 1] = c
-    return c
-end
 
 for i = 1, POOL do
     local lines = {}
     for k = 1, 12 do
         local ln = Drawing.new('Line')
-        ln.Thickness = THICKNESS
+        ln.Thickness = 1
         ln.Color = COL_SILVER
         ln.Visible = false
         lines[k] = ln
@@ -127,7 +177,6 @@ for i = 1, POOL do
 end
 
 local hud = Drawing.new('Text')
-hud.Center = false
 hud.Outline = true
 hud.Size = 14
 hud.Color = Color3.fromRGB(235, 235, 245)
@@ -163,19 +212,6 @@ end
 
 -- collector ---------------------------------------------------------
 
-local function mineTimer()
-    local mine = workspace:FindFirstChild('Mine')
-    local t = mine and mine:FindFirstChild('Timer')
-    local gui = t and t:FindFirstChild('SurfaceGui')
-    local frame = gui and gui:FindFirstChild('Frame')
-    local label = frame and frame:FindFirstChild('Timer')
-    if label then
-        local ok, v = pcall(function() return label.Text end)
-        if ok and type(v) == 'string' then return v end
-    end
-    return nil
-end
-
 task.spawn(function()
     while running do
         local out = {}
@@ -185,7 +221,6 @@ task.spawn(function()
         local char = lp.Character
         local root = char and char:FindFirstChild('HumanoidRootPart')
         local origin = root and root.Position
-        timerText = mineTimer()
         if blocks then
             local kids = blocks:GetChildren()
             for i = 1, #kids do
@@ -230,12 +265,6 @@ end)
 -- renderer ----------------------------------------------------------
 
 track(RunService.RenderStepped:Connect(function()
-    if not cfg.enabled then
-        hideAll()
-        hud.Visible = false
-        return
-    end
-
     local char   = lp.Character
     local root   = char and char:FindFirstChild('HumanoidRootPart')
     local origin = root and root.Position
@@ -285,13 +314,12 @@ track(RunService.RenderStepped:Connect(function()
                 local e = pool[n]
                 local col = colorFor(t.kind)
 
-                local tr = 0
                 local f = dist / MAX_DIST
                 if f > 1 then f = 1 end
-                tr = 0.1 + 0.65 * f
+                local tr = 0.1 + 0.65 * f
                 if not t.inReach then tr = tr + 0.45 end
 
-                local th = math.floor(THICKNESS * 150 / math.max(dist, 40))
+                local th = math.floor(150 / math.max(dist, 40))
                 if th < 1 then th = 1 elseif th > 5 then th = 5 end
                 if e.thick ~= th then
                     for k = 1, 12 do e.lines[k].Thickness = th end
@@ -312,7 +340,7 @@ track(RunService.RenderStepped:Connect(function()
                     end
                 end
 
-                if cfg.showNames and n <= NAME_NEAR then
+                if cfg.names and n <= NAME_NEAR then
                     e.tag.Text = t.kind
                     e.tag.Color = col
                     e.tag.Position = Vector2.new((minX + maxX) * 0.5, minY - 16)
@@ -342,21 +370,51 @@ track(RunService.RenderStepped:Connect(function()
         end
     end
 
-    if cfg.showHud then
-        local txt = string.format('mine %s | tracked %d | reach %d | auto %s [%s]',
-            timerText or '?', #targets, reachN,
-            cfg.autoMine and 'ON' or 'off', keyName())
-        if hudLast ~= txt then
-            hud.Text = txt
-            hudLast = txt
+    local txt = string.format('auto %s [%s] | tracked %d | reach %d',
+        cfg.enabled and 'ON' or 'off', keyLabel(cfg.key), #targets, reachN)
+    if hudLast ~= txt then
+        hud.Text = txt
+        hudLast = txt
+    end
+    hud.Visible = true
+end))
+
+-- keybind ------------------------------------------------------------
+
+local listening = false
+
+local function startListen()
+    listening = true
+    log('press any key to bind...')
+end
+
+track(UIS.InputBegan:Connect(function(input)
+    local k = input and input.KeyCode
+    if not k then return end
+    if listening then
+        listening = false
+        for code, _ in pairs(KEY_NAMES) do
+            if code == k then
+                cfg.key = k
+                saveCfg()
+                log('bound to ' .. keyLabel(k))
+                return
+            end
         end
-        hud.Visible = true
-    elseif hud.Visible then
-        hud.Visible = false
+        log('key not allowed')
+        return
+    end
+    if k == cfg.key then
+        cfg.enabled = not cfg.enabled
+        if not cfg.enabled then
+            pcall(function() mouse1release() end)
+            holding = false
+        end
+        log('auto mine ' .. (cfg.enabled and 'ON' or 'off'))
     end
 end))
 
--- mining ------------------------------------------------------------
+-- mining -------------------------------------------------------------
 
 local rp = RaycastParams.new()
 rp.FilterType = Enum.RaycastFilterType.Exclude
@@ -390,10 +448,10 @@ local holding   = false
 local holdStart = 0
 local holdTgt   = nil
 local lastEnd   = 0
-local minedN    = 0
 local saveX, saveY = 0, 0
 local walking   = false
 local fpMode    = false
+local minedN    = 0
 
 local function cursorPos()
     local ok, m = pcall(function() return lp:GetMouse() end)
@@ -445,7 +503,7 @@ local function pickTarget()
     return best
 end
 
--- first person: keep the camera on the ore while the click is held
+-- first person: hold the camera on the ore while the click is down
 track(RunService.RenderStepped:Connect(function()
     if not holding or not fpMode or not holdTgt then return end
     local cam = workspace.CurrentCamera
@@ -460,99 +518,77 @@ end))
 task.spawn(function()
     while running do
         task.wait(0.1)
-        if running then
-            local char = lp.Character
-            local root = char and char:FindFirstChild('HumanoidRootPart')
-            local hum  = char and char:FindFirstChild('Humanoid')
-            fpMode = firstPerson(char)
+        local char = lp.Character
+        local root = char and char:FindFirstChild('HumanoidRootPart')
+        local hum  = char and char:FindFirstChild('Humanoid')
+        fpMode = firstPerson(char)
 
-            if not root or not hum then
-                releaseMouse(true)
-                holdTgt = nil
-                walking = false
-            else
-                if holding then
-                    local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
-                    if gone or tick() - holdStart > HOLD_SEC then
-                        releaseMouse(true)
-                        if holdTgt and type(holdTgt.cell) == 'number' then
-                            done[holdTgt.cell] = tick()
-                        end
-                        if gone then minedN = minedN + 1 end
-                        holdTgt = nil
-                        lastEnd = tick()
+        if not root or not hum then
+            releaseMouse(true)
+            holdTgt = nil
+            walking = false
+        else
+            if holding then
+                local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
+                if gone or tick() - holdStart > HOLD_SEC then
+                    releaseMouse(true)
+                    if holdTgt and type(holdTgt.cell) == 'number' then
+                        done[holdTgt.cell] = tick()
                     end
-                elseif cfg.autoMine and tick() - lastEnd >= GAP_SEC then
-                    local best = pickTarget()
-                    if best then
-                        if fpMode then
-                            local cam = workspace.CurrentCamera
-                            if cam then
-                                pcall(function()
-                                    cam.CFrame = CFrame.lookAt(cam.CFrame.Position, best.pos)
-                                end)
-                            end
-                            task.wait(0.03)
-                            pcall(function() mouse1press() end)
-                        else
-                            local cx, cy = cursorPos()
-                            if cx then saveX, saveY = cx, cy else saveX, saveY = best.sx, best.sy end
-                            pcall(function() mousemoveabs(math.floor(best.sx), math.floor(best.sy)) end)
-                            task.wait(0.05)
-                            pcall(function() mouse1press() end)
+                    if gone then minedN = minedN + 1 end
+                    holdTgt = nil
+                    lastEnd = tick()
+                end
+            elseif cfg.enabled and tick() - lastEnd >= GAP_SEC then
+                local best = pickTarget()
+                if best then
+                    if fpMode then
+                        local cam = workspace.CurrentCamera
+                        if cam then
+                            pcall(function()
+                                cam.CFrame = CFrame.lookAt(cam.CFrame.Position, best.pos)
+                            end)
                         end
-                        holding   = true
-                        holdStart = tick()
-                        holdTgt   = best
+                        task.wait(0.03)
+                    else
+                        local cx, cy = cursorPos()
+                        if cx then saveX, saveY = cx, cy else saveX, saveY = best.sx, best.sy end
+                        pcall(function() mousemoveabs(math.floor(best.sx), math.floor(best.sy)) end)
+                        task.wait(0.05)
+                    end
+                    pcall(function() mouse1press() end)
+                    holding   = true
+                    holdStart = tick()
+                    holdTgt   = best
+                end
+            end
+
+            if cfg.enabled and not holding then
+                local far, farD
+                for i = 1, #targets do
+                    local t = targets[i]
+                    if t.top and t.top.Parent and not t.inReach and t.dist <= WALK_RANGE then
+                        if not farD or t.dist < farD then
+                            far, farD = t, t.dist
+                        end
                     end
                 end
-
-                if cfg.autoMine and not holding then
-                    local far, farD
-                    for i = 1, #targets do
-                        local t = targets[i]
-                        if t.top and t.top.Parent and not t.inReach and t.dist <= WALK_RANGE then
-                            if not farD or t.dist < farD then
-                                far, farD = t, t.dist
-                            end
-                        end
-                    end
-                    if far then
-                        pcall(function() hum.WalkToPoint = far.pos end)
-                        walking = true
-                    else
-                        stopWalk(hum, root)
-                    end
+                if far then
+                    pcall(function() hum.WalkToPoint = far.pos end)
+                    walking = true
                 else
                     stopWalk(hum, root)
                 end
+            else
+                stopWalk(hum, root)
             end
         end
     end
 end)
 
--- keybind ------------------------------------------------------------
-
-track(UIS.InputBegan:Connect(function(input)
-    local k = input and input.KeyCode
-    if k and k == KEY_LIST[keyIdx] then
-        cfg.autoMine = not cfg.autoMine
-        if not cfg.autoMine then releaseMouse(true) end
-        print('[TI] auto mine ' .. (cfg.autoMine and 'ON' or 'off'))
-    end
-end))
-
--- menu ---------------------------------------------------------------
+-- menu --------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
-
-local function firstBool(...)
-    for i = 1, select('#', ...) do
-        local v = select(i, ...)
-        if type(v) == 'boolean' then return v end
-    end
-    return nil
-end
 
 local function mkSection(tab, name)
     for _, side in ipairs({ 'Left', 'Right' }) do
@@ -561,85 +597,75 @@ local function mkSection(tab, name)
     end
     local ok, sec = pcall(function() return tab:Section(name) end)
     if ok and sec ~= nil then return sec end
-    warn('[TI] section failed: ' .. name)
     return nil
 end
 
 local function mkToggle(sec, label, id, default, apply)
     local cb = function(...)
-        local v = firstBool(...)
+        local v = nil
+        for i = 1, select('#', ...) do
+            local x = select(i, ...)
+            if type(x) == 'boolean' then v = x break end
+        end
         if v ~= nil then apply(v) end
     end
-    local triesList = {
+    local tries = {
         function() sec:Toggle(label, id, default, cb) end,
         function() sec:Toggle(id, label, default, cb) end,
         function() sec:Toggle(label, default, cb) end,
     }
-    for i = 1, #triesList do
-        if pcall(triesList[i]) then return true end
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
     end
-    warn('[TI] toggle failed: ' .. label)
     return false
 end
 
 local function mkButton(sec, label, cb)
     if pcall(function() sec:Button(label, cb) end) then return true end
     if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
-    warn('[TI] button failed: ' .. label)
     return false
-end
-
-local function buildTab(tab)
-    if built then return end
-    built = true
-
-    local main = mkSection(tab, 'Mine')
-    if main then
-        mkToggle(main, 'Auto Mine (walk + mine)', 'ti_automine', cfg.autoMine, function(v)
-            cfg.autoMine = v
-            if not v then releaseMouse(true) end
-        end)
-        mkToggle(main, 'ESP Enabled', 'ti_enabled', cfg.enabled, function(v) cfg.enabled = v end)
-        mkToggle(main, 'Silver Ore', 'ti_esp_silver', cfg.espSilver, function(v) cfg.espSilver = v end)
-        mkToggle(main, 'Iron Ore', 'ti_esp_iron', cfg.espIron, function(v) cfg.espIron = v end)
-        mkToggle(main, 'Stone Blocks', 'ti_esp_stone', cfg.espStone, function(v) cfg.espStone = v end)
-        mkToggle(main, 'Show Names', 'ti_label', cfg.showNames, function(v) cfg.showNames = v end)
-        mkToggle(main, 'Show HUD', 'ti_hud', cfg.showHud, function(v) cfg.showHud = v end)
-        mkButton(main, 'Change Key (' .. keyName() .. ')', function()
-            keyIdx = keyIdx + 1
-            if keyIdx > #KEY_LIST then keyIdx = 1 end
-            print('[TI] toggle key = ' .. keyName())
-        end)
-        mkButton(main, 'Clear Ignore List', function()
-            done = {}
-            print('[TI] ignore list cleared')
-        end)
-        mkButton(main, 'Stats', function()
-            print('[TI] mined=' .. minedN .. ' tracked=' .. #targets ..
-                ' reach=' .. reachN .. ' fp=' .. tostring(fpMode) ..
-                ' holding=' .. tostring(holding) .. ' key=' .. keyName())
-        end)
-    end
 end
 
 if HAS_UI then
     local ok, err = pcall(function()
         UI.AddTab('Mine', function(tab)
-            pcall(buildTab, tab)
+            local sec = mkSection(tab, 'Mine')
+            if not sec then return end
+            mkToggle(sec, 'Auto Mine', 'ti_enabled', cfg.enabled, function(v)
+                cfg.enabled = v
+                if not v then releaseMouse(true) end
+            end)
+            mkButton(sec, 'Set Key (' .. keyLabel(cfg.key) .. ')', startListen)
+            mkToggle(sec, 'Silver Ore', 'ti_silver', cfg.silver, function(v)
+                cfg.silver = v; saveCfg()
+            end)
+            mkToggle(sec, 'Iron Ore', 'ti_iron', cfg.iron, function(v)
+                cfg.iron = v; saveCfg()
+            end)
+            mkToggle(sec, 'Stone', 'ti_stone', cfg.stone, function(v)
+                cfg.stone = v; saveCfg()
+            end)
+            mkToggle(sec, 'Names', 'ti_names', cfg.names, function(v)
+                cfg.names = v; saveCfg()
+            end)
+            mkButton(sec, 'Stats', function()
+                log('mined=' .. minedN .. ' tracked=' .. #targets ..
+                    ' reach=' .. reachN .. ' fp=' .. tostring(fpMode) ..
+                    ' key=' .. keyLabel(cfg.key))
+            end)
         end)
     end)
     if not ok then
-        warn('[TI] UI.AddTab failed: ' .. tostring(err))
         HAS_UI = false
+        warn('[TI] menu failed: ' .. tostring(err))
     end
 end
 
--- stop ----------------------------------------------------------------
+-- stop --------------------------------------------------------------
 
 local function stop()
     running = false
     releaseMouse(true)
-    walking = false
     for i = 1, #conns do
         pcall(function() conns[i]:Disconnect() end)
     end
@@ -652,8 +678,8 @@ local function stop()
     end
     pcall(function() hud:Remove() end)
     _G[NAME] = nil
-    print('[TI] stopped')
+    log('stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[TI] ' .. VERSION .. ' loaded - press ' .. keyName() .. ' to toggle Auto Mine')
+log(VERSION .. ' loaded - press ' .. keyLabel(cfg.key) .. ' to toggle Auto Mine')
