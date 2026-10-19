@@ -1,12 +1,13 @@
 -- Tower Incremental - Auto Mine + ESP
 -- place 75766778174856
--- Toggle: F (remappable - press Set Key then any key)
+-- Toggle: F (one button in the menu cycles the key)
 -- Matcha LuauVM: no Instance.new, no hooks
 --
--- Same shape as Chop A Forest: small cfg table, key whitelist, Set Key binds
--- the next key you press, bind saved to a file so it survives a reload.
+-- Auto Mine: walks to ore it cannot mine yet, mines everything it can.
+--   * nothing mineable in reach  -> walk to the nearest ore
+--   * ore in reach but blocked   -> still walk, which usually unblocks it
+--   * stuck against geometry     -> skip that block for 15s and pick another
 --
--- Auto Mine: walks to ore that is out of reach, mines what is in reach.
 -- First person: camera is turned onto the ore before the click and held there.
 -- Third person: cursor is moved onto the ore's screen position instead.
 --
@@ -14,7 +15,7 @@
 --   ore 22 level / 30 above, stone 18 level / 24.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v18'
+local VERSION = 'v19'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
@@ -36,13 +37,13 @@ local HOLD_SEC   = 2.5
 local GAP_SEC    = 0.2
 local REARM_SEC  = 15
 local WALK_RANGE = 140
+local STUCK_SEC  = 2.5
 local FP_NEAR    = 2.0
 
 -- config -------------------------------------------------------------
 
 local cfg = {
     enabled  = false,
-    key      = Enum.KeyCode.F,
     silver   = true,
     iron     = true,
     stone    = false,
@@ -68,6 +69,20 @@ local KEY_NAMES = {
     [Enum.KeyCode.Z]          = 'Z',
 }
 
+local KEY_LIST = {
+    Enum.KeyCode.F, Enum.KeyCode.G, Enum.KeyCode.H, Enum.KeyCode.J,
+    Enum.KeyCode.K, Enum.KeyCode.E, Enum.KeyCode.Q, Enum.KeyCode.R,
+    Enum.KeyCode.T, Enum.KeyCode.V, Enum.KeyCode.B, Enum.KeyCode.C,
+    Enum.KeyCode.X, Enum.KeyCode.Z,
+    Enum.KeyCode.LeftShift, Enum.KeyCode.RightShift,
+}
+
+local keyIdx = 1
+
+local function curKey()
+    return KEY_LIST[keyIdx]
+end
+
 local function keyLabel(k)
     return KEY_NAMES[k] or tostring(k):gsub('Enum.KeyCode.', '')
 end
@@ -76,7 +91,7 @@ local CONFIG_FILE = 'towerincremental.cfg'
 
 local function saveCfg()
     local lines = {
-        'key=' .. tostring(cfg.key):gsub('Enum.KeyCode.', ''),
+        'key=' .. tostring(curKey()):gsub('Enum.KeyCode.', ''),
         'silver=' .. tostring(cfg.silver),
         'iron=' .. tostring(cfg.iron),
         'stone=' .. tostring(cfg.stone),
@@ -91,9 +106,9 @@ local function loadCfg()
     for line in string.gmatch(data, '[^\n]+') do
         local k, v = string.match(line, '^(%w+)=(.*)$')
         if k == 'key' and v then
-            for code, _ in pairs(KEY_NAMES) do
-                if tostring(code):gsub('Enum.KeyCode.', '') == v then
-                    cfg.key = code
+            for i = 1, #KEY_LIST do
+                if tostring(KEY_LIST[i]):gsub('Enum.KeyCode.', '') == v then
+                    keyIdx = i
                 end
             end
         elseif k == 'silver' then
@@ -370,8 +385,9 @@ track(RunService.RenderStepped:Connect(function()
         end
     end
 
-    local txt = string.format('auto %s [%s] | tracked %d | reach %d',
-        cfg.enabled and 'ON' or 'off', keyLabel(cfg.key), #targets, reachN)
+    local txt = string.format('auto %s [%s] | tracked %d | reach %d | %s',
+        cfg.enabled and 'ON' or 'off', keyLabel(curKey()), #targets, reachN,
+        walking and 'walking' or (holding and 'mining' or 'idle'))
     if hudLast ~= txt then
         hud.Text = txt
         hudLast = txt
@@ -381,34 +397,15 @@ end))
 
 -- keybind ------------------------------------------------------------
 
-local listening = false
-
-local function startListen()
-    listening = true
-    log('press any key to bind...')
-end
-
 track(UIS.InputBegan:Connect(function(input)
     local k = input and input.KeyCode
     if not k then return end
-    if listening then
-        listening = false
-        for code, _ in pairs(KEY_NAMES) do
-            if code == k then
-                cfg.key = k
-                saveCfg()
-                log('bound to ' .. keyLabel(k))
-                return
-            end
-        end
-        log('key not allowed')
-        return
-    end
-    if k == cfg.key then
+    if k == curKey() then
         cfg.enabled = not cfg.enabled
         if not cfg.enabled then
             pcall(function() mouse1release() end)
             holding = false
+            walking = false
         end
         log('auto mine ' .. (cfg.enabled and 'ON' or 'off'))
     end
@@ -450,6 +447,9 @@ local holdTgt   = nil
 local lastEnd   = 0
 local saveX, saveY = 0, 0
 local walking   = false
+local walkCell  = nil
+local walkPos   = nil
+local walkMove  = 0
 local fpMode    = false
 local minedN    = 0
 
@@ -479,9 +479,15 @@ local function stopWalk(hum, root)
     if walking and hum and root then
         pcall(function() hum.WalkToPoint = root.Position end)
     end
-    walking = false
+    walking  = false
+    walkCell = nil
 end
 
+local function skipCell(cell)
+    if type(cell) == 'number' then done[cell] = tick() end
+end
+
+-- closest ore we can actually mine right now
 local function pickTarget()
     local best, bestD
     local now = tick()
@@ -494,6 +500,28 @@ local function pickTarget()
                 if last and now - last < REARM_SEC then skip = true end
             end
             if not skip and t.inReach and clearShot(t) then
+                if not bestD or t.dist < bestD then
+                    best, bestD = t, t.dist
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- closest ore to walk toward when nothing is mineable
+local function pickWalkTarget()
+    local best, bestD
+    local now = tick()
+    for i = 1, #targets do
+        local t = targets[i]
+        if t.top and t.top.Parent and t.dist <= WALK_RANGE then
+            local skip = false
+            if type(t.cell) == 'number' then
+                local last = done[t.cell]
+                if last and now - last < REARM_SEC then skip = true end
+            end
+            if not skip then
                 if not bestD or t.dist < bestD then
                     best, bestD = t, t.dist
                 end
@@ -518,6 +546,7 @@ end))
 task.spawn(function()
     while running do
         task.wait(0.1)
+        local now  = tick()
         local char = lp.Character
         local root = char and char:FindFirstChild('HumanoidRootPart')
         local hum  = char and char:FindFirstChild('Humanoid')
@@ -527,60 +556,71 @@ task.spawn(function()
             releaseMouse(true)
             holdTgt = nil
             walking = false
-        else
-            if holding then
-                local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
-                if gone or tick() - holdStart > HOLD_SEC then
-                    releaseMouse(true)
-                    if holdTgt and type(holdTgt.cell) == 'number' then
-                        done[holdTgt.cell] = tick()
-                    end
-                    if gone then minedN = minedN + 1 end
-                    holdTgt = nil
-                    lastEnd = tick()
+        elseif not cfg.enabled then
+            releaseMouse(true)
+            holdTgt = nil
+            stopWalk(hum, root)
+        elseif holding then
+            local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
+            if gone or now - holdStart > HOLD_SEC then
+                releaseMouse(true)
+                if holdTgt and type(holdTgt.cell) == 'number' then
+                    done[holdTgt.cell] = now
                 end
-            elseif cfg.enabled and tick() - lastEnd >= GAP_SEC then
-                local best = pickTarget()
-                if best then
-                    if fpMode then
-                        local cam = workspace.CurrentCamera
-                        if cam then
-                            pcall(function()
-                                cam.CFrame = CFrame.lookAt(cam.CFrame.Position, best.pos)
-                            end)
-                        end
-                        task.wait(0.03)
-                    else
-                        local cx, cy = cursorPos()
-                        if cx then saveX, saveY = cx, cy else saveX, saveY = best.sx, best.sy end
-                        pcall(function() mousemoveabs(math.floor(best.sx), math.floor(best.sy)) end)
-                        task.wait(0.05)
-                    end
-                    pcall(function() mouse1press() end)
-                    holding   = true
-                    holdStart = tick()
-                    holdTgt   = best
-                end
+                if gone then minedN = minedN + 1 end
+                holdTgt = nil
+                lastEnd = now
             end
+        else
+            local best = nil
+            if now - lastEnd >= GAP_SEC then best = pickTarget() end
 
-            if cfg.enabled and not holding then
-                local far, farD
-                for i = 1, #targets do
-                    local t = targets[i]
-                    if t.top and t.top.Parent and not t.inReach and t.dist <= WALK_RANGE then
-                        if not farD or t.dist < farD then
-                            far, farD = t, t.dist
+            if best then
+                stopWalk(hum, root)
+                if fpMode then
+                    local cam = workspace.CurrentCamera
+                    if cam then
+                        pcall(function()
+                            cam.CFrame = CFrame.lookAt(cam.CFrame.Position, best.pos)
+                        end)
+                    end
+                    task.wait(0.03)
+                else
+                    local cx, cy = cursorPos()
+                    if cx then saveX, saveY = cx, cy else saveX, saveY = best.sx, best.sy end
+                    pcall(function() mousemoveabs(math.floor(best.sx), math.floor(best.sy)) end)
+                    task.wait(0.05)
+                end
+                pcall(function() mouse1press() end)
+                holding   = true
+                holdStart = now
+                holdTgt   = best
+            else
+                -- nothing mineable: walk to the nearest ore
+                local near = pickWalkTarget()
+                if near then
+                    pcall(function() hum.WalkToPoint = near.pos end)
+                    walking = true
+
+                    if walkCell ~= near.cell then
+                        walkCell = near.cell
+                        walkPos  = root.Position
+                        walkMove = now
+                    else
+                        local moved = walkPos and (root.Position - walkPos).Magnitude or 0
+                        if moved > 2 then
+                            walkPos  = root.Position
+                            walkMove = now
+                        elseif now - walkMove > STUCK_SEC then
+                            skipCell(near.cell)
+                            walkCell = nil
+                            walkMove = now
+                            log('skipped blocked block ' .. tostring(near.cell))
                         end
                     end
-                end
-                if far then
-                    pcall(function() hum.WalkToPoint = far.pos end)
-                    walking = true
                 else
                     stopWalk(hum, root)
                 end
-            else
-                stopWalk(hum, root)
             end
         end
     end
@@ -631,11 +671,20 @@ if HAS_UI then
         UI.AddTab('Mine', function(tab)
             local sec = mkSection(tab, 'Mine')
             if not sec then return end
-            mkToggle(sec, 'Auto Mine', 'ti_enabled', cfg.enabled, function(v)
+            mkToggle(sec, 'Auto Mine (walk + mine)', 'ti_enabled', cfg.enabled, function(v)
                 cfg.enabled = v
-                if not v then releaseMouse(true) end
+                if not v then
+                    pcall(function() mouse1release() end)
+                    holding = false
+                    walking = false
+                end
             end)
-            mkButton(sec, 'Set Key (' .. keyLabel(cfg.key) .. ')', startListen)
+            mkButton(sec, 'Key: ' .. keyLabel(curKey()), function()
+                keyIdx = keyIdx + 1
+                if keyIdx > #KEY_LIST then keyIdx = 1 end
+                saveCfg()
+                log('toggle key = ' .. keyLabel(curKey()))
+            end)
             mkToggle(sec, 'Silver Ore', 'ti_silver', cfg.silver, function(v)
                 cfg.silver = v; saveCfg()
             end)
@@ -651,7 +700,12 @@ if HAS_UI then
             mkButton(sec, 'Stats', function()
                 log('mined=' .. minedN .. ' tracked=' .. #targets ..
                     ' reach=' .. reachN .. ' fp=' .. tostring(fpMode) ..
-                    ' key=' .. keyLabel(cfg.key))
+                    ' walking=' .. tostring(walking) ..
+                    ' key=' .. keyLabel(curKey()))
+            end)
+            mkButton(sec, 'Clear Ignore List', function()
+                done = {}
+                log('ignore list cleared')
             end)
         end)
     end)
@@ -682,4 +736,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - press ' .. keyLabel(cfg.key) .. ' to toggle Auto Mine')
+log(VERSION .. ' loaded - press ' .. keyLabel(curKey()) .. ' to toggle Auto Mine')
