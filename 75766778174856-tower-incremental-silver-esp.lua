@@ -1,13 +1,18 @@
 -- Tower Incremental - Auto Mine + ESP
 -- place 75766778174856
--- Toggle: F (menu button cycles it)
+-- Toggle: press Set Key, then press the key you want
 -- Matcha LuauVM: no Instance.new, no hooks
 --
--- Hotkey fix: Matcha's InputBegan hands you a TABLE whose KeyCode is an
--- INTEGER, not an EnumItem. Comparing it to Enum.KeyCode.F is always false,
--- which is why the earlier bind never toggled. v20 matches the integer, the
--- EnumItem, or the name, and also polls iskeypressed with edge detection so
--- the toggle fires either way.
+-- Remap flow (what this file does):
+--   click "Set Key (F)" in the menu  ->  it prints "press any key to bind..."
+--   press any key  ->  that key is bound, saved to towerincremental.cfg
+--   press the bound key in game  ->  Auto Mine flips on/off
+--
+-- Why earlier binds failed: Matcha's UserInputService.InputBegan hands you a
+-- TABLE whose KeyCode is an INTEGER, not an EnumItem. Comparing it to
+-- Enum.KeyCode.F is always false. v21 compares the integer against each
+-- EnumItem's .Value, and also polls iskeypressed with both the enum and the
+-- raw integer, so the toggle fires whichever path works.
 --
 -- Auto Mine: walks to ore it cannot mine yet, mines everything it can.
 --   * nothing mineable in reach  -> walk to the nearest ore
@@ -21,7 +26,7 @@
 --   ore 22 level / 30 above, stone 18 level / 24.
 
 local NAME    = 'TIOreESP'
-local VERSION = 'v20'
+local VERSION = 'v21'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
@@ -36,15 +41,15 @@ local conns   = {}
 
 -- fixed numbers (no sliders) -----------------------------------------
 
-local MAX_DIST   = 600
-local MAX_BOXES  = 48
-local NAME_NEAR  = 6
-local HOLD_SEC   = 2.5
-local GAP_SEC    = 0.2
-local REARM_SEC  = 15
-local WALK_RANGE = 140
-local STUCK_SEC  = 2.5
-local FP_NEAR    = 2.0
+local MAX_DIST     = 600
+local MAX_BOXES    = 48
+local NAME_NEAR    = 6
+local HOLD_SEC     = 2.5
+local GAP_SEC      = 0.2
+local REARM_SEC    = 15
+local WALK_RANGE   = 140
+local STUCK_SEC    = 2.5
+local FP_NEAR      = 2.0
 local TOG_DEBOUNCE = 0.35
 
 -- config -------------------------------------------------------------
@@ -55,79 +60,99 @@ local cfg = {
     iron     = true,
     stone    = false,
     names    = true,
-}
-
-local KEY_NAMES = {
-    [Enum.KeyCode.RightShift] = 'Right Shift',
-    [Enum.KeyCode.LeftShift]  = 'Left Shift',
-    [Enum.KeyCode.F]          = 'F',
-    [Enum.KeyCode.G]          = 'G',
-    [Enum.KeyCode.H]          = 'H',
-    [Enum.KeyCode.J]          = 'J',
-    [Enum.KeyCode.K]          = 'K',
-    [Enum.KeyCode.E]          = 'E',
-    [Enum.KeyCode.Q]          = 'Q',
-    [Enum.KeyCode.R]          = 'R',
-    [Enum.KeyCode.T]          = 'T',
-    [Enum.KeyCode.V]          = 'V',
-    [Enum.KeyCode.B]          = 'B',
-    [Enum.KeyCode.C]          = 'C',
-    [Enum.KeyCode.X]          = 'X',
-    [Enum.KeyCode.Z]          = 'Z',
+    keyCode  = Enum.KeyCode.F,   -- EnumItem, used for iskeypressed
+    keyVal   = nil,              -- integer value, used for InputBegan
+    keyName  = 'F',
 }
 
 local KEY_LIST = {
     Enum.KeyCode.F, Enum.KeyCode.G, Enum.KeyCode.H, Enum.KeyCode.J,
     Enum.KeyCode.K, Enum.KeyCode.E, Enum.KeyCode.Q, Enum.KeyCode.R,
     Enum.KeyCode.T, Enum.KeyCode.V, Enum.KeyCode.B, Enum.KeyCode.C,
-    Enum.KeyCode.X, Enum.KeyCode.Z,
+    Enum.KeyCode.X, Enum.KeyCode.Z, Enum.KeyCode.U, Enum.KeyCode.I,
+    Enum.KeyCode.O, Enum.KeyCode.P, Enum.KeyCode.L, Enum.KeyCode.M,
+    Enum.KeyCode.N, Enum.KeyCode.Y,
     Enum.KeyCode.LeftShift, Enum.KeyCode.RightShift,
+    Enum.KeyCode.LeftControl, Enum.KeyCode.RightControl,
+    Enum.KeyCode.LeftAlt, Enum.KeyCode.RightAlt,
+    Enum.KeyCode.Tab, Enum.KeyCode.CapsLock,
 }
 
-local keyIdx = 1
-
-local function curKey()
-    return KEY_LIST[keyIdx]
+local function codeValue(code)
+    if code == nil then return nil end
+    local ok, v = pcall(function() return code.Value end)
+    if ok and type(v) == 'number' then return v end
+    return nil
 end
 
-local function keyLabel(k)
-    return KEY_NAMES[k] or tostring(k):gsub('Enum.KeyCode.', '')
+local function codeName(code)
+    if code == nil then return '?' end
+    local ok, v = pcall(function() return code.Name end)
+    if ok and type(v) == 'string' and v ~= '' then return v end
+    local s = tostring(code)
+    s = string.gsub(s, 'Enum.KeyCode.', '')
+    return s
 end
 
--- key match that survives Matcha handing us an integer -----------------
+-- bind whatever the game handed us -----------------------------------
 
-local function keyMatches(k)
+local function bindKey(k)
     if k == nil then return false end
-    local want = curKey()
-    if k == want then return true end
-    local ok, v = pcall(function() return want.Value end)
-    if ok and type(v) == 'number' and k == v then return true end
-    if type(k) == 'number' then
-        local ok2, n = pcall(function() return want.Name end)
-        if ok2 and type(n) == 'string' then
-            local ok3, v2 = pcall(function()
-                local t = {}
-                for code, _ in pairs(KEY_NAMES) do
-                    local okc, cv = pcall(function() return code.Value end)
-                    if okc and cv == k then t[#t + 1] = code end
-                end
-                return t[1]
-            end)
-            if ok3 and v2 == want then return true end
+    local asNum = (type(k) == 'number') and k or codeValue(k)
+    for i = 1, #KEY_LIST do
+        local item = KEY_LIST[i]
+        local v = codeValue(item)
+        if k == item then
+            cfg.keyCode = item
+            cfg.keyVal  = v
+            cfg.keyName = codeName(item)
+            return true
+        end
+        if asNum ~= nil and v ~= nil and asNum == v then
+            cfg.keyCode = item
+            cfg.keyVal  = v
+            cfg.keyName = codeName(item)
+            return true
         end
     end
-    local s = tostring(k)
-    if type(s) == 'string' and string.find(s, keyLabel(want), 1, true) then
+    -- outside the whitelist: bind the raw code, InputBegan only
+    if asNum ~= nil then
+        cfg.keyCode = nil
+        cfg.keyVal  = asNum
+        cfg.keyName = 'Key' .. tostring(asNum)
         return true
     end
     return false
 end
 
+local function keyMatches(k)
+    if k == nil then return false end
+    if cfg.keyCode ~= nil and k == cfg.keyCode then return true end
+    local num = (type(k) == 'number') and k or codeValue(k)
+    if num ~= nil and cfg.keyVal ~= nil and num == cfg.keyVal then return true end
+    return false
+end
+
+local function keyIsDown()
+    if cfg.keyCode ~= nil then
+        local ok, d = pcall(function() return iskeypressed(cfg.keyCode) end)
+        if ok and d == true then return true end
+    end
+    if cfg.keyVal ~= nil then
+        local ok, d = pcall(function() return iskeypressed(cfg.keyVal) end)
+        if ok and d == true then return true end
+    end
+    return false
+end
+
+-- persistence --------------------------------------------------------
+
 local CONFIG_FILE = 'towerincremental.cfg'
 
 local function saveCfg()
     local lines = {
-        'key=' .. tostring(curKey()):gsub('Enum.KeyCode.', ''),
+        'keyname=' .. tostring(cfg.keyName),
+        'keyval=' .. tostring(cfg.keyVal),
         'silver=' .. tostring(cfg.silver),
         'iron=' .. tostring(cfg.iron),
         'stone=' .. tostring(cfg.stone),
@@ -138,15 +163,14 @@ end
 
 local function loadCfg()
     local ok, data = pcall(function() return readfile(CONFIG_FILE) end)
-    if not ok or not data then return end
+    if not ok or not data or data == '' then return end
+    local wantName, wantVal
     for line in string.gmatch(data, '[^\n]+') do
         local k, v = string.match(line, '^(%w+)=(.*)$')
-        if k == 'key' and v then
-            for i = 1, #KEY_LIST do
-                if tostring(KEY_LIST[i]):gsub('Enum.KeyCode.', '') == v then
-                    keyIdx = i
-                end
-            end
+        if k == 'keyname' and v and v ~= '' then
+            wantName = v
+        elseif k == 'keyval' and v and v ~= '' then
+            wantVal = tonumber(v)
         elseif k == 'silver' then
             cfg.silver = v == 'true'
         elseif k == 'iron' then
@@ -157,9 +181,26 @@ local function loadCfg()
             cfg.names = v == 'true'
         end
     end
+    if wantName then
+        for i = 1, #KEY_LIST do
+            if codeName(KEY_LIST[i]) == wantName then
+                cfg.keyCode = KEY_LIST[i]
+                cfg.keyVal  = codeValue(KEY_LIST[i])
+                cfg.keyName = wantName
+                return
+            end
+        end
+        cfg.keyCode = nil
+        cfg.keyVal  = wantVal
+        cfg.keyName = wantName
+    end
 end
 
 loadCfg()
+
+if cfg.keyCode ~= nil and cfg.keyVal == nil then
+    cfg.keyVal = codeValue(cfg.keyCode)
+end
 
 local function log(msg)
     print('[' .. NAME .. '] ' .. msg)
@@ -196,22 +237,18 @@ local function reachFor(kind, above)
     return above and up or base
 end
 
--- state shared with the toggle ---------------------------------------
+-- shared state -------------------------------------------------------
 
-local holding   = false
-local walking   = false
-local holdTgt   = nil
+local holding    = false
+local walking    = false
+local holdTgt    = nil
 local lastToggle = 0
 
-local function releaseMouse(restore)
+local function releaseMouse()
     if holding then
         pcall(function() mouse1release() end)
         holding = false
     end
-end
-
-local function stopWalk()
-    walking = false
 end
 
 local function toggleAuto()
@@ -220,8 +257,8 @@ local function toggleAuto()
     lastToggle = now
     cfg.enabled = not cfg.enabled
     if not cfg.enabled then
-        releaseMouse(true)
-        stopWalk()
+        releaseMouse()
+        walking = false
     end
     log('auto mine ' .. (cfg.enabled and 'ON' or 'off'))
 end
@@ -278,7 +315,7 @@ local function hideAll()
     end
 end
 
--- first person detection --------------------------------------------
+-- first person -------------------------------------------------------
 
 local function firstPerson(char)
     local cam = workspace.CurrentCamera
@@ -291,7 +328,7 @@ local function firstPerson(char)
     return false
 end
 
--- collector ---------------------------------------------------------
+-- collector ----------------------------------------------------------
 
 task.spawn(function()
     while running do
@@ -343,7 +380,7 @@ task.spawn(function()
     end
 end)
 
--- renderer ----------------------------------------------------------
+-- renderer -----------------------------------------------------------
 
 track(RunService.RenderStepped:Connect(function()
     local char   = lp.Character
@@ -452,8 +489,8 @@ track(RunService.RenderStepped:Connect(function()
     end
 
     local txt = string.format('auto %s [%s] | tracked %d | reach %d | %s',
-        cfg.enabled and 'ON' or 'off', keyLabel(curKey()), #targets, reachN,
-        walking and 'walking' or (holding and 'mining' or 'idle'))
+        cfg.enabled and 'ON' or 'off', cfg.keyName, #targets, reachN,
+        listening and 'press a key' or (walking and 'walking' or (holding and 'mining' or 'idle')))
     if hudLast ~= txt then
         hud.Text = txt
         hudLast = txt
@@ -461,39 +498,70 @@ track(RunService.RenderStepped:Connect(function()
     hud.Visible = true
 end))
 
--- hotkey: poll iskeypressed with edge detection ----------------------
+-- remap listener -----------------------------------------------------
+-- Set Key sets listening=true, the next keypress binds and saves.
+
+local listening = false
+
+local function startListen()
+    listening = true
+    log('press any key to bind...')
+end
+
+local function readKeyCode(input)
+    if input == nil then return nil end
+    if type(input) == 'table' then
+        local k = input.KeyCode
+        if k ~= nil then return k end
+        local ok, v = pcall(function() return input.KeyCode end)
+        if ok then return v end
+        return nil
+    end
+    local ok, v = pcall(function() return input.KeyCode end)
+    if ok and v ~= nil then return v end
+    return input
+end
+
+track(UIS.InputBegan:Connect(function(input)
+    local k = readKeyCode(input)
+    if k == nil then return end
+
+    if listening then
+        listening = false
+        if bindKey(k) then
+            saveCfg()
+            log('bound to ' .. cfg.keyName .. ' - press it to toggle')
+        else
+            log('could not bind that key')
+        end
+        return
+    end
+
+    if keyMatches(k) then
+        toggleAuto()
+    end
+end))
+
+-- poll fallback: fires even if InputBegan plumbing changes -----------
 
 task.spawn(function()
     local wasDown = false
     while running do
         task.wait(0.05)
-        local ok, down = pcall(function() return iskeypressed(curKey()) end)
-        if ok and down == true then
-            if not wasDown then
-                wasDown = true
-                toggleAuto()
+        if not listening then
+            if keyIsDown() then
+                if not wasDown then
+                    wasDown = true
+                    toggleAuto()
+                end
+            else
+                wasDown = false
             end
         else
             wasDown = false
         end
     end
 end)
-
--- hotkey: InputBegan with a match that handles an integer KeyCode -----
-
-track(UIS.InputBegan:Connect(function(input)
-    local k = nil
-    if type(input) == 'table' then
-        k = input.KeyCode
-    else
-        local ok, v = pcall(function() return input.KeyCode end)
-        if ok then k = v end
-    end
-    if k == nil then return end
-    if keyMatches(k) then
-        toggleAuto()
-    end
-end))
 
 -- mining -------------------------------------------------------------
 
@@ -609,17 +677,17 @@ task.spawn(function()
         fpMode = firstPerson(char)
 
         if not root or not hum then
-            releaseMouse(true)
+            releaseMouse()
             holdTgt = nil
             walking = false
         elseif not cfg.enabled then
-            releaseMouse(true)
+            releaseMouse()
             holdTgt = nil
             walking = false
         elseif holding then
             local gone = not holdTgt or not holdTgt.top or holdTgt.top.Parent == nil
             if gone or now - holdStart > HOLD_SEC then
-                releaseMouse(true)
+                releaseMouse()
                 if holdTgt and type(holdTgt.cell) == 'number' then
                     done[holdTgt.cell] = now
                 end
@@ -681,7 +749,7 @@ task.spawn(function()
     end
 end)
 
--- menu --------------------------------------------------------------
+-- menu ---------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -729,16 +797,11 @@ if HAS_UI then
             mkToggle(sec, 'Auto Mine (walk + mine)', 'ti_enabled', cfg.enabled, function(v)
                 cfg.enabled = v
                 if not v then
-                    releaseMouse(true)
+                    releaseMouse()
                     walking = false
                 end
             end)
-            mkButton(sec, 'Key: ' .. keyLabel(curKey()), function()
-                keyIdx = keyIdx + 1
-                if keyIdx > #KEY_LIST then keyIdx = 1 end
-                saveCfg()
-                log('toggle key = ' .. keyLabel(curKey()))
-            end)
+            mkButton(sec, 'Set Key (' .. cfg.keyName .. ')', startListen)
             mkToggle(sec, 'Silver Ore', 'ti_silver', cfg.silver, function(v)
                 cfg.silver = v; saveCfg()
             end)
@@ -755,7 +818,7 @@ if HAS_UI then
                 log('mined=' .. minedN .. ' tracked=' .. #targets ..
                     ' reach=' .. reachN .. ' fp=' .. tostring(fpMode) ..
                     ' walking=' .. tostring(walking) ..
-                    ' key=' .. keyLabel(curKey()))
+                    ' key=' .. cfg.keyName .. ' val=' .. tostring(cfg.keyVal))
             end)
             mkButton(sec, 'Clear Ignore List', function()
                 done = {}
@@ -769,11 +832,11 @@ if HAS_UI then
     end
 end
 
--- stop --------------------------------------------------------------
+-- stop ---------------------------------------------------------------
 
 local function stop()
     running = false
-    releaseMouse(true)
+    releaseMouse()
     walking = false
     for i = 1, #conns do
         pcall(function() conns[i]:Disconnect() end)
@@ -791,4 +854,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - press ' .. keyLabel(curKey()) .. ' to toggle Auto Mine')
+log(VERSION .. ' loaded - key ' .. cfg.keyName .. '. Press Set Key in the menu to rebind.')
