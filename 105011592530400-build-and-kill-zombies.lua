@@ -1,26 +1,24 @@
--- Build and Kill Zombies - Freeze Enemies - Matcha LuauVM - v11.1
+-- Build and Kill Zombies -> Auto Roll and Buy - Matcha LuauVM - v12.0
 -- place 105011592530400
--- one tab (Mods), one toggle: Freeze Enemies.
--- Nothing runs until the toggle is on. Once it is on, the target list is
--- rebuilt every 0.5s for as long as the toggle stays on, so zombies that spawn
--- or respawn after build mode are picked up on their own. You do not need to
--- turn it off and on again.
+-- The old Freeze Enemies feature is gone. This version drives the two
+-- rollers on your plot: RollWeapons and RollBlocks.
 --
--- Why v9/v10 printed targets=0 while you could see zombies:
---   the walk only accepted a model that had a Humanoid AND a direct
---   HumanoidRootPart, and it only looked 4 container levels deep. A zombie
---   driven by an Animator, a zombie nested deeper, or a zombie whose root is
---   named something else was skipped. v11 drops the Humanoid requirement for
---   enemy-named models and walks 6 levels with a visit cap.
+-- Menu layout (one tab, two sections):
+--   Weapon Roller : Auto Roll Weapons + one Buy toggle per rarity
+--   Block Roller  : Auto Roll Blocks  + one Buy toggle per rarity
 --
--- Writable set used (Matcha has no Anchored and no WalkSpeed):
---   Humanoid.WalkToPoint         stop it pathing
---   root.Velocity                kill momentum
---   root.AssemblyLinearVelocity  same, for the assembly
---   root.CFrame                  only for targets with no Humanoid
+-- How it works (nothing in this game can be constructed, so no clicks):
+--   both rollers are ProximityPrompts. Rolling is the prompt on
+--   <Roller>.Roll, buying is the prompt under <Roller>.ItemPlace.
+--   The loop parks the character on the prompt part for a moment, holds E,
+--   then puts the character straight back where it was.
+--   Result is read from <Roller>.Info.Rarity / <Roller>.Info.ItemName.
+--   '???' means nothing has been rolled yet.
+--
+-- Writable set used: HumanoidRootPart.CFrame (short, on demand only).
 
-local NAME    = 'ModsMenu'
-local VERSION = 'v11.1'
+local NAME    = 'RollerMods'
+local VERSION = 'v12.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -28,151 +26,180 @@ end
 print('[' .. NAME .. '] ' .. VERSION)
 
 local Players = game:GetService('Players')
-local ws = game:GetService('Workspace')
+local ws      = game:GetService('Workspace')
+local lp      = Players.LocalPlayer
 
-local MAX_TARGETS = 40
-local MAX_VISITS  = 6000
-local MAX_DEPTH   = 6
+local alive = true
+local built = false
 
-local alive    = true
-local built    = false
-local frozen   = false
-local targets  = {}
-local nTargets = 0
+local state = {
+    autoW = false,
+    autoB = false,
+    buyW  = {},
+    buyB  = {},
+}
 
-local ZERO = Vector3.new(0, 0, 0)
+local RARITIES = {
+    'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary',
+    'Mythical', 'Secret', 'Divine', 'Celestial',
+}
 
-local PATTERNS = { 'zombie', 'enemy', 'monster', 'undead', 'walker', 'npc', 'mob' }
+-- locate -------------------------------------------------------------
 
-local function enemyName(n)
-    local l = string.lower(n)
-    for _, p in ipairs(PATTERNS) do
-        if string.find(l, p, 1, true) then return true end
+local cachedPlot = nil
+
+local function plotsFolder()
+    local g = ws:FindFirstChild('Game')
+    local l = g and g:FindFirstChild('Lobby')
+    return l and l:FindFirstChild('Plots')
+end
+
+local function billboardOwner(plot)
+    local ob = plot:FindFirstChild('OwnerBillboard')
+    local bg = ob and ob:FindFirstChild('BillboardGui')
+    if not bg then return nil end
+    local found = nil
+    local function walk(n, d)
+        if found or d > 4 then return end
+        for _, c in ipairs(n:GetChildren()) do
+            if c.ClassName == 'TextLabel' and c.Text ~= '' then
+                found = c.Text
+                return
+            end
+            walk(c, d + 1)
+        end
+    end
+    walk(bg, 0)
+    return found
+end
+
+local function nearestPlot()
+    local pf = plotsFolder()
+    local char = lp.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if not pf or not root then return nil end
+    local best = nil
+    local bd = math.huge
+    for _, p in ipairs(pf:GetChildren()) do
+        local anchor = p:FindFirstChild('PlayerSpawn') or p:FindFirstChild('Placement')
+        if anchor then
+            local d = (anchor.Position - root.Position).Magnitude
+            if d < bd then
+                bd = d
+                best = p
+            end
+        end
+    end
+    return best
+end
+
+local function getPlot()
+    local pf = plotsFolder()
+    if not pf then return nil end
+    if cachedPlot and cachedPlot.Parent then return cachedPlot end
+    for _, p in ipairs(pf:GetChildren()) do
+        local owner = billboardOwner(p)
+        if owner and owner == lp.Name then
+            cachedPlot = p
+            return p
+        end
+    end
+    cachedPlot = nearestPlot()
+    return cachedPlot
+end
+
+-- prompt driving -----------------------------------------------------
+
+local function holdE(secs)
+    pcall(keypress, Enum.KeyCode.E)
+    task.wait(secs or 0.2)
+    pcall(keyrelease, Enum.KeyCode.E)
+end
+
+local function tpTo(part)
+    local char = lp.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if not root or not part then return nil end
+    local save = root.CFrame
+    pcall(function()
+        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 2.5, 0))
+    end)
+    task.wait(0.1)
+    return save
+end
+
+local function tpBack(save)
+    if not save then return end
+    local char = lp.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if root then
+        pcall(function() root.CFrame = save end)
+    end
+    task.wait(0.1)
+end
+
+local function readInfo(roller, field)
+    local info = roller and roller:FindFirstChild('Info')
+    local lbl  = info and info:FindFirstChild(field)
+    if lbl then return lbl.Text end
+    return nil
+end
+
+local function doRoll(roller)
+    local rollPart = roller and roller:FindFirstChild('Roll')
+    if not rollPart then return false end
+    local before = readInfo(roller, 'ItemName')
+    local save = tpTo(rollPart)
+    holdE(0.25)
+    tpBack(save)
+    local t0 = tick()
+    while alive and (tick() - t0) < 4 do
+        task.wait(0.15)
+        local now = readInfo(roller, 'ItemName')
+        if now and now ~= before and now ~= '???' then return true end
     end
     return false
 end
 
-local function isPart(inst)
-    local cn = inst.ClassName
-    return cn == 'Part' or cn == 'MeshPart' or cn == 'UnionOperation'
-        or cn == 'WedgePart' or cn == 'TrussPart' or cn == 'CornerWedgePart'
+local function doBuy(roller)
+    local ip = roller and roller:FindFirstChild('ItemPlace')
+    if not ip then return false end
+    local save = tpTo(ip)
+    holdE(0.25)
+    tpBack(save)
+    task.wait(0.2)
+    return true
 end
 
-local function rootOf(model)
-    local r = model:FindFirstChild('HumanoidRootPart')
-    if r then return r end
-    r = model:FindFirstChild('UpperTorso')
-    if r then return r end
-    r = model:FindFirstChild('Torso')
-    if r then return r end
-    r = model.PrimaryPart
-    if r then return r end
-    for _, c in ipairs(model:GetChildren()) do
-        if isPart(c) then return c end
-    end
-    return nil
-end
+-- loop ---------------------------------------------------------------
 
--- collector: 2 Hz, walks 6 levels, no Humanoid requirement ------------
-
-local function collect()
-    local pnames = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        pnames[p.Name] = true
-    end
-
-    local out    = {}
-    local visits = 0
-
-    local function walk(node, depth)
-        if #out >= MAX_TARGETS or visits >= MAX_VISITS then return end
-        for _, c in ipairs(node:GetChildren()) do
-            if #out >= MAX_TARGETS or visits >= MAX_VISITS then return end
-            visits = visits + 1
-
-            if not pnames[c.Name] then
-                local hum  = c:FindFirstChildOfClass('Humanoid')
-                local root = nil
-                local take = false
-
-                if hum then
-                    root = rootOf(c)
-                    take = root ~= nil
-                elseif enemyName(c.Name) then
-                    root = rootOf(c)
-                    take = root ~= nil
-                end
-
-                if take then
-                    out[#out + 1] = { root = root, hum = hum, pos = root.Position }
-                elseif depth < MAX_DEPTH then
-                    local cn = c.ClassName
-                    if cn == 'Model' or cn == 'Folder' or cn == 'Workspace' then
-                        walk(c, depth + 1)
-                    end
-                end
-            end
-        end
-    end
-
-    walk(ws, 0)
-
-    targets  = out
-    nTargets = #out
-end
-
--- freeze pass: 20 Hz, writes only ------------------------------------
-
-local function freezeOne(t)
-    if t.hum then
-        t.hum.WalkToPoint             = t.pos
-        t.root.Velocity               = ZERO
-        t.root.AssemblyLinearVelocity = ZERO
-    else
-        t.root.CFrame                 = CFrame.new(t.pos)
-        t.root.Velocity               = ZERO
-        t.root.AssemblyLinearVelocity = ZERO
+local function runOne(roller, autoFlag, buyMap, tag)
+    if not autoFlag then return end
+    if not doRoll(roller) then return end
+    local rar  = readInfo(roller, 'Rarity') or '?'
+    local item = readInfo(roller, 'ItemName') or '?'
+    print('[' .. NAME .. '] ' .. tag .. ' rolled ' .. item .. ' (' .. rar .. ')')
+    if buyMap[rar] then
+        doBuy(roller)
+        print('[' .. NAME .. '] ' .. tag .. ' bought ' .. item)
     end
 end
 
-local function freeze()
-    for _, t in ipairs(targets) do
-        pcall(freezeOne, t)
-    end
-end
-
--- loops ---------------------------------------------------------------
-
-local lastN = -1
-
--- collector: keeps running while the toggle is on, so respawns are caught
 task.spawn(function()
     while alive do
-        if frozen then
-            collect()
-            if nTargets ~= lastN then
-                lastN = nTargets
-                print('[' .. NAME .. '] targets = ' .. nTargets)
-                if nTargets > 0 and targets[1] then
-                    print('[' .. NAME .. '] first = ' .. targets[1].root:GetFullName())
-                end
-            end
-        else
-            targets, nTargets, lastN = {}, 0, -1
+        local plot = getPlot()
+        local rolls = plot and plot:FindFirstChild('Rolls')
+        if rolls and (state.autoW or state.autoB) then
+            local W = rolls:FindFirstChild('RollWeapons')
+            local B = rolls:FindFirstChild('RollBlocks')
+            runOne(W, state.autoW, state.buyW, 'weapons')
+            runOne(B, state.autoB, state.buyB, 'blocks')
         end
-        task.wait(0.5)
+        task.wait(0.4)
     end
 end)
 
--- freeze: 20 Hz, skips silently when the list is empty
-task.spawn(function()
-    while alive do
-        if frozen and nTargets > 0 then freeze() end
-        task.wait(0.05)
-    end
-end)
-
--- menu ----------------------------------------------------------------
+-- menu ---------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -218,20 +245,33 @@ local function buildTab(tab)
     built = true
 
     local ok, err = pcall(function()
-        local sec = mkSection(tab, 'Enemies')
-        if not sec then return end
-        mkToggle(sec, 'Freeze Enemies', 'mm_freeze', false, function(v)
-            frozen = v
-            if v then
-                collect()
-                print('[' .. NAME .. '] freeze on, targets = ' .. nTargets)
-                if nTargets == 0 then
-                    pcall(notify, 'Mods', 'freeze on - searching, zombies are picked up as they spawn', 4)
-                end
-            else
-                print('[' .. NAME .. '] freeze off')
+        local secW = mkSection(tab, 'Weapon Roller')
+        if secW then
+            mkToggle(secW, 'Auto Roll Weapons', 'rb_auto_w', false, function(v)
+                state.autoW = v
+                print('[' .. NAME .. '] weapon auto roll ' .. (v and 'on' or 'off'))
+            end)
+            for _, rar in ipairs(RARITIES) do
+                local key = string.lower(rar)
+                mkToggle(secW, 'Buy ' .. rar, 'rb_w_' .. key, false, function(v)
+                    state.buyW[rar] = v
+                end)
             end
-        end)
+        end
+
+        local secB = mkSection(tab, 'Block Roller')
+        if secB then
+            mkToggle(secB, 'Auto Roll Blocks', 'rb_auto_b', false, function(v)
+                state.autoB = v
+                print('[' .. NAME .. '] block auto roll ' .. (v and 'on' or 'off'))
+            end)
+            for _, rar in ipairs(RARITIES) do
+                local key = string.lower(rar)
+                mkToggle(secB, 'Buy ' .. rar, 'rb_b_' .. key, false, function(v)
+                    state.buyB[rar] = v
+                end)
+            end
+        end
     end)
 
     if not ok then
@@ -242,7 +282,7 @@ end
 
 if HAS_UI then
     local ok, err = pcall(function()
-        UI.AddTab('Mods', function(tab)
+        UI.AddTab('Rollers', function(tab)
             if built then return end
             pcall(buildTab, tab)
         end)
@@ -255,18 +295,22 @@ else
     warn('[' .. NAME .. '] no UI table - menu unavailable')
 end
 
--- stop ----------------------------------------------------------------
+-- stop ---------------------------------------------------------------
 
 local function stop()
-    alive  = false
-    frozen = false
-    targets, nTargets = {}, 0
+    alive = false
+    state.autoW = false
+    state.autoB = false
+    state.buyW = {}
+    state.buyB = {}
+    cachedPlot = nil
+    pcall(keyrelease, Enum.KeyCode.E)
     if HAS_UI then
-        pcall(function() UI.RemoveTab('Mods') end)
+        pcall(function() UI.RemoveTab('Rollers') end)
     end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, collect = collect, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - Mods tab, Freeze Enemies')
+_G[NAME] = { stop = stop, version = VERSION, state = state }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - Rollers tab')
