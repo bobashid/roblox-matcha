@@ -1,28 +1,25 @@
--- Build and Kill Zombies -> Auto Roll and Buy - Matcha LuauVM - v13.0
+-- Build and Kill Zombies -> Auto Roll and Buy - Matcha LuauVM - v13.1
 -- place 105011592530400
 --
--- What v12 got wrong, proven by the RollController decompile:
---   1. OwnerBillboard text is not the username (plots read O_CsF, Tundr,
---      PlayerName, Borisder_2, Kozak). v12 silently fell back to the
---      nearest plot and rolled on somebody else.
---   2. RollController enables each roller's ProximityPrompt from
---      OwnerUserId / 70 studs, and the roll can be gated by the
---      Confirmation dialog (Menu.Confirmation). v12 pressed E for 0.25s
---      and never clicked ACCEPT.
---   3. Matcha cannot read ProximityPrompt.Enabled/HoldDuration, so the
---      script has to stay on the part long enough and poll the result.
+-- Root causes found by live probing (this is why v12 and v13 did nothing):
+--   1. keypress/keyrelease are INERT in this VM. keypress(87) returns ok,
+--      iskeypressed stays false, character moves 0 studs. The prompt was
+--      never pressed. The working primitive is
+--      setrobloxinput(pressed, keycode) with the BOOLEAN FIRST:
+--      setrobloxinput(true, 87) moved the character 7.12 studs.
+--      setrobloxinput(87, true) moved 0.
+--   2. The plot is identified by the OwnerUserId attribute, not by the
+--      OwnerBillboard text. Live: Plot3 uid=2251313101 == LocalPlayer.
+--      UserId, while its billboard read 'Tundr'. v12/v13 rolled another
+--      player's roller.
+--   3. A save dialog ('You haven't saved changes on This Build') can sit
+--      open and block the prompt. It is dismissed first, every attempt.
 --
--- v13 changes:
---   * plots are ordered by distance, and a plot that refuses to roll is
---     abandoned for the next one (logged).
---   * E is held 0.55s with the character standing on the prompt, then
---     the Confirmation dialog is clicked if it opened.
---   * roll success is proven by Info.ItemName changing before it is
---     counted, so a buy never fires on a stale label.
---   * buy success is proven by the ItemPlace model count dropping.
+-- Menu: one Rollers tab, two sections (Weapon Roller / Block Roller),
+-- an auto roll toggle plus one buy toggle per rarity in each.
 
 local NAME    = 'RollerMods'
-local VERSION = 'v13.0'
+local VERSION = 'v13.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -32,6 +29,8 @@ print('[' .. NAME .. '] ' .. VERSION)
 local Players = game:GetService('Players')
 local ws      = game:GetService('Workspace')
 local lp      = Players.LocalPlayer
+
+local KEY_E = 69
 
 local alive = true
 local built = false
@@ -79,46 +78,83 @@ local function itemPlaceCount(roller)
     return n
 end
 
--- plot order: nearest first, name match promoted ---------------------
+-- input: setrobloxinput(pressed, keycode) ----------------------------
+
+local function setKey(code, down)
+    pcall(setrobloxinput, down, code)
+end
+
+local function tapKey(code, secs)
+    setKey(code, true)
+    task.wait(secs or 0.6)
+    setKey(code, false)
+    task.wait(0.1)
+end
+
+-- confirmation / save dialog -----------------------------------------
+
+local function dialog()
+    local pg   = lp:FindFirstChild('PlayerGui')
+    local mg   = pg and pg:FindFirstChild('MainGui')
+    local mn   = mg and mn and mg:FindFirstChild('Menu')
+    if not mn then
+        mn = mg and mg:FindFirstChild('Menu')
+    end
+    local cf   = mn and mn:FindFirstChild('Confirmation')
+    local btns = cf and cf:FindFirstChild('Buttons')
+    local inf  = cf and cf:FindFirstChild('Information')
+    return btns, (inf and inf.Text) or ''
+end
+
+local function clickBtn(btn)
+    if not btn then return false end
+    local p, s = btn.AbsolutePosition, btn.AbsoluteSize
+    if not p or not s then return false end
+    if s.X < 4 or s.Y < 4 then return false end
+    pcall(mousemoveabs, p.X + s.X * 0.5, p.Y + s.Y * 0.5)
+    task.wait(0.06)
+    pcall(mouse1click)
+    return true
+end
+
+local function clearDialog()
+    local btns, txt = dialog()
+    if txt == '' then return false end
+    local lower  = string.lower(txt)
+    local target = btns and btns:FindFirstChild('Yes')
+    if string.find(lower, 'save', 1, true) then
+        target = btns and btns:FindFirstChild('No')
+    end
+    clickBtn(target)
+    task.wait(0.25)
+    return true
+end
+
+-- plot: OwnerUserId first, then nearest -----------------------------
 
 local plotOrder  = {}
 local orderIndex = 1
 
-local function billboardOwner(plot)
-    local ob = plot:FindFirstChild('OwnerBillboard')
-    local bg = ob and ob:FindFirstChild('BillboardGui')
-    if not bg then return nil end
-    local found = nil
-    local function walk(n, d)
-        if found or d > 4 then return end
-        for _, c in ipairs(n:GetChildren()) do
-            if c.ClassName == 'TextLabel' and c.Text ~= '' then
-                found = c.Text
-                return
-            end
-            walk(c, d + 1)
+local function buildOrder()
+    local pf   = plotsFolder()
+    local root = getRoot()
+    plotOrder  = {}
+    if not pf then return end
+    local mine = nil
+    local rest = {}
+    for _, p in ipairs(pf:GetChildren()) do
+        if p:GetAttribute('OwnerUserId') == lp.UserId then
+            mine = p
+        else
+            local anchor = p:FindFirstChild('PlayerSpawn') or p:FindFirstChild('Placement')
+            local d = 999999
+            if anchor and root then d = (anchor.Position - root.Position).Magnitude end
+            rest[#rest + 1] = { plot = p, d = d }
         end
     end
-    walk(bg, 0)
-    return found
-end
-
-local function buildOrder()
-    local pf  = plotsFolder()
-    local root = getRoot()
-    local list = {}
-    if not pf then plotOrder = {} return end
-    for _, p in ipairs(pf:GetChildren()) do
-        local anchor = p:FindFirstChild('PlayerSpawn') or p:FindFirstChild('Placement')
-        local d = 999999
-        if anchor and root then d = (anchor.Position - root.Position).Magnitude end
-        local owner = billboardOwner(p)
-        if owner and owner == lp.Name then d = -1 end
-        list[#list + 1] = { plot = p, d = d }
-    end
-    table.sort(list, function(a, b) return a.d < b.d end)
-    plotOrder = {}
-    for i, e in ipairs(list) do plotOrder[i] = e.plot end
+    table.sort(rest, function(a, b) return a.d < b.d end)
+    if mine then plotOrder[#plotOrder + 1] = mine end
+    for _, e in ipairs(rest) do plotOrder[#plotOrder + 1] = e.plot end
     if orderIndex > #plotOrder then orderIndex = 1 end
 end
 
@@ -131,40 +167,18 @@ local function nextPlot(reason)
     if #plotOrder == 0 then return end
     orderIndex = orderIndex + 1
     if orderIndex > #plotOrder then orderIndex = 1 end
-    print('[' .. NAME .. '] ' .. reason .. ' -> trying ' .. tostring(currentPlot() and currentPlot().Name))
+    local p = currentPlot()
+    print('[' .. NAME .. '] ' .. reason .. ' -> trying ' .. tostring(p and p.Name))
 end
 
--- confirmation dialog -------------------------------------------------
-
-local function confirmIfOpen()
-    local pg   = lp:FindFirstChild('PlayerGui')
-    local mg   = pg and pg:FindFirstChild('MainGui')
-    local menu = mg and mg:FindFirstChild('Menu')
-    local conf = menu and menu:FindFirstChild('Confirmation')
-    if not conf then return false end
-    local info = conf:FindFirstChild('Information')
-    if not info or info.Text == '' then return false end
-    local btns = conf:FindFirstChild('Buttons')
-    local yes  = btns and btns:FindFirstChild('Yes')
-    if not yes then return false end
-    local pos, size = yes.AbsolutePosition, yes.AbsoluteSize
-    if not pos or not size then return false end
-    if size.X < 4 or size.Y < 4 then return false end
-    pcall(mousemoveabs, pos.X + size.X * 0.5, pos.Y + size.Y * 0.5)
-    task.wait(0.05)
-    pcall(mouse1click)
-    return true
-end
-
--- prompt driving -----------------------------------------------------
+-- actions -------------------------------------------------------------
 
 local function standOn(part)
     local root = getRoot()
     if not root or not part then return nil end
     local save = root.CFrame
-    pcall(function()
-        root.CFrame = CFrame.new(part.Position + Vector3.new(0, 3, 0))
-    end)
+    local pos  = part.Position
+    pcall(function() root.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z) end)
     return save
 end
 
@@ -174,26 +188,20 @@ local function restore(save)
     if root then pcall(function() root.CFrame = save end) end
 end
 
-local function pressE()
-    pcall(keypress, Enum.KeyCode.E)
-    task.wait(0.55)
-    pcall(keyrelease, Enum.KeyCode.E)
-    task.wait(0.15)
-end
-
 local function doRoll(roller)
     local part = roller and roller:FindFirstChild('Roll')
     if not part then return false end
+    clearDialog()
     local before = readInfo(roller, 'ItemName')
     local save = standOn(part)
-    task.wait(0.4)
-    pressE()
-    confirmIfOpen()
+    task.wait(0.5)
+    tapKey(KEY_E, 1.1)
+    clearDialog()
     local changed = false
     local t0 = tick()
     while alive and (tick() - t0) < 3 do
-        task.wait(0.1)
-        confirmIfOpen()
+        task.wait(0.15)
+        if clearDialog() then task.wait(0.2) end
         local now = readInfo(roller, 'ItemName')
         if now and now ~= before and now ~= '???' then
             changed = true
@@ -201,31 +209,32 @@ local function doRoll(roller)
         end
     end
     restore(save)
-    task.wait(0.1)
+    task.wait(0.15)
     return changed
 end
 
 local function doBuy(roller)
     local ip = roller and roller:FindFirstChild('ItemPlace')
     if not ip then return false end
+    clearDialog()
     local before = itemPlaceCount(roller)
     if before == 0 then return false end
     local save = standOn(ip)
-    task.wait(0.4)
-    pressE()
-    confirmIfOpen()
+    task.wait(0.5)
+    tapKey(KEY_E, 1.1)
+    clearDialog()
     local bought = false
     local t0 = tick()
     while alive and (tick() - t0) < 2.5 do
-        task.wait(0.1)
-        confirmIfOpen()
+        task.wait(0.15)
+        if clearDialog() then task.wait(0.2) end
         if itemPlaceCount(roller) < before then
             bought = true
             break
         end
     end
     restore(save)
-    task.wait(0.1)
+    task.wait(0.15)
     return bought
 end
 
@@ -259,7 +268,7 @@ end
 task.spawn(function()
     while alive do
         if state.autoW or state.autoB then
-            local plot = currentPlot()
+            local plot  = currentPlot()
             local rolls = plot and plot:FindFirstChild('Rolls')
             if rolls then
                 runOne(rolls:FindFirstChild('RollWeapons'), state.autoW, state.buyW, 'weapons')
@@ -382,7 +391,7 @@ local function stop()
     state.buyB = {}
     plotOrder = {}
     orderIndex = 1
-    pcall(keyrelease, Enum.KeyCode.E)
+    pcall(setrobloxinput, false, KEY_E)
     if HAS_UI then
         pcall(function() UI.RemoveTab('Rollers') end)
     end
