@@ -1,33 +1,32 @@
--- Build and Kill Zombies -> Auto Roll (prompt gated) - Matcha LuauVM - v28.0
+-- Build and Kill Zombies -> Auto Roll (prompt gated) - Matcha LuauVM - v28.1
 -- place 105011592530400
 --
--- What changed from v27.0:
---   The press is no longer blind. Before pressing E it checks whether the
---   roller prompt is actually up:
---       ProximityPrompts has a child, and that child has a button with a
---       non-zero AbsoluteSize
---   It waits up to 2s for that. If the prompt never appears it prints
---   'prompt not up' and does not press at all. If it appears it presses E
---   and reports what happened.
+-- v28.1 fixes two bugs in v28.0:
+--   1. ItemPlace contains a DISPLAY model named 'Normal' (and 'Golden',
+--      'Rainbow' for the fancy frames). v28.0 treated that as an un-bought
+--      item and would have skipped every press with
+--      'roller blocked by pending Normal'. Those names are now ignored.
+--   2. The final print() was missing its closing paren, which is a syntax
+--      error at load. Fixed.
 --
--- Why that matters:
---   every earlier version pressed E whether or not the prompt existed. If
---   the prompt was not up (out of range, blocked roller, prompt disabled)
---   the press was wasted and the log said 'no change' without telling you
---   why. Now the two failures are distinguishable:
---       prompt not up      -> the game is not offering the prompt
---       prompt up, no change -> the prompt ignored the press
+-- What it does:
+--   checks the roller prompt BEFORE pressing. Presses E only when
+--   ProximityPrompts has a child and that child has a button with a
+--   non-zero AbsoluteSize. Waits up to 2s for that. If the prompt never
+--   appears it prints 'prompt not up' and does not press.
 --
--- Still no setrobloxinput anywhere. keypress/keyrelease only.
+-- Three distinguishable outcomes in the log:
+--   prompt not up            -> the game is not offering the prompt
+--   roller blocked by X      -> a real un-bought item is sitting there
+--   prompt was up, press ignored -> the prompt exists and rejected E
 --
--- A roller will not roll while ItemPlace holds an un-bought item, so the
--- log prints 'pending=<item>' before every attempt. Clear it by hand once.
+-- No setrobloxinput anywhere. keypress/keyrelease only.
 --
 -- Menu: Rollers tab, one section
 --   Enabled, Roll Weapons, Roll Blocks, Teleport to roller
 
 local NAME    = 'RollerMods'
-local VERSION = 'v28.0'
+local VERSION = 'v28.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -43,6 +42,10 @@ local running  = false
 local doW      = false
 local doB      = false
 local teleport = false
+
+-- display frames inside ItemPlace are not pending items ----------------
+
+local DISPLAY_NAMES = { Normal = true, Golden = true, Rainbow = true }
 
 local function myPlot()
     local g = ws:FindFirstChild('Game')
@@ -74,7 +77,11 @@ local function pendingItem(roller)
     if not ip then return nil end
     for _, c in ipairs(ip:GetChildren()) do
         local cn = c.ClassName
-        if cn == 'Model' or cn == 'MeshPart' or cn == 'Part' then return c.Name end
+        if cn == 'Model' or cn == 'MeshPart' or cn == 'Part' then
+            if not DISPLAY_NAMES[c.Name] then
+                return c.Name
+            end
+        end
     end
     return nil
 end
@@ -260,10 +267,10 @@ if HAS_UI then
                 print('[' .. NAME .. '] section failed')
                 return
             end
-            mkToggle(sec, 'Enabled', 'f1_on', false, function(v) running = v end)
-            mkToggle(sec, 'Roll Weapons', 'f1_w', false, function(v) doW = v end)
-            mkToggle(sec, 'Roll Blocks', 'f1_b', false, function(v) doB = v end)
-            mkToggle(sec, 'Teleport to roller', 'f1_tp', false, function(v) teleport = v end)
+            mkToggle(sec, 'Enabled', 'g1_on', false, function(v) running = v end)
+            mkToggle(sec, 'Roll Weapons', 'g1_w', false, function(v) doW = v end)
+            mkToggle(sec, 'Roll Blocks', 'g1_b', false, function(v) doB = v end)
+            mkToggle(sec, 'Teleport to roller', 'g1_tp', false, function(v) teleport = v end)
         end)
     end)
     if not ok then print('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err)) end
@@ -284,5 +291,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded - prompt gated, keypress only'
-)
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded - prompt gated, keypress only')
