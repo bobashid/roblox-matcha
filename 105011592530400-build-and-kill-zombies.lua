@@ -1,4 +1,4 @@
--- Build and Kill Zombies -> Auto Roll Both - Matcha LuauVM - v29.0
+-- Build and Kill Zombies -> Auto Roll Both - Matcha LuauVM - v29.1
 -- place 105011592530400
 --
 -- ONE toggle rolls both rollers, in order, and waits out the cooldown.
@@ -15,16 +15,11 @@
 --
 -- Cooldown handling:
 --   after a pass where at least one roller produced a new item, wait 3s
---   after a pass where nothing changed, wait 5s (the rollers are probably
---     still cooling, no point hammering them)
+--   after a pass where nothing changed, wait 5s
 --   5 dead passes in a row -> switches itself off and notifies
 --
 -- Still no setrobloxinput anywhere (that call freezes this client).
 -- keypress / keyrelease only.
---
--- The press is gated on the prompt being up, and every attempt logs:
---   before=<item> pending=<real item or nil> prompt=<bool>(<children>) clickable=<bool>
--- so a miss is never ambiguous.
 --
 -- Menu: Rollers tab, one section
 --   Enabled            master, default off
@@ -32,7 +27,7 @@
 --   Teleport to roller default ON
 
 local NAME    = 'RollerMods'
-local VERSION = 'v29.0'
+local VERSION = 'v29.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -54,8 +49,6 @@ local MAX_MISSES    = 5
 local misses        = 0
 
 local DISPLAY_NAMES = { Normal = true, Golden = true, Rainbow = true }
-
--- reads ---------------------------------------------------------------
 
 local function myPlot()
     local g = ws:FindFirstChild('Game')
@@ -99,8 +92,6 @@ local function getRoot()
     return char and char:FindFirstChild('HumanoidRootPart')
 end
 
--- prompt check --------------------------------------------------------
-
 local function promptState()
     local pg = lp:FindFirstChild('PlayerGui')
     local pp = pg and pg:FindFirstChild('ProximityPrompts')
@@ -122,13 +113,12 @@ end
 local function waitForPrompt(secs)
     local t0 = tick()
     while alive and (tick() - t0) < secs do
-        if (promptState()) then return true end
+        local up = promptState()
+        if up then return true end
         wait(0.2)
     end
     return false
 end
-
--- teleport, saved once per pass ---------------------------------------
 
 local function goTo(part, cyc)
     if not teleport then return end
@@ -145,8 +135,6 @@ local function goBack(cyc)
     if root then pcall(function() root.CFrame = cyc.saved end) end
     cyc.saved = nil
 end
-
--- one roller ----------------------------------------------------------
 
 local function rollOne(roller, tag, cyc)
     local part = roller and roller:FindFirstChild('Roll')
@@ -202,8 +190,6 @@ local function rollOne(roller, tag, cyc)
     return false
 end
 
--- the single loop -----------------------------------------------------
-
 task.spawn(function()
     while alive do
         if running and autoBoth then
@@ -243,8 +229,6 @@ task.spawn(function()
     end
 end)
 
--- status inside a spawn, load never yields ----------------------------
-
 task.spawn(function()
     local p = myPlot()
     if not p then
@@ -256,8 +240,6 @@ task.spawn(function()
     print('[' .. NAME .. '] weapons ' .. tostring(read(w, 'ItemName')) .. ' (' .. tostring(read(w, 'Rarity')) .. ') pending=' .. tostring(pendingItem(w)))
     print('[' .. NAME .. '] blocks  ' .. tostring(read(b, 'ItemName')) .. ' (' .. tostring(read(b, 'Rarity')) .. ') pending=' .. tostring(pendingItem(b)))
 end)
-
--- menu: callbacks only set booleans -----------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -296,20 +278,18 @@ if HAS_UI then
                 print('[' .. NAME .. '] section failed')
                 return
             end
-            mkToggle(sec, 'Enabled', 'h1_on', false, function(v) running = v end)
-            mkToggle(sec, 'Auto Roll Both', 'h1_both', false, function(v)
+            mkToggle(sec, 'Enabled', 'h2_on', false, function(v) running = v end)
+            mkToggle(sec, 'Auto Roll Both', 'h2_both', false, function(v)
                 autoBoth = v
                 misses = 0
             end)
-            mkToggle(sec, 'Teleport to roller', 'h1_tp', true, function(v) teleport = v end)
+            mkToggle(sec, 'Teleport to roller', 'h2_tp', true, function(v) teleport = v end)
         end)
     end)
     if not ok then print('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err)) end
 else
     print('[' .. NAME .. '] no UI table')
 end
-
--- stop ----------------------------------------------------------------
 
 local function stop()
     alive    = false
@@ -321,5 +301,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded - one toggle rolls both'
-)
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded - one toggle rolls both')
