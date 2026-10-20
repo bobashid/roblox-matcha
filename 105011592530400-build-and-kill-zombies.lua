@@ -1,28 +1,29 @@
--- Build and Kill Zombies -> Teleport, Press E - Matcha LuauVM - v20.0
+-- Build and Kill Zombies -> Teleport, Press E - Matcha LuauVM - v21.0
 -- place 105011592530400
 --
--- WHY YOUR INPUTS WERE FREEZING:
---   It was my bug, not the game. stop() and reloading called task.cancel on
---   the loop while it was inside pressE, waiting between key-down and
---   key-up. Cancelling there skips the release line, so E stayed held down.
---   A latched injected key is exactly what 'all my inputs are frozen' looks
---   like. Every version from v16 to v18 had that hole.
+-- WHY YOUR INPUT WAS STILL FREEZING (my bug, not the game):
+--   v20.0 added a 'watchdog' that called
+--       setrobloxinput(false, 69)
+--   three times every 200ms, STARTING THE MOMENT THE SCRIPT LOADED and
+--   continuing whether or not anything was held. That is about 15 input
+--   injections per second into a live game, forever. It froze your input
+--   before you even touched a toggle.
 --
--- THE FIX:
---   E is now owned by a separate watchdog thread that is never cancelled.
---   Whenever no hold is in progress it releases E, every 200ms, forever.
---   Even if the worker thread is killed mid-hold, E comes back up within
---   200ms. stop() clears the hold flag FIRST, then cancels the worker, then
---   lets the watchdog keep releasing for another 2 seconds.
+--   The watchdog is GONE. So is every other unconditional input call.
 --
--- WHAT IT DOES (the simple thing you asked for):
+-- RULES THIS VERSION FOLLOWS:
+--   1. ZERO input while idle. No press, no release, no loop, nothing.
+--   2. Input happens only inside one press attempt, at most twice per pass.
+--   3. One down is matched by exactly one up. 'down' is a flag; a second
+--      release cannot fire because releaseOnce() returns when down is false.
+--   4. The release is scheduled with task.delay AT THE SAME MOMENT as the
+--      key-down, so if the calling thread is cancelled or errors, the
+--      delayed thread still releases the key. Cancellation cannot latch it.
+--
+-- WHAT IT DOES (the simple shape you asked for):
 --   teleport onto the Roll part, press E, read Info.ItemName, then teleport
 --   onto ItemPlace and press E to buy when the item is on your list, then
 --   put you back where you were.
---
--- setrobloxinput is the only input primitive that reaches this game
--- (keypress was measured inert: W moved 0 studs and iskeypressed stayed
--- false, while setrobloxinput(true,87) moved 7.12 studs).
 --
 -- Menu: Rollers tab
 --   Master      Enabled (default off) - the stop switch
@@ -32,7 +33,7 @@
 --               one toggle per item = your buy list, saved to disk
 
 local NAME    = 'RollerMods'
-local VERSION = 'v20.0'
+local VERSION = 'v21.0'
 local KEY_E   = 69
 local LIST_FILE = 'roller-buylist.json'
 
@@ -45,8 +46,8 @@ local Players = game:GetService('Players')
 local ws      = game:GetService('Workspace')
 local lp      = Players.LocalPlayer
 
-local alive = true
-local built = false
+local alive  = true
+local built  = false
 local worker = nil
 
 local state = {
@@ -61,59 +62,35 @@ local state = {
 local MAX_MISSES = 6
 local misses = 0
 
--- E release watchdog: this is the fix -------------------------------
+-- input: one down, one up, release guaranteed ----------------------
 
-local holding    = false
-local watchdogOn = true
+local down = false
 
-local function releaseE()
-    for _ = 1, 3 do
-        pcall(setrobloxinput, false, KEY_E)
-    end
+local function releaseOnce()
+    if not down then return end
+    down = false
+    pcall(setrobloxinput, false, KEY_E)
 end
-
-task.spawn(function()
-    while watchdogOn do
-        if not holding then releaseE() end
-        task.wait(0.2)
-    end
-    releaseE()
-    releaseE()
-end)
 
 local function pressE(secs)
-    holding = true
+    local hold = secs or state.hold
+    releaseOnce()
+    down = true
     pcall(setrobloxinput, true, KEY_E)
-    task.wait(secs or 0.7)
-    holding = false
-    releaseE()
-    task.wait(0.12)
+    -- schedule the release NOW, so cancelling this thread cannot latch E
+    task.delay(hold, releaseOnce)
+    task.wait(hold + 0.1)
+    releaseOnce()
+    task.wait(0.1)
 end
 
--- helpers ------------------------------------------------------------
+-- helpers ----------------------------------------------------------
 
 local function norm(s)
     return (string.lower(tostring(s)):gsub('[^%w]', ''))
 end
 
 local CATS = { 'Engines', 'Fuels', 'Wheels', 'Blocks', 'Supports', 'Pushbars', 'Cosmetic', 'Seats' }
-
-local function catalogMap()
-    local out = {}
-    local rs = game:GetService('ReplicatedStorage')
-    local assets = rs:FindFirstChild('Assets')
-    local parts  = assets and assets:FindFirstChild('CarParts')
-    if not parts then return out end
-    for _, cat in ipairs(CATS) do
-        local folder = parts:FindFirstChild(cat)
-        if folder then
-            for _, item in ipairs(folder:GetChildren()) do
-                out[norm(item.Name)] = item.Name
-            end
-        end
-    end
-    return out
-end
 
 local function saveList()
     local http = game:GetService('HttpService')
@@ -146,7 +123,7 @@ local function wants(name)
     return name and state.want[norm(name)] == true
 end
 
--- world reads --------------------------------------------------------
+-- world reads ------------------------------------------------------
 
 local function myPlot()
     local g = ws:FindFirstChild('Game')
@@ -188,7 +165,7 @@ local function getRoot()
     return char and char:FindFirstChild('HumanoidRootPart')
 end
 
--- teleport -----------------------------------------------------------
+-- teleport ---------------------------------------------------------
 
 local savedCFrame = nil
 
@@ -209,7 +186,7 @@ local function snapBack()
     task.wait(0.15)
 end
 
--- roll / buy ---------------------------------------------------------
+-- roll / buy -------------------------------------------------------
 
 local function tryRoll(roller, tag)
     local part = roller and roller:FindFirstChild('Roll')
@@ -245,7 +222,7 @@ local function tryRoll(roller, tag)
     return got
 end
 
-local function tryBuy(roller, tag, item)
+local function tryBuy(roller, tag)
     local ip = roller and roller:FindFirstChild('ItemPlace')
     if not ip then return false end
     local pend = pendingModel(roller)
@@ -277,7 +254,7 @@ local function tryBuy(roller, tag, item)
     return bought
 end
 
--- one full pass -----------------------------------------------------
+-- one pass ---------------------------------------------------------
 
 local function pass(label)
     local w, b = rollersNow()
@@ -292,9 +269,7 @@ local function pass(label)
         local item = tryRoll(w, 'weapons')
         if item then
             any = true
-            if state.buyMatched and wants(item) then
-                tryBuy(w, 'weapons', item)
-            end
+            if state.buyMatched and wants(item) then tryBuy(w, 'weapons') end
         end
     end
 
@@ -302,9 +277,7 @@ local function pass(label)
         local item = tryRoll(b, 'blocks')
         if item then
             any = true
-            if state.buyMatched and wants(item) then
-                tryBuy(b, 'blocks', item)
-            end
+            if state.buyMatched and wants(item) then tryBuy(b, 'blocks') end
         end
     end
 
@@ -334,7 +307,7 @@ worker = task.spawn(function()
     end
 end)
 
--- status -------------------------------------------------------------
+-- status -----------------------------------------------------------
 
 local function status()
     local p = myPlot()
@@ -351,7 +324,7 @@ local function status()
     print('[' .. NAME .. '] buy list ' .. n .. ' item(s)')
 end
 
--- menu ---------------------------------------------------------------
+-- menu -------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -401,7 +374,7 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local secM = mkSection(tab, 'Master')
         if secM then
-            mkToggle(secM, 'Enabled', 'r2_on', false, function(v)
+            mkToggle(secM, 'Enabled', 'r3_on', false, function(v)
                 state.enabled = v
                 misses = 0
                 print('[' .. NAME .. '] enabled=' .. tostring(v))
@@ -411,29 +384,29 @@ local function buildTab(tab)
 
         local secG = mkSection(tab, 'Go + Press')
         if secG then
-            mkToggle(secG, 'Auto Roll Weapons', 'r2_w', false, function(v)
+            mkToggle(secG, 'Auto Roll Weapons', 'r3_w', false, function(v)
                 state.autoW = v
                 misses = 0
                 print('[' .. NAME .. '] weapons ' .. (v and 'on' or 'off'))
             end)
-            mkToggle(secG, 'Auto Roll Blocks', 'r2_b', false, function(v)
+            mkToggle(secG, 'Auto Roll Blocks', 'r3_b', false, function(v)
                 state.autoB = v
                 misses = 0
                 print('[' .. NAME .. '] blocks ' .. (v and 'on' or 'off'))
             end)
-            mkToggle(secG, 'Buy matched items', 'r2_buy', true, function(v)
+            mkToggle(secG, 'Buy matched items', 'r3_buy', true, function(v)
                 state.buyMatched = v
             end)
         end
 
         local secT = mkSection(tab, 'Test')
         if secT then
-            mkToggle(secT, 'Test one press', 'r2_test', false, function(v)
+            mkToggle(secT, 'Test one press', 'r3_test', false, function(v)
                 if not v then return end
                 if tick() - lastTest < 4 then return end
                 lastTest = tick()
                 task.spawn(function()
-                    local w, b = rollersNow()
+                    local w = rollersNow()
                     local keepW, keepB = state.autoW, state.autoB
                     state.autoW, state.autoB = w ~= nil, false
                     pass('test')
@@ -459,7 +432,7 @@ local function buildTab(tab)
                     table.sort(names)
                     for _, itemName in ipairs(names) do
                         local key = norm(itemName)
-                        mkToggle(sec, itemName, 'r2_buy_' .. key, state.want[key] == true, function(v)
+                        mkToggle(sec, itemName, 'r3_buy_' .. key, state.want[key] == true, function(v)
                             setWant(itemName, v)
                         end)
                     end
@@ -491,22 +464,20 @@ end
 
 status()
 
--- stop ---------------------------------------------------------------
+-- stop -------------------------------------------------------------
 
 local function stop()
-    holding = false          -- first, so the watchdog releases E
-    alive   = false
+    alive = false
     state.enabled = false
     state.autoW   = false
     state.autoB   = false
-    releaseE()
+    releaseOnce()
     if worker then pcall(task.cancel, worker) end
     worker = nil
     snapBack()
-    task.delay(2, function() watchdogOn = false end)
     _G[NAME] = nil
-    print('[' .. NAME .. '] stopped, E released')
+    print('[' .. NAME .. '] stopped')
 end
 
 _G[NAME] = { stop = stop, status = status, version = VERSION, state = state }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - teleport + E, watchdog releases E')
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - no input while idle')
