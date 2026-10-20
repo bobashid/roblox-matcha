@@ -1,6 +1,4 @@
--- Dogs (place 94009908234110) - Weapon Mods + Inf Stamina - Matcha LuauVM - v1
--- restored: this file had the Build and Kill Zombies script pasted into it by mistake.
--- The Build and Kill Zombies version now lives in 105011592530400-build-and-kill-zombies.lua.
+-- Dogs (place 94009908234110) - Weapon Mods + Inf Stamina - Matcha LuauVM
 --
 -- one Matcha menu tab: Mods (toggles + sliders, no keybinds)
 -- no Instance.new, no hooks, no getconnections.
@@ -8,7 +6,7 @@
 -- again only when you press Rescan. Never inside a loop.
 
 local NAME    = 'ModsMenu'
-local VERSION = 'v1'
+local VERSION = 'v1.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -132,7 +130,7 @@ task.spawn(function()
 end)
 
 -- menu ---------------------------------------------------------------
--- Same widget pattern as prison-life-hvh.lua:
+-- Same widget pattern as Prison Life HvH:
 --   tab:Section(name, 'Left') returns a usable handle, plain name does not.
 --   Toggle / SliderInt / Button each get an argument-order retry.
 
