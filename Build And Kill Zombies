@@ -1,63 +1,55 @@
--- Build and Kill Zombies -> Auto Roll Both - Matcha LuauVM - v30.0
+-- Build And Kill Zombies - Auto Roll both rollers - Matcha LuauVM
 -- place 105011592530400
 --
--- WHAT WAS ACTUALLY BROKEN IN v29.1, found by a live check this session:
---   1. THE PENDING GUARD. Plot1 reported
---          W = Mini Missile   pendW = MiniMissile
---          B = DoubleBarrels  pendB = DoubleBarrels
---      so v29.1 printed 'blocked by pending' and returned WITHOUT EVER
---      PRESSING. Every pass, forever. The guard is removed: a pending item
---      is logged, not obeyed. The Roll prompt is enabled by OwnerUserId /
---      distance in RollController, not by pending state.
---   2. ONE PRESS METHOD ONLY. Each attempt now tries three, in order:
---          a) keypress E held 1.0s
---          b) keypress E held 2.2s   (in case HoldDuration is longer)
---          c) mouse1press held 1.2s on the prompt button, only if that
---             button has a real size (>2x2)
---      The log says which one produced the change.
---   3. 'press ignored' now means all three failed, not one.
+-- v31 rewrite. What was wrong in v30:
+--   1. keypress(Enum.KeyCode.E): keypress takes a Windows VK integer (E = 69),
+--      so every press was a no-op and the roll never fired.
+--   2. the mouse path only ran if a prompt button already had a size, and the
+--      pass gave up whenever anything sat on ItemPlace.
+--   3. it never checked which roller the on-screen prompt belonged to, so a
+--      press could land on the wrong roller.
 --
--- NEW: 'Clear pending first' (default ON). Before rolling it teleports to
--- ItemPlace and presses E once, which buys the item sitting on the roller.
--- That is what actually unblocks a roller. Turn it off if you never want a
--- buy attempt.
+-- How this version presses:
+--   * WorldToScreen inside RenderStepped keeps the screen point of each
+--     roller's Roll part and of its ItemPlace part.
+--   * the prompt's own on-screen button nearest that point is clicked with
+--     mousemoveabs + mouse1press / mouse1release.
+--   * if no button is drawn, keypress(69) / keyrelease(69) is sent.
+--   * after either, the roller text and ItemPlace model are re-read; no
+--     change means the press was ignored.
 --
--- setrobloxinput is never called. That is the API that froze the client.
--- Only keypress / keyrelease / mousemoveabs / mouse1press / mouse1release.
---
--- Menu: Rollers tab
---   Roll section
---     Enabled             master, default off - the stop
---     Auto Roll Both      one toggle rolls weapons then blocks
---     Teleport to roller  default ON
---     Clear pending first default ON
+-- no Instance.new, no hooks, no getconnections, no teleports.
 
 local NAME    = 'RollerMods'
-local VERSION = 'v30.0'
+local VERSION = 'v31.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 print('[' .. NAME .. '] ' .. VERSION)
 
-local Players = game:GetService('Players')
-local ws      = game:GetService('Workspace')
-local lp      = Players.LocalPlayer
+local Players    = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local ws         = game:GetService('Workspace')
+local lp         = Players.LocalPlayer
 
-local alive      = true
-local running    = false
-local autoBoth   = false
-local teleport   = true
-local clearFirst = true
+local alive    = true
+local running  = false
+local autoBoth = false
+local buyFirst = true
+local delay    = 0.4
+local VK_E     = 69
 
-local COOLDOWN_OK   = 3
-local COOLDOWN_MISS = 6
-local MAX_MISSES    = 6
-local misses        = 0
+local conns = {}
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
 
-local DISPLAY_NAMES = { Normal = true, Golden = true, Rainbow = true }
+local cur    = { weapons = nil, blocks = nil }
+local screen = {}
 
--- reads ---------------------------------------------------------------
+-- reads ----------------------------------------------------------------
 
 local function myPlot()
     local g = ws:FindFirstChild('Game')
@@ -65,7 +57,8 @@ local function myPlot()
     local pf = l and l:FindFirstChild('Plots')
     if not pf then return nil end
     for _, p in ipairs(pf:GetChildren()) do
-        if p:GetAttribute('OwnerUserId') == lp.UserId then return p end
+        local ok, owner = pcall(function() return p:GetAttribute('OwnerUserId') end)
+        if ok and owner == lp.UserId then return p end
     end
     return nil
 end
@@ -77,257 +70,182 @@ local function rollers()
     return rolls:FindFirstChild('RollWeapons'), rolls:FindFirstChild('RollBlocks')
 end
 
-local function read(roller, field)
+local function text(roller, field)
     local info = roller and roller:FindFirstChild('Info')
     local lbl  = info and info:FindFirstChild(field)
-    if lbl then return lbl.Text end
+    if not lbl then return nil end
+    local ok, v = pcall(function() return lbl.Text end)
+    if ok then return v end
     return nil
 end
 
-local function pendingItem(roller)
+local function itemModel(roller)
     local ip = roller and roller:FindFirstChild('ItemPlace')
     if not ip then return nil end
     for _, c in ipairs(ip:GetChildren()) do
-        local cn = c.ClassName
-        if cn == 'Model' or cn == 'MeshPart' or cn == 'Part' then
-            if not DISPLAY_NAMES[c.Name] then return c.Name end
-        end
+        if c.ClassName == 'Model' then return c.Name end
     end
     return nil
 end
 
-local function getRoot()
-    local char = lp.Character
-    return char and char:FindFirstChild('HumanoidRootPart')
+local function sig(roller)
+    return tostring(text(roller, 'ItemName')) .. '|' .. tostring(itemModel(roller))
 end
 
--- prompt inspection ---------------------------------------------------
+-- prompt clicking ------------------------------------------------------
 
-local function promptState()
+local function promptButtons()
     local pg = lp:FindFirstChild('PlayerGui')
     local pp = pg and pg:FindFirstChild('ProximityPrompts')
-    if not pp then return false, 0, false end
-    local kids = #pp:GetChildren()
-    local clickable = false
-    for _, root in ipairs(pp:GetChildren()) do
-        for _, g in ipairs(root:GetDescendants()) do
-            local cn = g.ClassName
-            if cn == 'TextButton' or cn == 'ImageButton' then
-                local s = g.AbsoluteSize
-                if s and s.X > 2 and s.Y > 2 then clickable = true end
+    local out = {}
+    if not pp then return out end
+    for _, d in ipairs(pp:GetDescendants()) do
+        local cn = d.ClassName
+        if cn == 'TextButton' or cn == 'ImageButton' then
+            local okS, s = pcall(function() return d.AbsoluteSize end)
+            local okP, p = pcall(function() return d.AbsolutePosition end)
+            if okS and okP and s and p and s.X > 2 and s.Y > 2 then
+                out[#out + 1] = { x = p.X + s.X * 0.5, y = p.Y + s.Y * 0.5 }
             end
         end
     end
-    return kids > 0, kids, clickable
+    return out
 end
 
-local function promptButton()
-    local pg = lp:FindFirstChild('PlayerGui')
-    local pp = pg and pg:FindFirstChild('ProximityPrompts')
-    if not pp then return nil end
-    for _, root in ipairs(pp:GetChildren()) do
-        for _, g in ipairs(root:GetDescendants()) do
-            local cn = g.ClassName
-            if cn == 'TextButton' or cn == 'ImageButton' then
-                local p, s = g.AbsolutePosition, g.AbsoluteSize
-                if p and s and s.X > 2 and s.Y > 2 then return g, p, s end
-            end
+local function clickAt(target, maxDist)
+    local pick, pickD = nil, maxDist * maxDist
+    for _, b in ipairs(promptButtons()) do
+        local d = (b.x - target.x) * (b.x - target.x) + (b.y - target.y) * (b.y - target.y)
+        if d < pickD then pick, pickD = b, d end
+    end
+    if not pick then return false end
+    pcall(mousemoveabs, pick.x, pick.y)
+    task.wait(0.06)
+    pcall(mouse1press)
+    task.wait(0.1)
+    pcall(mouse1release)
+    return true
+end
+
+local function clickPromptFor(key)
+    local pt = screen[key]
+    if pt and clickAt(pt, 170) then return true end
+    local list = promptButtons()
+    if #list == 1 then return clickAt(list[1], 10000) end
+    return false
+end
+
+local function pressE(hold)
+    pcall(keypress, VK_E)
+    task.wait(hold or 0.12)
+    pcall(keyrelease, VK_E)
+    task.wait(0.04)
+    pcall(keyrelease, VK_E)
+end
+
+-- actions --------------------------------------------------------------
+
+local function activate(roller, key, tag)
+    local before = sig(roller)
+    for attempt = 1, 3 do
+        if not alive then return false end
+        local clicked = clickPromptFor(key)
+        task.wait(0.45)
+        if sig(roller) ~= before then
+            print('[' .. NAME .. '] ' .. tag .. ' -> ' .. tostring(text(roller, 'ItemName')) .. ' via click try ' .. attempt)
+            return true
         end
-    end
-    return nil
-end
-
--- teleport, saved once per pass ---------------------------------------
-
-local function goTo(part, cyc)
-    if not teleport then return end
-    local root = getRoot()
-    if not root or not part then return end
-    if not cyc.saved then cyc.saved = root.CFrame end
-    local p = part.Position
-    pcall(function() root.CFrame = CFrame.new(p.X, p.Y + 2, p.Z) end)
-end
-
-local function goBack(cyc)
-    if not cyc.saved then return end
-    local root = getRoot()
-    if root then pcall(function() root.CFrame = cyc.saved) end end
-    cyc.saved = nil
-end
-
--- the only loop -------------------------------------------------------
-
-task.spawn(function()
-    local function waitForPrompt(secs)
-        local t0 = tick()
-        while alive and (tick() - t0) < secs do
-            if (promptState()) then return true end
-            wait(0.2)
+        pressE(0.12)
+        task.wait(0.45)
+        if sig(roller) ~= before then
+            print('[' .. NAME .. '] ' .. tag .. ' -> ' .. tostring(text(roller, 'ItemName')) .. ' via E try ' .. attempt)
+            return true
         end
-        return false
+        print('[' .. NAME .. '] ' .. tag .. ' no change try ' .. attempt .. ' (clicked=' .. tostring(clicked) .. ')')
+        task.wait(delay)
     end
+    return false
+end
 
-    local function pressKey(secs)
-        pcall(keypress, Enum.KeyCode.E)
-        wait(secs)
-        pcall(keyrelease, Enum.KeyCode.E)
-        pcall(keyrelease, Enum.KeyCode.E)
-    end
-
-    local function pressMouse(secs)
-        local btn, bp, bs = promptButton()
-        if not btn then return false end
-        pcall(mousemoveabs, bp.X + bs.X * 0.5, bp.Y + bs.Y * 0.5)
-        wait(0.15)
-        pcall(mouse1press)
-        wait(secs)
-        pcall(mouse1release)
+local function buyItem(roller, key, tag)
+    local before = itemModel(roller)
+    if not before then return false end
+    clickPromptFor(key .. ':buy')
+    task.wait(0.9)
+    local now = itemModel(roller)
+    if now ~= before then
+        print('[' .. NAME .. '] ' .. tag .. ' bought ' .. tostring(before))
         return true
     end
+    print('[' .. NAME .. '] ' .. tag .. ' buy ignored, still ' .. tostring(now))
+    return false
+end
 
-    local function watchChange(roller, before, secs)
-        local t0 = tick()
-        while alive and (tick() - t0) < secs do
-            wait(0.2)
-            local now = read(roller, 'ItemName')
-            if now and now ~= before and now ~= '???' then return now end
-        end
-        return nil
-    end
+-- screen tracking ------------------------------------------------------
 
-    -- buy the item sitting on the roller, so the next roll is not wasted
-    local function clearPending(roller, tag, cyc)
-        local pend = pendingItem(roller)
-        if not pend then return false end
-        local ip = roller:FindFirstChild('ItemPlace')
-        if not ip then return false end
-        goTo(ip, cyc)
-        wait(0.6)
-        if not (promptState()) then waitForPrompt(2.5) end
-        pressKey(1.2)
-        local t0 = tick()
-        while alive and (tick() - t0) < 2.5 do
-            wait(0.2)
-            if pendingItem(roller) ~= pend then
-                print('[' .. NAME .. '] ' .. tag .. ' cleared pending ' .. pend)
-                return true
-            end
-        end
-        print('[' .. NAME .. '] ' .. tag .. ' could not clear pending ' .. pend)
-        return false
-    end
-
-    local function rollOne(roller, tag, cyc)
-        local part = roller and roller:FindFirstChild('Roll')
-        if not part then return false end
-
-        goTo(part, cyc)
-        wait(0.6)
-
-        local before = read(roller, 'ItemName')
-        local pend   = pendingItem(roller)
-        local up, kids, clickable = promptState()
-
-        print('[' .. NAME .. '] ' .. tag .. ' before=' .. tostring(before)
-            .. ' pending=' .. tostring(pend)
-            .. ' prompt=' .. tostring(up) .. '(' .. tostring(kids) .. ')'
-            .. ' clickable=' .. tostring(clickable))
-
-        if not up then
-            if not waitForPrompt(2.5) then
-                print('[' .. NAME .. '] ' .. tag .. ' prompt never appeared')
-                return false
-            end
-        end
-
-        pressKey(1.0)
-        local got = watchChange(roller, before, 2.0)
-        if got then
-            print('[' .. NAME .. '] ' .. tag .. ' ROLLED ' .. got .. ' via key-1.0')
-            pcall(notify, tag .. ': ' .. got, 'Rollers', 3)
-            return true
-        end
-
-        pressKey(2.2)
-        got = watchChange(roller, before, 2.0)
-        if got then
-            print('[' .. NAME .. '] ' .. tag .. ' ROLLED ' .. got .. ' via key-2.2')
-            pcall(notify, tag .. ': ' .. got, 'Rollers', 3)
-            return true
-        end
-
-        if promptButton() then
-            pressMouse(1.2)
-            got = watchChange(roller, before, 2.0)
-            if got then
-                print('[' .. NAME .. '] ' .. tag .. ' ROLLED ' .. got .. ' via mouse')
-                pcall(notify, tag .. ': ' .. got, 'Rollers', 3)
-                return true
-            end
-        end
-
-        print('[' .. NAME .. '] ' .. tag .. ' all 3 press methods ignored (still '
-            .. tostring(read(roller, 'ItemName')) .. ')')
-        return false
-    end
-
-    while alive do
-        if running and autoBoth then
-            local cyc = {}
-            local any = false
-
-            local w, b = rollers()
-            if w then
-                if clearFirst then clearPending(w, 'weapons', cyc) end
-                if rollOne(w, 'weapons', cyc) then any = true end
-            end
-            if b then
-                if clearFirst then clearPending(b, 'blocks', cyc) end
-                if rollOne(b, 'blocks', cyc) then any = true end
-            end
-
-            goBack(cyc)
-
-            if any then
-                misses = 0
-                wait(COOLDOWN_OK)
-            else
-                misses = misses + 1
-                print('[' .. NAME .. '] dead pass ' .. misses .. '/' .. MAX_MISSES
-                    .. ' - waiting ' .. COOLDOWN_MISS .. 's')
-                if misses >= MAX_MISSES then
-                    running  = false
-                    autoBoth = false
-                    misses   = 0
-                    print('[' .. NAME .. '] switched off - no press method worked ' .. MAX_MISSES .. ' passes in a row')
-                    pcall(notify, 'auto roll off: prompt ignored every press', 'Rollers', 8)
-                else
-                    wait(COOLDOWN_MISS)
-                end
-            end
-        else
-            wait(0.5)
-        end
-    end
-end)
-
--- status inside a spawn so load never yields --------------------------
-
-task.spawn(function()
-    local p = myPlot()
-    if not p then
-        print('[' .. NAME .. '] no plot with your OwnerUserId (' .. lp.UserId .. ')')
+local function project(roller, key)
+    if not roller then
+        screen[key] = nil
+        screen[key .. ':buy'] = nil
         return
     end
-    local w, b = rollers()
-    print('[' .. NAME .. '] plot ' .. p.Name)
-    print('[' .. NAME .. '] weapons ' .. tostring(read(w, 'ItemName'))
-        .. ' (' .. tostring(read(w, 'Rarity')) .. ') pending=' .. tostring(pendingItem(w)))
-    print('[' .. NAME .. '] blocks  ' .. tostring(read(b, 'ItemName'))
-        .. ' (' .. tostring(read(b, 'Rarity')) .. ') pending=' .. tostring(pendingItem(b)))
+    local roll = roller:FindFirstChild('Roll')
+    if roll then
+        local ok, sp, on = pcall(WorldToScreen, roll.Position)
+        if ok and on and sp then screen[key] = { x = sp.X, y = sp.Y } else screen[key] = nil end
+    else
+        screen[key] = nil
+    end
+    local ip = roller:FindFirstChild('ItemPlace')
+    if ip then
+        local ok2, sp2, on2 = pcall(WorldToScreen, ip.Position)
+        if ok2 and on2 and sp2 then screen[key .. ':buy'] = { x = sp2.X, y = sp2.Y } else screen[key .. ':buy'] = nil end
+    else
+        screen[key .. ':buy'] = nil
+    end
+end
+
+track(RunService.RenderStepped:Connect(function()
+    pcall(project, cur.weapons, 'RollWeapons')
+    pcall(project, cur.blocks, 'RollBlocks')
+end))
+
+-- roller discovery, once a second --------------------------------------
+
+task.spawn(function()
+    while alive do
+        local w, b = rollers()
+        cur.weapons, cur.blocks = w, b
+        task.wait(1)
+    end
 end)
 
--- menu: callbacks only set booleans -----------------------------------
+-- main loop ------------------------------------------------------------
+
+task.spawn(function()
+    while alive do
+        if running and autoBoth then
+            local w, b = cur.weapons, cur.blocks
+            local got = false
+            if w then
+                if buyFirst then buyItem(w, 'RollWeapons', 'weapons') end
+                if activate(w, 'RollWeapons', 'weapons') then got = true end
+            end
+            if alive and b then
+                if buyFirst then buyItem(b, 'RollBlocks', 'blocks') end
+                if activate(b, 'RollBlocks', 'blocks') then got = true end
+            end
+            if not w and not b then
+                print('[' .. NAME .. '] no plot or no Rolls folder yet')
+            end
+            task.wait(got and 1.2 or 3)
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- menu ----------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -366,19 +284,29 @@ if HAS_UI then
                 print('[' .. NAME .. '] section failed')
                 return
             end
-            mkToggle(sec, 'Enabled', 'j1_on', false, function(v) running = v end)
-            mkToggle(sec, 'Auto Roll Both', 'j1_both', false, function(v)
-                autoBoth = v
-                misses = 0
-            end)
-            mkToggle(sec, 'Teleport to roller', 'j1_tp', true, function(v) teleport = v end)
-            mkToggle(sec, 'Clear pending first', 'j1_clr', true, function(v) clearFirst = v end)
+            mkToggle(sec, 'Enabled', 'rm_on', false, function(v) running = v end)
+            mkToggle(sec, 'Auto Roll Both', 'rm_both', false, function(v) autoBoth = v end)
+            mkToggle(sec, 'Buy item first', 'rm_buy', true, function(v) buyFirst = v end)
         end)
     end)
     if not ok then print('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err)) end
 else
-    print('[' .. NAME .. '] no UI table')
+    print('[' .. NAME .. '] no UI table - menu unavailable')
 end
+
+-- status ---------------------------------------------------------------
+
+task.spawn(function()
+    local p = myPlot()
+    if not p then
+        print('[' .. NAME .. '] no plot with your OwnerUserId (' .. tostring(lp.UserId) .. ')')
+        return
+    end
+    local w, b = rollers()
+    print('[' .. NAME .. '] plot ' .. p.Name)
+    print('[' .. NAME .. '] weapons ' .. tostring(text(w, 'ItemName')) .. ' (' .. tostring(text(w, 'Rarity')) .. ') item=' .. tostring(itemModel(w)))
+    print('[' .. NAME .. '] blocks  ' .. tostring(text(b, 'ItemName')) .. ' (' .. tostring(text(b, 'Rarity')) .. ') item=' .. tostring(itemModel(b)))
+end)
 
 -- stop ----------------------------------------------------------------
 
@@ -386,11 +314,15 @@ local function stop()
     alive    = false
     running  = false
     autoBoth = false
-    pcall(keyrelease, Enum.KeyCode.E)
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    conns = {}
+    pcall(keyrelease, VK_E)
     pcall(mouse1release)
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded - one toggle rolls both')
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded - open the Rollers tab, menu=' .. tostring(HAS_UI))
