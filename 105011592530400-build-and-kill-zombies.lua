@@ -1,32 +1,38 @@
--- Build and Kill Zombies -> Auto Roll (prompt gated) - Matcha LuauVM - v28.1
+-- Build and Kill Zombies -> Auto Roll Both - Matcha LuauVM - v29.0
 -- place 105011592530400
 --
--- v28.1 fixes two bugs in v28.0:
---   1. ItemPlace contains a DISPLAY model named 'Normal' (and 'Golden',
---      'Rainbow' for the fancy frames). v28.0 treated that as an un-bought
---      item and would have skipped every press with
---      'roller blocked by pending Normal'. Those names are now ignored.
---   2. The final print() was missing its closing paren, which is a syntax
---      error at load. Fixed.
+-- ONE toggle rolls both rollers, in order, and waits out the cooldown.
 --
--- What it does:
---   checks the roller prompt BEFORE pressing. Presses E only when
---   ProximityPrompts has a child and that child has a button with a
---   non-zero AbsoluteSize. Waits up to 2s for that. If the prompt never
---   appears it prints 'prompt not up' and does not press.
+-- Cycle (one pass of the loop):
+--   1. save your CFrame once
+--   2. teleport to RollWeapons.Roll, press E, read the result
+--   3. teleport to RollBlocks.Roll,  press E, read the result
+--   4. put you back where you started
+--   5. wait the cooldown, then start the next pass
 --
--- Three distinguishable outcomes in the log:
---   prompt not up            -> the game is not offering the prompt
---   roller blocked by X      -> a real un-bought item is sitting there
---   prompt was up, press ignored -> the prompt exists and rejected E
+-- Because step 5 waits, it does not bounce between the two rollers during
+-- the cooldown. One teleport pair per pass, not one per press.
 --
--- No setrobloxinput anywhere. keypress/keyrelease only.
+-- Cooldown handling:
+--   after a pass where at least one roller produced a new item, wait 3s
+--   after a pass where nothing changed, wait 5s (the rollers are probably
+--     still cooling, no point hammering them)
+--   5 dead passes in a row -> switches itself off and notifies
+--
+-- Still no setrobloxinput anywhere (that call freezes this client).
+-- keypress / keyrelease only.
+--
+-- The press is gated on the prompt being up, and every attempt logs:
+--   before=<item> pending=<real item or nil> prompt=<bool>(<children>) clickable=<bool>
+-- so a miss is never ambiguous.
 --
 -- Menu: Rollers tab, one section
---   Enabled, Roll Weapons, Roll Blocks, Teleport to roller
+--   Enabled            master, default off
+--   Auto Roll Both     the single toggle you asked for
+--   Teleport to roller default ON
 
 local NAME    = 'RollerMods'
-local VERSION = 'v28.1'
+local VERSION = 'v29.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -39,13 +45,17 @@ local lp      = Players.LocalPlayer
 
 local alive    = true
 local running  = false
-local doW      = false
-local doB      = false
-local teleport = false
+local autoBoth = false
+local teleport = true
 
--- display frames inside ItemPlace are not pending items ----------------
+local COOLDOWN_OK   = 3
+local COOLDOWN_MISS = 5
+local MAX_MISSES    = 5
+local misses        = 0
 
 local DISPLAY_NAMES = { Normal = true, Golden = true, Rainbow = true }
+
+-- reads ---------------------------------------------------------------
 
 local function myPlot()
     local g = ws:FindFirstChild('Game')
@@ -78,9 +88,7 @@ local function pendingItem(roller)
     for _, c in ipairs(ip:GetChildren()) do
         local cn = c.ClassName
         if cn == 'Model' or cn == 'MeshPart' or cn == 'Part' then
-            if not DISPLAY_NAMES[c.Name] then
-                return c.Name
-            end
+            if not DISPLAY_NAMES[c.Name] then return c.Name end
         end
     end
     return nil
@@ -114,56 +122,57 @@ end
 local function waitForPrompt(secs)
     local t0 = tick()
     while alive and (tick() - t0) < secs do
-        local up = promptState()
-        if up then return true end
+        if (promptState()) then return true end
         wait(0.2)
     end
     return false
 end
 
--- one roll ------------------------------------------------------------
+-- teleport, saved once per pass ---------------------------------------
 
-local function rollOne(roller, tag)
+local function goTo(part, cyc)
+    if not teleport then return end
+    local root = getRoot()
+    if not root or not part then return end
+    if not cyc.saved then cyc.saved = root.CFrame end
+    local p = part.Position
+    pcall(function() root.CFrame = CFrame.new(p.X, p.Y + 2, p.Z) end)
+end
+
+local function goBack(cyc)
+    if not cyc.saved then return end
+    local root = getRoot()
+    if root then pcall(function() root.CFrame = cyc.saved end) end
+    cyc.saved = nil
+end
+
+-- one roller ----------------------------------------------------------
+
+local function rollOne(roller, tag, cyc)
     local part = roller and roller:FindFirstChild('Roll')
-    if not part then return end
+    if not part then return false end
 
-    local saved = nil
-    local root  = getRoot()
-    if teleport and root then
-        saved = root.CFrame
-        local pp = part.Position
-        pcall(function() root.CFrame = CFrame.new(pp.X, pp.Y + 2, pp.Z) end)
-    end
+    goTo(part, cyc)
+    wait(0.5)
 
     local before  = read(roller, 'ItemName')
     local pending = pendingItem(roller)
     local up, kids, clickable = promptState()
+
     print('[' .. NAME .. '] ' .. tag .. ' before=' .. tostring(before)
         .. ' pending=' .. tostring(pending)
         .. ' prompt=' .. tostring(up) .. '(' .. tostring(kids) .. ')'
         .. ' clickable=' .. tostring(clickable))
 
     if pending then
-        print('[' .. NAME .. '] ' .. tag .. ' roller blocked by pending ' .. pending .. ' - buy it by hand')
-        if saved then
-            local r0 = getRoot()
-            if r0 then pcall(function() r0.CFrame = saved end) end
-        end
-        return
+        print('[' .. NAME .. '] ' .. tag .. ' blocked by pending ' .. pending)
+        return false
     end
 
     if not up then
-        local appeared = waitForPrompt(2)
-        up, kids, clickable = promptState()
-        print('[' .. NAME .. '] ' .. tag .. ' waited for prompt -> ' .. tostring(appeared)
-            .. ' prompt=' .. tostring(up) .. '(' .. tostring(kids) .. ')')
-        if not appeared then
-            print('[' .. NAME .. '] ' .. tag .. ' prompt not up - stand closer to the roller')
-            if saved then
-                local r1 = getRoot()
-                if r1 then pcall(function() r1.CFrame = saved end) end
-            end
-            return
+        if not waitForPrompt(2) then
+            print('[' .. NAME .. '] ' .. tag .. ' prompt not up')
+            return false
         end
     end
 
@@ -183,38 +192,58 @@ local function rollOne(roller, tag)
         end
     end
 
-    if saved then
-        local r2 = getRoot()
-        if r2 then pcall(function() r2.CFrame = saved end) end
-    end
-
     if got then
         print('[' .. NAME .. '] ' .. tag .. ' ROLLED ' .. got .. ' (' .. tostring(read(roller, 'Rarity')) .. ')')
         pcall(notify, tag .. ': ' .. got, 'Rollers', 3)
-    else
-        print('[' .. NAME .. '] ' .. tag .. ' prompt was up, press ignored (still ' .. tostring(read(roller, 'ItemName')) .. ')')
+        return true
     end
+
+    print('[' .. NAME .. '] ' .. tag .. ' press ignored (still ' .. tostring(read(roller, 'ItemName')) .. ')')
+    return false
 end
 
 -- the single loop -----------------------------------------------------
 
 task.spawn(function()
     while alive do
-        if running and (doW or doB) then
-            local ok, err = pcall(function()
-                local w, b = rollers()
-                if doW and w then rollOne(w, 'weapons') end
-                if doB and b then rollOne(b, 'blocks') end
-            end)
-            if not ok then print('[' .. NAME .. '] pass error: ' .. tostring(err)) end
-            wait(2)
+        if running and autoBoth then
+            local cyc = {}
+            local any = false
+
+            local w, b = rollers()
+            if w then
+                if rollOne(w, 'weapons', cyc) then any = true end
+            end
+            if b then
+                if rollOne(b, 'blocks', cyc) then any = true end
+            end
+
+            goBack(cyc)
+
+            if any then
+                misses = 0
+                wait(COOLDOWN_OK)
+            else
+                misses = misses + 1
+                print('[' .. NAME .. '] dead pass ' .. misses .. '/' .. MAX_MISSES
+                    .. ' - waiting ' .. COOLDOWN_MISS .. 's for cooldown')
+                if misses >= MAX_MISSES then
+                    running  = false
+                    autoBoth = false
+                    misses   = 0
+                    print('[' .. NAME .. '] switched off - press ignored ' .. MAX_MISSES .. ' passes in a row')
+                    pcall(notify, 'auto roll off: E not reaching the prompt', 'Rollers', 8)
+                else
+                    wait(COOLDOWN_MISS)
+                end
+            end
         else
             wait(0.5)
         end
     end
 end)
 
--- status inside a spawn -----------------------------------------------
+-- status inside a spawn, load never yields ----------------------------
 
 task.spawn(function()
     local p = myPlot()
@@ -267,10 +296,12 @@ if HAS_UI then
                 print('[' .. NAME .. '] section failed')
                 return
             end
-            mkToggle(sec, 'Enabled', 'g1_on', false, function(v) running = v end)
-            mkToggle(sec, 'Roll Weapons', 'g1_w', false, function(v) doW = v end)
-            mkToggle(sec, 'Roll Blocks', 'g1_b', false, function(v) doB = v end)
-            mkToggle(sec, 'Teleport to roller', 'g1_tp', false, function(v) teleport = v end)
+            mkToggle(sec, 'Enabled', 'h1_on', false, function(v) running = v end)
+            mkToggle(sec, 'Auto Roll Both', 'h1_both', false, function(v)
+                autoBoth = v
+                misses = 0
+            end)
+            mkToggle(sec, 'Teleport to roller', 'h1_tp', true, function(v) teleport = v end)
         end)
     end)
     if not ok then print('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err)) end
@@ -281,14 +312,14 @@ end
 -- stop ----------------------------------------------------------------
 
 local function stop()
-    alive   = false
-    running = false
-    doW     = false
-    doB     = false
+    alive    = false
+    running  = false
+    autoBoth = false
     pcall(keyrelease, Enum.KeyCode.E)
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded - prompt gated, keypress only')
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded - one toggle rolls both'
+)
