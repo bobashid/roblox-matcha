@@ -1,36 +1,45 @@
--- Build and Kill Zombies -> Teleport Roll + Buy - Matcha LuauVM - v16.0
+-- Build and Kill Zombies -> Roller (menu only) - Matcha LuauVM - v17.0
 -- place 105011592530400
 --
--- What this does:
---   Auto Roll Weapons / Auto Roll Blocks teleport you onto the roller,
---   press its prompt, read the result, and if the item is on your buy list
---   teleport to ItemPlace and press the buy prompt. Your CFrame is saved
---   and restored on every single attempt, including on failure.
+-- EVERYTHING is in the menu. No console command is needed to start, test or
+-- stop this script.
 --
--- What was fixed from v15.2:
---   The Item Buy List section was built only from the saved list, which
---   starts empty, so the menu showed nothing. It now lists every part in
---   ReplicatedStorage.Assets.CarParts, grouped by category, all off.
+--   Rollers tab
+--     Master
+--       Enabled              <- master switch, default OFF. Turn off to stop.
+--     Auto
+--       Teleport to roller   <- default ON
+--       Auto Roll Weapons
+--       Auto Roll Blocks
+--       Buy matched items    <- default ON
+--     Test
+--       Test Roll Weapons    <- runs one attempt and reports
+--       Test Roll Blocks
+--       Test Buy Weapons
+--     Engines / Fuels / Wheels / Blocks / Supports / Pushbars / Cosmetic
+--       one toggle per item, that is your buy list
 --
--- Honest caveat, measured this session:
---   injected input has never triggered these prompts. keypress(69) is
---   inert, setrobloxinput(true,69) moves the character but not the prompt,
---   mouse1click / mouse1press on the prompt button did nothing, and the
---   Buy prompt renders no clickable button at all. This version tries the
---   prompt button with a mouse hold AND the E key with a long hold, then
---   proves success from the labels. If neither works you will see
---   'no change' in the log rather than a false 'rolled'.
+-- What v17.0 fixes from v16.0:
+--   1. A pending item in ItemPlace BLOCKS the roller. The live probe showed
+--      'itemplace children 1 item Rocket Turbo', so v16 could sit forever
+--      rolling a blocked roller. runOne now checks first: if the pending
+--      item is on your buy list it buys it, otherwise it prints and
+--      notifies that the roller is blocked.
+--   2. No console needed. Master switch stops everything, Test toggles run a
+--      single attempt and print the outcome, status prints on load.
 --
--- Commands:
---   _G.RollerMods.test()     -- one roll attempt, prints what happened
---   _G.RollerMods.status()
---   _G.RollerMods.list()
---   _G.RollerMods.stop()
+-- Honest limit, measured this session:
+--   injected input has never triggered these prompts. keypress(69) is inert,
+--   setrobloxinput(true,69) moves the character but not the prompt,
+--   mouse1click and mouse1press on the prompt button did nothing, and the
+--   Buy prompt rendered no clickable button at 1.45 studs. v17.0 tries the
+--   prompt button with a mouse hold, then E held 1.2s, and proves the
+--   result from the labels. If it cannot, it says so instead of lying.
 
 local NAME    = 'RollerMods'
-local VERSION = 'v16.0'
+local VERSION = 'v17.0'
 local KEY_E   = 69
-local WATCH_FILE = 'roller-buylist.json'
+local LIST_FILE = 'roller-buylist.json'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -46,14 +55,16 @@ local built = false
 local conn  = nil
 
 local state = {
-    autoW    = false,
-    autoB    = false,
-    teleport = true,
-    hold     = 1.6,
-    want     = {},
+    enabled    = false,
+    autoW      = false,
+    autoB      = false,
+    teleport   = true,
+    buyMatched = true,
+    hold       = 1.2,
+    want       = {},
 }
 
--- helpers -------------------------------------------------------------
+-- naming / catalog ----------------------------------------------------
 
 local function norm(s)
     return (string.lower(tostring(s)):gsub('[^%w]', ''))
@@ -87,11 +98,11 @@ local function saveList()
     for k in pairs(state.want) do keys[#keys + 1] = k end
     table.sort(keys)
     local ok, enc = pcall(function() return http:JSONEncode(keys) end)
-    if ok and type(enc) == 'string' then pcall(writefile, WATCH_FILE, enc) end
+    if ok and type(enc) == 'string' then pcall(writefile, LIST_FILE, enc) end
 end
 
 local function loadList()
-    local ok, data = pcall(readfile, WATCH_FILE)
+    local ok, data = pcall(readfile, LIST_FILE)
     if not ok or type(data) ~= 'string' or data == '' then return end
     local http = game:GetService('HttpService')
     local ok2, dec = pcall(function() return http:JSONDecode(data) end)
@@ -101,52 +112,29 @@ local function loadList()
     end
 end
 
-local function add(name)
+local function setWant(name, on)
     local key = norm(name)
-    if key == '' then return false end
+    if key == '' then return end
     local cat = catalogMap()
     local real = cat[key]
-    if not real then
+    if not real and on then
         local hits = {}
         for k, v in pairs(cat) do
             if string.find(k, key, 1, true) then hits[#hits + 1] = v end
         end
-        if #hits == 0 then
-            print('[' .. NAME .. '] no item matches "' .. tostring(name) .. '"')
-            return false
-        elseif #hits == 1 then
+        if #hits == 1 then
             real, key = hits[1], norm(hits[1])
-        else
+        elseif #hits > 1 then
             table.sort(hits)
             print('[' .. NAME .. '] ambiguous: ' .. table.concat(hits, ', '))
-            return false
+            return
+        else
+            print('[' .. NAME .. '] no item matches "' .. tostring(name) .. '"')
+            return
         end
     end
-    state.want[key] = true
+    if on then state.want[key] = true else state.want[key] = nil end
     saveList()
-    print('[' .. NAME .. '] buying ' .. real)
-    return true
-end
-
-local function remove(name)
-    local key = norm(name)
-    if state.want[key] then
-        state.want[key] = nil
-        saveList()
-        print('[' .. NAME .. '] removed ' .. tostring(name))
-        return true
-    end
-    return false
-end
-
-local function listWant()
-    local cat = catalogMap()
-    local rows = {}
-    for k in pairs(state.want) do rows[#rows + 1] = cat[k] or k end
-    table.sort(rows)
-    if #rows == 0 then print('[' .. NAME .. '] buy list empty') return end
-    print('[' .. NAME .. '] buy list (' .. #rows .. '):')
-    for _, n in ipairs(rows) do print('  ' .. n) end
 end
 
 -- world reads ---------------------------------------------------------
@@ -156,14 +144,10 @@ local function getRoot()
     return char and char:FindFirstChild('HumanoidRootPart')
 end
 
-local function plotsFolder()
+local function myPlot()
     local g = ws:FindFirstChild('Game')
     local l = g and g:FindFirstChild('Lobby')
-    return l and l:FindFirstChild('Plots')
-end
-
-local function myPlot()
-    local pf = plotsFolder()
+    local pf = l and l:FindFirstChild('Plots')
     if not pf then return nil end
     for _, p in ipairs(pf:GetChildren()) do
         if p:GetAttribute('OwnerUserId') == lp.UserId then return p end
@@ -178,15 +162,14 @@ local function read(roller, field)
     return nil
 end
 
-local function itemCount(roller)
+local function pendingModel(roller)
     local ip = roller and roller:FindFirstChild('ItemPlace')
-    if not ip then return 0 end
-    local n = 0
+    if not ip then return nil end
     for _, c in ipairs(ip:GetChildren()) do
         local cn = c.ClassName
-        if cn == 'Model' or cn == 'MeshPart' or cn == 'Part' then n = n + 1 end
+        if cn == 'Model' or cn == 'MeshPart' or cn == 'Part' then return c.Name end
     end
-    return n
+    return nil
 end
 
 -- prompt attempt ------------------------------------------------------
@@ -242,13 +225,17 @@ end
 
 local function doRoll(roller, label)
     local part = roller and roller:FindFirstChild('Roll')
-    if not part then return false end
+    if not part then
+        print('[' .. NAME .. '] ' .. label .. ': no Roll part')
+        return false
+    end
     local before = read(roller, 'ItemName')
     local save = nil
     if state.teleport then
         save = placeOn(part)
         task.wait(0.8)
     end
+    local hadButton = promptButton() ~= nil
     local how = pressPrompt(state.hold)
     local changed, item, rar = false, before, nil
     local t0 = tick()
@@ -256,18 +243,20 @@ local function doRoll(roller, label)
         task.wait(0.15)
         local now = read(roller, 'ItemName')
         if now and now ~= before and now ~= '???' then
-            changed = true
-            item  = now
-            rar   = read(roller, 'Rarity')
+            changed, item, rar = true, now, read(roller, 'Rarity')
             break
         end
     end
     if save then restore(save) end
     task.wait(0.1)
     if changed then
-        print('[' .. NAME .. '] ' .. label .. ' rolled ' .. item .. ' (' .. tostring(rar) .. ') via ' .. how)
+        print('[' .. NAME .. '] ' .. label .. ' ROLLED ' .. item .. ' (' .. tostring(rar) .. ') via ' .. how)
+        pcall(notify, label .. ': ' .. item .. ' (' .. tostring(rar) .. ')', 'Rollers', 4)
     else
-        print('[' .. NAME .. '] ' .. label .. ' no change via ' .. how .. ' (still ' .. tostring(read(roller, 'ItemName')) .. ')')
+        print('[' .. NAME .. '] ' .. label .. ' no change via ' .. how
+            .. ' | prompt button=' .. tostring(hadButton)
+            .. ' | still ' .. tostring(read(roller, 'ItemName')))
+        pcall(notify, label .. ': prompt did not trigger (input blocked)', 'Rollers', 4)
     end
     return changed, item, rar
 end
@@ -275,9 +264,9 @@ end
 local function doBuy(roller, label)
     local ip = roller and roller:FindFirstChild('ItemPlace')
     if not ip then return false end
-    local before = itemCount(roller)
-    if before == 0 then
-        print('[' .. NAME .. '] ' .. label .. ' nothing to buy')
+    local pending = pendingModel(roller)
+    if not pending then
+        print('[' .. NAME .. '] ' .. label .. ': nothing pending to buy')
         return false
     end
     local save = nil
@@ -290,11 +279,12 @@ local function doBuy(roller, label)
     local t0 = tick()
     while alive and (tick() - t0) < 2.5 do
         task.wait(0.15)
-        if itemCount(roller) < before then bought = true break end
+        if pendingModel(roller) ~= pending then bought = true break end
     end
     if save then restore(save) end
     task.wait(0.1)
-    print('[' .. NAME .. '] ' .. label .. (bought and ' bought' or ' buy no change') .. ' via ' .. how)
+    print('[' .. NAME .. '] ' .. label .. ' buy ' .. pending .. (bought and ' OK' or ' FAILED') .. ' via ' .. how)
+    pcall(notify, label .. ' buy ' .. pending .. (bought and ': ok' or ': failed'), 'Rollers', 4)
     return bought
 end
 
@@ -302,15 +292,26 @@ end
 
 local function runOne(roller, autoFlag, label)
     if not autoFlag or not roller then return end
-    local ok, item, rar = doRoll(roller, label)
-    if ok and state.want[norm(item)] then
+    local pending = pendingModel(roller)
+    if pending then
+        if state.want[norm(pending)] then
+            print('[' .. NAME .. '] ' .. label .. ': pending ' .. pending .. ' is on the buy list -> buying')
+            doBuy(roller, label)
+        else
+            print('[' .. NAME .. '] ' .. label .. ' BLOCKED by pending ' .. pending .. ' (not on buy list)')
+            pcall(notify, label .. ': ' .. pending .. ' blocks the roller', 'Rollers', 5)
+        end
+        return
+    end
+    local ok, item = doRoll(roller, label)
+    if ok and state.buyMatched and state.want[norm(item)] then
         doBuy(roller, label)
     end
 end
 
 conn = task.spawn(function()
     while alive do
-        if state.autoW or state.autoB then
+        if state.enabled and (state.autoW or state.autoB) then
             local p = myPlot()
             local rolls = p and p:FindFirstChild('Rolls')
             if rolls then
@@ -322,28 +323,23 @@ conn = task.spawn(function()
     end
 end)
 
--- status / test -------------------------------------------------------
+-- status --------------------------------------------------------------
 
 local function status()
     local p = myPlot()
-    if not p then print('[' .. NAME .. '] no plot with your OwnerUserId') return end
+    if not p then
+        print('[' .. NAME .. '] no plot carries your OwnerUserId (' .. lp.UserId .. ')')
+        return
+    end
     local rolls = p:FindFirstChild('Rolls')
     local w = rolls and rolls:FindFirstChild('RollWeapons')
     local b = rolls and rolls:FindFirstChild('RollBlocks')
-    print('[' .. NAME .. '] plot ' .. p.Name)
-    print('[' .. NAME .. '] weapons ' .. tostring(read(w, 'ItemName')) .. ' (' .. tostring(read(w, 'Rarity')) .. ') pending=' .. itemCount(w))
-    print('[' .. NAME .. '] blocks  ' .. tostring(read(b, 'ItemName')) .. ' (' .. tostring(read(b, 'Rarity')) .. ') pending=' .. itemCount(b))
+    print('[' .. NAME .. '] plot ' .. p.Name .. ' | enabled=' .. tostring(state.enabled))
+    print('[' .. NAME .. '] weapons ' .. tostring(read(w, 'ItemName')) .. ' (' .. tostring(read(w, 'Rarity')) .. ') pending=' .. tostring(pendingModel(w)))
+    print('[' .. NAME .. '] blocks  ' .. tostring(read(b, 'ItemName')) .. ' (' .. tostring(read(b, 'Rarity')) .. ') pending=' .. tostring(pendingModel(b)))
     local n = 0
     for _ in pairs(state.want) do n = n + 1 end
-    print('[' .. NAME .. '] buy list ' .. n .. ' item(s), teleport=' .. tostring(state.teleport))
-end
-
-local function test()
-    local p = myPlot()
-    local rolls = p and p:FindFirstChild('Rolls')
-    local w = rolls and rolls:FindFirstChild('RollWeapons')
-    if not w then print('[' .. NAME .. '] no roller found') return end
-    doRoll(w, 'test')
+    print('[' .. NAME .. '] buy list ' .. n .. ' item(s)')
 end
 
 -- menu ---------------------------------------------------------------
@@ -387,12 +383,28 @@ local function mkToggle(sec, label, id, default, fn)
     return false
 end
 
+local function rollersNow()
+    local p = myPlot()
+    local rolls = p and p:FindFirstChild('Rolls')
+    if not rolls then return nil, nil end
+    return rolls:FindFirstChild('RollWeapons'), rolls:FindFirstChild('RollBlocks')
+end
+
 local function buildTab(tab)
     if built then return end
     built = true
 
     local ok, err = pcall(function()
-        local secA = mkSection(tab, 'Auto Roll')
+        local secM = mkSection(tab, 'Master')
+        if secM then
+            mkToggle(secM, 'Enabled', 'rb_on', false, function(v)
+                state.enabled = v
+                print('[' .. NAME .. '] enabled=' .. tostring(v))
+                if v then status() end
+            end)
+        end
+
+        local secA = mkSection(tab, 'Auto')
         if secA then
             mkToggle(secA, 'Teleport to roller', 'rb_tp', true, function(v)
                 state.teleport = v
@@ -404,6 +416,37 @@ local function buildTab(tab)
             mkToggle(secA, 'Auto Roll Blocks', 'rb_auto_b', false, function(v)
                 state.autoB = v
                 print('[' .. NAME .. '] block auto roll ' .. (v and 'on' or 'off'))
+            end)
+            mkToggle(secA, 'Buy matched items', 'rb_buym', true, function(v)
+                state.buyMatched = v
+            end)
+        end
+
+        local secT = mkSection(tab, 'Test')
+        if secT then
+            mkToggle(secT, 'Test Roll Weapons', 'rb_t_w', false, function(v)
+                if not v then return end
+                task.spawn(function()
+                    local w = rollersNow()
+                    if not w then print('[' .. NAME .. '] test: no weapon roller') return end
+                    doRoll(w, 'test-weapons')
+                end)
+            end)
+            mkToggle(secT, 'Test Roll Blocks', 'rb_t_b', false, function(v)
+                if not v then return end
+                task.spawn(function()
+                    local _, b = rollersNow()
+                    if not b then print('[' .. NAME .. '] test: no block roller') return end
+                    doRoll(b, 'test-blocks')
+                end)
+            end)
+            mkToggle(secT, 'Test Buy Weapons', 'rb_t_buy', false, function(v)
+                if not v then return end
+                task.spawn(function()
+                    local w = rollersNow()
+                    if not w then print('[' .. NAME .. '] test: no weapon roller') return end
+                    doBuy(w, 'test-weapons')
+                end)
             end)
         end
 
@@ -425,8 +468,7 @@ local function buildTab(tab)
                     for _, itemName in ipairs(names) do
                         local key = norm(itemName)
                         mkToggle(sec, itemName, 'rb_buy_' .. key, state.want[key] == true, function(v)
-                            if v then state.want[key] = true else state.want[key] = nil end
-                            saveList()
+                            setWant(itemName, v)
                         end)
                     end
                 end
@@ -455,10 +497,13 @@ else
     warn('[' .. NAME .. '] no UI table - menu unavailable')
 end
 
+status()
+
 -- stop ---------------------------------------------------------------
 
 local function stop()
     alive = false
+    state.enabled = false
     state.autoW = false
     state.autoB = false
     if conn then pcall(task.cancel, conn) end
@@ -472,8 +517,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = {
-    stop = stop, status = status, test = test, add = add, remove = remove,
-    list = listWant, version = VERSION, state = state,
-}
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - teleport roll + item buy list')
+_G[NAME] = { stop = stop, status = status, version = VERSION, state = state }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - turn Enabled on in the Rollers tab')
