@@ -1,39 +1,37 @@
--- Build and Kill Zombies -> Teleport, Press E - Matcha LuauVM - v21.0
+-- Build and Kill Zombies -> Teleport, Press E - Matcha LuauVM - v22.0
 -- place 105011592530400
 --
--- WHY YOUR INPUT WAS STILL FREEZING (my bug, not the game):
---   v20.0 added a 'watchdog' that called
---       setrobloxinput(false, 69)
---   three times every 200ms, STARTING THE MOMENT THE SCRIPT LOADED and
---   continuing whether or not anything was held. That is about 15 input
---   injections per second into a live game, forever. It froze your input
---   before you even touched a toggle.
+-- WHY IT STILL FROZE WITH EVERYTHING OFF:
+--   v20.0 started a watchdog thread the moment it loaded:
+--       while watchdogOn do releaseE() task.wait(0.2) end
+--   That is 15 input injections per second. Loading another script does NOT
+--   kill a thread from the previous one, so that watchdog kept running in
+--   the same VM no matter which version was loaded on top, and turning
+--   toggles off could not stop it. Only rejoining the server clears it.
 --
---   The watchdog is GONE. So is every other unconditional input call.
+-- WHAT v22.0 DOES DIFFERENTLY:
+--   1. NO thread is spawned at load. The loop is created only when you turn
+--      Enabled on, and cancelled the moment you turn it off.
+--   2. Exactly ONE key release pass at load (E, W, A, S, D, Space), to clear
+--      a key left latched by an older version. Never repeated in a loop.
+--   3. A 'Clean Keys' toggle in the menu does the same release pass on
+--      demand, so you can clear a stuck key without rejoining.
+--   4. One down is matched by one up, and the release is scheduled with
+--      task.delay at the same moment as the key-down, so cancelling the
+--      thread cannot leave E held.
 --
--- RULES THIS VERSION FOLLOWS:
---   1. ZERO input while idle. No press, no release, no loop, nothing.
---   2. Input happens only inside one press attempt, at most twice per pass.
---   3. One down is matched by exactly one up. 'down' is a flag; a second
---      release cannot fire because releaseOnce() returns when down is false.
---   4. The release is scheduled with task.delay AT THE SAME MOMENT as the
---      key-down, so if the calling thread is cancelled or errors, the
---      delayed thread still releases the key. Cancellation cannot latch it.
---
--- WHAT IT DOES (the simple shape you asked for):
---   teleport onto the Roll part, press E, read Info.ItemName, then teleport
---   onto ItemPlace and press E to buy when the item is on your list, then
---   put you back where you were.
+-- BEFORE YOU LOAD THIS: rejoin the server. Otherwise v20's watchdog is
+-- still in memory and no version can fix it from inside Lua.
 --
 -- Menu: Rollers tab
---   Master      Enabled (default off) - the stop switch
+--   Master      Enabled (the stop), Clean Keys
 --   Go + Press  Auto Roll Weapons / Auto Roll Blocks / Buy matched items
 --   Test        Test one press
 --   Engines/Fuels/Wheels/Blocks/Supports/Pushbars/Cosmetic/Seats
 --               one toggle per item = your buy list, saved to disk
 
 local NAME    = 'RollerMods'
-local VERSION = 'v21.0'
+local VERSION = 'v22.0'
 local KEY_E   = 69
 local LIST_FILE = 'roller-buylist.json'
 
@@ -62,7 +60,20 @@ local state = {
 local MAX_MISSES = 6
 local misses = 0
 
--- input: one down, one up, release guaranteed ----------------------
+-- one-shot key release -----------------------------------------------
+
+local RELEASE_KEYS = { KEY_E, 87, 65, 83, 68, 32 }
+
+local function releaseAllKeys()
+    for _, k in ipairs(RELEASE_KEYS) do
+        pcall(setrobloxinput, false, k)
+    end
+    print('[' .. NAME .. '] keys released')
+end
+
+releaseAllKeys()   -- exactly once, at load, never in a loop
+
+-- input: one down, one up --------------------------------------------
 
 local down = false
 
@@ -77,14 +88,13 @@ local function pressE(secs)
     releaseOnce()
     down = true
     pcall(setrobloxinput, true, KEY_E)
-    -- schedule the release NOW, so cancelling this thread cannot latch E
     task.delay(hold, releaseOnce)
     task.wait(hold + 0.1)
     releaseOnce()
     task.wait(0.1)
 end
 
--- helpers ----------------------------------------------------------
+-- helpers ------------------------------------------------------------
 
 local function norm(s)
     return (string.lower(tostring(s)):gsub('[^%w]', ''))
@@ -123,7 +133,7 @@ local function wants(name)
     return name and state.want[norm(name)] == true
 end
 
--- world reads ------------------------------------------------------
+-- world reads --------------------------------------------------------
 
 local function myPlot()
     local g = ws:FindFirstChild('Game')
@@ -165,7 +175,7 @@ local function getRoot()
     return char and char:FindFirstChild('HumanoidRootPart')
 end
 
--- teleport ---------------------------------------------------------
+-- teleport -----------------------------------------------------------
 
 local savedCFrame = nil
 
@@ -186,7 +196,7 @@ local function snapBack()
     task.wait(0.15)
 end
 
--- roll / buy -------------------------------------------------------
+-- roll / buy ---------------------------------------------------------
 
 local function tryRoll(roller, tag)
     local part = roller and roller:FindFirstChild('Roll')
@@ -254,7 +264,7 @@ local function tryBuy(roller, tag)
     return bought
 end
 
--- one pass ---------------------------------------------------------
+-- one pass -----------------------------------------------------------
 
 local function pass(label)
     local w, b = rollersNow()
@@ -298,16 +308,28 @@ local function pass(label)
     return any
 end
 
-worker = task.spawn(function()
-    while alive do
-        if state.enabled and (state.autoW or state.autoB) then
-            pass('auto')
-        end
-        task.wait(1.2)
-    end
-end)
+-- worker: only exists while Enabled is on ----------------------------
 
--- status -----------------------------------------------------------
+local startWorker, stopWorker
+
+stopWorker = function()
+    if worker then pcall(task.cancel, worker) end
+    worker = nil
+    releaseOnce()
+end
+
+startWorker = function()
+    if worker then return end
+    worker = task.spawn(function()
+        while alive and state.enabled and (state.autoW or state.autoB) do
+            pass('auto')
+            task.wait(1.2)
+        end
+        worker = nil
+    end)
+end
+
+-- status -------------------------------------------------------------
 
 local function status()
     local p = myPlot()
@@ -324,7 +346,7 @@ local function status()
     print('[' .. NAME .. '] buy list ' .. n .. ' item(s)')
 end
 
--- menu -------------------------------------------------------------
+-- menu ---------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -374,34 +396,44 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local secM = mkSection(tab, 'Master')
         if secM then
-            mkToggle(secM, 'Enabled', 'r3_on', false, function(v)
+            mkToggle(secM, 'Enabled', 'r4_on', false, function(v)
                 state.enabled = v
                 misses = 0
                 print('[' .. NAME .. '] enabled=' .. tostring(v))
-                if v then status() end
+                if v then
+                    status()
+                    if state.autoW or state.autoB then startWorker() end
+                else
+                    stopWorker()
+                end
+            end)
+            mkToggle(secM, 'Clean Keys', 'r4_clean', false, function(v)
+                if v then releaseAllKeys() end
             end)
         end
 
         local secG = mkSection(tab, 'Go + Press')
         if secG then
-            mkToggle(secG, 'Auto Roll Weapons', 'r3_w', false, function(v)
+            mkToggle(secG, 'Auto Roll Weapons', 'r4_w', false, function(v)
                 state.autoW = v
                 misses = 0
                 print('[' .. NAME .. '] weapons ' .. (v and 'on' or 'off'))
+                if state.enabled and v then startWorker() end
             end)
-            mkToggle(secG, 'Auto Roll Blocks', 'r3_b', false, function(v)
+            mkToggle(secG, 'Auto Roll Blocks', 'r4_b', false, function(v)
                 state.autoB = v
                 misses = 0
                 print('[' .. NAME .. '] blocks ' .. (v and 'on' or 'off'))
+                if state.enabled and v then startWorker() end
             end)
-            mkToggle(secG, 'Buy matched items', 'r3_buy', true, function(v)
+            mkToggle(secG, 'Buy matched items', 'r4_buy', true, function(v)
                 state.buyMatched = v
             end)
         end
 
         local secT = mkSection(tab, 'Test')
         if secT then
-            mkToggle(secT, 'Test one press', 'r3_test', false, function(v)
+            mkToggle(secT, 'Test one press', 'r4_test', false, function(v)
                 if not v then return end
                 if tick() - lastTest < 4 then return end
                 lastTest = tick()
@@ -432,7 +464,7 @@ local function buildTab(tab)
                     table.sort(names)
                     for _, itemName in ipairs(names) do
                         local key = norm(itemName)
-                        mkToggle(sec, itemName, 'r3_buy_' .. key, state.want[key] == true, function(v)
+                        mkToggle(sec, itemName, 'r4_buy_' .. key, state.want[key] == true, function(v)
                             setWant(itemName, v)
                         end)
                     end
@@ -464,20 +496,19 @@ end
 
 status()
 
--- stop -------------------------------------------------------------
+-- stop ---------------------------------------------------------------
 
 local function stop()
     alive = false
     state.enabled = false
     state.autoW   = false
     state.autoB   = false
-    releaseOnce()
-    if worker then pcall(task.cancel, worker) end
-    worker = nil
+    stopWorker()
+    releaseAllKeys()
     snapBack()
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
 _G[NAME] = { stop = stop, status = status, version = VERSION, state = state }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - no input while idle')
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - no thread at load')
