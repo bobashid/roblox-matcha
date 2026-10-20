@@ -1,9 +1,9 @@
 -- Auto Roll
--- Version: 2.0.0
+-- Version: 2.1.0
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Auto%20Roll",true))()
 
-local VERSION = "2.0.0"
+local VERSION = "2.1.0"
 print("[Auto Roll] v" .. VERSION)
 
 if _G.AutoRoll and _G.AutoRoll.stop then
@@ -15,15 +15,16 @@ local lp = Players.LocalPlayer
 
 local CONFIG = {
     Key         = Enum.KeyCode.E,
-    HoldTime    = 0.9,
-    RollWait    = 1.2,
-    BuyWait     = 1.2,
+    ClickPrompt = true,   -- click the game's ProximityPrompts UI
+    KeyFallback = true,   -- also hold the prompt key
     DoRoll      = true,
     DoBuy       = true,
-    ClickPrompt = true,
-    KeyFallback = true,
     MoveToRoll  = true,
     MoveToBuy   = true,
+    Range       = 8,
+    PromptWait  = 2.0,
+    RollWait    = 1.0,
+    BuyWait     = 1.0,
     WalkTimeout = 5,
     StopAfter   = 0,
 }
@@ -44,16 +45,14 @@ _G.AutoRoll = { stop = stop, version = VERSION }
 
 local function getChar()
     local c = lp.Character
-    local root = c and c:FindFirstChild("HumanoidRootPart")
-    local hum = c and c:FindFirstChildOfClass("Humanoid")
-    return c, root, hum
+    return c, c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
 end
 
 local function dist(a, b)
     return (a - b).Magnitude
 end
 
-local function nearestPlot()
+local function nearestCategory()
     local _, root = getChar()
     if not root then return nil end
     local g = workspace:FindFirstChild("Game")
@@ -76,6 +75,11 @@ local function nearestPlot()
     return best
 end
 
+local function inRange(pos)
+    local _, root = getChar()
+    return root ~= nil and dist(root.Position, pos) <= CONFIG.Range
+end
+
 local function walkTo(pos, timeout)
     local _, root, hum = getChar()
     if not (root and hum) then return false end
@@ -84,98 +88,99 @@ local function walkTo(pos, timeout)
     while tick() - t0 < timeout and running do
         _, root, hum = getChar()
         if not (root and hum) then return false end
-        if dist(root.Position, pos) < 4 then
+        if dist(root.Position, pos) <= CONFIG.Range * 0.6 then
             pcall(function() hum.WalkToPoint = root.Position end)
             return true
         end
         task.wait(0.1)
     end
-    local _, r2, h2 = getChar()
-    if r2 and h2 then pcall(function() h2.WalkToPoint = r2.Position end) end
+    _, root, hum = getChar()
+    if root and hum then pcall(function() hum.WalkToPoint = root.Position end) end
     return false
 end
 
--- find a visible clickable GUI button by name under PlayerGui
-local function findButton(names)
+-- Click the game's own proximity prompt UI (PlayerGui.ProximityPrompts).
+local function clickPromptUI()
+    if not CONFIG.ClickPrompt then return false end
     local pg = lp:FindFirstChild("PlayerGui")
-    if not pg then return nil end
-    local found = nil
-    for _, d in ipairs(pg:GetDescendants()) do
-        if names[d.Name] then
-            local ap = d.AbsolutePosition
-            local as = d.AbsoluteSize
-            if ap and as and as.X > 0 and as.Y > 0 then
-                found = d
+    local sp = pg and pg:FindFirstChild("ProximityPrompts")
+    if not sp then return false end
+
+    local target = nil
+    for _, d in ipairs(sp:GetDescendants()) do
+        local ap = d.AbsolutePosition
+        local as = d.AbsoluteSize
+        if ap and as and as.X > 4 and as.Y > 4 then
+            local cls = d.ClassName
+            if cls == "ImageButton" or cls == "TextButton" then
+                target = d
                 break
+            elseif not target and (cls == "ImageLabel" or cls == "Frame" or cls == "TextLabel") then
+                target = d
             end
         end
     end
-    return found
-end
+    if not target then return false end
 
-local function clickGui(obj)
-    if not obj then return false end
-    local ap = obj.AbsolutePosition
-    local as = obj.AbsoluteSize
-    if not (ap and as) then return false end
-    if as.X <= 0 or as.Y <= 0 then return false end
+    local ap = target.AbsolutePosition
+    local as = target.AbsoluteSize
     local x = ap.X + as.X * 0.5
     local y = ap.Y + as.Y * 0.5
     pcall(function() mousemoveabs(x, y) end)
-    task.wait(0.08)
-    pcall(function() mouse1click() end)
+    task.wait(0.05)
+    pcall(function() mouse1press() end)
+    task.wait(0.12)
+    pcall(function() mouse1release() end)
     return true
 end
 
 local function holdKey()
     if not CONFIG.KeyFallback then return end
     pcall(function() setrobloxinput(CONFIG.Key, true) end)
-    task.wait(CONFIG.HoldTime)
+end
+
+local function releaseKey()
     pcall(function() setrobloxinput(CONFIG.Key, false) end)
 end
 
-local PROMPT_NAMES = { PromptFrame = true, Prompt = true, ProximityPrompt = true }
-local ROLL_NAMES   = { ["ROLL"] = true, ["Roll button BG"] = true, ["ROLL Shadow"] = true, ["Roll IMG"] = true }
-local BUY_NAMES    = { BuyAll = true, Buy = true, BuyButton = true }
-
-local function activate(buttonNames, fallbackKey)
-    if CONFIG.ClickPrompt then
-        local b = findButton(buttonNames)
-        if b and clickGui(b) then
-            task.wait(0.2)
-            return true
-        end
+-- Hold the key and click the prompt UI until it goes away or times out.
+local function activatePrompt()
+    holdKey()
+    local t0 = tick()
+    local clicked = false
+    while running and tick() - t0 < CONFIG.PromptWait do
+        if clickPromptUI() then clicked = true end
+        task.wait(0.15)
     end
-    if fallbackKey then holdKey() end
-    return false
+    releaseKey()
+    return clicked
 end
 
 task.spawn(function()
     local cycles = 0
     while running do
-        local cat = nearestPlot()
+        local cat = nearestCategory()
         if cat then
             local roll = cat:FindFirstChild("Roll")
             local ip   = cat:FindFirstChild("ItemPlace")
 
             if CONFIG.DoRoll and roll then
-                if CONFIG.MoveToRoll then
-                    local _, root = getChar()
-                    if root and dist(root.Position, roll.Position) > 8 then
-                        walkTo(roll.Position, CONFIG.WalkTimeout)
-                    end
+                if not inRange(roll.Position) and CONFIG.MoveToRoll then
+                    walkTo(roll.Position, CONFIG.WalkTimeout)
                 end
-                activate(ROLL_NAMES, true)
+                if inRange(roll.Position) then
+                    activatePrompt()
+                end
                 task.wait(CONFIG.RollWait)
             end
 
             if CONFIG.DoBuy and ip and running then
-                if CONFIG.MoveToBuy then
+                if not inRange(ip.Position) and CONFIG.MoveToBuy then
                     walkTo(ip.Position, CONFIG.WalkTimeout)
                 end
-                activate(PROMPT_NAMES, true)
-                task.wait(0.25)
-                activate(BUY_NAMES, true)
+                if inRange(ip.Position) then
+                    activatePrompt()
+                end
                 task.wait(CONFIG.BuyWait)
             end
         end
