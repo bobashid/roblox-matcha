@@ -1,32 +1,29 @@
--- Build and Kill Zombies -> Roll Watcher + Buy List - Matcha LuauVM - v15.1
+-- Build and Kill Zombies -> Item Buy List - Matcha LuauVM - v15.2
 -- place 105011592530400
 --
--- What changed from v15.0:
---   The per-rarity toggles used to be 'Alert on' (notify for everything).
---   They are now a BUY LIST: turn on only the rarities you actually want.
---   When a roll matches, the notification says 'BUY NOW: <item> (<rarity>)'
---   so you click the prompt for the good ones and ignore the rest.
+-- AUTO ROLL AND AUTO BUY ARE NOT POSSIBLE IN THIS VM. Evidence gathered live:
+--   keypress(69)                            -> ok, iskeypressed stays false
+--   setrobloxinput(true, 69)                -> W moves 7.12 studs, E does nothing
+--   mouse1click on the Roll prompt button   -> no change
+--   mouse1press + mouse1release 1.2s        -> no change
+--   standing 1.45 studs from the Buy prompt -> no clickable prompt button
+--   fireproximityprompt                     -> absent
+--   require(Packets / RollController)       -> errors
+-- So this version does what CAN be done: it watches both rollers and shouts
+-- the moment an item YOU named lands, so you only press for those.
 --
--- This version still issues NO input and NO movement:
---   no keypress / keyrelease / setrobloxinput
---   no mouse1click / mouse1press / mousemoveabs
---   no CFrame or Position writes, no teleport
---
--- Why it cannot buy by itself:
---   buying is the BuyPrompt under <Roller>.ItemPlace. Every input route to
---   a prompt was tested in this VM and none reach it (keypress inert,
---   setrobloxinput moves the character but not the prompt, mouse1click and
---   mouse1press/release on the prompt button do nothing, fireproximityprompt
---   absent, require on Packets/RollController errors).
---   So it watches and flags; you press the prompt.
---
--- Use:
---   _G.RollerMods.status()   -> print both rollers now
---   _G.RollerMods.want()     -> check the current rollers against your list
---   _G.RollerMods.stop()     -> stop watching
+-- Commands:
+--   _G.RollerMods.add("Quad Launcher")     -- fuzzy: "quadlauncher" works too
+--   _G.RollerMods.remove("Quad Launcher")
+--   _G.RollerMods.list()
+--   _G.RollerMods.clear()
+--   _G.RollerMods.status()
+--   _G.RollerMods.stop()
+-- The list is saved to roller-watchlist.json in the Matcha workspace.
 
 local NAME    = 'RollerMods'
-local VERSION = 'v15.1'
+local VERSION = 'v15.2'
+local WATCH_FILE = 'roller-watchlist.json'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -41,16 +38,109 @@ local alive = true
 local built = false
 local conn  = nil
 
-local RARITIES = {
-    'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary',
-    'Mythical', 'Secret', 'Divine', 'Celestial',
-}
-
 local state = {
     watchW = true,
     watchB = true,
     want   = {},
 }
+
+-- helpers -------------------------------------------------------------
+
+local function norm(s)
+    return (string.lower(tostring(s)):gsub('[^%w]', ''))
+end
+
+local catalog = nil
+
+local function catalogMap()
+    if catalog then return catalog end
+    catalog = {}
+    local rs = game:GetService('ReplicatedStorage')
+    local assets = rs:FindFirstChild('Assets')
+    local parts  = assets and assets:FindFirstChild('CarParts')
+    if not parts then return catalog end
+    for _, folder in ipairs(parts:GetChildren()) do
+        for _, item in ipairs(folder:GetChildren()) do
+            catalog[norm(item.Name)] = item.Name
+        end
+    end
+    return catalog
+end
+
+local function saveList()
+    local http = game:GetService('HttpService')
+    local keys = {}
+    for k in pairs(state.want) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local ok, encoded = pcall(function() return http:JSONEncode(keys) end)
+    if ok and type(encoded) == 'string' then
+        pcall(writefile, WATCH_FILE, encoded)
+    end
+end
+
+local function loadList()
+    local ok, data = pcall(readfile, WATCH_FILE)
+    if not ok or type(data) ~= 'string' or data == '' then return end
+    local http = game:GetService('HttpService')
+    local ok2, decoded = pcall(function() return http:JSONDecode(data) end)
+    if not ok2 or type(decoded) ~= 'table' then return end
+    for _, key in ipairs(decoded) do
+        if type(key) == 'string' then state.want[key] = true end
+    end
+end
+
+local function add(name)
+    local key = norm(name)
+    if key == '' then return false end
+    local cat = catalogMap()
+    local real = cat[key]
+    if not real then
+        local hits = {}
+        for k, v in pairs(cat) do
+            if string.find(k, key, 1, true) then hits[#hits + 1] = v end
+        end
+        if #hits == 0 then
+            print('[' .. NAME .. '] no catalog item matches "' .. tostring(name) .. '"')
+            return false
+        elseif #hits == 1 then
+            real = hits[1]
+            key = norm(real)
+        else
+            table.sort(hits)
+            print('[' .. NAME .. '] ambiguous: ' .. table.concat(hits, ', '))
+            return false
+        end
+    end
+    state.want[key] = true
+    saveList()
+    print('[' .. NAME .. '] watching ' .. real)
+    return true
+end
+
+local function remove(name)
+    local key = norm(name)
+    if state.want[key] then
+        state.want[key] = nil
+        saveList()
+        print('[' .. NAME .. '] removed ' .. tostring(name))
+        return true
+    end
+    print('[' .. NAME .. '] not in list: ' .. tostring(name))
+    return false
+end
+
+local function listWant()
+    local cat = catalogMap()
+    local rows = {}
+    for key in pairs(state.want) do rows[#rows + 1] = cat[key] or key end
+    table.sort(rows)
+    if #rows == 0 then
+        print('[' .. NAME .. '] buy list empty - use add("Item Name")')
+        return
+    end
+    print('[' .. NAME .. '] buy list (' .. #rows .. '):')
+    for _, n in ipairs(rows) do print('  ' .. n) end
+end
 
 -- read only helpers ---------------------------------------------------
 
@@ -90,12 +180,11 @@ local last = { wItem = nil, wRar = nil, bItem = nil, bRar = nil }
 local function announce(tag, item, rar)
     if not item then return end
     local line = tag .. ': ' .. item .. ' (' .. tostring(rar) .. ')'
-    if state.want[rar] then
+    if state.want[norm(item)] then
         print('[' .. NAME .. '] BUY NOW -> ' .. line)
-        pcall(notify, 'BUY NOW: ' .. item .. ' (' .. tostring(rar) .. ')', tag, 7)
+        pcall(notify, 'BUY NOW: ' .. item .. ' (' .. tostring(rar) .. ')', tag, 8)
     else
         print('[' .. NAME .. '] ' .. line)
-        pcall(notify, line, 'Rollers', 3)
     end
 end
 
@@ -118,15 +207,6 @@ local function tickOnce()
     end
 end
 
-conn = task.spawn(function()
-    while alive do
-        tickOnce()
-        task.wait(0.5)
-    end
-end)
-
--- status / want -------------------------------------------------------
-
 local function status()
     local p = myPlot()
     if not p then
@@ -137,21 +217,9 @@ local function status()
     print('[' .. NAME .. '] plot ' .. p.Name)
     print('[' .. NAME .. '] weapons ' .. tostring(read(w, 'ItemName')) .. ' (' .. tostring(read(w, 'Rarity')) .. ')')
     print('[' .. NAME .. '] blocks  ' .. tostring(read(b, 'ItemName')) .. ' (' .. tostring(read(b, 'Rarity')) .. ')')
-end
-
-local function want()
-    local w, b = rollers()
-    local function line(tag, roller)
-        local item, rar = read(roller, 'ItemName'), read(roller, 'Rarity')
-        if not item then
-            print('[' .. NAME .. '] ' .. tag .. ': (no roller)')
-            return
-        end
-        local verdict = state.want[rar] and 'MATCH - buy it' or 'skip'
-        print('[' .. NAME .. '] ' .. tag .. ': ' .. tostring(item) .. ' (' .. tostring(rar) .. ') -> ' .. verdict)
-    end
-    line('weapons', w)
-    line('blocks',  b)
+    local n = 0
+    for _ in pairs(state.want) do n = n + 1 end
+    print('[' .. NAME .. '] buy list has ' .. n .. ' item(s)')
 end
 
 -- menu ----------------------------------------------------------------
@@ -202,11 +270,17 @@ local function buildTab(tab)
         mkToggle(sec, 'Watch Weapons', 'rw_w', true, function(v) state.watchW = v end)
         mkToggle(sec, 'Watch Blocks',  'rw_b', true, function(v) state.watchB = v end)
 
-        local secW = mkSection(tab, 'Weapon Buy List')
-        if secW then
-            for _, r in ipairs(RARITIES) do
-                mkToggle(secW, r, 'rw_w_' .. string.lower(r), false, function(v)
-                    state.want[r] = v
+        local secL = mkSection(tab, 'Item Buy List')
+        if secL then
+            local cat = catalogMap()
+            local keys = {}
+            for key in pairs(state.want) do keys[#keys + 1] = key end
+            table.sort(keys)
+            for _, key in ipairs(keys) do
+                local label = cat[key] or key
+                mkToggle(secL, label, 'rw_i_' .. key, true, function(v)
+                    if v then state.want[key] = true else state.want[key] = nil end
+                    saveList()
                 end)
             end
         end
@@ -214,6 +288,8 @@ local function buildTab(tab)
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
     print('[' .. NAME .. '] tab built')
 end
+
+loadList()
 
 if HAS_UI then
     local ok, err = pcall(function()
@@ -228,6 +304,13 @@ if HAS_UI then
     end
 end
 
+conn = task.spawn(function()
+    while alive do
+        tickOnce()
+        task.wait(0.5)
+    end
+end)
+
 -- stop ----------------------------------------------------------------
 
 local function stop()
@@ -241,5 +324,9 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, status = status, want = want, version = VERSION, state = state }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded - watch + buy list, no input, no movement')
+_G[NAME] = {
+    stop = stop, status = status, add = add, remove = remove,
+    list = listWant, clear = function() state.want = {} saveList() end,
+    version = VERSION, state = state,
+}
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded - no input, no movement. add("Item Name") to build the buy list')
