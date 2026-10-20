@@ -1,26 +1,32 @@
--- Build and Kill Zombies -> Roll Watcher (no input) - Matcha LuauVM - v15.0
+-- Build and Kill Zombies -> Roll Watcher + Buy List - Matcha LuauVM - v15.1
 -- place 105011592530400
 --
--- This version issues NO input and NO movement:
+-- What changed from v15.0:
+--   The per-rarity toggles used to be 'Alert on' (notify for everything).
+--   They are now a BUY LIST: turn on only the rarities you actually want.
+--   When a roll matches, the notification says 'BUY NOW: <item> (<rarity>)'
+--   so you click the prompt for the good ones and ignore the rest.
+--
+-- This version still issues NO input and NO movement:
 --   no keypress / keyrelease / setrobloxinput
 --   no mouse1click / mouse1press / mousemoveabs
 --   no CFrame or Position writes, no teleport
--- It only reads the two rollers' Info labels on your plot and reports
--- what changed. That is the only thing proven to work in this VM.
 --
--- Why it cannot roll for you:
---   every input route was tested against the roller ProximityPrompt and
---   none of them reach it (keypress inert, setrobloxinput moves the
---   character but not the prompt, mouse1click and mouse1press/release on
---   the prompt button do nothing, fireproximityprompt is absent).
---   So this script watches and tells you; you press the prompt.
+-- Why it cannot buy by itself:
+--   buying is the BuyPrompt under <Roller>.ItemPlace. Every input route to
+--   a prompt was tested in this VM and none reach it (keypress inert,
+--   setrobloxinput moves the character but not the prompt, mouse1click and
+--   mouse1press/release on the prompt button do nothing, fireproximityprompt
+--   absent, require on Packets/RollController errors).
+--   So it watches and flags; you press the prompt.
 --
 -- Use:
 --   _G.RollerMods.status()   -> print both rollers now
+--   _G.RollerMods.want()     -> check the current rollers against your list
 --   _G.RollerMods.stop()     -> stop watching
 
 local NAME    = 'RollerMods'
-local VERSION = 'v15.0'
+local VERSION = 'v15.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -31,9 +37,9 @@ local Players = game:GetService('Players')
 local ws      = game:GetService('Workspace')
 local lp      = Players.LocalPlayer
 
-local alive  = true
-local built  = false
-local conn   = nil
+local alive = true
+local built = false
+local conn  = nil
 
 local RARITIES = {
     'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary',
@@ -43,9 +49,8 @@ local RARITIES = {
 local state = {
     watchW = true,
     watchB = true,
-    alert  = {},
+    want   = {},
 }
-for _, r in ipairs(RARITIES) do state.alert[r] = true end
 
 -- read only helpers ---------------------------------------------------
 
@@ -84,9 +89,13 @@ local last = { wItem = nil, wRar = nil, bItem = nil, bRar = nil }
 
 local function announce(tag, item, rar)
     if not item then return end
-    print('[' .. NAME .. '] ' .. tag .. ': ' .. item .. ' (' .. tostring(rar) .. ')')
-    if state.alert[rar] then
-        pcall(notify, tag .. ': ' .. item .. ' (' .. tostring(rar) .. ')', 'Rollers', 4)
+    local line = tag .. ': ' .. item .. ' (' .. tostring(rar) .. ')'
+    if state.want[rar] then
+        print('[' .. NAME .. '] BUY NOW -> ' .. line)
+        pcall(notify, 'BUY NOW: ' .. item .. ' (' .. tostring(rar) .. ')', tag, 7)
+    else
+        print('[' .. NAME .. '] ' .. line)
+        pcall(notify, line, 'Rollers', 3)
     end
 end
 
@@ -116,7 +125,7 @@ conn = task.spawn(function()
     end
 end)
 
--- status --------------------------------------------------------------
+-- status / want -------------------------------------------------------
 
 local function status()
     local p = myPlot()
@@ -128,6 +137,21 @@ local function status()
     print('[' .. NAME .. '] plot ' .. p.Name)
     print('[' .. NAME .. '] weapons ' .. tostring(read(w, 'ItemName')) .. ' (' .. tostring(read(w, 'Rarity')) .. ')')
     print('[' .. NAME .. '] blocks  ' .. tostring(read(b, 'ItemName')) .. ' (' .. tostring(read(b, 'Rarity')) .. ')')
+end
+
+local function want()
+    local w, b = rollers()
+    local function line(tag, roller)
+        local item, rar = read(roller, 'ItemName'), read(roller, 'Rarity')
+        if not item then
+            print('[' .. NAME .. '] ' .. tag .. ': (no roller)')
+            return
+        end
+        local verdict = state.want[rar] and 'MATCH - buy it' or 'skip'
+        print('[' .. NAME .. '] ' .. tag .. ': ' .. tostring(item) .. ' (' .. tostring(rar) .. ') -> ' .. verdict)
+    end
+    line('weapons', w)
+    line('blocks',  b)
 end
 
 -- menu ----------------------------------------------------------------
@@ -177,11 +201,12 @@ local function buildTab(tab)
         if not sec then return end
         mkToggle(sec, 'Watch Weapons', 'rw_w', true, function(v) state.watchW = v end)
         mkToggle(sec, 'Watch Blocks',  'rw_b', true, function(v) state.watchB = v end)
-        local secA = mkSection(tab, 'Alert on')
-        if secA then
+
+        local secW = mkSection(tab, 'Weapon Buy List')
+        if secW then
             for _, r in ipairs(RARITIES) do
-                mkToggle(secA, r, 'rw_a_' .. string.lower(r), true, function(v)
-                    state.alert[r] = v
+                mkToggle(secW, r, 'rw_w_' .. string.lower(r), false, function(v)
+                    state.want[r] = v
                 end)
             end
         end
@@ -216,5 +241,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, status = status, version = VERSION, state = state }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded - watch only, no input, no movement')
+_G[NAME] = { stop = stop, status = status, want = want, version = VERSION, state = state }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded - watch + buy list, no input, no movement')
