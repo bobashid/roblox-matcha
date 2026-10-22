@@ -1,7 +1,7 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v2.6  MINIMAL MENU - four toggles, no sliders
+--  v2.7  MINIMAL MENU - four toggles, no sliders
 --
 --    Always Heal   TransfuseBlood remote. Humanoid.Health is
 --                  READ-ONLY in Matcha (a write throws), so the
@@ -11,6 +11,11 @@
 --    Kill Aura     Finds the nearest enemy anywhere on the map, moves
 --                  to the slot under it, swings, repeats.
 --
+--  v2.7 change
+--    The max-health log used to print on every increase, which floods
+--    the console while Always Heal runs. It now prints at most once
+--    every 5 seconds, and always shows the current value.
+--
 --  Swing
 --    Fires Runtime.Actors.Tool_Character_<userId>_*..Events.Attack.
 --    Attack takes no arguments, the server resolves the hit from the
@@ -19,8 +24,7 @@
 --    still have a live parent chain, so a weapon upgrade is picked up.
 --
 --  Fixed values (no UI on purpose)
---    AURA_DEPTH = 8   studs below the target, so you swing from under
---                     the map. Edit the constant to change it.
+--    AURA_DEPTH = 8   studs below the target. Edit the constant.
 --    MOVE_EPS2  = 4   only write CFrame when more than 2 studs away.
 --    No CFrame writes while Health is 0.
 --
@@ -33,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.6"
+local VERSION = "v2.7"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -47,6 +51,7 @@ local built   = false
 local POLL_RATE    = 0.1    -- toggle poller
 local HEAL_RATE    = 0.25   -- transfusion control loop
 local HEAL_REFIRE  = 1.0    -- seconds between TransfuseBlood fires
+local HP_LOG_RATE  = 5.0    -- max seconds between health log lines
 local COLLECT_RATE = 1.5    -- income collection
 local FARM_RATE    = 0.3    -- auto farm swing cadence
 local AURA_RATE    = 0.25   -- kill aura pass
@@ -352,26 +357,30 @@ end)
 
 --------------------------------------------------------------------
 -- ALWAYS HEAL
+--   Health log is throttled: at most one line every HP_LOG_RATE.
 --------------------------------------------------------------------
 task.spawn(function()
     local transfusing = false
     local lastFire    = 0
     local lastMax     = 0
+    local lastLog     = 0
 
     while running do
         if Config.Heal then
             local hum = humanoid()
             if hum then
-                if hum.MaxHealth ~= lastMax then
-                    if lastMax ~= 0 and hum.MaxHealth > lastMax then
-                        print("[" .. NAME .. "] max health "
-                            .. tostring(math.floor(lastMax)) .. " -> "
-                            .. tostring(math.floor(hum.MaxHealth)))
+                local now = tick()
+                local max = math.floor(hum.MaxHealth)
+
+                if max ~= lastMax then
+                    if lastMax ~= 0 and max > lastMax
+                        and (now - lastLog) >= HP_LOG_RATE then
+                        print("[" .. NAME .. "] max health " .. tostring(max))
+                        lastLog = now
                     end
-                    lastMax = hum.MaxHealth
+                    lastMax = max
                 end
 
-                local now = tick()
                 if not transfusing or (now - lastFire) >= HEAL_REFIRE then
                     if fireEvent("TransfuseBlood") then
                         transfusing = true
