@@ -1,59 +1,47 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.1  -  REPEAT THE NEW CONTACT, NOT THE INPUT
+--  v8.2  -  BOSS GROWTH IS GONE FOR GOOD
 --
---  WHY v7.6 HIT ONCE, SILENTLY
---    AttackPart is already map sized, so a boss model is created
---    INSIDE it. Touched fires when a contact BEGINS, and a part that
---    appears inside another is a brand new contact. That is the one
---    silent hit at spawn. Afterwards the two never stop overlapping,
---    so no contact ever begins again - no input involved, it simply
---    has nothing new to report.
+--  WHY v8.1 BROKE AFTER THE FIRST RUN
+--    Boss growth saved a part's size the first time it saw it. On the
+--    next run those parts were still grown (or had been grown by the
+--    previous run), so the grown size was saved as the "original" and
+--    multiplied again. Each reload made the bosses bigger, until the
+--    physics gave out and it stopped working. That is the "worked
+--    once then broke" you saw.
 --
---  WHY firetouchinterest DID NOT REPEAT IT
---    It only signals touch/untouch to a part's handlers. It does not
---    end the real physics contact between two parts that are still
---    overlapping, so the next signal is a duplicate the engine drops.
---    A huge AttackPart also never re-crosses a boss, so the contact
---    can never restart that way either.
+--    So nothing on a boss is written any more. No size, no CanCollide,
+--    no CFrame. The boss models are only ever READ.
 --
---  THE MECHANISM THAT DOES RESTART IT: A MOVING SURFACE
---    In the old hitbox build the BOSS parts were grown. A boss is
---    animated every frame, so a grown part's surface sweeps through
---    the tool and back out - end contact, begin contact - over and
---    over. Each sweep is a new contact, so hits keep landing with no
---    input at all. That is the piece this version brings back, and it
---    is now done so it cannot break the map:
+--  WHAT RESTARTS THE CONTACT INSTEAD
+--    Only our own AttackPart is touched, which is why it cannot
+--    compound and cannot break anything:
 --
---      - a boss must be a Model whose name ends in "Mama" AND that has
---        a Humanoid. There is NO fallback, so Walls / grass / water /
---        House in the same area are never read or written.
---      - CanCollide is NEVER written. That was what made walls and
---        floors walk-through. Only Size is written.
---      - HumanoidRootPart is skipped. Scaling it is what launched
---        bosses into the void.
---      - one multiplier per boss, from the distance to it:
---            mult = (dist + 25) / largestHalf * 1.15   [2 .. 2000]
---        capped so no axis exceeds 3000 studs.
---      - original sizes saved once per Address, written only when the
---        current size actually differs, restored on toggle off/stop.
+--        Size = 2 studs      -> every contact with every boss ends
+--        (one frame)
+--        Size = map size     -> every boss part is a NEW contact and
+--                               the tool's TouchTransmitter fires
 --
---  Everything from v7.6 is still here and still runs each pass:
---    - AttackPart scaled to the farthest boss (reach)
---    - the alternating touch cycle on the boss parts
---    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
---      the tool's ActorId value (name matching picks a dead copy)
---  No mouse input of any kind. No click, no press, no PlayAnim, no
---  equip or unequip, nothing reparented.
+--    One pair per pass at 0.12 s = one fresh hit per boss per pass.
+--    The map size is recomputed from the farthest spawned boss:
+--        side = (farthest + 30) * 2      [60 .. 4000]
+--    Original size saved per Address and restored on toggle off.
+--
+--  Everything else is v7.6, which you said was right:
+--    - touch signals on the boss parts every pass
+--    - PlaySound("SwingSound") + Attack fired on the LIVE tool actor,
+--      resolved from the tool's ActorId value (name matching picks a
+--      dead copy, because every equip leaves one behind)
+--    - no mouse input of any kind, no click, no press, no PlayAnim, no
+--      equip or unequip, nothing reparented, so nothing can crash
 --
 --  TOGGLES
 --      Auto Health   - TransfuseBlood loop
 --      Auto Collect  - CollectIncome / ClaimOfflineIncome
---      Kill Farm     - the loops above
---      Boss Growth   - the moving-surface mechanism; turn it off if a
---                      boss ever behaves oddly, the rest keeps working
+--      Kill Farm     - the size cycle + touch + burst above
 --
+--  Boss HP is summed each pass; one line prints if it stops dropping.
 --  Keep a weapon equipped. All toggles start OFF.
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -64,7 +52,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.1"
+local VERSION = "v8.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -84,26 +72,16 @@ local TOUCH_PARTS  = 4
 local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
--- growth tuning
-local HB_PAD       = 25
-local HB_MULT_MIN  = 2
-local HB_MULT_MAX  = 2000
-local HB_MAX_AXIS  = 3000
-
--- reach tuning
+-- size cycle tuning
+local AP_SMALL     = 2      -- studs; small enough that no contact remains
+local AP_HOLD      = 0.03   -- one frame between the two writes
 local REACH_PAD    = 30
 local REACH_MIN    = 60
 local REACH_MAX    = 4000
 local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
 
-local SKIP_GROW = {
-    Area             = true,
-    ChaseArea        = true,
-    HumanoidRootPart = true,
-}
-
-local SKIP_TOUCH = {
+local SKIP_PART = {
     Area      = true,
     ChaseArea = true,
 }
@@ -112,7 +90,6 @@ local Config = {
     Heal        = false,
     AutoCollect = false,
     Farm        = false,
-    Growth      = false,
 }
 
 local TOGGLES     = {}
@@ -248,7 +225,7 @@ local function remotesOfActor(name)
 end
 
 --------------------------------------------------------------------
--- Boss lookup (read only, strict, cached)
+-- Boss lookup (READ ONLY, strict, cached)
 --------------------------------------------------------------------
 local bossCache = {}
 local bossStamp = 0
@@ -343,7 +320,7 @@ local function bossParts(boss)
             if #parts >= TOUCH_PARTS then break end
 
             local d = desc[j]
-            if isBasePart(d) and not SKIP_TOUCH[d.Name] and d ~= r then
+            if isBasePart(d) and not SKIP_PART[d.Name] and d ~= r then
                 parts[#parts + 1] = d
             end
         end
@@ -399,136 +376,7 @@ local function farthestBoss(myPos)
 end
 
 --------------------------------------------------------------------
--- BOSS GROWTH  (moving surface = new contacts, Size writes only)
---------------------------------------------------------------------
-local hbSaved = {}   -- part address -> { part, size }
-
-local function pruneHb()
-    local dead = nil
-
-    for k, e in pairs(hbSaved) do
-        local gone = false
-
-        if not e.part then
-            gone = true
-        else
-            local ok, parent = pcall(function() return e.part.Parent end)
-            if not ok or parent == nil then gone = true end
-        end
-
-        if gone then
-            dead = dead or {}
-            dead[#dead + 1] = k
-        end
-    end
-
-    if dead then
-        for i = 1, #dead do hbSaved[dead[i]] = nil end
-    end
-end
-
-local function restoreGrowth()
-    local n = 0
-
-    for k, e in pairs(hbSaved) do
-        local p = e.part
-        if p then
-            local ok, parent = pcall(function() return p.Parent end)
-            if ok and parent ~= nil then
-                pcall(function() p.Size = e.size end)
-                n = n + 1
-            end
-        end
-    end
-
-    hbSaved = {}
-    return n
-end
-
-local function multFor(dist, maxHalf)
-    if maxHalf < 0.5 then maxHalf = 0.5 end
-
-    local m = ((dist + HB_PAD) / maxHalf) * 1.15
-
-    if m < HB_MULT_MIN then m = HB_MULT_MIN end
-    if m > HB_MULT_MAX then m = HB_MULT_MAX end
-
-    local cap = HB_MAX_AXIS / (maxHalf * 2)
-    if m > cap then m = cap end
-    if m < 1 then m = 1 end
-
-    return m
-end
-
--- only called with a verified boss model; writes Size and nothing else
-local function growBoss(boss, myPos)
-    local center = bossPosition(boss)
-    if not center then return 0 end
-
-    local okD, dist = pcall(function() return (center - myPos).Magnitude end)
-    if not okD or type(dist) ~= "number" then return 0 end
-
-    local ok, desc = pcall(function() return boss:GetDescendants() end)
-    if not ok or not desc then return 0 end
-
-    local entries = {}
-    local maxHalf = 0.5
-
-    for j = 1, #desc do
-        local d = desc[j]
-
-        if isBasePart(d) and not SKIP_GROW[d.Name] then
-            local k = keyOf(d)
-
-            if k ~= nil then
-                local e = hbSaved[k]
-
-                if e == nil then
-                    local okS, s = pcall(function() return d.Size end)
-                    if okS and s then
-                        e = { part = d, size = s }
-                        hbSaved[k] = e
-                    end
-                end
-
-                if e then
-                    entries[#entries + 1] = e
-
-                    local half = math.max(e.size.X, e.size.Y, e.size.Z) * 0.5
-                    if half > maxHalf then maxHalf = half end
-                end
-            end
-        end
-    end
-
-    if #entries == 0 then return 0 end
-
-    local mult    = multFor(dist, maxHalf)
-    local touched = 0
-
-    for j = 1, #entries do
-        local e = entries[j]
-
-        local target = Vector3.new(
-            e.size.X * mult,
-            e.size.Y * mult,
-            e.size.Z * mult
-        )
-
-        local okCur, cur = pcall(function() return e.part.Size end)
-
-        if not okCur or not cur or sizeDiffers(cur, target) then
-            pcall(function() e.part.Size = target end)
-        end
-
-        touched = touched + 1
-    end
-
-    return touched
-end
-
---------------------------------------------------------------------
--- ATTACKPART REACH (size saved per Address)
+-- ATTACKPART  (the only thing ever written)
 --------------------------------------------------------------------
 local apSaved = {}
 local reachOn = false
@@ -550,12 +398,12 @@ local function attackPartOf(tool)
     return nil
 end
 
-local function scaleAttackPart(ap)
+local function mapSize()
     local hrp = rootPart()
-    if not hrp then return 0 end
+    if not hrp then return nil, 0 end
 
     local okM, myPos = pcall(function() return hrp.Position end)
-    if not okM or not myPos then return 0 end
+    if not okM or not myPos then return nil, 0 end
 
     local far, seen = farthestBoss(myPos)
 
@@ -563,25 +411,19 @@ local function scaleAttackPart(ap)
     if side < REACH_MIN then side = REACH_MIN end
     if side > REACH_MAX then side = REACH_MAX end
 
+    return Vector3.new(side, side, side), seen
+end
+
+local function rememberPart(ap)
     local k = keyOf(ap)
-    if k == nil then return seen end
+    if k == nil then return end
 
-    local e = apSaved[k]
-    if e == nil then
+    if apSaved[k] == nil then
         local okS, s = pcall(function() return ap.Size end)
-        if not okS or not s then return seen end
-        e = { part = ap, size = s }
-        apSaved[k] = e
+        if okS and s then
+            apSaved[k] = { part = ap, size = s }
+        end
     end
-
-    local target = Vector3.new(side, side, side)
-
-    local okCur, cur = pcall(function() return ap.Size end)
-    if not okCur or not cur or sizeDiffers(cur, target) then
-        pcall(function() ap.Size = target end)
-    end
-
-    return seen
 end
 
 local function restoreAttackParts()
@@ -664,8 +506,7 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Kill Farm (cross-map hits)", "fam_farm", "Farm", false)
-            addToggle(combat, "Boss Growth (repeat contacts)", "fam_grow", "Growth", false)
+            addToggle(combat, "Kill Farm (repeat hits)", "fam_farm", "Farm", false)
         end
     end)
 
@@ -721,7 +562,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- KILL FARM
+-- KILL FARM  (size cycle + touch signals + live actor burst)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -730,17 +571,15 @@ task.spawn(function()
     local warnedTool = false
     local warnedAct  = false
     local staleWarn  = false
-    local growWarn   = false
+    local noBossWarn = false
 
     local lastSum  = nil
     local stale    = 0
     local cachedId = nil
     local cachedAtk, cachedPs = nil, nil
 
-    local touching = false
-
     if not hasTouch then
-        print("[" .. NAME .. "] firetouchinterest missing - remotes only")
+        print("[" .. NAME .. "] firetouchinterest missing - size cycle only")
     end
 
     while running do
@@ -782,66 +621,53 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] kill farm on (growth + contact cycle)")
+                        print("[" .. NAME .. "] kill farm on (size cycle per pass)")
                     end
 
-                    local hrp = rootPart()
-                    local myPos = nil
+                    rememberPart(ap)
 
-                    if hrp then
-                        local okM, mp = pcall(function() return hrp.Position end)
-                        if okM then myPos = mp end
+                    local big, seen = mapSize()
+
+                    -- 1. shrink: every contact with every boss ends
+                    pcall(function()
+                        ap.Size = Vector3.new(AP_SMALL, AP_SMALL, AP_SMALL)
+                    end)
+
+                    task.wait(AP_HOLD)
+
+                    -- 2. grow back: every boss part is a brand new contact
+                    if big then
+                        pcall(function() ap.Size = big end)
+                        reachOn = true
                     end
-
-                    scaleAttackPart(ap)
-                    reachOn = true
 
                     local list = bossList()
 
-                    -- moving surfaces: grown boss parts sweep through the tool
-                    if Config.Growth and myPos then
-                        pruneHb()
+                    if seen > 0 then
+                        noBossWarn = false
 
-                        local grown = 0
+                        if hasTouch then
+                            pruneParts()
 
-                        for i = 1, #list do
-                            local hp = bossHealth(list[i])
-                            if hp and hp > 0 then
-                                grown = grown + growBoss(list[i], myPos)
-                            end
-                        end
+                            for i = 1, #list do
+                                local boss = list[i]
+                                local hp   = bossHealth(boss)
 
-                        if grown == 0 and not growWarn then
-                            growWarn = true
-                            print("[" .. NAME .. "] growth: no boss parts to grow")
-                        elseif grown > 0 then
-                            growWarn = false
-                        end
-                    end
+                                if hp and hp > 0 then
+                                    local parts = bossParts(boss)
 
-                    -- contact cycle, flipped once per pass as in v7.6
-                    if hasTouch then
-                        pruneParts()
-                        touching = not touching
-
-                        for i = 1, #list do
-                            local boss = list[i]
-                            local hp   = bossHealth(boss)
-
-                            if hp and hp > 0 then
-                                local parts = bossParts(boss)
-
-                                for j = 1, #parts do
-                                    local part = parts[j]
-
-                                    if touching then
-                                        pcall(function() firetouchinterest(ap, part, 0) end)
-                                    else
-                                        pcall(function() firetouchinterest(ap, part, 1) end)
+                                    for j = 1, #parts do
+                                        local part = parts[j]
+                                        pcall(function()
+                                            firetouchinterest(ap, part, 0)
+                                        end)
                                     end
                                 end
                             end
                         end
+                    elseif not noBossWarn then
+                        noBossWarn = true
+                        print("[" .. NAME .. "] no boss spawned - box kept at minimum")
                     end
 
                     if cachedAtk then
@@ -895,17 +721,12 @@ task.spawn(function()
             warnedAct  = false
             stale      = 0
             staleWarn  = false
+            noBossWarn = false
             lastSum    = nil
-            touching   = false
-            growWarn   = false
             cachedId, cachedAtk, cachedPs = nil, nil, nil
 
-            local g = restoreGrowth()
-            local m = restoreAttackParts()
-
-            if g > 0 or m > 0 then
-                print("[" .. NAME .. "] restored " .. tostring(g)
-                    .. " boss parts, " .. tostring(m) .. " tool parts")
+            if reachOn then
+                restoreAttackParts()
             end
 
             task.wait(0.1)
@@ -957,7 +778,6 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
-    pcall(restoreGrowth)
     pcall(restoreAttackParts)
     pcall(function() fireEvent("StopTransfuseBlood") end)
     bossCache = {}
@@ -969,5 +789,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - growth restarts the contact", 5)
+notifyUser("Loaded - no boss writes, size cycle hits", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
