@@ -1,37 +1,32 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v3.9
+--  v4.0
 --
---  ONE COMBAT TOGGLE: Auto Farm
---    The boss select list is gone. One toggle hits every living
---    boss on the map, every pass.
+--  NO TELEPORTS AT ALL
+--    Every CFrame write is gone. You stand wherever you are and the
+--    Auto Swing toggle fires the Attack remote on a loop.
 --
---  WHY FAR HITS WERE INCONSISTENT
---    The Attack remote is fired with NO arguments, so the server
---    resolves the hit from your character position at the moment
---    the swing arrives. The old Far Hit wrote the CFrame, swung and
---    wrote the old CFrame back in the same frame - the position
---    often never reached the server, so the swing resolved at your
---    real spot and missed. Auto Farm waits after the teleport, then
---    swings, then waits again before going back:
---        save CFrame -> teleport to boss feet -> TP_SETTLE
---        -> swing -> TP_SETTLE -> teleport back -> FARM_GAP
+--  AUTO SWING
+--    Attack is fired with no arguments, so the server resolves the
+--    hit from wherever you are standing. This just keeps swinging:
+--    fire every boss tool's Attack remote, wait SWING_RATE, repeat.
+--
+--  BOSS HITBOX MAX
+--    Every BasePart of every boss model is grown so each axis is at
+--    least HB_TARGET studs (never smaller than it already is, and
+--    big parts are left alone). Original sizes are remembered the
+--    first time a part is seen and put back when the toggle goes off
+--    or the script stops. Local change only - it makes the bosses
+--    huge on your screen, the server keeps its own sizes.
 --
 --  BOSS LIST
 --    Workspace.SpawnAreas.<Type>Area holds a Model whose name
---    contains "Mama" with a Humanoid. Mythical / Divine / Secret
---    have no boss model and are skipped automatically.
---    Feet = model bounding box: centre X/Z, lowest part Y + 1.
---
---  HITBOX
---    While Auto Farm is on, every boss BasePart is scaled x6 around
---    its own centre, capped at 24 studs per axis and never made
---    smaller. Original sizes are remembered and put back when Auto
---    Farm goes off or the script stops. Local change only.
+--    contains "Mama". Mythical / Divine / Secret have no boss model
+--    and are skipped automatically.
 --
 --  MAIN
---    Always Heal, Auto Collect - unchanged.
+--    Always Heal, Auto Collect.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -42,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v3.9"
+local VERSION = "v4.0"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -58,15 +53,12 @@ local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
 local HP_LOG_RATE  = 5.0
 local COLLECT_RATE = 1.5
-local FARM_GAP     = 0.15
-local TP_SETTLE    = 0.05
+local SWING_RATE   = 0.1
 local ATK_TTL      = 0.5
-local FOOT_LIFT    = 1
 local HB_RATE      = 0.4
 
 -- hitbox tuning
-local HB_MULT      = 6
-local HB_AXIS_CAP  = 24
+local HB_TARGET    = 24
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -76,7 +68,8 @@ local BOSS_TYPES = {
 local Config = {
     Heal        = false,
     AutoCollect = false,
-    Farm        = false,
+    Swing       = false,
+    Hitbox      = false,
 }
 
 local TOGGLES     = {}
@@ -95,11 +88,6 @@ local function humanoid()
     return nil
 end
 
-local function rootPart()
-    local c = LP.Character
-    return c and c:FindFirstChild("HumanoidRootPart") or nil
-end
-
 local function alive()
     local hum = humanoid()
     return hum ~= nil and hum.Health > 0
@@ -114,12 +102,6 @@ local function child(a, b, c)
     local n1 = a:FindFirstChild(b)
     if not n1 or not c then return n1 end
     return n1:FindFirstChild(c)
-end
-
-local function fmt(p)
-    return tostring(math.floor(p.X)) .. ","
-        .. tostring(math.floor(p.Y)) .. ","
-        .. tostring(math.floor(p.Z))
 end
 
 local function isBasePart(p)
@@ -215,7 +197,7 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- Area / boss lookup
+-- Boss lookup
 --------------------------------------------------------------------
 local function areaModel(bossType)
     local areas = WS:FindFirstChild("SpawnAreas")
@@ -240,113 +222,16 @@ local function bossOf(bossType)
     return bossModelIn(areaModel(bossType))
 end
 
--- ClassName walk, because IsA() is always true here and
--- FindFirstChildOfClass can hand back the wrong child.
-local function findHumanoid(boss)
-    if not boss then return nil end
-
-    local direct = boss:FindFirstChild("Humanoid")
-    if direct and direct.ClassName == "Humanoid" then return direct end
-
-    local ok, desc = pcall(function() return boss:GetDescendants() end)
-    if not ok or not desc then return nil end
-
-    for i = 1, #desc do
-        if desc[i].ClassName == "Humanoid" then return desc[i] end
-    end
-    return nil
-end
-
--- returns current health, max health; both nil when not readable
-local function bossHealth(bossType)
-    local boss = bossOf(bossType)
-    if not boss then return nil, nil end
-
-    local hum = findHumanoid(boss)
-    if hum then
-        local okH, hp = pcall(function() return hum.Health end)
-        if okH and type(hp) == "number" then
-            local okM, mx = pcall(function() return hum.MaxHealth end)
-            if not okM or type(mx) ~= "number" or mx <= 0 then mx = hp end
-            return hp, mx
-        end
-    end
-
-    local pairsToTry = {
-        { "Health", "MaxHealth" },
-        { "HP",     "MaxHP" },
-        { "Hp",     "MaxHp" },
-    }
-
-    for i = 1, #pairsToTry do
-        local okA, hp = pcall(function()
-            return boss:GetAttribute(pairsToTry[i][1])
-        end)
-        if okA and type(hp) == "number" then
-            local okB, mx = pcall(function()
-                return boss:GetAttribute(pairsToTry[i][2])
-            end)
-            if not okB or type(mx) ~= "number" or mx <= 0 then mx = hp end
-            return hp, mx
-        end
-    end
-
-    return nil, nil
-end
-
--- landing point at the boss FEET: centre X/Z, lowest part Y + FOOT_LIFT
-local function bossFeet(bossType)
-    local boss = bossOf(bossType)
-    if not boss then return nil, "no boss" end
-
-    local hp = bossHealth(bossType)
-    if hp and hp <= 0 then return nil, "dead" end
-
-    local okD, desc = pcall(function() return boss:GetDescendants() end)
-    if not okD or not desc then return nil, "no parts" end
-
-    local minX, maxX = 1e9, -1e9
-    local minY = 1e9
-    local minZ, maxZ = 1e9, -1e9
-    local n = 0
-
-    for i = 1, #desc do
-        local d = desc[i]
-        if isBasePart(d) then
-            local okP, p = pcall(function() return d.Position end)
-            if okP and p then
-                n = n + 1
-                if p.X < minX then minX = p.X end
-                if p.X > maxX then maxX = p.X end
-                if p.Y < minY then minY = p.Y end
-                if p.Z < minZ then minZ = p.Z end
-                if p.Z > maxZ then maxZ = p.Z end
-            end
-        end
-    end
-
-    if n == 0 then return nil, "no parts" end
-
-    local pos = Vector3.new(
-        (minX + maxX) * 0.5,
-        minY + FOOT_LIFT,
-        (minZ + maxZ) * 0.5
-    )
-
-    return pos, boss.Name .. " feet"
-end
-
 --------------------------------------------------------------------
--- BOSS HITBOX EXPANDER (on while Auto Farm is on)
+-- BOSS HITBOX MAX
+--   Each axis: at least HB_TARGET studs, never smaller than it was.
 --------------------------------------------------------------------
 local hbSaved   = {}
 local hbApplied = false
 
-local function scaleAxis(v, f)
-    local n = v * f
-    if n > HB_AXIS_CAP and v < HB_AXIS_CAP then n = HB_AXIS_CAP end
-    if n < v then n = v end
-    return n
+local function growAxis(v)
+    if v < HB_TARGET then return HB_TARGET end
+    return v
 end
 
 local function applyHitbox()
@@ -369,12 +254,14 @@ local function applyHitbox()
                             end
                         end
                         if base then
-                            local nx = scaleAxis(base.X, HB_MULT)
-                            local ny = scaleAxis(base.Y, HB_MULT)
-                            local nz = scaleAxis(base.Z, HB_MULT)
-                            pcall(function()
-                                d.Size = Vector3.new(nx, ny, nz)
-                            end)
+                            local nx = growAxis(base.X)
+                            local ny = growAxis(base.Y)
+                            local nz = growAxis(base.Z)
+                            if nx ~= base.X or ny ~= base.Y or nz ~= base.Z then
+                                pcall(function()
+                                    d.Size = Vector3.new(nx, ny, nz)
+                                end)
+                            end
                             touched = touched + 1
                         end
                     end
@@ -461,7 +348,8 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Farm (all bosses)", "fam_farm", "Farm", false)
+            addToggle(combat, "Auto Swing", "fam_swing", "Swing", false)
+            addToggle(combat, "Boss Hitbox Max", "fam_hitbox", "Hitbox", false)
         end
     end)
 
@@ -517,16 +405,15 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HITBOX LOOP (follows Auto Farm)
+-- HITBOX LOOP
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Farm then
+        if Config.Hitbox then
             local n = applyHitbox()
             if n > 0 and not hbApplied then
                 hbApplied = true
-                print("[" .. NAME .. "] hitbox x" .. tostring(HB_MULT)
-                    .. " on " .. tostring(n) .. " parts (local)")
+                print("[" .. NAME .. "] hitbox max on " .. tostring(n) .. " parts (local)")
             end
         elseif hbApplied then
             restoreHitbox()
@@ -536,60 +423,24 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO FARM  (every living boss, every pass)
---   Teleport in, let the position land, swing, let it land, back.
+-- AUTO SWING  (no movement, just fire Attack)
 --------------------------------------------------------------------
 task.spawn(function()
-    local lastSeen = -1
+    local wasOn = false
 
     while running do
-        if Config.Farm then
-            local hrp = rootPart()
-            if hrp and alive() then
-                local seen = 0
-                local hit  = 0
-
-                for i = 1, #BOSS_TYPES do
-                    if not running or not Config.Farm then break end
-
-                    local t  = BOSS_TYPES[i]
-                    local hp = bossHealth(t)
-
-                    if hp and hp > 0 then
-                        seen = seen + 1
-
-                        local pos, label = bossFeet(t)
-                        if pos then
-                            local back = hrp.CFrame
-
-                            pcall(function()
-                                hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z)
-                            end)
-                            task.wait(TP_SETTLE)
-
-                            if swing() then hit = hit + 1 end
-
-                            task.wait(TP_SETTLE)
-                            pcall(function()
-                                if hrp and hrp.Parent then hrp.CFrame = back end
-                            end)
-                            task.wait(FARM_GAP)
-                        elseif label ~= "no parts" then
-                            print("[" .. NAME .. "] skip " .. t .. ": "
-                                .. tostring(label))
-                        end
-                    end
-                end
-
-                if seen ~= lastSeen then
-                    lastSeen = seen
-                    print("[" .. NAME .. "] farming " .. tostring(seen)
-                        .. " living boss(es), hit " .. tostring(hit) .. " this pass")
-                end
+        if Config.Swing then
+            if not wasOn then
+                wasOn = true
+                print("[" .. NAME .. "] auto swing on")
             end
-            task.wait(0.1)
+            swing()
+            task.wait(SWING_RATE)
         else
-            lastSeen = -1
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] auto swing off")
+            end
             task.wait(0.2)
         end
     end
@@ -661,5 +512,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Auto Farm hits every boss", 5)
+notifyUser("Loaded - Auto Swing + Boss Hitbox Max", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
