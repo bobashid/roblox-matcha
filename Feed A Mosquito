@@ -1,45 +1,51 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.8  -  AUTO PICKUP: ONE TOGGLE PER RARITY + SIZE SLIDER
+--  v8.9  -  PICKUP VIA THE EGG'S OWN PROMPT
 --
---  WHAT THE PROBE FOUND (this decides the whole approach)
---    An egg model contains: ActorId StringValue, a BillboardGui named
---    EggGui with Countdown + Rarity TextLabels, and parts Box, Head,
---    Body1, Body2, EggTrail, HumanoidRootPart.
---    It has NO ProximityPrompt, NO ClickDetector, NO TouchTransmitter,
---    and the only egg remote on the player actor is PlaceEgg. A scan
---    of the whole Workspace found 0 ProximityPrompts.
---    So there is no pickup remote to fire - collection is decided on
---    contact. This build therefore simulates the contact on the egg's
---    root part rather than pretending a remote exists.
+--  WHAT v8.8 GOT WRONG
+--    v8.8 assumed an egg had no prompt and simulated a touch on its
+--    root part. That was based on an incomplete scan. A full scan found
+--    52 ProximityPrompts in the Workspace, and every egg carries one:
 --
---  SIZE, MEASURED NOT GUESSED
---    Egg root sizes seen live: 3.53 and 5.30, with matching part sizes
---    (Body2 0.88 vs 1.32). Base root is 3.53, so
+--        Egg model
+--          PromptAttachment
+--            ProximityPrompt named "CarryPrompt"
 --
---        sizeMult = root.Size.X / 3.53
+--    So the correct silent, no-teleport pickup is firing that prompt:
+--    fireproximityprompt(egg.CarryPrompt). No movement, no touch hack.
 --
---    gives 1.00 for the smallest egg and about 1.50 for the largest
---    seen. That is the number the sliders compare against.
+--  PICKUP ORDER OF ATTEMPTS
+--      1. fireproximityprompt(prompt)      <- what v8.9 uses
+--      2. firetouchinterest fallback       <- only if no prompt found
+--    If fireproximityprompt is nil the script says so once and does not
+--    pretend it worked.
 --
 --  UI
 --      Auto Pickup            master switch
---      Common / Uncommon / Rare / Epic / Legendary / Mythical /
---      Divine / Secret        one toggle per rarity
---      a Size slider under each rarity (1.00 .. 2.00): an egg is only
---      taken if its rarity toggle is on AND its sizeMult is at least
---      that rarity's slider. Each rarity filters independently.
+--      one toggle per rarity  Common .. Secret
+--      a Size slider under each rarity (1.00 .. 2.00)
 --
---    Rarity is read from the egg's own EggGui Rarity label, which is
---    what the game displays. If a label is missing the area name is
---    used as a fallback.
+--    An egg is taken only if its rarity toggle is ON and its measured
+--    size multiplier is at least that rarity's slider value. Each
+--    rarity filters independently, so e.g. "Rare only, size >= 1.40"
+--    is Rare on with slider 1.40 and every other rarity off.
 --
---  Everything else is unchanged from v8.5/v8.7:
---    - boss panel and egg panel in the bottom area, game colours
+--  SIZE (measured, not guessed)
+--    Egg root parts seen live: 3.53 (smallest) and 5.30 (largest).
+--        sizeMult = root.Size.X / 3.53      -> 1.00 .. ~1.50
+--    The panel shows this as x1.42 next to each egg.
+--
+--  RARITY comes from the egg's own EggGui "Rarity" TextLabel, which is
+--  what the game displays. The area name is only a fallback. This
+--  matters: an IceMosquitoEgg was seen inside UncommonArea labelled
+--  Rare.
+--
+--  Everything else is unchanged:
+--    - boss panel (name, HP bar, hp/max) and egg panel, game colours
 --    - Kill Farm size cycle on AttackPart only, live actor remotes
 --    - no mouse input, no equip/unequip, nothing reparented
---    - bosses and eggs are read only; the character is never moved
+--    - bosses and eggs are read only; the character never moves
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -51,7 +57,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.8"
+local VERSION = "v8.9"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -82,9 +88,9 @@ local PART_TTL     = 2.0
 local EGG_TTL      = 1.0
 
 -- pickup tuning
-local EGG_BASE_SIZE = 3.53   -- smallest egg root seen live
-local PICK_RATE     = 0.15
-local PICK_SCAN     = 1.0
+local EGG_BASE_SIZE = 3.53
+local PICK_RATE     = 0.2
+local PICK_COOLDOWN = 0.5
 
 -- panel tuning
 local PANEL_ROWS   = 6
@@ -101,7 +107,6 @@ local PAD_X        = 10
 local PAD_TOP      = 12
 local PAD_BOTTOM   = 12
 
--- colours from the game's own GUIs
 local COL_BACK   = Color3.fromRGB(40, 40, 50)
 local COL_BAR_BG = Color3.fromRGB(26, 26, 33)
 local COL_FILL   = Color3.fromRGB(120, 190, 135)
@@ -147,7 +152,6 @@ local Config = {
     Pickup      = false,
 }
 
--- per rarity: enabled flag + minimum size multiplier
 local PickCfg = {}
 
 for i = 1, #RARITIES do
@@ -261,6 +265,30 @@ local function eggSizeMult(model)
     if not ok or not s then return 1 end
 
     return s.X / EGG_BASE_SIZE
+end
+
+-- the egg's own prompt, CarryPrompt under PromptAttachment
+local function eggPrompt(model)
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "ProximityPrompt" and d.Name == "CarryPrompt" then
+            return d
+        end
+    end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "ProximityPrompt" then
+            return d
+        end
+    end
+
+    return nil
 end
 
 --------------------------------------------------------------------
@@ -385,7 +413,7 @@ local function bossList()
 end
 
 --------------------------------------------------------------------
--- Egg lookup (rarity from billboard, size from root, price from config)
+-- Egg lookup
 --------------------------------------------------------------------
 local eggCache = {}
 local eggStamp = 0
@@ -415,8 +443,8 @@ local function collectEggs()
                     if id then price = EGG_PRICE[id] end
 
                     out[#out + 1] = {
-                        model = m,
-                        name  = m.Name,
+                        model  = m,
+                        name   = m.Name,
                         rarity = rarity,
                         price  = price,
                         size   = eggSizeMult(m),
@@ -624,7 +652,7 @@ local function restoreAttackParts()
 end
 
 --------------------------------------------------------------------
--- HUD  (boss column + egg column, pooled Drawings)
+-- HUD
 --------------------------------------------------------------------
 local hudPool   = {}
 local eggPool   = {}
@@ -1096,66 +1124,87 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- EGG PICKUP  (contact simulated on the egg's own root)
+-- EGG PICKUP  (fireproximityprompt on the egg's CarryPrompt)
 --------------------------------------------------------------------
 task.spawn(function()
-    local hasTouch = (type(firetouchinterest) == "function")
-    local warned   = false
-    local wasOn    = false
-    local picked   = 0
+    local hasPrompt = (type(fireproximityprompt) == "function")
+    local hasTouch  = (type(firetouchinterest) == "function")
 
-    if not hasTouch then
-        print("[" .. NAME .. "] firetouchinterest missing - pickup cannot run")
+    local warned  = false
+    local wasOn   = false
+    local picked  = 0
+    local lastAt  = {}
+
+    if not hasPrompt then
+        print("[" .. NAME .. "] fireproximityprompt missing - re-run the Matcha loader")
     end
 
     while running do
-        if Config.Pickup and alive() and hasTouch then
-            local hrp = rootPart()
+        if Config.Pickup and hasPrompt then
+            local eggs = eggList()
+            local hit  = 0
+            local now  = tick()
 
-            if not hrp then
-                task.wait(0.25)
-            else
-                if not wasOn then
-                    wasOn = true
-                    print("[" .. NAME .. "] auto pickup on")
-                end
+            for i = 1, #eggs do
+                local egg = eggs[i]
+                local cfg = PickCfg[egg.rarity]
 
-                local eggs = eggList()
-                local hit  = 0
+                if cfg and cfg.on and egg.size >= cfg.minSize then
+                    local okP, parent = pcall(function() return egg.model.Parent end)
 
-                for i = 1, #eggs do
-                    local egg = eggs[i]
-                    local cfg = PickCfg[egg.rarity]
+                    if okP and parent ~= nil then
+                        local k = keyOf(egg.model)
+                        local ready = true
 
-                    if cfg and cfg.on and egg.size >= cfg.minSize then
-                        local okP, parent = pcall(function() return egg.model.Parent end)
+                        if k ~= nil and lastAt[k] ~= nil then
+                            if (now - lastAt[k]) < PICK_COOLDOWN then
+                                ready = false
+                            end
+                        end
 
-                        if okP and parent ~= nil then
-                            local er = egg.model:FindFirstChild("HumanoidRootPart")
+                        if ready then
+                            local prompt = eggPrompt(egg.model)
 
-                            if er then
-                                pcall(function() firetouchinterest(er, hrp, 0) end)
-                                pcall(function() firetouchinterest(er, hrp, 1) end)
+                            if prompt then
+                                pcall(function() fireproximityprompt(prompt) end)
                                 hit = hit + 1
+
+                                if k ~= nil then lastAt[k] = now end
+                            elseif hasTouch then
+                                local hrp = rootPart()
+                                local er  = egg.model:FindFirstChild("HumanoidRootPart")
+
+                                if hrp and er then
+                                    pcall(function() firetouchinterest(er, hrp, 0) end)
+                                    pcall(function() firetouchinterest(er, hrp, 1) end)
+                                    hit = hit + 1
+
+                                    if k ~= nil then lastAt[k] = now end
+                                end
                             end
                         end
                     end
                 end
-
-                if hit > 0 then
-                    picked = picked + hit
-                    warned = false
-                elseif not warned then
-                    warned = true
-                    print("[" .. NAME .. "] pickup: nothing matches the filters right now")
-                end
-
-                task.wait(PICK_RATE)
             end
+
+            if hit > 0 then
+                picked = picked + hit
+                warned = false
+
+                if not wasOn then
+                    wasOn = true
+                    print("[" .. NAME .. "] auto pickup on (prompt)")
+                end
+            elseif not warned then
+                warned = true
+                print("[" .. NAME .. "] pickup: nothing matches the filters right now")
+            end
+
+            task.wait(PICK_RATE)
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto pickup off (" .. tostring(picked) .. " touches)")
+                print("[" .. NAME .. "] auto pickup off (" .. tostring(picked) .. " fired)")
             end
             task.wait(0.2)
         end
@@ -1387,5 +1436,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - pickup filters + panels", 5)
+notifyUser("Loaded - pickup via CarryPrompt", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
