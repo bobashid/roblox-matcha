@@ -39,7 +39,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.7"
+local VERSION = "v1.8"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -467,7 +467,7 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
-    pcall(function() fireStopEvent() end)
+    pcall(function() fireEvent("StopTransfuseBlood") end)
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
