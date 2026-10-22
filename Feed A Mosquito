@@ -18,18 +18,25 @@
 --    Fires the tool actor's Attack remote directly:
 --      Runtime.Actors.Tool_Character_<userId>_<n>_<m>.Events.Attack
 --    Attack takes NO arguments, so the server resolves the hit from
---    the character's position. There is no client-side hitbox to
---    enlarge, which is why range cannot be spoofed directly.
+--    the character's position. No client-side hitbox exists to grow.
 --
 --  Attack From Afar
---    Works on top of Auto Attack. Finds the nearest enemy model, saves
---    your CFrame, teleports onto it, fires Attack, teleports back.
---    Same call the client makes, just from closer. Range slider caps
---    how far it will reach. Teleports are throttled - each one is a
---    heavy write, so the pass runs at AFAR_RATE, not per frame.
+--    Teleports onto the nearest enemy, swings, teleports back.
 --
---  Enemy models are named *Area_Enemy_* in Workspace (Common, Rare,
---  Legendary, Mythical, Divine, Secret, Epic...). They come and go.
+--  Auto Kill
+--    Stays attached to the chosen boss instead of bouncing back. Locks
+--    your CFrame under it every pass and swings. The original CFrame is
+--    saved on the first pass and restored when you switch it off.
+--
+--  Under Map
+--    Places you Depth studs BELOW the boss instead of above it. Kept
+--    separate from Auto Kill so you can test it with normal Auto Attack
+--    first. Depth 0 puts you level with the boss.
+--
+--  Bosses
+--    One toggle per area prefix. Enemy models are named
+--    <Area>Area_Enemy_<n> in Workspace, so Common matches
+--    CommonArea_Enemy_129 and Epic matches Egg_EpicArea_Enemy_132_0.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -40,7 +47,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.1"
+local VERSION = "v2.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -56,7 +63,13 @@ local HEAL_RATE    = 0.2    -- transfusion control
 local FEED_RATE    = 0.3    -- mosquito feed pass
 local COLLECT_RATE = 1.5    -- income collection
 local ATTACK_RATE  = 0.25   -- normal weapon swings
-local AFAR_RATE    = 0.7    -- teleport swing pass (heavy writes)
+local AFAR_RATE    = 0.7    -- teleport swing pass
+local KILL_RATE    = 0.2    -- stay-attached kill pass
+
+local BOSS_NAMES = {
+    "Common", "Uncommon", "Rare", "Legendary",
+    "Mythical", "Divine", "Secret", "Epic",
+}
 
 local Config = {
     Heal        = false,
@@ -65,10 +78,26 @@ local Config = {
     AutoAttack  = false,
     Afar        = false,
     AfarRange   = 300,
+    Kill        = false,
+    Under       = true,
+    Depth       = 8,
+    KillRange   = 1500,
+
+    BossCommon    = true,
+    BossUncommon  = true,
+    BossRare      = true,
+    BossLegendary = true,
+    BossMythical  = true,
+    BossDivine    = true,
+    BossSecret    = true,
+    BossEpic      = true,
 }
 
 local TOGGLES     = {}
 local getterWorks = {}
+
+local savedCF = nil
+local killing = false
 
 _G.FeedAMosquito = { stop = function() running = false end }
 
@@ -148,7 +177,6 @@ end
 
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
---   Tool_Character_<userId>_<n>_<m>.Events.Attack
 --------------------------------------------------------------------
 local atkCache = nil
 local atkFor   = nil
@@ -195,9 +223,11 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- Nearest enemy model in Workspace
---   Names seen: CommonArea_Enemy_129, RareArea_Enemy_114,
---   Egg_EpicArea_Enemy_132_0, ... all contain "Enemy".
+-- Enemy lookup
+--   Names seen live: CommonArea_Enemy_129, RareArea_Enemy_114,
+--   LegendaryArea_Enemy_99, MythicalArea_Enemy_21,
+--   DivineArea_Enemy_9, SecretArea_Enemy_4,
+--   Egg_EpicArea_Enemy_132_0, UncommonArea_Enemy_126.
 --------------------------------------------------------------------
 local function enemyPart(model)
     return model:FindFirstChild("HumanoidRootPart")
@@ -205,25 +235,48 @@ local function enemyPart(model)
         or model.PrimaryPart
 end
 
-local function nearestEnemy(fromPos, maxDist)
+local function enabledPrefixes()
+    local out = {}
+    for i = 1, #BOSS_NAMES do
+        local n = BOSS_NAMES[i]
+        if Config["Boss" .. n] then out[#out + 1] = n end
+    end
+    return out
+end
+
+local function nearestEnemyOf(fromPos, prefixes, maxDist)
+    if not prefixes or #prefixes == 0 then return nil, nil end
+
     local best, bestDist, bestPos = nil, maxDist, nil
     local kids = WS:GetChildren()
 
     for i = 1, #kids do
-        local d = kids[i]
-        if string.find(d.Name, "Enemy", 1, true) then
-            local part = enemyPart(d)
-            if part then
-                local pos = part.Position
-                local dist = (pos - fromPos).Magnitude
-                if dist <= bestDist then
-                    best, bestDist, bestPos = d, dist, pos
+        local d  = kids[i]
+        local nm = d.Name
+
+        if string.find(nm, "Area_Enemy", 1, true) then
+            local picked = false
+            for j = 1, #prefixes do
+                if string.find(nm, prefixes[j] .. "Area_Enemy", 1, true) then
+                    picked = true
+                    break
+                end
+            end
+
+            if picked then
+                local part = enemyPart(d)
+                if part then
+                    local pos  = part.Position
+                    local dist = (pos - fromPos).Magnitude
+                    if dist <= bestDist then
+                        best, bestDist, bestPos = d, dist, pos
+                    end
                 end
             end
         end
     end
 
-    return best, bestPos, bestDist
+    return best, bestPos
 end
 
 --------------------------------------------------------------------
@@ -306,6 +359,29 @@ local function buildTab(tab)
                 function(v)
                     if type(v) == "number" then Config.AfarRange = v end
                 end)
+        end
+
+        local kill = makeSection(tab, "Auto Kill", "Left")
+        if kill then
+            addToggle(kill, "Auto Kill", "fam_kill", "Kill", false)
+            addToggle(kill, "Under Map", "fam_under", "Under", true)
+            safeSlider(kill, "Depth", "fam_depth", 0, 40, 8,
+                function(v)
+                    if type(v) == "number" then Config.Depth = v end
+                end)
+            safeSlider(kill, "Kill Range", "fam_killrange", 50, 5000, 1500,
+                function(v)
+                    if type(v) == "number" then Config.KillRange = v end
+                end)
+        end
+
+        local bosses = makeSection(tab, "Bosses", "Right")
+        if bosses then
+            for i = 1, #BOSS_NAMES do
+                local n = BOSS_NAMES[i]
+                local id = "fam_boss_" .. string.lower(n)
+                addToggle(bosses, n, id, "Boss" .. n, true)
+            end
         end
     end)
 
@@ -451,11 +527,11 @@ end)
 
 --------------------------------------------------------------------
 -- AUTO ATTACK  (normal reach)
---   Only runs when Attack From Afar is off, so the two never overlap.
+--   Skipped while Afar or Auto Kill owns the movement.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.AutoAttack and not Config.Afar then
+        if Config.AutoAttack and not Config.Afar and not Config.Kill then
             swing()
         end
         task.wait(ATTACK_RATE)
@@ -463,24 +539,25 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- ATTACK FROM AFAR
---   Teleport onto the nearest enemy, swing, teleport back.
---   The CFrame restore runs in a pcall so a mid-swing respawn cannot
---   leave the loop stuck.
+-- ATTACK FROM AFAR  (touch and return)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.AutoAttack and Config.Afar then
+        if Config.AutoAttack and Config.Afar and not Config.Kill then
             local hrp = rootPart()
             if hrp then
                 local range = tonumber(Config.AfarRange) or 300
-                local target, pos, dist = nearestEnemy(hrp.Position, range)
+                local target, pos = nearestEnemyOf(hrp.Position,
+                    enabledPrefixes(), range)
 
                 if target and pos then
                     local back = hrp.CFrame
-                    local tx, ty, tz = pos.X, pos.Y + 3, pos.Z
+                    local under = Config.Under
+                    local depth = tonumber(Config.Depth) or 8
+                    local ty = pos.Y + 3
+                    if under then ty = pos.Y - depth end
 
-                    pcall(function() hrp.CFrame = CFrame.new(tx, ty, tz) end)
+                    pcall(function() hrp.CFrame = CFrame.new(pos.X, ty, pos.Z) end)
                     task.wait(0.06)
                     swing()
                     task.wait(0.06)
@@ -493,9 +570,68 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
+-- AUTO KILL  (stay attached to the chosen boss)
+--   First pass saves your CFrame; switching the toggle off puts you
+--   back. Every pass re-locks position, so a moving boss is followed.
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.Kill then
+            local hrp = rootPart()
+            if hrp then
+                local range = tonumber(Config.KillRange) or 1500
+                local target, pos = nearestEnemyOf(hrp.Position,
+                    enabledPrefixes(), range)
+
+                if target and pos then
+                    if not killing then
+                        savedCF = hrp.CFrame
+                        killing = true
+                        print("[" .. NAME .. "] auto kill on " .. target.Name)
+                    end
+
+                    local depth = tonumber(Config.Depth) or 8
+                    local ty = pos.Y + 3
+                    if Config.Under then ty = pos.Y - depth end
+
+                    pcall(function()
+                        hrp.CFrame = CFrame.new(pos.X, ty, pos.Z)
+                    end)
+                    swing()
+                elseif killing then
+                    if savedCF then
+                        pcall(function() hrp.CFrame = savedCF end)
+                    end
+                    killing = false
+                    print("[" .. NAME .. "] no target in range")
+                end
+            end
+        elseif killing then
+            if savedCF then
+                pcall(function()
+                    local hrp = rootPart()
+                    if hrp then hrp.CFrame = savedCF end
+                end)
+            end
+            killing = false
+        end
+        task.wait(KILL_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
 local function stop()
     running = false
     pcall(function() fireEvent("StopTransfuseBlood") end)
+
+    if killing and savedCF then
+        pcall(function()
+            local hrp = rootPart()
+            if hrp then hrp.CFrame = savedCF end
+        end)
+    end
+    killing = false
+
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
