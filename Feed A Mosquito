@@ -1,34 +1,38 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.9
+--  v6.0
 --
---  CROSS-MAP HIT (teleport swing)
---    The server measures how far you are from the boss when the Attack
---    remote lands, so the only reliable way is to actually be there.
---    This mode saves your CFrame, jumps onto the boss for the swing,
---    then jumps straight back.
+--  WHY YOU WERE STILL GETTING HIT
+--    v5.9 teleported you ONTO the boss centre. Standing inside a boss
+--    model is exactly what its own damage/attack logic looks for, so
+--    even a one-frame visit got you hit. Keep Alive only healed you
+--    afterwards - it never stopped the damage.
 --
---    v5.9 removes the wait between the two volleys: both Attack calls
---    now go out in the SAME frame as the teleport, so you are standing
---    inside the boss for a single frame instead of two. That is the
---    whole exposure window - there is no way to shrink it further from
---    the client, because the server decides damage on its own tick.
+--  THE FIX: STANDOFF POINT
+--    The server only checks how far you are from the boss when the
+--    Attack remote lands - it does not require you to be inside the
+--    model. So this version teleports you to a point OUTSIDE the
+--    boss body but still inside attack range:
 --
---  KEEP ALIVE (new, ON by default)
---    Bosses still get the odd hit in while you are parked inside them,
---    so the reach loop now watches your health fraction. Under 40% it
---    stops teleporting, stays home and fires TransfuseBlood until you
---    are back over 40%, then resumes on its own. Turn the toggle off
---    if you would rather keep swinging at low health.
+--        pos = bossCentre + outward * (bossRadius + PAD)
 --
---  HUGE HITBOX (off by default) - unchanged, grows boss parts except
---  HumanoidRootPart / Area / ChaseArea / anything already 40+ studs.
+--    You are never inside the model, so contact damage never fires,
+--    and the attack still lands because you are inside reach.
 --
+--  KILL EVERYTHING (one toggle)
+--    Single toggle, no other toggle needed. Each pass walks every boss
+--    type, jumps to its standoff point, fires ATTACK_BURST volleys in
+--    that same frame and moves on, then puts you back exactly where
+--    you were. No waits, no per-boss return trip, no damage window.
+--
+--  Keep Alive is gone, as asked.
+--
+--  CROSS-MAP HIT - same standoff logic, one boss per pass.
+--  HUGE HITBOX - unchanged, off by default.
 --  Always Heal / Auto Collect / Auto Farm - unchanged.
 --
---  All toggles start OFF except Keep Alive. Stop with
---  _G.FeedAMosquito.stop().
+--  Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -37,7 +41,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.9"
+local VERSION = "v6.0"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -57,10 +61,13 @@ local SWING_BURST  = 3
 local BURST_GAP    = 0.015
 local ATK_TTL      = 1.0
 local HB_RATE      = 0.2
-local REACH_RATE   = 0.15
-local REACH_HEIGHT = 2.5
-local RETREAT_HP   = 0.4
-local RETREAT_RATE = 0.2
+local REACH_RATE   = 0.12
+local REACH_HEIGHT = 2.0
+
+-- standoff tuning
+local STANDOFF_PAD = 8      -- studs past the boss surface
+local STANDOFF_MIN = 10     -- never closer than this to the centre
+local ATTACK_BURST = 10     -- volleys fired in the SAME frame
 
 -- reach tuning
 local HB_PAD        = 25
@@ -84,8 +91,8 @@ local Config = {
     AutoCollect = false,
     Farm        = false,
     Reach       = false,
+    KillAll     = false,
     HitboxBig   = false,
-    KeepAlive   = true,
 }
 
 local TOGGLES     = {}
@@ -112,18 +119,6 @@ end
 local function alive()
     local hum = humanoid()
     return hum ~= nil and hum.Health > 0
-end
-
--- 0..1 health fraction, 1 when it cannot be read
-local function healthFrac()
-    local hum = humanoid()
-    if not hum then return 1 end
-    local okH, hp = pcall(function() return hum.Health end)
-    local okM, mx = pcall(function() return hum.MaxHealth end)
-    if not okH or not okM then return 1 end
-    if type(hp) ~= "number" or type(mx) ~= "number" then return 1 end
-    if mx <= 0 then return 1 end
-    return hp / mx
 end
 
 local function notifyUser(msg, dur)
@@ -256,6 +251,15 @@ local function swingOnce()
     return true
 end
 
+-- heavy volley, all in the caller's frame
+local function swingBurst(n)
+    local any = false
+    for i = 1, n do
+        if swingOnce() then any = true end
+    end
+    return any
+end
+
 --------------------------------------------------------------------
 -- Boss lookup
 --------------------------------------------------------------------
@@ -269,13 +273,17 @@ local function bossModelIn(area)
     if not area then return nil end
 
     local kids = area:GetChildren()
+    local fallback = nil
+
     for i = 1, #kids do
         local c = kids[i]
-        if c.ClassName == "Model" and string.find(c.Name, "Mama", 1, true) then
-            return c
+        if c.ClassName == "Model" then
+            if string.find(c.Name, "Mama", 1, true) then return c end
+            if not fallback then fallback = c end
         end
     end
-    return nil
+
+    return fallback
 end
 
 local function bossOf(bossType)
@@ -303,8 +311,52 @@ local function bossCenter(boss)
     return nil
 end
 
+-- rough surface distance, cached per boss address
+local radiusCache = {}
+
+local function bossRadius(boss)
+    local k = keyOf(boss)
+    if k and radiusCache[k] then return radiusCache[k] end
+
+    local rad = STANDOFF_MIN
+    local r = boss:FindFirstChild("HumanoidRootPart")
+
+    if r then
+        local ok, s = pcall(function() return r.Size end)
+        if ok and s then
+            rad = math.max(s.X, s.Y, s.Z) * 0.5 + STANDOFF_PAD
+        end
+    end
+
+    if rad < STANDOFF_MIN then rad = STANDOFF_MIN end
+    if k then radiusCache[k] = rad end
+    return rad
+end
+
 --------------------------------------------------------------------
--- CROSS-MAP HIT (teleport swing, single frame in the boss)
+-- STANDOFF POINT (outside the body, inside attack range)
+--------------------------------------------------------------------
+local function standoffPoint(center, basePos, radius)
+    local dx = basePos.X - center.X
+    local dz = basePos.Z - center.Z
+    local len = math.sqrt(dx * dx + dz * dz)
+
+    if len < 0.5 then
+        dx, dz, len = 1, 0, 1
+    end
+
+    local ux = dx / len
+    local uz = dz / len
+
+    return Vector3.new(
+        center.X + ux * radius,
+        center.Y + REACH_HEIGHT,
+        center.Z + uz * radius
+    )
+end
+
+--------------------------------------------------------------------
+-- CROSS-MAP HIT (single boss per pass)
 --------------------------------------------------------------------
 local reachIndex = 0
 local reachHome  = nil
@@ -342,17 +394,13 @@ local function reachPass()
     local center = bossCenter(boss)
     if not center then return nil end
 
+    local spot = standoffPoint(center, home.Position, bossRadius(boss))
+
     reachHome = home
     reachAway = true
 
-    pcall(function()
-        hrp.CFrame = CFrame.new(center.X, center.Y + REACH_HEIGHT, center.Z)
-    end)
-
-    -- both volleys go out in the same frame as the teleport: the server
-    -- only needs us in range when the remote lands, so no wait here.
-    swingOnce()
-    swingOnce()
+    pcall(function() hrp.CFrame = CFrame.new(spot) end)
+    swingBurst(ATTACK_BURST)
 
     local okR, hrp2 = pcall(function() return rootPart() end)
     local back = (okR and hrp2) or hrp
@@ -361,6 +409,36 @@ local function reachPass()
     reachAway = false
     reachHome = nil
     return BOSS_TYPES[reachIndex]
+end
+
+--------------------------------------------------------------------
+-- KILL EVERYTHING (all bosses, one toggle, no body contact)
+--------------------------------------------------------------------
+local function killAllPass()
+    local hrp = rootPart()
+    if not hrp then return 0 end
+
+    local okH, home = pcall(function() return hrp.CFrame end)
+    if not okH or not home then return 0 end
+
+    local basePos = home.Position
+    local done    = 0
+
+    for i = 1, #BOSS_TYPES do
+        local boss = bossOf(BOSS_TYPES[i])
+        if boss then
+            local center = bossCenter(boss)
+            if center then
+                local spot = standoffPoint(center, basePos, bossRadius(boss))
+                pcall(function() hrp.CFrame = CFrame.new(spot) end)
+                swingBurst(ATTACK_BURST)
+                done = done + 1
+            end
+        end
+    end
+
+    pcall(function() hrp.CFrame = home end)
+    return done
 end
 
 --------------------------------------------------------------------
@@ -568,9 +646,9 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
+            addToggle(combat, "Kill Everything (no damage)", "fam_killall", "KillAll", false)
+            addToggle(combat, "Cross-Map Hit (one boss)", "fam_reach", "Reach", false)
             addToggle(combat, "Auto Farm (spam attack)", "fam_farm", "Farm", false)
-            addToggle(combat, "Cross-Map Hit (teleport swing)", "fam_reach", "Reach", false)
-            addToggle(combat, "Keep Alive (retreat under 40% HP)", "fam_keepalive", "KeepAlive", true)
             addToggle(combat, "Huge Hitbox (x2 reach)", "fam_hitbox_big", "HitboxBig", false)
         end
     end)
@@ -627,51 +705,64 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- CROSS-MAP REACH LOOP (with low-HP retreat)
+-- KILL EVERYTHING LOOP
 --------------------------------------------------------------------
 task.spawn(function()
-    local wasOn   = false
-    local warned  = false
-    local resting = false
+    local wasOn  = false
+    local warned = false
 
     while running do
-        if Config.Reach and Config.Farm and alive() then
+        if Config.KillAll and alive() then
             if not wasOn then
-                wasOn   = true
-                warned  = false
-                resting = false
+                wasOn  = true
+                warned = false
+                print("[" .. NAME .. "] kill everything on (standoff, no contact)")
+            end
+
+            local n = killAllPass()
+
+            if n == 0 and not warned then
+                warned = true
+                print("[" .. NAME .. "] no bosses found - check SpawnAreas")
+            end
+
+            task.wait(REACH_RATE)
+        else
+            if wasOn then
+                wasOn = false
+                pcall(reachBack)
+                print("[" .. NAME .. "] kill everything off")
+            end
+            task.wait(0.1)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- CROSS-MAP REACH LOOP (skipped while KillAll runs)
+--------------------------------------------------------------------
+task.spawn(function()
+    local wasOn  = false
+    local warned = false
+
+    while running do
+        if Config.Reach and not Config.KillAll and alive() then
+            if not wasOn then
+                wasOn  = true
+                warned = false
                 print("[" .. NAME .. "] cross-map reach on")
             end
 
-            local frac = healthFrac()
-
-            if Config.KeepAlive and frac < RETREAT_HP then
-                if not resting then
-                    resting = true
-                    print("[" .. NAME .. "] low HP ("
-                        .. tostring(math.floor(frac * 100))
-                        .. "%) - holding home and healing")
-                end
-                fireEvent("TransfuseBlood")
-                task.wait(RETREAT_RATE)
-            else
-                if resting then
-                    resting = false
-                    print("[" .. NAME .. "] HP back up - resuming reach")
-                end
-
-                local used = reachPass()
-                if not used and not warned then
-                    warned = true
-                    print("[" .. NAME .. "] reach: no boss found yet")
-                end
-
-                task.wait(REACH_RATE)
+            local used = reachPass()
+            if not used and not warned then
+                warned = true
+                print("[" .. NAME .. "] reach: no boss found yet")
             end
+
+            task.wait(REACH_RATE)
         else
             if wasOn then
-                wasOn   = false
-                resting = false
+                wasOn = false
                 pcall(reachBack)
                 print("[" .. NAME .. "] cross-map reach off")
             end
@@ -681,11 +772,11 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HITBOX LOOP (only when Reach is off)
+-- HITBOX LOOP (plain auto farm only)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Farm and not Config.Reach then
+        if Config.Farm and not Config.Reach and not Config.KillAll then
             pruneSaved()
             local n = applyHitbox()
             if n > 0 and not hbApplied then
@@ -701,14 +792,14 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO SWING (only when Reach is off - reach does its own swings)
+-- AUTO SWING (plain auto farm only)
 --------------------------------------------------------------------
 task.spawn(function()
     local wasOn  = false
     local warned = false
 
     while running do
-        if Config.Farm and not Config.Reach and alive() then
+        if Config.Farm and not Config.Reach and not Config.KillAll and alive() then
             if not wasOn then
                 wasOn  = true
                 warned = false
@@ -723,7 +814,8 @@ task.spawn(function()
             else
                 for b = 2, SWING_BURST do
                     task.wait(BURST_GAP)
-                    if not running or not Config.Farm or Config.Reach then break end
+                    if not running or not Config.Farm then break end
+                    if Config.Reach or Config.KillAll then break end
                     swingOnce()
                 end
             end
@@ -786,12 +878,13 @@ local function stop()
     pcall(reachBack)
     pcall(function() restoreHitbox() end)
     pcall(function() fireEvent("StopTransfuseBlood") end)
-    atkCache = nil
+    atkCache    = nil
+    radiusCache = {}
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - reach now retreats at low HP", 5)
+notifyUser("Loaded - Kill Everything uses standoff, no contact", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
