@@ -1,27 +1,40 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v3.6
+--  v3.7
 --
---  BOSS LIST ORDER
---    The Boss Select section is sorted by boss HP, highest first, and
---    is rebuilt every time the tab is opened. Bosses with no Humanoid
---    (Mythical / Divine / Secret have no Mama model) sort last.
+--  SORT FIX
+--    v3.6 sorted inside buildTab, but UI.AddTab fires on the first
+--    frame after load, before the boss Humanoids are readable. Every
+--    max health came back nil, so the tie-break fell through to the
+--    alphabet and the list was never actually ordered by HP.
+--    The tab now waits until at least two bosses report a MaxHealth
+--    before it builds (or 15 seconds, whichever comes first), sorts by
+--    MaxHealth descending, and prints the resulting order to console
+--    so it can be checked.
+--    Each toggle label also shows the HP it was sorted by.
 --
---  MULTIPLE SELECTIONS
---    Several Go toggles can be on at once. Kill Aura then works the
---    selected bosses one at a time: dead ones are skipped, and among
---    the living it always picks the one with the most current Health.
+--  NO HITBOX EXPANDER (why)
+--    Attack is fired with NO arguments. The server resolves the hit
+--    from the character position, so it never reads any size we could
+--    change on the client. Enlarging the boss parts locally changes
+--    nothing on the server and the swing still misses.
+--    What does work is being next to the boss for the instant the
+--    swing lands. That is what Far Hit does.
 --
---  NO REPEATED TELEPORTING
---    The first move to a target is a teleport. After that it holds:
---    you are not moved again until either
---      - you drift more than 12 studs from where it put you, or
---      - the chosen target changes (it died, or a healthier selected
---        boss appeared).
+--  FAR HIT
+--    Remembers where you were, teleports to the selected boss feet,
+--    swings, then teleports straight back. You keep your position and
+--    the hit resolves from on top of the boss. Two CFrame writes per
+--    pass, throttled to FARHIT_RATE.
+--
+--  KILL AURA
+--    Multi-select, dead bosses skipped, healthiest living selected
+--    boss wins. Teleports only on target change or if you drift more
+--    than 12 studs. Skipped entirely while Far Hit is on so the two do
+--    not fight over your position.
 --
 --  NO SELECTION = NO MOVEMENT
---    With nothing selected Kill Aura only swings where you stand.
 --
 --  WHAT THE GAME HAS (read live)
 --    Workspace.SpawnAreas.<Type>Area holds:
@@ -29,16 +42,10 @@
 --      ChaseArea   Part   - trigger volume ~14 studs up, never used
 --      <boss>Mama  Model  - the boss, with a Humanoid
 --    UncommonMama's parts span Y 3 to Y 12, so the landing point is the
---    model bounding box: centre X/Z, lowest part Y + 1. That is the
---    feet, not the head.
+--    model bounding box: centre X/Z, lowest part Y + 1 (the feet).
 --    Common -> MosquitoMama, Uncommon -> UncommonMama,
 --    Rare -> RareMama, Epic -> EpicMama, Legendary -> LegendaryMama.
 --    Mythical / Divine / Secret have no boss model.
---
---  Sections
---    Main          Always Heal, Auto Collect
---    Combat        Kill Aura
---    Boss Select   one toggle per type, sorted by HP
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -49,7 +56,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v3.6"
+local VERSION = "v3.7"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -58,6 +65,7 @@ print("[" .. NAME .. "] " .. VERSION)
 
 local running = true
 local built   = false
+local buildTries = 0
 
 -- fixed tuning
 local POLL_RATE    = 0.1
@@ -66,10 +74,12 @@ local HEAL_REFIRE  = 1.0
 local HP_LOG_RATE  = 5.0
 local COLLECT_RATE = 1.5
 local AURA_RATE    = 0.2
+local FARHIT_RATE  = 0.5
 local ATK_TTL      = 0.5
-local MOVE_EPS2    = 1      -- ignore moves shorter than 1 stud
-local FOOT_LIFT    = 1      -- studs above the lowest part
-local STRAY_D2     = 144    -- 12 studs squared before it teleports again
+local MOVE_EPS2    = 1
+local FOOT_LIFT    = 1
+local STRAY_D2     = 144
+local BUILD_WAIT   = 900
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -80,15 +90,13 @@ local Config = {
     Heal        = false,
     AutoCollect = false,
     Aura        = false,
+    FarHit      = false,
 }
 
 local TOGGLES     = {}
 local getterWorks = {}
 
--- multi-select: type -> true
-local selected = {}
-
--- where the last teleport put us, and which boss it was for
+local selected   = {}
 local holdPos    = nil
 local holdTarget = nil
 
@@ -247,7 +255,7 @@ local function bossOf(bossType)
     return bossModelIn(areaModel(bossType))
 end
 
--- current health and max health of a boss, nil if it has no Humanoid
+-- returns current health, max health; both nil when not readable
 local function bossHealth(bossType)
     local boss = bossOf(bossType)
     if not boss then return nil, nil end
@@ -307,7 +315,24 @@ local function bossFeet(bossType)
     return pos, boss.Name .. " feet"
 end
 
--- boss types sorted by max health, highest first, no-Humanoid last
+local function bossCount()
+    local n = 0
+    for i = 1, #BOSS_TYPES do
+        if bossOf(BOSS_TYPES[i]) then n = n + 1 end
+    end
+    return n
+end
+
+local function healthReady()
+    local n = 0
+    for i = 1, #BOSS_TYPES do
+        local _, mx = bossHealth(BOSS_TYPES[i])
+        if mx then n = n + 1 end
+    end
+    return n >= 2
+end
+
+-- sorted by MAX health descending; unreadable bosses last
 local function orderedTypes()
     local arr = {}
     for i = 1, #BOSS_TYPES do arr[i] = BOSS_TYPES[i] end
@@ -334,8 +359,10 @@ local function pickTarget()
             if hp and hp > 0 then
                 local pos, label = bossFeet(t)
                 if pos and hp > bestHp then
-                    bestType, bestHp = t, hp
-                    bestPos, bestLabel = pos, t .. " " .. label
+                    bestType  = t
+                    bestHp    = hp
+                    bestPos   = pos
+                    bestLabel = t .. " " .. tostring(label)
                 end
             end
         end
@@ -347,14 +374,12 @@ end
 local function moveTo(hrp, pos)
     if not hrp or not hrp.Parent or not pos then return false end
     if not alive() then return false end
-
     if dist2(hrp.Position, pos) <= MOVE_EPS2 then return false end
 
     pcall(function() hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z) end)
     return true
 end
 
--- called when a boss toggle flips ON
 local function selectBoss(bossType)
     selected[bossType] = true
 
@@ -377,7 +402,7 @@ local function selectBoss(bossType)
     holdPos    = pos
     holdTarget = bossType
 
-    print("[" .. NAME .. "] go " .. bossType .. " via " .. label
+    print("[" .. NAME .. "] go " .. bossType .. " via " .. tostring(label)
         .. " " .. fmt(pos))
     notifyUser("Go " .. bossType, 2)
 end
@@ -443,17 +468,31 @@ local function buildTab(tab)
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
             addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
+            addToggle(combat, "Far Hit", "fam_farhit", "FarHit", false)
         end
 
         local pick = makeSection(tab, "Boss Select", "Right")
         if pick then
             local ordered = orderedTypes()
+            local shown   = {}
+
             for i = 1, #ordered do
                 local t   = ordered[i]
                 local key = "Sel" .. t
                 local id  = "fam_go_" .. string.lower(t)
-                addToggle(pick, "Go " .. t, id, key, false, t)
+                local _, mx = bossHealth(t)
+
+                local label = "Go " .. t
+                if mx then
+                    label = label .. " (" .. tostring(math.floor(mx)) .. ")"
+                end
+
+                addToggle(pick, label, id, key, false, t)
+                shown[#shown + 1] = t .. "="
+                    .. tostring(mx and math.floor(mx) or 0)
             end
+
+            print("[" .. NAME .. "] boss order: " .. table.concat(shown, ", "))
         end
     end)
 
@@ -469,6 +508,15 @@ if HAS_UI then
     local ok, err = pcall(function()
         UI.AddTab(NAME, function(tab)
             if built then return end
+            if type(tab) ~= "table" then return end
+
+            buildTries = buildTries + 1
+
+            -- wait for boss Health to be readable, or give up waiting
+            if not healthReady() and buildTries < BUILD_WAIT then
+                return
+            end
+
             pcall(buildTab, tab)
         end)
     end)
@@ -482,7 +530,6 @@ end
 
 --------------------------------------------------------------------
 -- TOGGLE POLLER
---   Rising edge selects and teleports, falling edge deselects.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -579,16 +626,14 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- KILL AURA
---   Works the selected bosses one at a time: dead skipped, healthiest
---   living one wins. Teleports only on a target change or after you
---   drift more than STRAY_D2 from where it placed you.
+-- KILL AURA  (hold position)
+--   Skipped while Far Hit is on so they never fight over your CFrame.
 --------------------------------------------------------------------
 task.spawn(function()
     local lastLabel = nil
 
     while running do
-        if Config.Aura then
+        if Config.Aura and not Config.FarHit then
             local hrp = rootPart()
             if hrp and alive() then
                 local targetType, pos, label = pickTarget()
@@ -622,6 +667,46 @@ task.spawn(function()
             end
         end
         task.wait(AURA_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- FAR HIT
+--   In, swing, straight back. This is the closest thing to hitting a
+--   boss from a distance: the server resolves the hit from the
+--   character position at the moment of the swing.
+--------------------------------------------------------------------
+task.spawn(function()
+    local lastLabel = nil
+
+    while running do
+        if Config.FarHit then
+            local hrp = rootPart()
+            if hrp and alive() then
+                local targetType, pos, label = pickTarget()
+
+                if pos then
+                    local back = hrp.CFrame
+
+                    pcall(function()
+                        hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z)
+                    end)
+                    swing()
+                    pcall(function()
+                        if hrp and hrp.Parent then hrp.CFrame = back end
+                    end)
+
+                    if label ~= lastLabel then
+                        lastLabel = label
+                        print("[" .. NAME .. "] far hit -> " .. tostring(label))
+                    end
+                elseif lastLabel ~= "none" then
+                    lastLabel = "none"
+                    print("[" .. NAME .. "] far hit: no living selected boss")
+                end
+            end
+        end
+        task.wait(FARHIT_RATE)
     end
 end)
 
