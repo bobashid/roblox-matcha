@@ -1,45 +1,46 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.3
+--  v5.4  -  CROSS-MAP REACH, WITHOUT EATING THE FLOOR
 --
---  "IT REMOVED THE FLOORS"
---    The boss's HumanoidRootPart sits at its feet. At x8-x40 it turns
---    into an enormous flat slab lying right on top of the arena floor,
---    and CanCollide is off on it, so the arena looks like it has lost
---    its floor and you can drop through where the slab is.
---    The root part is now never multiplied. It is only nudged up to a
---    small fixed size (HB_ROOT_MAX = 16 studs) so it stays a hit
---    target, and it keeps its original CanCollide. The visible body
---    parts are what get grown.
---    As a second guard, any part whose ORIGINAL size is already 40
---    studs or more on any axis (arena geometry, walls, big props) is
---    skipped entirely - it is scenery, not a boss hitbox.
+--  WHY THE REACH WENT AWAY
+--    v4.2 grew every part by a flat x8, and that was enough for the
+--    near arenas but not the far ones - the first four died, the rest
+--    did not. v5.3 fixed the floor swallowing by capping the root
+--    part, but that also removed most of the reach, so now nothing
+--    dies from range.
 --
---  "IT STOPPED WORKING AFTER A WHILE"
---    v5.2 only wrote a size when the multiplier changed. If the game
---    itself reset a part's size (respawn, streaming, replication), the
---    multiplier was unchanged so nothing was rewritten and the boss
---    silently went back to normal size while the script still thought
---    it was grown.
---    Now every pass compares the part's CURRENT size with the size it
---    should have and rewrites it only when they differ. The expected
---    size is always original * multiplier, taken from the size saved
---    by Address the first time the part was seen, so this cannot
---    compound.
+--  THE FIX: SIZE EACH BOSS TO REACH YOU
+--    The multiplier is not a fixed number any more. For each boss:
+--        d  = distance from you to the boss centre
+--        r  = half of the largest ORIGINAL body part size
+--        mult = (d - HB_REACH) / r, clamped to [8, 300]
+--    That makes the grown body parts span from the boss out to within
+--    HB_REACH (15) studs of you, whichever arena it is in. A boss 40
+--    studs away gets a small multiplier; a boss 600 studs away gets a
+--    huge one. Nothing is ever shrunk below x8.
+--    The multiplier is recomputed every pass from the ORIGINAL size
+--    saved by Address, so it can never compound, and the size is
+--    rewritten only when the part is not already the size it should
+--    be - a game-side reset is corrected on the next pass.
 --
---  Everything else is the v5.2 you were happy with:
---    - live scan of SpawnAreas for <Type>Mama models with a Humanoid
---      (Divine, Mythical and Secret included - they do exist)
---    - eggs, players, pets (UUID names) and area containers excluded
---    - multiplier scales with distance: base x8 (x16 with Huge),
---      +1 per 12 studs, capped x40
---    - Area / ChaseArea parts are never resized
---    - stand still, Attack fired every SWING_RATE, no CFrame writes
---    - size and CanCollide restored exactly on toggle off / stop
+--  WHY THE FLOOR STAYS
+--    The boss's HumanoidRootPart sits at its centre, right over the
+--    arena floor. At x40+ it becomes a slab that covers the whole
+--    arena. It is now skipped entirely - only the visible body parts
+--    are grown, and they are what carries the hit. Any part whose
+--    ORIGINAL size is already 40 studs on an axis (arena floor, walls,
+--    big props) is skipped too. Area / ChaseArea are skipped by name
+--    as a third guard.
 --
---  "Print Boss List" prints what the scan accepted, with part count,
---  HP and the multiplier each boss would get right now.
+--  Also kept: live SpawnAreas scan for <Type>Mama with a Humanoid
+--  (Divine / Mythical / Secret included), eggs and players excluded,
+--  Address-keyed size table, CanCollide off on grown parts and put back
+--  with the size on toggle off / stop, stand still, Attack fired every
+--  0.1 s, no CFrame writes, no teleports.
+--
+--  "Print Boss List" shows what the scan accepted, with part count, HP
+--  and the multiplier each boss would get right now.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -50,7 +51,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.3"
+local VERSION = "v5.4"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -74,13 +75,12 @@ local BOSS_MEMORY  = 20.0
 local BOSS_CAP     = 30
 local TRACK_LOG    = 5.0
 
--- hitbox tuning
-local HB_MULT      = 8
-local HB_MULT_BIG  = 16
-local HB_MAX       = 40
-local HB_PER_STUD  = 12
-local HB_ROOT_MAX  = 16    -- root part is never multiplied past this
-local HB_SKIP_SIZE = 40    -- scenery: any original axis this big is left alone
+-- reach tuning
+local HB_REACH     = 15    -- parts should reach to within this many studs of you
+local HB_MULT_MIN  = 8     -- never smaller than x8
+local HB_MULT_MAX  = 300   -- hard cap on any single part
+local HB_BOOST     = 1.5   -- extra multiplier while "Bigger Reach" is on
+local HB_SKIP_SIZE = 40    -- original axis this big -> scenery, never touched
 
 -- parts that must never be resized
 local SKIP_PART = {
@@ -139,8 +139,8 @@ local function isBasePart(p)
         or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
 end
 
--- Matcha returns a new proxy for the same part each scan, so the
--- instance cannot be a table key. Address is stable.
+-- Matcha hands back a new proxy for the same part on every scan, so
+-- the instance cannot be a table key. Address is stable.
 local function keyOf(inst)
     if inst == nil then return nil end
     local ok, a = pcall(function() return inst.Address end)
@@ -400,16 +400,11 @@ local function allBosses()
     return scanBosses()
 end
 
+-- stable centre: HumanoidRootPart first (never grown), then any part
 local function bossCenter(boss)
     local r = boss:FindFirstChild("HumanoidRootPart")
     if r and r.ClassName == "Part" then
         local ok, p = pcall(function() return r.Position end)
-        if ok and p then return p end
-    end
-
-    local pp = boss.PrimaryPart
-    if pp then
-        local ok, p = pcall(function() return pp.Position end)
         if ok and p then return p end
     end
 
@@ -427,31 +422,25 @@ local function bossCenter(boss)
     return nil
 end
 
-local function multFor(boss)
-    local base = HB_MULT
-    if Config.HitboxBig then base = HB_MULT_BIG end
-
-    local hrp = rootPart()
-    local c   = bossCenter(boss)
-    if not hrp or not c then return base end
-
-    local okD, d = pcall(function() return (c - hrp.Position).Magnitude end)
-    if not okD or type(d) ~= "number" then return base end
-
-    local m = base + math.floor(d / HB_PER_STUD)
-    if m > HB_MAX then m = HB_MAX end
-    if m < base then m = base end
+-- how big a boss's grown body should be to reach the player from here
+local function multForDistance(dist, maxHalf)
+    if maxHalf < 0.5 then maxHalf = 0.5 end
+    local m = (dist - HB_REACH) / maxHalf
+    if m < HB_MULT_MIN then m = HB_MULT_MIN end
+    if Config.HitboxBig then m = m * HB_BOOST end
+    if m > HB_MULT_MAX then m = HB_MULT_MAX end
     return m
 end
 
 local function reportBosses()
     local list = scanBosses()
+    local seen, order = {}, {}
 
-    local seen  = {}
-    local order = {}
+    local hrp = rootPart()
+    local myPos = hrp and hrp.Position or nil
 
     for i = 1, #list do
-        local m  = list[i]
+        local m = list[i]
         local hp = "?"
 
         local h = bossHumanoid(m)
@@ -474,137 +463,153 @@ local function reportBosses()
         local m     = order[i].m
         local parts = countParts(m)
         local note  = ""
-        if parts == 0 then note = "  (no parts on client - cannot grow)" end
+        local mult  = HB_MULT_MIN
+
+        if parts == 0 then
+            note = "  (no parts on client - cannot grow)"
+        elseif myPos then
+            local c = bossCenter(m)
+            if c then
+                local okD, d = pcall(function()
+                    return (c - myPos).Magnitude
+                end)
+                if okD and type(d) == "number" then
+                    local maxHalf = 0
+                    local ok, desc = pcall(function() return m:GetDescendants() end)
+                    if ok and desc then
+                        for j = 1, #desc do
+                            local p = desc[j]
+                            if isBasePart(p) and not SKIP_PART[p.Name]
+                                and p.Name ~= "HumanoidRootPart" then
+                                local okS, s = pcall(function() return p.Size end)
+                                if okS and s and s.X < HB_SKIP_SIZE
+                                    and s.Y < HB_SKIP_SIZE and s.Z < HB_SKIP_SIZE then
+                                    local half = math.max(s.X, s.Y, s.Z) * 0.5
+                                    if half > maxHalf then maxHalf = half end
+                                end
+                            end
+                        end
+                    end
+                    mult = multForDistance(d, maxHalf)
+                    note = "  dist=" .. tostring(math.floor(d))
+                end
+            end
+        end
 
         print("  " .. m.Name .. "  parts=" .. tostring(parts)
             .. "  hp=" .. order[i].hp
-            .. "  mult=x" .. tostring(multFor(m)) .. note)
+            .. "  mult=x" .. tostring(math.floor(mult)) .. note)
     end
 end
 
 --------------------------------------------------------------------
 -- BOSS HITBOX EXPANDER
---   Root part capped, scenery skipped, sizes re-applied on drift.
+--   Root skipped, scenery skipped, mult computed per boss per pass.
 --------------------------------------------------------------------
-local hbSaved   = {}   -- address -> { part, size, collide, root }
+local hbSaved   = {}   -- address -> { part, size, collide }
 local hbApplied = false
 
-local function hbFactor()
-    if not Config.Farm then return 0 end
-    if Config.HitboxBig then return HB_MULT_BIG end
-    return HB_MULT
-end
-
-local function pruneSaved()
-    local dead = nil
-    for k, e in pairs(hbSaved) do
-        local gone = false
-
-        if not e.part then
-            gone = true
-        else
-            local ok, parent = pcall(function() return e.part.Parent end)
-            if not ok or parent == nil then gone = true end
-        end
-
-        if gone then
-            dead = dead or {}
-            dead[#dead + 1] = k
-        end
-    end
-
-    if dead then
-        for i = 1, #dead do hbSaved[dead[i]] = nil end
-    end
-end
-
-local function growPart(d, mult, isRoot)
-    if SKIP_PART[d.Name] then return false end
+-- register a part's original size exactly once
+local function ensureSaved(d)
+    if SKIP_PART[d.Name] then return nil end
 
     local k = keyOf(d)
-    if k == nil then return false end
+    if k == nil then return nil end
 
     local e = hbSaved[k]
+    if e then return e end
 
-    if e == nil then
-        local okS, s = pcall(function() return d.Size end)
-        if not okS or not s then return false end
+    local okS, s = pcall(function() return d.Size end)
+    if not okS or not s then return nil end
 
-        -- arena geometry, walls and other scenery: never touched
-        if s.X >= HB_SKIP_SIZE or s.Y >= HB_SKIP_SIZE or s.Z >= HB_SKIP_SIZE then
-            return false
-        end
-
-        local okC, c = pcall(function() return d.CanCollide end)
-
-        e = {
-            part    = d,
-            size    = s,
-            collide = (okC and c) and true or false,
-            root    = isRoot and true or false,
-        }
-        hbSaved[k] = e
+    -- scenery: never register, never grow
+    if s.X >= HB_SKIP_SIZE or s.Y >= HB_SKIP_SIZE or s.Z >= HB_SKIP_SIZE then
+        return nil
     end
 
-    -- the root part sits on the floor: keep it small so it cannot
-    -- swallow the arena, and leave its collision alone
-    local target
-    if e.root then
-        local base = e.size
-        local rx, ry, rz = base.X, base.Y, base.Z
-        if rx > HB_ROOT_MAX then rx = HB_ROOT_MAX end
-        if ry > HB_ROOT_MAX then ry = HB_ROOT_MAX end
-        if rz > HB_ROOT_MAX then rz = HB_ROOT_MAX end
-        if rx < 6 then rx = 6 end
-        if ry < 6 then ry = 6 end
-        if rz < 6 then rz = 6 end
-        target = Vector3.new(rx, ry, rz)
-    else
-        target = Vector3.new(e.size.X * mult, e.size.Y * mult, e.size.Z * mult)
-    end
+    local okC, c = pcall(function() return d.CanCollide end)
 
-    -- rewrite only when the part is not already the size it should be
+    e = {
+        part    = d,
+        size    = s,
+        collide = (okC and c) and true or false,
+    }
+    hbSaved[k] = e
+    return e
+end
+
+local function growPart(d, e, mult)
+    if not e then return false end
+    if SKIP_PART[d.Name] then return false end
+
+    local target = Vector3.new(
+        e.size.X * mult,
+        e.size.Y * mult,
+        e.size.Z * mult
+    )
+
     local okCur, cur = pcall(function() return d.Size end)
-    if okCur and cur and not sizeDiffers(cur, target) then
-        return true
-    end
+    if okCur and cur and not sizeDiffers(cur, target) then return true end
 
     pcall(function() d.Size = target end)
-
-    if not e.root then
-        -- a grown body part must not shove the player around
-        pcall(function() d.CanCollide = false end)
-    end
-
+    pcall(function() d.CanCollide = false end)
     return true
 end
 
 local function applyHitbox()
+    local hrp = rootPart()
+    if not hrp then return 0 end
+
+    local myPos = hrp.Position
     local touched = 0
-    local list    = allBosses()
+    local list = allBosses()
 
     for i = 1, #list do
         local boss = list[i]
         if boss and boss.Parent then
-            local mult = multFor(boss)
+            local c = bossCenter(boss)
+            if c then
+                local okD, dist = pcall(function()
+                    return (c - myPos).Magnitude
+                end)
 
-            local okP, pp = pcall(function() return boss.PrimaryPart end)
-            if not okP then pp = nil end
+                if okD and type(dist) == "number" then
+                    local ok, desc = pcall(function() return boss:GetDescendants() end)
+                    if ok and desc then
+                        -- pass 1: register every growable body part, find the
+                        -- largest ORIGINAL half-extent
+                        local entries = {}
+                        local maxHalf = 0
+                        local primary = nil
+                        pcall(function() primary = boss.PrimaryPart end)
 
-            local okD, desc = pcall(function() return boss:GetDescendants() end)
-            if okD and desc then
-                for j = 1, #desc do
-                    local d = desc[j]
-                    if isBasePart(d) then
-                        local isRoot = false
-                        if d.Name == "HumanoidRootPart" then
-                            isRoot = true
-                        elseif pp ~= nil then
-                            local okE, same = pcall(function() return pp == d end)
-                            if okE and same then isRoot = true end
+                        for j = 1, #desc do
+                            local d = desc[j]
+                            if isBasePart(d) then
+                                local isRoot = (d.Name == "HumanoidRootPart")
+                                    or (primary ~= nil and primary == d)
+                                if not isRoot then
+                                    local e = ensureSaved(d)
+                                    if e then
+                                        entries[#entries + 1] = { part = d, e = e }
+                                        local half = math.max(e.size.X, e.size.Y, e.size.Z) * 0.5
+                                        if half > maxHalf then maxHalf = half end
+                                    end
+                                end
+                            end
                         end
 
-                        if growPart(d, mult, isRoot) then touched = touched + 1 end
+                        -- pass 2: one multiplier for the whole boss, sized
+                        -- so its parts reach the player from this distance
+                        if #entries > 0 then
+                            local mult = multForDistance(dist, maxHalf)
+                            for j = 1, #entries do
+                                local en = entries[j]
+                                if growPart(en.part, en.e, mult) then
+                                    touched = touched + 1
+                                end
+                            end
+                        end
                     end
                 end
             end
@@ -614,9 +619,28 @@ local function applyHitbox()
     return touched
 end
 
+local function pruneSaved()
+    local dead = nil
+    for k, e in pairs(hbSaved) do
+        local gone = false
+        if not e.part then
+            gone = true
+        else
+            local ok, parent = pcall(function() return e.part.Parent end)
+            if not ok or parent == nil then gone = true end
+        end
+        if gone then
+            dead = dead or {}
+            dead[#dead + 1] = k
+        end
+    end
+    if dead then
+        for i = 1, #dead do hbSaved[dead[i]] = nil end
+    end
+end
+
 local function restoreHitbox()
     local n = 0
-
     for k, e in pairs(hbSaved) do
         local p = e.part
         if p then
@@ -628,7 +652,6 @@ local function restoreHitbox()
             end
         end
     end
-
     hbSaved = {}
 
     if hbApplied then
@@ -710,8 +733,8 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Farm (hitbox + swing)", "fam_farm", "Farm", false)
-            addToggle(combat, "Huge Hitbox (x16 base)", "fam_hitbox_big", "HitboxBig", false)
+            addToggle(combat, "Auto Farm (reach + swing)", "fam_farm", "Farm", false)
+            addToggle(combat, "Bigger Reach (+50%)", "fam_hitbox_big", "HitboxBig", false)
             safeButton(combat, "Print Boss List", "fam_bosslist", function()
                 reportBosses()
                 notifyUser("Boss list printed to console", 4)
@@ -775,13 +798,13 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if hbFactor() > 0 then
+        if Config.Farm then
             pruneSaved()
             local n = applyHitbox()
             if n > 0 and not hbApplied then
                 hbApplied = true
                 print("[" .. NAME .. "] hitbox on " .. tostring(n)
-                    .. " boss parts (distance scaled, root capped, local)")
+                    .. " boss parts (reach sized, root skipped, local)")
             end
         elseif hbApplied then
             restoreHitbox()
@@ -889,5 +912,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Auto Farm: big hitboxes + swing", 5)
+notifyUser("Loaded - Auto Farm: cross-map reach", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
