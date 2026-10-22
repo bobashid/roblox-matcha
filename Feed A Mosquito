@@ -1,28 +1,35 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v7.2  -  YOU NO LONGER SLICE ANYTHING YOURSELF
+--  v7.3  -  SILENT: NOTHING SWINGS ON SCREEN
 --
---  What v7.1 proved
---    The touch cycle works: hits land on every boss once the reach is
---    scaled. What it still needed was your own swing to actually deal
---    the damage, so you had to slice the air.
+--  v7.2 clicked for you, which fires the real swing animation and the
+--  swing sound. That is automatic but not silent, so the click is off
+--  by default now. Two toggles instead of one behaviour:
 --
---  What changed here
---    The hit loop now does the swing itself, every pass:
---        1. scale AttackPart (Reach)
---        2. alternate untouch / touch on every boss part, so each
---           second pass is a brand new contact (the condition that
---           produces a hit)
---        3. PlaySound + Attack on the tool's LIVE actor (from ActorId)
---        4. mouse1click, the same input your own click makes
---    so nothing is left for you to press. Hold no key, click nothing.
+--      Silent (on by default)  - no mouse click at all, nothing is
+--                                animated on your character
+--      Visible Swing (off)     - mouse1click every pass, the old
+--                                automatic swing, for when silent is
+--                                not enough
 --
---  Why the live actor matters
+--  Both modes share the same core, which is what was actually landing
+--  hits in v7.1:
+--      1. scale AttackPart so the box covers the whole map (Reach)
+--      2. alternate untouch / touch on every boss part, so each
+--         second pass is a BRAND NEW contact - a contact that already
+--         exists does not fire again, which is why a plain repeated
+--         touch did nothing
+--      3. PlaySound + Attack on the tool's LIVE actor, resolved from
+--         the tool's ActorId value
+--  No part of the tool is moved, equipped or unequipped, so nothing
+--  can crash and nothing is reparented.
+--
+--  WHY THE LIVE ACTOR
 --    Every equip leaves a dead copy of the tool actor in
---    Runtime.Actors. Matching by name prefix picked a dead one, which
---    is why earlier Attack loops did nothing. The tool's ActorId names
---    the live actor and is re-resolved whenever it changes.
+--    Runtime.Actors, and matching by name prefix picked a dead one,
+--    which is why earlier Attack loops did nothing at all. ActorId
+--    names the live actor and is re-resolved when it changes.
 --
 --  Reach
 --    AttackPart is the only part ever resized:
@@ -31,10 +38,10 @@
 --    so none is launched into the void and the map stays solid.
 --    Original size is saved per Address and restored on toggle off.
 --
---  Boss HP is summed every pass; one line prints if it stops dropping
---  so a miss is obvious instead of silent.
+--  Boss HP is summed every pass; one line prints if it stops dropping,
+--  so you can tell silent mode is not landing and flip Visible Swing.
 --
---  Keep a weapon equipped. All toggles start OFF.
+--  Keep a weapon equipped. All toggles start OFF except Silent.
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
@@ -44,7 +51,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v7.2"
+local VERSION = "v7.3"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -59,9 +66,9 @@ local POLL_RATE    = 0.1
 local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
 local COLLECT_RATE = 1.5
-local HIT_RATE     = 0.2
+local HIT_RATE     = 0.12
 local TOUCH_PARTS  = 4
-local STALE_LIMIT  = 25
+local STALE_LIMIT  = 40
 
 -- reach tuning
 local REACH_PAD    = 30
@@ -80,6 +87,8 @@ local Config = {
     AutoCollect = false,
     Farm        = false,
     Reach       = false,
+    Silent      = true,
+    Swing       = false,
 }
 
 local TOGGLES     = {}
@@ -214,7 +223,7 @@ local function remotesOfActor(name)
     return ev:FindFirstChild("Attack"), ev:FindFirstChild("PlaySound")
 end
 
--- the same input your own click sends, so no hand needed
+-- only used when Visible Swing is on; this is what animates you
 local function swingClick()
     if type(mouse1click) ~= "function" then return false end
 
@@ -514,8 +523,10 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Hit (swings for you)", "fam_farm", "Farm", false)
+            addToggle(combat, "Auto Hit (silent loop)", "fam_farm", "Farm", false)
             addToggle(combat, "Reach (scale the weapon)", "fam_reach", "Reach", false)
+            addToggle(combat, "Silent (no visible swing)", "fam_silent", "Silent", true)
+            addToggle(combat, "Visible Swing (click)", "fam_swing", "Swing", false)
         end
     end)
 
@@ -571,7 +582,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HIT LOOP  (touch cycle + attack + click, fully automatic)
+-- HIT LOOP  (silent contact cycle; click only if you ask for it)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -589,7 +600,7 @@ task.spawn(function()
     local touching = false
 
     if not hasTouch then
-        print("[" .. NAME .. "] firetouchinterest missing - attack only")
+        print("[" .. NAME .. "] firetouchinterest missing - remotes only")
     end
 
     while running do
@@ -628,7 +639,9 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] auto hit on (swings for you)")
+                        print("[" .. NAME .. "] auto hit on ("
+                            .. (Config.Swing and "silent + click" or "silent")
+                            .. ")")
                     end
 
                     local ap = attackPartOf(tool)
@@ -637,6 +650,8 @@ task.spawn(function()
                         scaleAttackPart(ap)
                         reachOn = true
                     end
+
+                    local fired = false
 
                     if hasTouch and ap then
                         pruneParts()
@@ -663,17 +678,15 @@ task.spawn(function()
                             end
                         end
 
-                        if touching then
-                            if cachedPs then
-                                pcall(function() cachedPs:FireServer("SwingSound") end)
-                            end
-                            pcall(function() cachedAtk:FireServer() end)
-                            swingClick()
-                        end
-                    else
-                        pcall(function() cachedAtk:FireServer() end)
-                        swingClick()
+                        fired = true
                     end
+
+                    if cachedPs then
+                        pcall(function() cachedPs:FireServer("SwingSound") end)
+                    end
+                    pcall(function() cachedAtk:FireServer() end)
+
+                    if Config.Swing then swingClick() end
 
                     local list = bossList()
                     local sum  = 0
@@ -696,7 +709,7 @@ task.spawn(function()
 
                         if stale >= STALE_LIMIT and not staleWarn then
                             staleWarn = true
-                            print("[" .. NAME .. "] boss HP not dropping - hits are not landing")
+                            print("[" .. NAME .. "] boss HP not dropping - enable Visible Swing")
                         end
                     else
                         stale = 0
@@ -705,7 +718,11 @@ task.spawn(function()
 
                     if live > 0 then lastSum = sum end
 
-                    task.wait(HIT_RATE)
+                    if not fired and not Config.Swing then
+                        task.wait(0.25)
+                    else
+                        task.wait(HIT_RATE)
+                    end
                 end
             end
         else
@@ -786,5 +803,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - swings for you, no clicking", 5)
+notifyUser("Loaded - silent hits, no swing", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
