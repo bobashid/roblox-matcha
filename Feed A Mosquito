@@ -1,35 +1,44 @@
 --==================================================================
---  Feed A Mosquito  |  Chair Health Bonus  (no sitting)
---  Matcha LuaVM  -  built-in menu tab (UI.AddTab)
+--  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  FINDINGS
---    Humanoid.Health / MaxHealth are READ-ONLY in Matcha - writing
---    them throws "Unknown property: Health". The chair models carry
---    no health data at all; they are blood-transfusion chairs (a
---    Blood model full of Nozzle parts inside the BeanbagChair).
---    Firing the player's TransfuseBlood remote was measured live:
---    MaxHealth 2999 -> 3029 -> 3079 -> 3089 while standing, with no
---    seat involved.
+--  Always Heal
+--    Keeps TransfuseBlood running. Measured live: MaxHealth climbed
+--    2999 -> 3029 -> 3079 -> 3089 while standing, no seat involved.
+--    Humanoid.Health is READ-ONLY in Matcha (write throws), so the
+--    server remote is the only heal path.
 --
---    So the chair bonus IS the transfusion, and it is a MAX HEALTH
---    gain that keeps stacking while the transfusion runs. A heal
---    that stops at full never earns the bonus - which is why the
---    previous version looked like it did nothing.
+--  Auto Feed
+--    Every mosquito actor owns a FeedMosquito remote. Fires it for
+--    each mosquito whose FeedProgress is below full and not already
+--    Feeding. This is the game's main income action.
 --
---  THIS SCRIPT
---    Health Bonus (no sit) : keeps TransfuseBlood running so max HP
---                            keeps climbing. Turning it off fires
---                            StopTransfuseBlood.
---    Stop at Full HP       : optional; pauses while HP is full.
---    Heal Now              : one short transfusion burst.
+--  Auto Collect
+--    Fires the player's CollectIncome event, and ClaimOfflineIncome
+--    when it exists. Server decides what is ready, so a slow loop is
+--    enough.
+--
+--  Auto Upgrade
+--    Fires UpgradeSpeed / UpgradeDamage / UpgradeBase on a slow loop.
+--    The server rejects purchases you cannot afford, so this is safe.
+--
+--  Auto Sell
+--    SellAllEggs / SellAllMosquitoes are RemoteFunctions; they are
+--    only invoked when their toggle is on. Default off.
+--
+--  Auto Attack
+--    Fires the equipped tool's Attack remote when an enemy model is
+--    close. Enemy logic itself is server-side.
+--
+--  All toggles default OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
+local WS      = game:GetService("Workspace")
 
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.3"
+local VERSION = "v1.4"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -40,25 +49,25 @@ local running = true
 local built   = false
 
 -- fixed tuning
-local LOOP_RATE = 0.2    -- control loop rate
-local POLL_RATE = 0.1    -- toggle poller rate
-local REFIRE    = 0.5    -- re-fire if the server drops it
+local POLL_RATE   = 0.1    -- toggle poller
+local HEAL_RATE   = 0.2    -- transfusion control
+local FEED_RATE   = 0.3    -- mosquito feed pass
+local COLLECT_RATE= 1.5    -- income collection
+local UPGRADE_RATE= 1.0    -- upgrades
+local SELL_RATE   = 5.0    -- selling
+local ATTACK_RATE = 0.25   -- weapon attacks
 
 local Config = {
-    Bonus    = false,
-    StopFull = false,
-    Force    = false,
+    Heal        = false,
+    AutoFeed    = false,
+    AutoCollect = false,
+    AutoUpgrade = false,
+    AutoSell    = false,
+    AutoAttack  = false,
 }
 
 local TOGGLES     = {}
 local getterWorks = {}
-
-local transfusing = false
-local lastFire    = 0
-
--- remotes, resolved lazily and cached per UserId
-local remotes    = nil
-local remotesFor = nil
 
 _G.FeedAMosquito = { stop = function() running = false end }
 
@@ -70,40 +79,80 @@ local function humanoid()
     return c and c:FindFirstChild("Humanoid") or nil
 end
 
+local function rootPart()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+
 local function notifyUser(msg, dur)
     pcall(function() notify(NAME, msg, dur or 3) end)
 end
 
-local function getRemotes()
-    if remotes and remotesFor == LP.UserId then return remotes end
-
-    local runtime = RS:FindFirstChild("Runtime")
-    local actors  = runtime and runtime:FindFirstChild("Actors")
-    if not actors then return nil end
-
-    local actor  = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
-    local events = actor and actor:FindFirstChild("Events")
-    if not events then return nil end
-
-    local startR = events:FindFirstChild("TransfuseBlood")
-    local stopR  = events:FindFirstChild("StopTransfuseBlood")
-    if not startR or not stopR then return nil end
-
-    remotes    = { start = startR, stop = stopR }
-    remotesFor = LP.UserId
-    return remotes
+local function find(base, ...)
+    local node = base
+    local args = { ... }
+    for i = 1, #args do
+        if not node then return nil end
+        node = node:FindFirstChild(args[i])
+    end
+    return node
 end
 
-local function fireStart()
-    local r = getRemotes()
+--------------------------------------------------------------------
+-- Player actor remotes (Events / Functions)
+--------------------------------------------------------------------
+local pEvents = nil
+local pFuncs  = nil
+local pFor    = nil
+
+local function playerRemotes()
+    if pFor == LP.UserId and pEvents then return pEvents, pFuncs end
+
+    local actors = find(RS, "Runtime", "Actors")
+    if not actors then return nil, nil end
+
+    local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
+    if not actor then return nil, nil end
+
+    pEvents = actor:FindFirstChild("Events")
+    pFuncs  = actor:FindFirstChild("Functions")
+    pFor    = LP.UserId
+
+    return pEvents, pFuncs
+end
+
+local function fireEvent(name, ...)
+    local events = playerRemotes()
+    local r = events and events:FindFirstChild(name)
     if not r then return false end
-    return (pcall(function() r.start:FireServer() end))
+    return (pcall(function() r:FireServer(...) end))
 end
 
-local function fireStop()
-    local r = getRemotes()
-    if not r then return end
-    pcall(function() r.stop:FireServer() end)
+local function invokeFunc(name, ...)
+    local _, funcs = playerRemotes()
+    local f = funcs and funcs:FindFirstChild(name)
+    if not f then return false end
+    return (pcall(function() f:InvokeServer(...) end))
+end
+
+--------------------------------------------------------------------
+-- My base (Base<N> whose ActorId mentions my UserId)
+--------------------------------------------------------------------
+local function myBase()
+    local bases = find(WS, "SafeZone", "Bases")
+    if not bases then return nil end
+
+    local tag = tostring(LP.UserId)
+    local kids = bases:GetChildren()
+    for i = 1, #kids do
+        local b = kids[i]
+        local aid = b:FindFirstChild("ActorId")
+        local val = aid and aid.Value
+        if type(val) == "string" and string.find(val, tag, 1, true) then
+            return b
+        end
+    end
+    return nil
 end
 
 --------------------------------------------------------------------
@@ -140,24 +189,18 @@ local function safeToggle(sec, name, id, default, cb)
     return false
 end
 
-local function safeButton(sec, name, cb)
-    local tries = {
-        function() sec:Button(name, cb) end,
-        function() sec:Button(name, name .. "_btn", cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    warn("[" .. NAME .. "] Button failed: " .. tostring(name))
-    return false
-end
-
 local function makeSection(tab, name, side)
     local ok, sec = pcall(function() return tab:Section(name, side) end)
     if ok and type(sec) == "table" then return sec end
     ok, sec = pcall(function() return tab:Section(name) end)
     if ok and type(sec) == "table" then return sec end
     return nil
+end
+
+local function addToggle(sec, label, id, key, default)
+    if safeToggle(sec, label, id, default, applyBool(key)) then
+        registerToggle(key, id, label)
+    end
 end
 
 --------------------------------------------------------------------
@@ -169,24 +212,22 @@ local function buildTab(tab)
     built = true
 
     local ok, err = pcall(function()
-        local sec = makeSection(tab, "Chair", "Left")
-        if sec then
-            if safeToggle(sec, "Health Bonus (no sit)", "fam_bonus",
-                false, applyBool("Bonus")) then
-                registerToggle("Bonus", "fam_bonus", "Health Bonus (no sit)")
-            end
-            if safeToggle(sec, "Stop at Full HP", "fam_stopfull",
-                false, applyBool("StopFull")) then
-                registerToggle("StopFull", "fam_stopfull", "Stop at Full HP")
-            end
+        local main = makeSection(tab, "Main", "Left")
+        if main then
+            addToggle(main, "Always Heal", "fam_heal", "Heal", false)
+            addToggle(main, "Auto Feed", "fam_feed", "AutoFeed", false)
+            addToggle(main, "Auto Collect", "fam_collect", "AutoCollect", false)
         end
 
-        local tools = makeSection(tab, "Tools", "Right")
-        if tools then
-            safeButton(tools, "Heal Now", function()
-                print("[" .. NAME .. "] heal now pressed")
-                Config.Force = true
-            end)
+        local econ = makeSection(tab, "Economy", "Left")
+        if econ then
+            addToggle(econ, "Auto Upgrade", "fam_upgrade", "AutoUpgrade", false)
+            addToggle(econ, "Auto Sell", "fam_sell", "AutoSell", false)
+        end
+
+        local combat = makeSection(tab, "Combat", "Right")
+        if combat then
+            addToggle(combat, "Auto Attack", "fam_attack", "AutoAttack", false)
         end
     end)
 
@@ -214,7 +255,7 @@ else
 end
 
 --------------------------------------------------------------------
--- TOGGLE POLLER - single source of truth
+-- TOGGLE POLLER
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -243,77 +284,174 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- TRANSFUSION LOOP
---   The bonus is max HP gained while the transfusion runs, so the
---   default keeps it running. Health stays full on its own because
---   the server raises MaxHealth and Health together.
+-- ALWAYS HEAL
+--   Health/MaxHealth are read-only here; the server remote does the
+--   work and also raises MaxHealth while it runs.
 --------------------------------------------------------------------
 task.spawn(function()
-    local lastMax = 0
+    local transfusing = false
+    local lastFire    = 0
+    local lastMax     = 0
 
     while running do
-        local active   = Config.Bonus or Config.Force
-        local stopFull = Config.StopFull or Config.Force
-
-        if active then
+        if Config.Heal then
             local hum = humanoid()
             if hum then
-                local hp   = hum.Health
-                local max  = hum.MaxHealth
-                local full = (max > 0 and hp >= max)
-
-                if max ~= lastMax then
-                    if lastMax ~= 0 and max > lastMax then
+                if hum.MaxHealth ~= lastMax then
+                    if lastMax ~= 0 and hum.MaxHealth > lastMax then
                         print("[" .. NAME .. "] max health "
                             .. tostring(math.floor(lastMax)) .. " -> "
-                            .. tostring(math.floor(max)))
+                            .. tostring(math.floor(hum.MaxHealth)))
                     end
-                    lastMax = max
+                    lastMax = hum.MaxHealth
                 end
 
-                if stopFull and full then
-                    if transfusing then
-                        fireStop()
-                        transfusing = false
-                        print("[" .. NAME .. "] full - paused")
-                    end
-                    if Config.Force then Config.Force = false end
-                else
-                    local now = tick()
-                    if not transfusing or (now - lastFire) >= REFIRE then
-                        if fireStart() then
-                            if not transfusing then
-                                print("[" .. NAME .. "] transfusion on (max "
-                                    .. tostring(math.floor(max)) .. ")")
-                            end
-                            transfusing = true
-                            lastFire    = now
-                        end
+                local now = tick()
+                if not transfusing or (now - lastFire) >= 0.5 then
+                    if fireEvent("TransfuseBlood") then
+                        transfusing = true
+                        lastFire    = now
                     end
                 end
             end
         elseif transfusing then
-            fireStop()
+            fireEvent("StopTransfuseBlood")
             transfusing = false
-            print("[" .. NAME .. "] transfusion off")
         end
 
-        task.wait(LOOP_RATE)
+        task.wait(HEAL_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO FEED
+--   Per-mosquito remote. Skip full ones and ones already feeding.
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoFeed then
+            local base = myBase()
+            local folder = base and base:FindFirstChild("Mosquitoes")
+            if folder then
+                local actors = find(RS, "Runtime", "Actors")
+                local kids = folder:GetChildren()
+
+                for i = 1, #kids do
+                    local m = kids[i]
+                    local fp = m:FindFirstChild("FeedProgress")
+                    local fg = m:FindFirstChild("Feeding")
+                    local prog = (fp and tonumber(fp.Value)) or 1
+                    local busy = (fg and fg.Value) or false
+
+                    if prog < 0.99 and not busy then
+                        local aid = m:FindFirstChild("ActorId")
+                        local id  = aid and aid.Value
+                        local actor = id and actors and actors:FindFirstChild(tostring(id))
+                        local ev = actor and actor:FindFirstChild("Events")
+                        local rem = ev and ev:FindFirstChild("FeedMosquito")
+                        if rem then
+                            pcall(function() rem:FireServer() end)
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(FEED_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO COLLECT
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoCollect then
+            fireEvent("CollectIncome")
+            fireEvent("ClaimOfflineIncome")
+        end
+        task.wait(COLLECT_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO UPGRADE
+--   Server rejects what you cannot afford.
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoUpgrade then
+            fireEvent("UpgradeSpeed")
+            fireEvent("UpgradeDamage")
+            fireEvent("UpgradeBase")
+        end
+        task.wait(UPGRADE_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO SELL
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoSell then
+            invokeFunc("SellAllEggs")
+            invokeFunc("SellAllMosquitoes")
+        end
+        task.wait(SELL_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO ATTACK
+--   Uses the equipped tool's own Attack remote; range checked here.
+--------------------------------------------------------------------
+task.spawn(function()
+    local RANGE = 40
+
+    while running do
+        if Config.AutoAttack then
+            local me = rootPart()
+            local char = LP.Character
+            local tool = char and char:FindFirstChildOfClass("Tool")
+            local actorId = tool and tool:FindFirstChild("ActorId")
+            local actors = find(RS, "Runtime", "Actors")
+            local actor = actorId and actors
+                and actors:FindFirstChild(tostring(actorId.Value))
+            local ev = actor and actor:FindFirstChild("Events")
+            local atk = ev and ev:FindFirstChild("Attack")
+
+            if me and atk then
+                local kids = WS:GetChildren()
+                for i = 1, #kids do
+                    local d = kids[i]
+                    if string.find(d.Name, "Enemy", 1, true) then
+                        local part = d:FindFirstChild("HumanoidRootPart")
+                            or d:FindFirstChild("Head")
+                            or d.PrimaryPart
+                        if part then
+                            local dist = (part.Position - me.Position).Magnitude
+                            if dist <= RANGE then
+                                pcall(function() atk:FireServer(d) end)
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(ATTACK_RATE)
     end
 end)
 
 --------------------------------------------------------------------
 local function stop()
     running = false
-    if transfusing then
-        fireStop()
-        transfusing = false
-    end
+    pcall(function() fireEvent("StopTransfuseBlood") end)
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - toggle Health Bonus (no sit)", 5)
+notifyUser("Loaded - all toggles start OFF", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
