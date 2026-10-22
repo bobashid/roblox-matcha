@@ -1,48 +1,32 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  Always Heal
---    Keeps TransfuseBlood running. Humanoid.Health is READ-ONLY in
---    Matcha (a write throws), so the server remote is the only path.
---    Refire slowed to 1s to cut remote volume.
+--  v2.4
+--    - Auto Feed removed (toggle, loop and myBase helper deleted).
+--    - Two attack toggles:
+--        Auto Farm : swings on a fixed cadence, no target needed.
+--        Kill Aura : swings only while an enemy is inside Aura Range.
+--    - Auto Attack removed; Auto Farm replaces it.
+--    - Attack From Afar and Auto Kill no longer depend on Auto Attack.
 --
---  Auto Feed
---    FeedMosquito remote per mosquito model, skipped when full/busy.
+--  Always Heal
+--    TransfuseBlood remote. Humanoid.Health is READ-ONLY in Matcha
+--    (a write throws), so the server remote is the only heal path.
 --
 --  Auto Collect
 --    CollectIncome + ClaimOfflineIncome.
 --
---  Auto Attack
---    Fires the tool actor's Attack remote:
---      Runtime.Actors.Tool_Character_<userId>_<n>_<m>.Events.Attack
---    Attack takes NO arguments, the server resolves the hit.
---
---  WEAPON SWAP FIX (v2.3)
---    The old build cached the Attack remote list forever. Upgrading a
---    weapon destroys the old Tool_Character_<id>_<n>_<m> actor and
---    creates a new one, so the cache kept firing a dead remote and
---    auto kill silently stopped. The cache now expires every 0.75s and
---    is also dropped when the equipped tool name changes.
---
---  CRASH MITIGATION (v2.3)
---    - CFrame is only written when you are more than 2 studs from the
---      target slot, instead of every pass. CFrame writes are the
---      expensive operation here (thousands of internal writes each).
---    - No CFrame writes while Health is 0 (dead / respawning).
---    - All remote and position calls stay inside pcall.
---    - Swing rates reduced (0.3s normal, 0.25s kill, 1s heal refire).
---    - Actor folder is scanned at most every 0.75s, not per swing.
+--  Swing
+--    Fires Runtime.Actors.Tool_Character_<userId>_*..Events.Attack.
+--    Attack takes no arguments; the server resolves the hit from the
+--    character position. No client-side hitbox exists to enlarge.
+--    The remote list expires every 0.75s and also resets when the
+--    equipped tool name changes, so a weapon upgrade is picked up.
 --
 --  Auto Kill
---    Stays attached to the chosen boss, swings, restores your CFrame
---    when switched off.
---
---  Under Map
---    Places you Depth studs BELOW the boss. Depth 0 = level with it.
---
---  Bosses
---    One toggle per area prefix (Common, Uncommon, Rare, Legendary,
---    Mythical, Divine, Secret, Epic).
+--    Teleports onto the chosen boss and stays there. Under Map places
+--    you Depth studs below it. CFrame is written only when more than
+--    2 studs from the slot, and never while Health is 0.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -53,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.3"
+local VERSION = "v2.4"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -67,9 +51,9 @@ local built   = false
 local POLL_RATE    = 0.1    -- toggle poller
 local HEAL_RATE    = 0.25   -- transfusion control loop
 local HEAL_REFIRE  = 1.0    -- seconds between TransfuseBlood fires
-local FEED_RATE    = 0.35   -- mosquito feed pass
 local COLLECT_RATE = 1.5    -- income collection
-local ATTACK_RATE  = 0.3    -- normal weapon swings
+local FARM_RATE    = 0.3    -- auto farm swing cadence
+local AURA_RATE    = 0.2    -- kill aura check cadence
 local AFAR_RATE    = 0.7    -- touch-and-return pass
 local KILL_RATE    = 0.25   -- stay-attached kill pass
 local ATK_TTL      = 0.75   -- attack remote cache lifetime
@@ -82,9 +66,10 @@ local BOSS_NAMES = {
 
 local Config = {
     Heal        = false,
-    AutoFeed    = false,
     AutoCollect = false,
-    AutoAttack  = false,
+    Farm        = false,
+    Aura        = false,
+    AuraRange   = 30,
     Afar        = false,
     AfarRange   = 300,
     Kill        = false,
@@ -171,29 +156,9 @@ local function fireEvent(name)
 end
 
 --------------------------------------------------------------------
--- My base: the Base<N> whose ActorId mentions my UserId
---------------------------------------------------------------------
-local function myBase()
-    local bases = child(WS, "SafeZone", "Bases")
-    if not bases then return nil end
-
-    local tag = tostring(LP.UserId)
-    local kids = bases:GetChildren()
-    for i = 1, #kids do
-        local b = kids[i]
-        local aid = b:FindFirstChild("ActorId")
-        local val = aid and aid.Value
-        if type(val) == "string" and string.find(val, tag, 1, true) then
-            return b
-        end
-    end
-    return nil
-end
-
---------------------------------------------------------------------
 -- Tool actor Attack remotes
 --   Tool_Character_<userId>_<n>_<m>.Events.Attack
---   The <n> changes when you upgrade a weapon, so this list EXPIRES.
+--   The <n> changes when a weapon is upgraded, so this list EXPIRES.
 --------------------------------------------------------------------
 local atkCache = nil
 local atkFor   = nil
@@ -316,7 +281,7 @@ local function nearestEnemyOf(fromPos, prefixes, maxDist)
     return best, bestPos
 end
 
--- moves only if further than 2 studs from the slot, returns the delta
+-- moves only if further than 2 studs from the slot
 local function moveTo(hrp, x, y, z)
     if not hrp or not hrp.Parent then return false end
     if not alive() then return false end
@@ -402,13 +367,17 @@ local function buildTab(tab)
         local main = makeSection(tab, "Main", "Left")
         if main then
             addToggle(main, "Always Heal", "fam_heal", "Heal", false)
-            addToggle(main, "Auto Feed", "fam_feed", "AutoFeed", false)
             addToggle(main, "Auto Collect", "fam_collect", "AutoCollect", false)
         end
 
-        local combat = makeSection(tab, "Combat", "Right")
+        local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Attack", "fam_attack", "AutoAttack", false)
+            addToggle(combat, "Auto Farm", "fam_farm", "Farm", false)
+            addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
+            safeSlider(combat, "Aura Range", "fam_aurarange", 5, 200, 30,
+                function(v)
+                    if type(v) == "number" then Config.AuraRange = v end
+                end)
             addToggle(combat, "Attack From Afar", "fam_afar", "Afar", false)
             safeSlider(combat, "Afar Range", "fam_afarrange", 50, 2000, 300,
                 function(v)
@@ -416,7 +385,7 @@ local function buildTab(tab)
                 end)
         end
 
-        local kill = makeSection(tab, "Auto Kill", "Left")
+        local kill = makeSection(tab, "Auto Kill", "Right")
         if kill then
             addToggle(kill, "Auto Kill", "fam_kill", "Kill", false)
             addToggle(kill, "Under Map", "fam_under", "Under", true)
@@ -531,43 +500,6 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO FEED
---------------------------------------------------------------------
-task.spawn(function()
-    while running do
-        if Config.AutoFeed then
-            local base   = myBase()
-            local folder = base and base:FindFirstChild("Mosquitoes")
-            if folder then
-                local actors = child(RS, "Runtime", "Actors")
-                local kids   = folder:GetChildren()
-
-                for i = 1, #kids do
-                    local m    = kids[i]
-                    local fp   = m:FindFirstChild("FeedProgress")
-                    local fg   = m:FindFirstChild("Feeding")
-                    local prog = (fp and tonumber(fp.Value)) or 1
-                    local busy = (fg and fg.Value) or false
-
-                    if prog < 0.99 and not busy then
-                        local aid   = m:FindFirstChild("ActorId")
-                        local id    = aid and aid.Value
-                        local actor = id and actors
-                            and actors:FindFirstChild(tostring(id))
-                        local ev    = actor and actor:FindFirstChild("Events")
-                        local rem   = ev and ev:FindFirstChild("FeedMosquito")
-                        if rem then
-                            pcall(function() rem:FireServer() end)
-                        end
-                    end
-                end
-            end
-        end
-        task.wait(FEED_RATE)
-    end
-end)
-
---------------------------------------------------------------------
 -- AUTO COLLECT
 --------------------------------------------------------------------
 task.spawn(function()
@@ -581,15 +513,37 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO ATTACK  (normal reach)
---   Skipped while Afar or Auto Kill owns the movement.
+-- AUTO FARM
+--   Fixed cadence, no target required. Swings wherever you stand.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.AutoAttack and not Config.Afar and not Config.Kill then
+        if Config.Farm then
             swing()
         end
-        task.wait(ATTACK_RATE)
+        task.wait(FARM_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- KILL AURA
+--   Swings only while an enabled enemy is inside Aura Range.
+--   No movement, no teleport - just attacks what is already near.
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.Aura then
+            local hrp = rootPart()
+            if hrp and alive() then
+                local range = tonumber(Config.AuraRange) or 30
+                local target = nearestEnemyOf(hrp.Position,
+                    enabledPrefixes(), range)
+                if target then
+                    swing()
+                end
+            end
+        end
+        task.wait(AURA_RATE)
     end
 end)
 
@@ -598,7 +552,7 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.AutoAttack and Config.Afar and not Config.Kill then
+        if Config.Afar and not Config.Kill then
             local hrp = rootPart()
             if hrp and alive() then
                 local range = tonumber(Config.AfarRange) or 300
@@ -631,8 +585,7 @@ end)
 --------------------------------------------------------------------
 -- AUTO KILL  (stay attached to the chosen boss)
 --   First pass saves your CFrame; switching the toggle off puts you
---   back. Position is only written when you drift more than 2 studs,
---   which keeps the expensive CFrame writes rare.
+--   back. Position is only written when you drift more than 2 studs.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
