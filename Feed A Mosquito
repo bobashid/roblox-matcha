@@ -1,45 +1,54 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.0  -  SCALE OFF THE HUMANOIDS, NOT A NAME LIST
+--  v5.1  -  BACK TO BOSSES ONLY
 --
---  WHY THIS IS SIMPLER AND WORKS ON ALL OF THEM
---    There is no single "boss folder". SpawnAreas holds one area
---    model per type, and the boss sits inside it - but the same
---    <Type>Mama model is not always there (it cycles), and eggs, rigs
---    and other humanoids live in the same tree. Matching on the name
---    "Mama" was the thing that kept missing bosses.
---    Every hit target in this game is a Model with a Humanoid. So the
---    scan now just walks Workspace, finds every Humanoid, and takes
---    its parent Model. No name list, no area list, no distance maths.
+--  WHAT BROKE IN v5.0 (read from your own log)
+--    21:09:28  hitbox x40 on 1071 parts
+--    21:09:29  Hothead_2100 -8, Robloxpapi382 -8,
+--              blondemanpizza17 -8
+--    21:09:52  targets 56, report full of UUID models, eggs,
+--              and player names
+--    "Every model with a Humanoid" meant PLAYER CHARACTERS too. The
+--    filter used Players:GetPlayerFromCharacter and a == compare,
+--    which does not hold here: Matcha hands back a different proxy
+--    each call, so the equality check is always false and every
+--    player got grown x40 and swung at. 1071 parts at x40 with
+--    collision off is what tanked the game.
 --
---  MULTIPLIER IS FIXED AT MAX (x40)
---    Every BasePart of every target is set to its first-seen size
---    times 40, once. No distance scaling, no second multiplier, no
---    compounding. The Huge Hitbox toggle is gone because there is
---    nothing left to scale up to.
+--  THE RULE NOW
+--    Only boss models are targets:
+--      Workspace.SpawnAreas  ->  <Type>Area  ->  <Type>Mama
+--    A model counts if it sits under SpawnAreas, has a direct
+--    Humanoid, and its name does not contain "Egg".
+--    Player characters are excluded by NAME: every name in
+--    Players:GetPlayers() is skipped, and so is anything with a
+--    player's name as an ancestor. No equality compare is used for
+--    that test, so the proxy problem cannot sneak players back in.
+--    Models named Rig are skipped.
 --
---  WHAT IS NEVER TOUCHED
---    - your own character, and any other player's character
---    - Models named "Rig" (animation rigs, not enemies)
---    - parts named Area / ChaseArea (that was the floor being grown
---      and flinging you in earlier versions)
---    - anything with no BasePart at all (nothing to resize)
+--  WHY THIS STILL HITS THEM FROM WHERE YOU STAND
+--    Every BasePart of every boss is set to its first-seen size x40.
+--    Distance maths and the Huge Hitbox toggle are gone - x40 is the
+--    only multiplier, applied once.
 --
---  TABLES KEYED BY Address
---    Matcha hands back a fresh proxy for the same part on every scan,
---    so a table keyed by the instance re-saved and re-multiplied the
---    same part over and over (x40, x1600, x64000...) until the client
---    choked. Both tables are keyed by Address now, the original size
---    is saved exactly once, and a part is only re-sized when its
---    multiplier actually changes.
+--  NO COMPOUNDING (the v4.8 slowdown)
+--    Matcha returns a fresh proxy for the same part on every scan, so
+--    a table keyed by the instance re-saved and re-multiplied the
+--    part every pass: x40, x1600, x64000... Both tables are keyed by
+--    part.Address / model.Address, the original size is saved exactly
+--    once, and a part is only re-sized when its multiplier changes.
+--
+--  NEVER RESIZED
+--    parts named Area / ChaseArea (that was the floor being grown),
+--    player characters, eggs, Rig models.
 --
 --  AUTO SWING
 --    Stand still, Attack remote fired every SWING_RATE. No CFrame
 --    writes anywhere, no teleports.
 --
---  Everything restores exactly when Auto Farm goes off or you stop:
---  original size and original CanCollide on every part touched.
+--  Turning Auto Farm off (or stopping) puts every part back to its
+--  original size and original CanCollide.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -50,7 +59,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.0"
+local VERSION = "v5.1"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -71,10 +80,10 @@ local ATK_TTL      = 1.0
 local HB_RATE      = 0.25
 local SCAN_TTL     = 2.0
 local TARGET_MEMORY = 20.0
-local TARGET_CAP   = 250
+local TARGET_CAP   = 40
 local TRACK_LOG    = 5.0
 
--- one multiplier: max
+-- one multiplier
 local HB_MULT      = 40
 local HB_ROOT_MIN  = 14
 
@@ -84,7 +93,7 @@ local SKIP_PART = {
     ChaseArea = true,
 }
 
--- models that are never a hit target
+-- model names that are never a target
 local SKIP_MODEL = {
     Rig = true,
 }
@@ -153,23 +162,50 @@ local function countParts(m)
     return n
 end
 
-local function isPlayerChar(m)
-    if m == LP.Character then return true end
-    local ok, plr = pcall(function() return Players:GetPlayerFromCharacter(m) end)
-    return ok and plr ~= nil
-end
-
 local function bossHumanoid(m)
     local h = m:FindFirstChild("Humanoid")
     if h and h.ClassName == "Humanoid" then return h end
     return nil
 end
 
--- any Model with a Humanoid that is not a player and not a rig
-local function looksLikeTarget(m)
+-- player names, rebuilt each scan. Compared as strings, never as
+-- instances, because instance equality does not hold in this VM.
+local function playerNames()
+    local set = {}
+
+    local ok, list = pcall(function() return Players:GetPlayers() end)
+    if ok and list then
+        for i = 1, #list do
+            local okN, n = pcall(function() return list[i].Name end)
+            if okN and type(n) == "string" then set[n] = true end
+        end
+    end
+
+    local okN, myName = pcall(function() return LP.Name end)
+    if okN and type(myName) == "string" then set[myName] = true end
+
+    return set
+end
+
+local function underPlayer(m, names)
+    local node = m
+    for _ = 1, 6 do
+        if not node then return false end
+        local ok, n = pcall(function() return node.Name end)
+        if ok and type(n) == "string" and names[n] then return true end
+        local okP, parent = pcall(function() return node.Parent end)
+        if not okP then return false end
+        node = parent
+    end
+    return false
+end
+
+-- boss = under SpawnAreas, direct Humanoid, not an egg, not a player
+local function looksLikeBoss(m, names)
     if m.ClassName ~= "Model" then return false end
     if SKIP_MODEL[m.Name] then return false end
-    if isPlayerChar(m) then return false end
+    if string.find(m.Name, "Egg", 1, true) then return false end
+    if underPlayer(m, names) then return false end
     return bossHumanoid(m) ~= nil
 end
 
@@ -259,7 +295,7 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- TARGET SCAN  (every Humanoid model in Workspace)
+-- BOSS SCAN  (SpawnAreas only, Address keyed, capped, throttled)
 --------------------------------------------------------------------
 local targets     = {}   -- address -> { model, t }
 local targetStamp = 0
@@ -325,15 +361,31 @@ local function remember(m, now)
 end
 
 local function scanTargets()
-    local now = tick()
+    local now   = tick()
+    local names = playerNames()
+    local areas = WS:FindFirstChild("SpawnAreas")
 
-    local ok, desc = pcall(function() return WS:GetDescendants() end)
-    if ok and desc then
-        for i = 1, #desc do
-            local d = desc[i]
-            if d.ClassName == "Humanoid" then
-                local m = d.Parent
-                if m and looksLikeTarget(m) then remember(m, now) end
+    if areas then
+        local ok, desc = pcall(function() return areas:GetDescendants() end)
+        if ok and desc then
+            for i = 1, #desc do
+                local d = desc[i]
+                if looksLikeBoss(d, names) then remember(d, now) end
+            end
+        end
+    end
+
+    -- nothing under SpawnAreas: last resort, Mama models anywhere
+    if targetCount() == 0 then
+        local ok, desc = pcall(function() return WS:GetDescendants() end)
+        if ok and desc then
+            for i = 1, #desc do
+                local d = desc[i]
+                if d.ClassName == "Model"
+                    and string.find(d.Name, "Mama", 1, true)
+                    and not underPlayer(d, names) then
+                    remember(d, now)
+                end
             end
         end
     end
@@ -342,12 +394,12 @@ local function scanTargets()
     targetStamp = now
 
     local out   = {}
-    local names = {}
+    local labels = {}
 
     for k, e in pairs(targets) do
         if e.model then
-            out[#out + 1]     = e.model
-            names[#names + 1] = e.model.Name
+            out[#out + 1]    = e.model
+            labels[#labels + 1] = e.model.Name
         end
     end
 
@@ -356,10 +408,10 @@ local function scanTargets()
         trackCount  = n
         trackLogged = now
 
-        table.sort(names)
-        local shown = table.concat(names, ",")
+        table.sort(labels)
+        local shown = table.concat(labels, ",")
         if #shown > 220 then shown = string.sub(shown, 1, 220) .. "..." end
-        print("[" .. NAME .. "] targets " .. tostring(n) .. ": " .. shown)
+        print("[" .. NAME .. "] bosses " .. tostring(n) .. ": " .. shown)
     end
 
     return out
@@ -399,11 +451,11 @@ local function reportTargets()
         end
     end
 
-    print("[" .. NAME .. "] target report (" .. tostring(#order)
+    print("[" .. NAME .. "] boss report (" .. tostring(#order)
         .. " distinct, " .. tostring(#list) .. " tracked)")
 
     local cap = #order
-    if cap > 25 then cap = 25 end
+    if cap > 20 then cap = 20 end
 
     for i = 1, cap do
         local m     = order[i].m
@@ -506,8 +558,11 @@ local function applyHitbox()
                         else
                             local okP, pp = pcall(function() return boss.PrimaryPart end)
                             if okP and pp ~= nil then
-                                local okE, same = pcall(function() return pp == d end)
-                                if okE and same then isRoot = true end
+                                local okA, addrPP = pcall(function() return pp.Address end)
+                                local okB, addrD  = pcall(function() return d.Address end)
+                                if okA and okB and addrPP ~= nil and addrPP == addrD then
+                                    isRoot = true
+                                end
                             end
                         end
 
@@ -646,9 +701,9 @@ local function buildTab(tab)
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
             addToggle(combat, "Auto Farm (x40 + swing)", "fam_farm", "Farm", false)
-            safeButton(combat, "Print Target List", "fam_targets", function()
+            safeButton(combat, "Print Boss List", "fam_bosslist", function()
                 reportTargets()
-                notifyUser("Target list printed to console", 4)
+                notifyUser("Boss list printed to console", 4)
             end)
         end
     end)
@@ -715,7 +770,7 @@ task.spawn(function()
             if n > 0 and not hbApplied then
                 hbApplied = true
                 print("[" .. NAME .. "] hitbox x" .. tostring(HB_MULT)
-                    .. " on " .. tostring(n) .. " parts (no collide, local)")
+                    .. " on " .. tostring(n) .. " boss parts (no collide, local)")
             end
         elseif hbApplied then
             restoreHitbox()
@@ -834,5 +889,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Auto Farm x40, no name list", 5)
+notifyUser("Loaded - bosses only, x40", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
