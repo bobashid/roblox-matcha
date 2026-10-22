@@ -1,34 +1,38 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v3.4
+--  v3.5
 --
---  BOSS SELECT (toggles, not buttons)
---    One toggle per boss type under "Boss Select". Switching one ON
---    selects that boss and teleports you onto it immediately.
---    Switching it OFF clears the selection.
---    Matcha cannot untick a widget from script, so if you leave two on,
---    the most recently switched ON one wins - it is the one that took
---    you there last. Turn the previous one off to keep it tidy.
+--  NO SELECTION = NO MOVEMENT
+--    Kill Aura used to fall back to the nearest boss and drag you there.
+--    That fallback is gone. With nothing selected it only swings where
+--    you stand. The only thing that ever moves you is a Boss Select
+--    toggle you turned on yourself.
 --
---  KILL AURA
---    Swings every pass. With a boss selected it moves onto that boss
---    and keeps hitting it. With nothing selected it targets the
---    nearest boss model. With no boss model anywhere it just swings
---    where you stand instead of walking to an empty arena.
+--  FEET HEIGHT (read live, not guessed)
+--    UncommonMama's parts span Y 3 to Y 12. Its PrimaryPart sits up near
+--    the head, which is why you landed in the air. The landing point is
+--    now the bounding box of the boss model: centre X/Z, lowest part Y
+--    plus 1 stud. That is the feet.
 --
---  WHAT THE GAME HAS (read live)
+--  DEAD BOSSES
+--    Every Mama model carries a Humanoid (UncommonMama read 71.5 / 150).
+--    If the selected boss has Health <= 0 it is skipped: no teleport, no
+--    swinging at it, and the selection is kept so it resumes when the
+--    boss respawns.
+--
+--  WHAT THE GAME HAS
 --    Workspace.SpawnAreas.<Type>Area holds:
---      Area        Part   - the arena floor (the standing spot)
---      ChaseArea   Part   - a trigger volume ~14 studs UP, never used
---      <boss>Mama  Model  - the boss itself
+--      Area        Part   - arena floor
+--      ChaseArea   Part   - trigger volume ~14 studs up, never used
+--      <boss>Mama  Model  - the boss, with a Humanoid
 --    Common    -> MosquitoMama   (0, 0, -75)
 --    Uncommon  -> UncommonMama   (0, -1, -145)
 --    Rare      -> RareMama       (0, 0, -215)
 --    Epic      -> EpicMama       (0, 0, -290)
 --    Legendary -> LegendaryMama  (0, -1, -375)
---    Mythical / Divine / Secret hold only Walls and eggs, so those
---    three land on the Area floor part.
+--    Mythical / Divine / Secret hold only Walls and eggs, so those land
+--    on the Area floor part.
 --
 --  Sections
 --    Main          Always Heal, Auto Collect
@@ -44,7 +48,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v3.4"
+local VERSION = "v3.5"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -63,6 +67,7 @@ local COLLECT_RATE = 1.5
 local AURA_RATE    = 0.2
 local ATK_TTL      = 0.5
 local MOVE_EPS2    = 1
+local FOOT_LIFT    = 1      -- studs above the lowest part
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -214,27 +219,6 @@ local function areaModel(bossType)
     return areas:FindFirstChild(bossType .. "Area")
 end
 
-local function modelPoint(model)
-    if not model then return nil, nil end
-
-    local pp = model.PrimaryPart
-    if pp then
-        local ok, p = pcall(function() return pp.Position end)
-        if ok and p then return p, pp.Name end
-    end
-
-    local names = { "Head", "HumanoidRootPart", "Root" }
-    for i = 1, #names do
-        local part = model:FindFirstChild(names[i])
-        if part then
-            local ok, p = pcall(function() return part.Position end)
-            if ok and p then return p, part.Name end
-        end
-    end
-
-    return nil, nil
-end
-
 local function bossModelIn(area)
     if not area then return nil end
 
@@ -248,44 +232,56 @@ local function bossModelIn(area)
     return nil
 end
 
-local function spotFor(bossType)
+-- landing point at the boss FEET: centre X/Z, lowest part Y + FOOT_LIFT
+local function bossFeet(bossType)
     local area = areaModel(bossType)
-    if not area then return nil, "no area" end
+    if not area then return nil, "no area", nil end
 
     local boss = bossModelIn(area)
-    local pos, partName = modelPoint(boss)
-    if pos then
-        return pos, boss.Name .. "." .. tostring(partName)
+    if not boss then return nil, "no boss", nil end
+
+    local hum = boss:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local okH, hp = pcall(function() return hum.Health end)
+        if okH and type(hp) == "number" and hp <= 0 then
+            return nil, "dead", boss
+        end
     end
 
-    local floor = area:FindFirstChild("Area")
-    if floor then
-        local ok, p = pcall(function() return floor.Position end)
-        if ok and p then return p, "Area floor" end
-    end
+    local okD, desc = pcall(function() return boss:GetDescendants() end)
+    if not okD or not desc then return nil, "no parts", boss end
 
-    return nil, "no part"
-end
+    local minY, maxY = 1e9, -1e9
+    local minX, maxX = 1e9, -1e9
+    local minZ, maxZ = 1e9, -1e9
+    local n = 0
 
-local function nearestBoss(myPos)
-    local bestPos, bestLabel, bestD = nil, nil, 1e9
-
-    for i = 1, #BOSS_TYPES do
-        local t    = BOSS_TYPES[i]
-        local area = areaModel(t)
-        local boss = bossModelIn(area)
-        local pos, partName = modelPoint(boss)
-        if pos then
-            local d = (pos - myPos).Magnitude
-            if d < bestD then
-                bestD     = d
-                bestPos   = pos
-                bestLabel = boss.Name .. "." .. tostring(partName)
+    for i = 1, #desc do
+        local d  = desc[i]
+        local cn = d.ClassName
+        if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
+            local okP, p = pcall(function() return d.Position end)
+            if okP and p then
+                n = n + 1
+                if p.X < minX then minX = p.X end
+                if p.X > maxX then maxX = p.X end
+                if p.Y < minY then minY = p.Y end
+                if p.Y > maxY then maxY = p.Y end
+                if p.Z < minZ then minZ = p.Z end
+                if p.Z > maxZ then maxZ = p.Z end
             end
         end
     end
 
-    return bestPos, bestLabel
+    if n == 0 then return nil, "no parts", boss end
+
+    local pos = Vector3.new(
+        (minX + maxX) * 0.5,
+        minY + FOOT_LIFT,
+        (minZ + maxZ) * 0.5
+    )
+
+    return pos, boss.Name .. " feet", boss
 end
 
 local function moveTo(hrp, pos)
@@ -314,11 +310,11 @@ local function selectBoss(bossType)
         return
     end
 
-    local pos, label = spotFor(bossType)
+    local pos, label = bossFeet(bossType)
     if not pos then
         print("[" .. NAME .. "] selected " .. bossType
-            .. " but no spot: " .. tostring(label))
-        notifyUser("Selected " .. bossType .. " (no spot)", 3)
+            .. " but not moving: " .. tostring(label))
+        notifyUser("Selected " .. bossType .. " (" .. tostring(label) .. ")", 3)
         return
     end
 
@@ -521,8 +517,9 @@ end)
 
 --------------------------------------------------------------------
 -- KILL AURA
---   Swings every pass. Uses the selected boss if there is one,
---   otherwise the nearest boss model, otherwise just swings here.
+--   Only the selected boss is ever approached. No selection means no
+--   movement at all - it just swings where you stand. A dead boss is
+--   skipped until it respawns.
 --------------------------------------------------------------------
 task.spawn(function()
     local lastLabel = nil
@@ -531,30 +528,24 @@ task.spawn(function()
         if Config.Aura then
             local hrp = rootPart()
             if hrp and alive() then
-                local pos, label
-
                 if selectedBoss then
-                    pos, label = spotFor(selectedBoss)
+                    local pos, label = bossFeet(selectedBoss)
+
                     if pos then
-                        label = selectedBoss .. " (" .. tostring(label) .. ")"
-                    end
-                end
-
-                if not pos then
-                    pos, label = nearestBoss(hrp.Position)
-                end
-
-                if pos then
-                    moveTo(hrp, pos)
-                    if label ~= lastLabel then
+                        moveTo(hrp, pos)
+                        if label ~= lastLabel then
+                            lastLabel = label
+                            print("[" .. NAME .. "] aura -> " .. label)
+                        end
+                        swing()
+                    elseif label ~= lastLabel then
                         lastLabel = label
-                        print("[" .. NAME .. "] aura -> " .. tostring(label))
+                        print("[" .. NAME .. "] waiting: " .. tostring(label))
                     end
                 else
                     lastLabel = nil
+                    swing()
                 end
-
-                swing()
             end
         end
         task.wait(AURA_RATE)
