@@ -1,35 +1,44 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.6  -  "BRING THE HITBOX TO ME"
+--  v5.7
 --
---  Scaling parts at the boss only helps if the swing is resolved
---  against something that actually reaches you. So now one part per
---  boss is turned into a big box AND moved onto your position every
---  pass - the hit target is literally where you are standing.
+--  WHY "BRING HITBOX TO ME" DID NOTHING
+--    The boss parts are driven by Motor6D / weld joints. Writing a
+--    CFrame to a jointed part is reverted by the animation on the same
+--    physics step, so the box never actually appears on you. That whole
+--    approach is gone.
 --
---  "Bring Hitbox To Me" toggle
---    For each boss it picks the largest growable body part, sets it to
---    an absolute BRING_SIZE cube (60 studs), turns its collision off
---    and writes its CFrame to your HumanoidRootPart position. The
---    original CFrame is saved once per part and restored when the
---    toggle goes off or the script stops.
---    If the game drives that part through a joint, the CFrame write is
---    simply overwritten and you still keep the huge size - so this can
---    only help, it cannot make the reach worse.
+--  WHY x100 STILL MISSED
+--    A part grows around its own centre. A 2-stud part at x100 reaches
+--    about 100 studs from the boss. If you stand two arenas away, that
+--    is simply not enough, so the swing resolves at your real spot and
+--    misses. The multiplier is now computed per boss from the distance:
 --
---  "Auto Farm" still grows every body part x100 (x200 with Huge
---  Hitbox), so both routes are active at once.
+--        mult = (dist + PAD) / largestHalfExtent * 1.15
 --
---  WHY THE FLOOR IS SAFE
---    HumanoidRootPart is never grown or moved (it sits on the arena
---    floor and at x100 it swallows it - that was the floor bug), and
---    parts named Area / ChaseArea are skipped by name. Original sizes
---    and CFrames are stored by Address, so nothing is ever applied
---    twice.
+--    so the largest grown part always spans from the boss to at least
+--    your position, wherever you stand. Clamped to [50, 1500]. Near
+--    bosses sit at the floor value, far bosses get huge.
+--    The size is always original * mult, taken from the size saved by
+--    Address the first time a part was seen, so it can never compound
+--    and a game-side reset is corrected on the next pass.
 --
---  Stand still, Attack fired every 0.1 s, no teleports of your own
---  character, everything restored on toggle off / stop.
+--  RAPID SWING
+--    Every tool's Attack remote is fired in BURST passes per cycle
+--    (default 3) with a tiny gap, then the loop repeats every 0.04 s.
+--    That is roughly 75 full volleys per second across every boss tool,
+--    so all of them get hit constantly instead of one per 0.1 s.
+--
+--  WHY THE FLOOR IS STILL SAFE
+--    HumanoidRootPart is never resized (it lies on the arena floor and
+--    at these multipliers it would swallow the arena), parts named
+--    Area / ChaseArea are skipped, and any part whose ORIGINAL size is
+--    already 40 studs on an axis is treated as scenery and left alone.
+--    CanCollide is off while grown and restored with the size.
+--
+--  Stand still, no CFrame writes to your character, everything restored
+--  when Auto Farm goes off or the script stops.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -40,7 +49,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.6"
+local VERSION = "v5.7"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -56,22 +65,25 @@ local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
 local HP_LOG_RATE  = 5.0
 local COLLECT_RATE = 1.5
-local SWING_RATE   = 0.1
+local SWING_RATE   = 0.04
+local SWING_BURST  = 3
+local BURST_GAP    = 0.015
 local ATK_TTL      = 1.0
-local HB_RATE      = 0.35
+local HB_RATE      = 0.2
 
--- hitbox multipliers
-local HB_MULT      = 100
-local HB_MULT_BIG  = 200
-local HB_SKIP_SIZE = 40    -- original axis this big -> scenery, never touched
-local BRING_SIZE   = 60    -- absolute size of the box carried to the player
+-- reach tuning
+local HB_PAD        = 25     -- margin past the player, in studs
+local HB_MULT_MIN   = 50
+local HB_MULT_MAX   = 1500
+local HB_BOOST      = 2      -- Huge Hitbox
+local HB_SKIP_SIZE  = 40     -- original axis this big -> scenery
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
     "Mythical", "Divine", "Secret", "Epic",
 }
 
--- parts that must never be resized or moved
+-- parts that must never be resized
 local SKIP_PART = {
     Area      = true,
     ChaseArea = true,
@@ -82,7 +94,6 @@ local Config = {
     AutoCollect = false,
     Farm        = false,
     HitboxBig   = false,
-    Bring       = false,
 }
 
 local TOGGLES     = {}
@@ -148,6 +159,16 @@ local function isGrowable(d)
         return false
     end
     return true, s
+end
+
+local function sizeDiffers(a, b)
+    if not a or not b then return false end
+    local eps = 0.5
+    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
+    if dx < 0 then dx = -dx end
+    if dy < 0 then dy = -dy end
+    if dz < 0 then dz = -dz end
+    return dx > eps or dy > eps or dz > eps
 end
 
 --------------------------------------------------------------------
@@ -223,9 +244,7 @@ local function attackRemotes()
     return out
 end
 
-local function swing()
-    if not alive() then return false end
-
+local function swingOnce()
     local list = attackRemotes()
     if not list then return false end
 
@@ -236,7 +255,7 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- Boss lookup  (v4.2 area list)
+-- Boss lookup
 --------------------------------------------------------------------
 local function areaModel(bossType)
     local areas = WS:FindFirstChild("SpawnAreas")
@@ -261,21 +280,34 @@ local function bossOf(bossType)
     return bossModelIn(areaModel(bossType))
 end
 
---------------------------------------------------------------------
--- BOSS HITBOX EXPANDER
---   size = first-seen size * multiplier, saved once per Address.
---   Root part and arena parts are never touched.
---------------------------------------------------------------------
-local hbSaved   = {}   -- address -> { part, size, collide }
-local hbApplied = 0
+-- stable centre: root part first (never grown), then any part
+local function bossCenter(boss)
+    local r = boss:FindFirstChild("HumanoidRootPart")
+    if r and r.ClassName == "Part" then
+        local ok, p = pcall(function() return r.Position end)
+        if ok and p then return p end
+    end
 
-local function hbFactor()
-    if not Config.Farm then return 0 end
-    if Config.HitboxBig then return HB_MULT_BIG end
-    return HB_MULT
+    local ok, desc = pcall(function() return boss:GetDescendants() end)
+    if ok and desc then
+        for i = 1, #desc do
+            local d = desc[i]
+            if isBasePart(d) then
+                local okP, p = pcall(function() return d.Position end)
+                if okP and p then return p end
+            end
+        end
+    end
+
+    return nil
 end
 
--- forget parts that no longer exist so respawned bosses start clean
+--------------------------------------------------------------------
+-- BOSS HITBOX EXPANDER  (distance sized, saved once per Address)
+--------------------------------------------------------------------
+local hbSaved   = {}   -- address -> { part, size, collide }
+local hbApplied = false
+
 local function pruneSaved()
     local dead = nil
     for k, e in pairs(hbSaved) do
@@ -299,65 +331,6 @@ local function pruneSaved()
     end
 end
 
-local function growPart(d, mult)
-    local okG, s = isGrowable(d)
-    if not okG then return false end
-
-    local k = keyOf(d)
-    if k == nil then return false end
-
-    local e = hbSaved[k]
-
-    if e == nil then
-        -- save the ORIGINAL size exactly once, before anything changes
-        local okS, size = pcall(function() return d.Size end)
-        if not okS or not size then return false end
-
-        local okC, c = pcall(function() return d.CanCollide end)
-
-        e = {
-            part    = d,
-            size    = size,
-            collide = (okC and c) and true or false,
-        }
-        hbSaved[k] = e
-    end
-
-    pcall(function()
-        d.Size = Vector3.new(
-            e.size.X * mult,
-            e.size.Y * mult,
-            e.size.Z * mult
-        )
-    end)
-
-    -- a grown part must not shove the player around
-    pcall(function() d.CanCollide = false end)
-
-    return true
-end
-
-local function applyHitbox(mult)
-    local touched = 0
-
-    for i = 1, #BOSS_TYPES do
-        local boss = bossOf(BOSS_TYPES[i])
-        if boss then
-            local okD, desc = pcall(function() return boss:GetDescendants() end)
-            if okD and desc then
-                for j = 1, #desc do
-                    local d = desc[j]
-                    if growPart(d, mult) then
-                        touched = touched + 1
-                    end
-                end
-            end
-        end
-    end
-
-    return touched
-end
-
 local function restoreHitbox()
     local n = 0
 
@@ -375,119 +348,107 @@ local function restoreHitbox()
 
     hbSaved = {}
 
-    if hbApplied ~= 0 then
+    if hbApplied then
         print("[" .. NAME .. "] hitbox restored on " .. tostring(n) .. " parts")
     end
-    hbApplied = 0
+    hbApplied = false
 end
 
---------------------------------------------------------------------
--- BRING HITBOX TO ME
---   One part per boss becomes a BRING_SIZE cube sitting on the player.
---------------------------------------------------------------------
-local bringSaved   = {}   -- address -> { part, cframe }
-local bringApplied = false
-
-local function pruneBring()
-    local dead = nil
-    for k, e in pairs(bringSaved) do
-        local gone = false
-        if not e.part then
-            gone = true
-        else
-            local ok, parent = pcall(function() return e.part.Parent end)
-            if not ok or parent == nil then gone = true end
-        end
-        if gone then
-            dead = dead or {}
-            dead[#dead + 1] = k
-        end
-    end
-    if dead then
-        for i = 1, #dead do bringSaved[dead[i]] = nil end
-    end
+-- multiplier that makes the largest grown part span the gap to you
+local function multForDistance(dist, maxHalf)
+    if maxHalf < 0.5 then maxHalf = 0.5 end
+    local m = ((dist + HB_PAD) / maxHalf) * 1.15
+    if Config.HitboxBig then m = m * HB_BOOST end
+    if m < HB_MULT_MIN then m = HB_MULT_MIN end
+    if m > HB_MULT_MAX then m = HB_MULT_MAX end
+    return m
 end
 
--- biggest growable part of one boss
-local function pickCarrier(boss)
-    local pick, pickVol = nil, -1
+-- register + grow one boss; returns parts touched
+local function growBoss(boss, myPos)
+    local center = bossCenter(boss)
+    if not center then return 0 end
+
+    local okD, dist = pcall(function() return (center - myPos).Magnitude end)
+    if not okD or type(dist) ~= "number" then return 0 end
 
     local ok, desc = pcall(function() return boss:GetDescendants() end)
-    if not ok or not desc then return nil end
+    if not ok or not desc then return 0 end
+
+    -- pass 1: register originals, find the largest half-extent
+    local entries = {}
+    local maxHalf = 0
 
     for j = 1, #desc do
         local d = desc[j]
-        local okG, s = isGrowable(d)
-        if okG and s then
-            local vol = s.X * s.Y * s.Z
-            if vol > pickVol then
-                pickVol = vol
-                pick = d
-            end
-        end
-    end
-
-    return pick
-end
-
-local function applyBring()
-    local hrp = rootPart()
-    if not hrp then return 0 end
-
-    local pos = hrp.Position
-    if not pos then return 0 end
-
-    local moved = 0
-
-    for i = 1, #BOSS_TYPES do
-        local boss = bossOf(BOSS_TYPES[i])
-        if boss then
-            local pick = pickCarrier(boss)
-            if pick then
-                local k = keyOf(pick)
-                if k then
-                    if bringSaved[k] == nil then
-                        local okC, cf = pcall(function() return pick.CFrame end)
-                        if okC and cf then
-                            bringSaved[k] = { part = pick, cframe = cf }
-                        end
+        local okG = isGrowable(d)
+        if okG then
+            local k = keyOf(d)
+            if k ~= nil then
+                local e = hbSaved[k]
+                if e == nil then
+                    local okS, s = pcall(function() return d.Size end)
+                    if okS and s then
+                        local okC, c = pcall(function() return d.CanCollide end)
+                        e = {
+                            part    = d,
+                            size    = s,
+                            collide = (okC and c) and true or false,
+                        }
+                        hbSaved[k] = e
                     end
-
-                    pcall(function()
-                        pick.Size = Vector3.new(BRING_SIZE, BRING_SIZE, BRING_SIZE)
-                        pick.CanCollide = false
-                        pick.CFrame = CFrame.new(pos.X, pos.Y, pos.Z)
-                    end)
-
-                    moved = moved + 1
+                end
+                if e then
+                    entries[#entries + 1] = e
+                    local half = math.max(e.size.X, e.size.Y, e.size.Z) * 0.5
+                    if half > maxHalf then maxHalf = half end
                 end
             end
         end
     end
 
-    return moved
+    if #entries == 0 then return 0 end
+
+    -- pass 2: one multiplier for the whole boss
+    local mult = multForDistance(dist, maxHalf)
+    local touched = 0
+
+    for j = 1, #entries do
+        local e = entries[j]
+        local target = Vector3.new(
+            e.size.X * mult,
+            e.size.Y * mult,
+            e.size.Z * mult
+        )
+
+        local okCur, cur = pcall(function() return e.part.Size end)
+        if not okCur or not cur or sizeDiffers(cur, target) then
+            pcall(function() e.part.Size = target end)
+            pcall(function() e.part.CanCollide = false end)
+        end
+        touched = touched + 1
+    end
+
+    return touched
 end
 
-local function restoreBring()
-    local n = 0
+local function applyHitbox()
+    local hrp = rootPart()
+    if not hrp then return 0 end
 
-    for k, e in pairs(bringSaved) do
-        local p = e.part
-        if p then
-            local ok, parent = pcall(function() return p.Parent end)
-            if ok and parent ~= nil then
-                pcall(function() p.CFrame = e.cframe end)
-                n = n + 1
-            end
+    local myPos = hrp.Position
+    if not myPos then return 0 end
+
+    local touched = 0
+
+    for i = 1, #BOSS_TYPES do
+        local boss = bossOf(BOSS_TYPES[i])
+        if boss then
+            touched = touched + growBoss(boss, myPos)
         end
     end
 
-    bringSaved = {}
-
-    if bringApplied then
-        print("[" .. NAME .. "] carried hitbox returned on " .. tostring(n) .. " parts")
-    end
-    bringApplied = false
+    return touched
 end
 
 --------------------------------------------------------------------
@@ -550,9 +511,8 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Farm (hitbox x100 + swing)", "fam_farm", "Farm", false)
-            addToggle(combat, "Bring Hitbox To Me", "fam_bring", "Bring", false)
-            addToggle(combat, "Huge Hitbox (x200)", "fam_hitbox_big", "HitboxBig", false)
+            addToggle(combat, "Auto Farm (all bosses, spam)", "fam_farm", "Farm", false)
+            addToggle(combat, "Huge Hitbox (x2 reach)", "fam_hitbox_big", "HitboxBig", false)
         end
     end)
 
@@ -608,34 +568,19 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HITBOX LOOP  (growth + carried hitbox)
+-- HITBOX LOOP
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        local mult = hbFactor()
-
-        if mult > 0 then
+        if Config.Farm then
             pruneSaved()
-            local n = applyHitbox(mult)
-            if n > 0 and hbApplied ~= mult then
-                hbApplied = mult
-                print("[" .. NAME .. "] hitbox x" .. tostring(mult)
-                    .. " on " .. tostring(n) .. " parts (root skipped, local)")
+            local n = applyHitbox()
+            if n > 0 and not hbApplied then
+                hbApplied = true
+                print("[" .. NAME .. "] hitbox on " .. tostring(n)
+                    .. " boss parts (distance sized, root skipped, local)")
             end
-
-            if Config.Bring then
-                pruneBring()
-                local moved = applyBring()
-                if moved > 0 and not bringApplied then
-                    bringApplied = true
-                    print("[" .. NAME .. "] carried hitbox x" .. tostring(moved)
-                        .. " boss(es) onto you")
-                end
-            elseif bringApplied then
-                restoreBring()
-            end
-        elseif hbApplied ~= 0 or bringApplied then
-            restoreBring()
+        elseif hbApplied then
             restoreHitbox()
         end
 
@@ -644,23 +589,31 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO SWING  (stand still, fire Attack)
+-- AUTO SWING  (burst spam across every boss tool)
 --------------------------------------------------------------------
 task.spawn(function()
     local wasOn  = false
     local warned = false
 
     while running do
-        if Config.Farm then
+        if Config.Farm and alive() then
             if not wasOn then
                 wasOn  = true
                 warned = false
-                print("[" .. NAME .. "] auto farm on (swinging)")
+                print("[" .. NAME .. "] auto farm on (burst spam)")
             end
 
-            if not swing() and not warned then
-                warned = true
-                print("[" .. NAME .. "] no Attack remote - equip a weapon")
+            if not swingOnce() then
+                if not warned then
+                    warned = true
+                    print("[" .. NAME .. "] no Attack remote - equip a weapon")
+                end
+            else
+                for b = 2, SWING_BURST do
+                    task.wait(BURST_GAP)
+                    if not running or not Config.Farm then break end
+                    swingOnce()
+                end
             end
 
             task.wait(SWING_RATE)
@@ -669,7 +622,7 @@ task.spawn(function()
                 wasOn = false
                 print("[" .. NAME .. "] auto farm off")
             end
-            task.wait(0.2)
+            task.wait(0.1)
         end
     end
 end)
@@ -731,7 +684,6 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
-    pcall(function() restoreBring() end)
     pcall(function() restoreHitbox() end)
     pcall(function() fireEvent("StopTransfuseBlood") end)
     atkCache = nil
@@ -741,5 +693,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Auto Farm + Bring Hitbox", 5)
+notifyUser("Loaded - distance reach + spam", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
