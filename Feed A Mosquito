@@ -1,27 +1,29 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v3.1
+--  v3.2
 --
---  KILL AURA FIX (the real one)
---    The build that actually did damage was the stand-still spam swing.
---    Kill Aura was gated: it only swung AFTER a successful move to a
---    boss, and collectBosses() often returns nothing, so no swing ever
---    fired. Now the swing is UNCONDITIONAL - every pass fires Attack,
---    and if a boss is found it also lands on its exact root first. So
---    it behaves like the working spam swing plus the teleport.
+--  WHAT THE GAME ACTUALLY HAS (read live, not guessed)
+--    Workspace.SpawnAreas.<Type>Area is a Model holding:
+--      Area        Part   - the arena floor, the spot to stand on
+--      ChaseArea   Part   - a trigger volume ~14 studs UP, NOT the spot
+--      <Type>Mama  Model  - the boss itself (CommonMama, RareMama, ...)
+--    There is no "<Type>Area_Enemy_*" model. That name came from the
+--    actor list, not from Workspace, which is why the old scan found 0
+--    bosses and the old teleport picked ChaseArea and put you in the
+--    air above the arena.
 --
---  TELEPORT FIX
---    Old buttons used a part from Workspace.SpawnAreas.<Type>Area and
---    added 2 studs, which put you above the area marker rather than on
---    the mosquito. Now a button first looks for a LIVE boss of that
---    type and lands exactly on its root position. Only if none is
---    spawned does it fall back to the area part. Every press prints
---    which path it used and the coordinates.
+--  BOSS TELEPORT
+--    Per type it now lands on the boss model's PrimaryPart/Head if the
+--    boss is there, otherwise exactly on the Area part. Never on
+--    ChaseArea. Prints the part name and coordinates used.
 --
---  Bosses are Actors under PlayerScripts.Runtime.Actors with models
---  under Workspace.SpawnAreas, so the scan walks Workspace children,
---  Workspace.SpawnAreas, and the local Runtime.Actors folder.
+--  KILL AURA
+--    Swings unconditionally every pass (the behaviour that landed hits
+--    before), and moves onto the boss model in the matching area first.
+--    Scans SpawnAreas for "<Type>Mama" models plus any *Area_Enemy*
+--    model, so it works whether the boss is the Mama model or a spawned
+--    actor.
 --
 --  Sections
 --    Main          Always Heal, Auto Collect
@@ -38,7 +40,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v3.1"
+local VERSION = "v3.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -57,7 +59,6 @@ local COLLECT_RATE = 1.5
 local AURA_RATE    = 0.2
 local ATK_TTL      = 0.5
 local MOVE_EPS2    = 1
-local AURA_MAX     = 1000000
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -104,10 +105,6 @@ local function child(a, b, c)
     return n1:FindFirstChild(c)
 end
 
-local function mag2(p)
-    return p.X * p.X + p.Y * p.Y + p.Z * p.Z
-end
-
 --------------------------------------------------------------------
 -- Player actor remotes
 --------------------------------------------------------------------
@@ -137,9 +134,6 @@ end
 
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
---   Tool_Character_<userId>_<n>_<m>.Events.Attack
---   <n> changes on a weapon upgrade, so the cache expires and the
---   cached remote must still have a live parent chain.
 --------------------------------------------------------------------
 local atkCache = nil
 local atkStamp = 0
@@ -197,108 +191,90 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- Boss scan
---   Boss models are named <Type>Area_Enemy_<n> or
---   Egg_<Type>Area_Enemy_<n>. They live under Workspace.SpawnAreas
---   and in the local Runtime.Actors folder, so all three are walked.
+-- Area / boss lookup
+--   SpawnAreas.<Type>Area holds: Area (floor), ChaseArea (up high,
+--   never use), <Type>Mama (the boss model).
 --------------------------------------------------------------------
-local function modelPart(model)
-    local p = model:FindFirstChild("HumanoidRootPart")
-    if p then return p end
-    p = model:FindFirstChild("Head")
-    if p then return p end
-    return model.PrimaryPart
+local function spawnAreas()
+    return WS:FindFirstChild("SpawnAreas")
 end
 
-local function collectBosses()
-    local out  = {}
-    local seen = {}
-
-    local function consider(m)
-        if not m or not m.Name then return end
-        if not string.find(m.Name, "Area_Enemy", 1, true) then return end
-        if seen[m.Name] then return end
-        local part = modelPart(m)
-        if not part then return end
-        local ok, pos = pcall(function() return part.Position end)
-        if ok and pos then
-            seen[m.Name] = true
-            out[#out + 1] = { model = m, pos = pos }
-        end
-    end
-
-    local kids = WS:GetChildren()
-    for i = 1, #kids do consider(kids[i]) end
-
-    local areas = WS:FindFirstChild("SpawnAreas")
-    if areas then
-        local okD, desc = pcall(function() return areas:GetDescendants() end)
-        if okD and desc then
-            for i = 1, #desc do consider(desc[i]) end
-        end
-    end
-
-    return out
+local function areaModel(bossType)
+    local areas = spawnAreas()
+    return areas and areas:FindFirstChild(bossType .. "Area") or nil
 end
 
-local function matchesType(nm, bossType)
-    return string.find(nm, bossType .. "Area_Enemy", 1, true) ~= nil
-end
+local function modelPoint(model)
+    if not model then return nil, nil end
 
-local function nearestOf(list, fromPos, bossType)
-    local best, bestDist, bestPos = nil, AURA_MAX, nil
-
-    for i = 1, #list do
-        local e = list[i]
-        if bossType == nil or matchesType(e.model.Name, bossType) then
-            local d = (e.pos - fromPos).Magnitude
-            if d <= bestDist then
-                best, bestDist, bestPos = e.model, d, e.pos
-            end
-        end
+    local pp = model.PrimaryPart
+    if pp then
+        local ok, p = pcall(function() return pp.Position end)
+        if ok and p then return p, pp.Name end
     end
 
-    return best, bestPos
-end
-
--- fallback: a real part from Workspace.SpawnAreas.<Type>Area
-local function areaPos(bossType)
-    local areas = WS:FindFirstChild("SpawnAreas")
-    if not areas then return nil end
-
-    local m = areas:FindFirstChild(bossType .. "Area")
-    if not m then return nil end
-
-    local okD, desc = pcall(function() return m:GetDescendants() end)
-    if not okD or not desc then return nil end
-
-    for i = 1, #desc do
-        local c  = desc[i]
-        local cn = c.ClassName
-        if cn == "Part" or cn == "MeshPart"
-            or cn == "UnionOperation" or cn == "SpawnLocation" then
-            local ok, p = pcall(function() return c.Position end)
-            if ok and p and mag2(p) > 1 then return p end
-        end
+    local head = model:FindFirstChild("Head")
+    if head then
+        local ok, p = pcall(function() return head.Position end)
+        if ok and p then return p, "Head" end
     end
 
+    local hrp = model:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local ok, p = pcall(function() return hrp.Position end)
+        if ok and p then return p, "HumanoidRootPart" end
+    end
+
+    return nil, nil
+end
+
+-- the boss model inside an area, e.g. UncommonMama
+local function bossModelIn(area, bossType)
+    if not area then return nil end
+
+    local m = area:FindFirstChild(bossType .. "Mama")
+    if m then return m end
+
+    local kids = area:GetChildren()
+    for i = 1, #kids do
+        local c = kids[i]
+        if c.ClassName == "Model" and string.find(c.Name, "Mama", 1, true) then
+            return c
+        end
+    end
     return nil
 end
 
-local function moveTo(hrp, x, y, z)
-    if not hrp or not hrp.Parent then return false end
+-- exact standing spot for a boss type: boss model, else Area part
+local function spotFor(bossType)
+    local area = areaModel(bossType)
+    if not area then return nil, "no area" end
+
+    local boss = bossModelIn(area, bossType)
+    local pos, partName = modelPoint(boss)
+    if pos then return pos, bossType .. "Mama." .. tostring(partName) end
+
+    local floor = area:FindFirstChild("Area")
+    if floor then
+        local ok, p = pcall(function() return floor.Position end
+        if ok and p then return p, "Area part" end
+    end
+
+    return nil, "no part"
+end
+
+local function moveTo(hrp, pos)
+    if not hrp or not hrp.Parent or not pos then return false end
     if not alive() then return false end
 
     local p  = hrp.Position
-    local dx = p.X - x
-    local dy = p.Y - y
-    local dz = p.Z - z
+    local dx = p.X - pos.X
+    local dy = p.Y - pos.Y
+    local dz = p.Z - pos.Z
 
-    if (dx * dx + dy * dy + dz * dz) <= MOVE_EPS2 then
-        return false
-    end
+    if (dx * dx + dy * dy + dz * dz) <= MOVE_EPS2 then return false end
 
-    pcall(function() hrp.CFrame = CFrame.new(x, y, z) end)
+    pcall(function() hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z) end)
     return true
 end
 
@@ -388,22 +364,11 @@ local function buildTab(tab)
                         return
                     end
 
-                    local pos, label = nil, nil
-
-                    local list = collectBosses()
-                    local target, bpos = nearestOf(list, hrp.Position, bossType)
-                    if bpos then
-                        pos   = bpos
-                        label = target.Name
-                    else
-                        pos   = areaPos(bossType)
-                        label = "area part"
-                    end
-
+                    local pos, label = spotFor(bossType)
                     if not pos then
-                        print("[" .. NAME .. "] no " .. bossType
-                            .. " boss and no area part")
-                        notifyUser("No " .. bossType, 3)
+                        print("[" .. NAME .. "] tp " .. bossType
+                            .. " failed: " .. tostring(label))
+                        notifyUser("No " .. bossType .. " spot", 3)
                         return
                     end
 
@@ -529,30 +494,35 @@ end)
 
 --------------------------------------------------------------------
 -- KILL AURA
---   Swings EVERY pass, unconditionally - this is the behaviour that
---   was landing hits before. If a boss is found it also lands exactly
---   on its root first, so the hit resolves from on top of it.
+--   Swings every pass. If a boss model exists in any area it lands on
+--   it first; otherwise it keeps swinging where you stand.
 --------------------------------------------------------------------
 task.spawn(function()
-    local lastTarget = nil
+    local lastLabel = nil
 
     while running do
         if Config.Aura then
             local hrp = rootPart()
             if hrp and alive() then
-                local list = collectBosses()
-                local target, pos = nearestOf(list, hrp.Position, nil)
+                local moved, label = false, nil
+                local myPos = hrp.Position
+                local bestD = 1e9
 
-                if target and pos then
-                    pcall(function()
-                        hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z)
-                    end)
-                    if lastTarget ~= target.Name then
-                        lastTarget = target.Name
-                        print("[" .. NAME .. "] aura -> " .. target.Name)
+                for i = 1, #BOSS_TYPES do
+                    local t = BOSS_TYPES[i]
+                    local pos, src = spotFor(t)
+                    if pos then
+                        local d = (pos - myPos).Magnitude
+                        if d < bestD then
+                            bestD, label = d, t .. " (" .. tostring(src) .. ")"
+                            moved = moveTo(hrp, pos)
+                        end
                     end
-                else
-                    lastTarget = nil
+                end
+
+                if label and label ~= lastLabel then
+                    lastLabel = label
+                    print("[" .. NAME .. "] aura target " .. label)
                 end
 
                 swing()
