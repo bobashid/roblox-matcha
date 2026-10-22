@@ -1,35 +1,34 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.8
+--  v5.9
 --
---  NEW: CROSS-MAP HIT (teleport swing)
---    The server measures how far your character is from the boss when
---    the Attack remote lands, so a client cannot just claim a hit from
---    across the map. The one thing that always works is actually being
---    there. This mode does that for a single frame:
+--  CROSS-MAP HIT (teleport swing)
+--    The server measures how far you are from the boss when the Attack
+--    remote lands, so the only reliable way is to actually be there.
+--    This mode saves your CFrame, jumps onto the boss for the swing,
+--    then jumps straight back.
 --
---        save your CFrame -> jump onto the boss -> fire the Attack
---        volley -> jump straight back to the saved CFrame
+--    v5.9 removes the wait between the two volleys: both Attack calls
+--    now go out in the SAME frame as the teleport, so you are standing
+--    inside the boss for a single frame instead of two. That is the
+--    whole exposure window - there is no way to shrink it further from
+--    the client, because the server decides damage on its own tick.
 --
---    One boss per pass, round-robin through every type, so it costs
---    2 CFrame writes per pass instead of one per frame. You stay put
---    visually; the server sees you in range for the swing.
---    Nothing is resized, so the Huge Hitbox mode is now optional and
---    can be left off.
+--  KEEP ALIVE (new, ON by default)
+--    Bosses still get the odd hit in while you are parked inside them,
+--    so the reach loop now watches your health fraction. Under 40% it
+--    stops teleporting, stays home and fires TransfuseBlood until you
+--    are back over 40%, then resumes on its own. Turn the toggle off
+--    if you would rather keep swinging at low health.
 --
---  HUGE HITBOX (still there, off by default)
---    Grows every boss part except HumanoidRootPart / Area / ChaseArea
---    and anything already 40+ studs, sized from your distance each
---    pass so a far boss gets a bigger box. Restored on toggle off.
+--  HUGE HITBOX (off by default) - unchanged, grows boss parts except
+--  HumanoidRootPart / Area / ChaseArea / anything already 40+ studs.
 --
---  AUTO FARM
---    Fires every tool's Attack remote in bursts. Equip a weapon or the
---    remotes do not exist yet - the script says so in the console.
+--  Always Heal / Auto Collect / Auto Farm - unchanged.
 --
---  Always Heal / Auto Collect are unchanged.
---
---  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
+--  All toggles start OFF except Keep Alive. Stop with
+--  _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -38,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.8"
+local VERSION = "v5.9"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -60,6 +59,8 @@ local ATK_TTL      = 1.0
 local HB_RATE      = 0.2
 local REACH_RATE   = 0.15
 local REACH_HEIGHT = 2.5
+local RETREAT_HP   = 0.4
+local RETREAT_RATE = 0.2
 
 -- reach tuning
 local HB_PAD        = 25
@@ -84,6 +85,7 @@ local Config = {
     Farm        = false,
     Reach       = false,
     HitboxBig   = false,
+    KeepAlive   = true,
 }
 
 local TOGGLES     = {}
@@ -110,6 +112,18 @@ end
 local function alive()
     local hum = humanoid()
     return hum ~= nil and hum.Health > 0
+end
+
+-- 0..1 health fraction, 1 when it cannot be read
+local function healthFrac()
+    local hum = humanoid()
+    if not hum then return 1 end
+    local okH, hp = pcall(function() return hum.Health end)
+    local okM, mx = pcall(function() return hum.MaxHealth end)
+    if not okH or not okM then return 1 end
+    if type(hp) ~= "number" or type(mx) ~= "number" then return 1 end
+    if mx <= 0 then return 1 end
+    return hp / mx
 end
 
 local function notifyUser(msg, dur)
@@ -290,7 +304,7 @@ local function bossCenter(boss)
 end
 
 --------------------------------------------------------------------
--- CROSS-MAP HIT (teleport swing)
+-- CROSS-MAP HIT (teleport swing, single frame in the boss)
 --------------------------------------------------------------------
 local reachIndex = 0
 local reachHome  = nil
@@ -307,7 +321,6 @@ local function reachBack()
     reachHome = nil
 end
 
--- returns the boss it used, or nil
 local function reachPass()
     local hrp = rootPart()
     if not hrp then return nil end
@@ -336,10 +349,10 @@ local function reachPass()
         hrp.CFrame = CFrame.new(center.X, center.Y + REACH_HEIGHT, center.Z)
     end)
 
+    -- both volleys go out in the same frame as the teleport: the server
+    -- only needs us in range when the remote lands, so no wait here.
     swingOnce()
-
-    task.wait(BURST_GAP)
-    if running then swingOnce() end
+    swingOnce()
 
     local okR, hrp2 = pcall(function() return rootPart() end)
     local back = (okR and hrp2) or hrp
@@ -353,7 +366,7 @@ end
 --------------------------------------------------------------------
 -- BOSS HITBOX EXPANDER (distance sized, saved once per Address)
 --------------------------------------------------------------------
-local hbSaved   = {}   -- address -> { part, size, collide }
+local hbSaved   = {}
 local hbApplied = false
 
 local function pruneSaved()
@@ -557,6 +570,7 @@ local function buildTab(tab)
         if combat then
             addToggle(combat, "Auto Farm (spam attack)", "fam_farm", "Farm", false)
             addToggle(combat, "Cross-Map Hit (teleport swing)", "fam_reach", "Reach", false)
+            addToggle(combat, "Keep Alive (retreat under 40% HP)", "fam_keepalive", "KeepAlive", true)
             addToggle(combat, "Huge Hitbox (x2 reach)", "fam_hitbox_big", "HitboxBig", false)
         end
     end)
@@ -613,30 +627,51 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- CROSS-MAP REACH LOOP
+-- CROSS-MAP REACH LOOP (with low-HP retreat)
 --------------------------------------------------------------------
 task.spawn(function()
-    local wasOn = false
-    local warned = false
+    local wasOn   = false
+    local warned  = false
+    local resting = false
 
     while running do
         if Config.Reach and Config.Farm and alive() then
             if not wasOn then
-                wasOn  = true
-                warned = false
+                wasOn   = true
+                warned  = false
+                resting = false
                 print("[" .. NAME .. "] cross-map reach on")
             end
 
-            local used = reachPass()
-            if not used and not warned then
-                warned = true
-                print("[" .. NAME .. "] reach: no boss found yet")
-            end
+            local frac = healthFrac()
 
-            task.wait(REACH_RATE)
+            if Config.KeepAlive and frac < RETREAT_HP then
+                if not resting then
+                    resting = true
+                    print("[" .. NAME .. "] low HP ("
+                        .. tostring(math.floor(frac * 100))
+                        .. "%) - holding home and healing")
+                end
+                fireEvent("TransfuseBlood")
+                task.wait(RETREAT_RATE)
+            else
+                if resting then
+                    resting = false
+                    print("[" .. NAME .. "] HP back up - resuming reach")
+                end
+
+                local used = reachPass()
+                if not used and not warned then
+                    warned = true
+                    print("[" .. NAME .. "] reach: no boss found yet")
+                end
+
+                task.wait(REACH_RATE)
+            end
         else
             if wasOn then
-                wasOn = false
+                wasOn   = false
+                resting = false
                 pcall(reachBack)
                 print("[" .. NAME .. "] cross-map reach off")
             end
@@ -758,5 +793,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - cross-map reach ready", 5)
+notifyUser("Loaded - reach now retreats at low HP", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
