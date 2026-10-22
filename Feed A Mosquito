@@ -1,32 +1,32 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v2.8
+--  v2.9
 --
---  TOGGLE NAMES now describe what they actually do:
---    Always Heal   TransfuseBlood remote, keeps max HP climbing.
+--  TOGGLE NAMES describe exactly what they do:
+--    Always Heal   TransfuseBlood remote. Keeps max HP climbing.
 --    Auto Collect  CollectIncome + ClaimOfflineIncome.
---    Spam Swing    Fires Attack on a fixed cadence wherever you stand.
---                  No target, no movement. This is what used to be
---                  called "Auto Farm".
---    Kill Aura     Finds the nearest boss of any type, moves to it,
---                  swings, repeats. This is what used to be called
---                  "Auto Kill".
+--    Spam Swing    Fires Attack on a cadence wherever you stand.
+--                  No target, no movement. (was "Auto Farm")
+--    Kill Aura     Moves to the nearest boss and swings. (was
+--                  "Auto Kill")
 --
 --  KILL AURA FIX
---    The old version parked you AURA_DEPTH studs BELOW the target,
---    which put you out of the server's hit range, so the swing landed
---    on nothing. It now stands LEVEL with the target (2 studs above
---    its root) and waits 0.1s after the move before swinging, so the
---    server sees the new position before the hit is resolved.
+--    v2.8 scanned only Workspace:GetChildren(). The bosses are Actors
+--    under PlayerScripts.Runtime.Actors (Egg_RareArea_Enemy_140_4 and
+--    friends), and their models sit under Workspace.SpawnAreas, so the
+--    scan returned nothing and the toggle never fired a swing.
+--    The scan now walks Workspace children AND every descendant of
+--    Workspace.SpawnAreas.
+--    It also stands 2 studs ABOVE the target root instead of under the
+--    map, and waits 0.1s after moving so the server resolves the hit
+--    from the new position.
 --
---  BOSS TELEPORT BUTTONS
---    One button per boss type. They do NOT use hardcoded coordinates:
---    the area models under Workspace.SafeZone.SafeZone carry no usable
---    position at runtime (every part reads 0,0,0) and bosses are
---    spawned by the server. Each button instead looks up the nearest
---    live boss of that type and teleports you to it, or tells you
---    none is spawned.
+--  BOSS TELEPORT
+--    Workspace.SpawnAreas.<Type>Area holds the real coordinates. Each
+--    button reads that model at click time and uses the first part
+--    that is not at the origin. If the area model has no usable part,
+--    it falls back to the nearest live boss of that type.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -37,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.8"
+local VERSION = "v2.9"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -53,11 +53,11 @@ local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
 local HP_LOG_RATE  = 5.0
 local COLLECT_RATE = 1.5
-local SWING_RATE   = 0.3    -- spam swing cadence
-local AURA_RATE    = 0.3    -- kill aura pass
+local SWING_RATE   = 0.3
+local AURA_RATE    = 0.3
 local ATK_TTL      = 0.5
 local MOVE_EPS2    = 4
-local AURA_UP      = 2      -- studs above the target root
+local AURA_UP      = 2
 local AURA_MAX     = 1000000
 
 local BOSS_TYPES = {
@@ -104,6 +104,10 @@ local function child(a, b, c)
     local n1 = a:FindFirstChild(b)
     if not n1 or not c then return n1 end
     return n1:FindFirstChild(c)
+end
+
+local function mag2(p)
+    return p.X * p.X + p.Y * p.Y + p.Z * p.Z
 end
 
 --------------------------------------------------------------------
@@ -192,33 +196,61 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- Boss lookup
---   Models are named <Type>Area_Enemy_<n> or Egg_<Type>Area_Enemy_<n>.
+-- Boss scan
+--   Boss models are named <Type>Area_Enemy_<n> or
+--   Egg_<Type>Area_Enemy_<n>. They are not always direct children of
+--   Workspace - the live ones sit under Workspace.SpawnAreas - so the
+--   scan walks both.
 --------------------------------------------------------------------
-local function enemyPart(model)
-    return model:FindFirstChild("HumanoidRootPart")
-        or model:FindFirstChild("Head")
-        or model.PrimaryPart
+local function modelPart(model)
+    local p = model:FindFirstChild("HumanoidRootPart")
+    if p then return p end
+    p = model:FindFirstChild("Head")
+    if p then return p end
+    return model.PrimaryPart
+end
+
+local function collectBosses()
+    local out = {}
+
+    local function consider(m)
+        if not m or not m.Name then return end
+        if not string.find(m.Name, "Area_Enemy", 1, true) then return end
+        local part = modelPart(m)
+        if not part then return end
+        local ok, pos = pcall(function() return part.Position end)
+        if ok and pos then
+            out[#out + 1] = { model = m, pos = pos }
+        end
+    end
+
+    local kids = WS:GetChildren()
+    for i = 1, #kids do consider(kids[i]) end
+
+    local areas = WS:FindFirstChild("SpawnAreas")
+    if areas then
+        local okD, desc = pcall(function() return areas:GetDescendants() end)
+        if okD and desc then
+            for i = 1, #desc do consider(desc[i]) end
+        end
+    end
+
+    return out
 end
 
 local function matchesType(nm, bossType)
     return string.find(nm, bossType .. "Area_Enemy", 1, true) ~= nil
 end
 
-local function nearestBossOfType(fromPos, bossType, maxDist)
-    local best, bestDist, bestPos = nil, maxDist, nil
-    local kids = WS:GetChildren()
+local function nearestOf(list, fromPos, bossType)
+    local best, bestDist, bestPos = nil, AURA_MAX, nil
 
-    for i = 1, #kids do
-        local d = kids[i]
-        if matchesType(d.Name, bossType) then
-            local part = enemyPart(d)
-            if part then
-                local pos  = part.Position
-                local dist = (pos - fromPos).Magnitude
-                if dist <= bestDist then
-                    best, bestDist, bestPos = d, dist, pos
-                end
+    for i = 1, #list do
+        local e = list[i]
+        if bossType == nil or matchesType(e.model.Name, bossType) then
+            local d = (e.pos - fromPos).Magnitude
+            if d <= bestDist then
+                best, bestDist, bestPos = e.model, d, e.pos
             end
         end
     end
@@ -226,25 +258,28 @@ local function nearestBossOfType(fromPos, bossType, maxDist)
     return best, bestPos
 end
 
-local function nearestBoss(fromPos, maxDist)
-    local best, bestDist, bestPos = nil, maxDist, nil
-    local kids = WS:GetChildren()
+-- real coordinates for an area, read from Workspace.SpawnAreas
+local function areaPos(bossType)
+    local areas = WS:FindFirstChild("SpawnAreas")
+    if not areas then return nil end
 
-    for i = 1, #kids do
-        local d = kids[i]
-        if string.find(d.Name, "Area_Enemy", 1, true) then
-            local part = enemyPart(d)
-            if part then
-                local pos  = part.Position
-                local dist = (pos - fromPos).Magnitude
-                if dist <= bestDist then
-                    best, bestDist, bestPos = d, dist, pos
-                end
-            end
+    local m = areas:FindFirstChild(bossType .. "Area")
+    if not m then return nil end
+
+    local okD, desc = pcall(function() return m:GetDescendants() end)
+    if not okD or not desc then return nil end
+
+    for i = 1, #desc do
+        local c = desc[i]
+        local cn = c.ClassName
+        if cn == "Part" or cn == "MeshPart"
+            or cn == "UnionOperation" or cn == "SpawnLocation" then
+            local ok, p = pcall(function() return c.Position end)
+            if ok and p and mag2(p) > 1 then return p end
         end
     end
 
-    return best, bestPos
+    return nil
 end
 
 local function moveTo(hrp, x, y, z)
@@ -351,20 +386,30 @@ local function buildTab(tab)
                         return
                     end
 
-                    local target, pos = nearestBossOfType(
-                        hrp.Position, bossType, AURA_MAX)
+                    local pos   = areaPos(bossType)
+                    local label = "area"
 
-                    if not target or not pos then
+                    if not pos then
+                        local list = collectBosses()
+                        local target, bpos = nearestOf(list, hrp.Position, bossType)
+                        if bpos then
+                            pos   = bpos
+                            label = target.Name
+                        end
+                    end
+
+                    if not pos then
                         print("[" .. NAME .. "] no " .. bossType
-                            .. " boss spawned")
-                        notifyUser("No " .. bossType .. " boss", 3)
+                            .. " position (no area part, no boss)")
+                        notifyUser("No " .. bossType .. " spot", 3)
                         return
                     end
 
                     pcall(function()
                         hrp.CFrame = CFrame.new(pos.X, pos.Y + AURA_UP, pos.Z)
                     end)
-                    print("[" .. NAME .. "] tp " .. target.Name
+
+                    print("[" .. NAME .. "] tp " .. bossType .. " via " .. label
                         .. " " .. tostring(math.floor(pos.X)) .. ","
                         .. tostring(math.floor(pos.Y)) .. ","
                         .. tostring(math.floor(pos.Z)))
@@ -481,7 +526,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- SPAM SWING  (was Auto Farm)
+-- SPAM SWING
 --   Swings wherever you stand, no target needed.
 --------------------------------------------------------------------
 task.spawn(function()
@@ -495,15 +540,16 @@ end)
 
 --------------------------------------------------------------------
 -- KILL AURA
---   Nearest boss of any type, stand LEVEL with it, then swing.
---   The 0.1s wait lets the server see the new position first.
+--   Scans Workspace plus Workspace.SpawnAreas, stands above the
+--   nearest boss, swings.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
         if Config.Aura then
             local hrp = rootPart()
             if hrp and alive() then
-                local target, pos = nearestBoss(hrp.Position, AURA_MAX)
+                local list = collectBosses()
+                local target, pos = nearestOf(list, hrp.Position, nil)
                 if target and pos then
                     moveTo(hrp, pos.X, pos.Y + AURA_UP, pos.Z)
                     task.wait(0.1)
