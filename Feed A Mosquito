@@ -1,44 +1,39 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v4.6
+--  v4.7
 --
---  WHAT THE LIVE SCAN SHOWED (measured in the game, not guessed)
---    SpawnAreas has 8 areas. The boss models are named <Type>Mama and
---    sit directly under their area:
---      CommonArea     no Mama (only *MosquitoEgg models)
---      UncommonArea   UncommonMama    22 parts
---      RareArea       RareMama        22 parts
---      EpicArea       EpicMama        23 parts
---      LegendaryArea  LegendaryMama    0 parts   <-- no parts at all
---      MythicalArea   no Mama
---      DivineArea     DivineMama      (parts only when loaded)
---      SecretArea     no Mama
---    A model with 0 parts cannot be resized: its parts are not on the
---    client at that moment (streamed out because it is far away) or
---    the body lives in another model. Nothing client-side can enlarge
---    what the client does not have. That is why the last bosses stay
---    normal size while the near ones work.
---    The scan now reports part counts, so the log shows exactly which
---    boss has nothing to grow, and a boss whose parts stream in later
---    is picked up on the next pass instead of being skipped forever.
+--  WHY ONLY THE FIRST FOUR DIED
+--    The four bosses that work are the near ones (Common/Uncommon/
+--    Rare/Epic areas). Legendary, Mythical, Divine and Secret sit
+--    further away, and at a fixed x8 their grown parts still do not
+--    reach you, so the swing misses them.
+--    v4.7 scales each boss by its DISTANCE from you:
+--        mult = base + floor(distance / 12), capped at HB_MAX (40)
+--    A boss 200 studs away is grown x24 instead of x8. Near bosses
+--    keep the small multiplier, so the close ones look normal-ish and
+--    the far ones get the reach they need.
+--    Size is always recomputed from the FIRST-SEEN size, so a part is
+--    never multiplied twice no matter how the multiplier changes.
 --
---  WHAT CHANGED
---    - Boss scan: <Type>Mama models anywhere under SpawnAreas, plus
---      any model there with a direct Humanoid that is not an Egg and
---      not a player character. Player characters are never touched.
---    - HumanoidRootPart (or PrimaryPart) is grown to at least
---      HB_ROOT_MIN studs even when the rest of the body is small, so
---      every boss that has any parts at all gets a big hit target.
---    - Parts named Area / ChaseArea are never resized (that was the
---      floor being grown and flinging you in v4.3/v4.4).
---    - "Print Boss List" button in Combat: writes every boss the scan
---      sees, with part count and health, to the console.
---    - CanCollide off while a part is grown, restored with the size.
+--  WHAT THE LIVE SCAN SHOWED (measured in this game)
+--    SpawnAreas bosses: UncommonMama 22 parts, RareMama 22,
+--    EpicMama 23, MosquitoMama 22, DivineMama (when loaded),
+--    LegendaryMama 0 parts - its body is not on the client at that
+--    moment, so nothing local can grow it. The report below says so
+--    per boss instead of silently skipping.
+--    Models ending in "Egg" and player characters are never grown.
+--    Parts named Area / ChaseArea are never resized (that was the
+--    floor being grown and flinging you in earlier versions).
+--
+--  "Print Boss List" button
+--    Writes every boss the scan sees with part count, health and the
+--    multiplier it would get right now.
 --
 --  AUTO SWING
 --    Stand still, Attack remote fired every SWING_RATE. No CFrame
---    writes anywhere, no teleports.
+--    writes anywhere, no teleports. CanCollide is off on grown parts
+--    and restored with the size.
 --
 --  MAIN
 --    Always Heal, Auto Collect.
@@ -52,7 +47,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v4.6"
+local VERSION = "v4.7"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -76,6 +71,8 @@ local BOSS_TTL     = 2.0
 -- hitbox tuning
 local HB_MULT      = 8
 local HB_MULT_BIG  = 16
+local HB_MAX       = 40
+local HB_PER_STUD  = 12   -- one extra multiplier step per this many studs
 local HB_ROOT_MIN  = 14
 
 -- parts that must never be resized
@@ -105,6 +102,11 @@ local function humanoid()
     local h = c:FindFirstChild("Humanoid")
     if h and h.ClassName == "Humanoid" then return h end
     return nil
+end
+
+local function rootPart()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
 end
 
 local function alive()
@@ -309,20 +311,71 @@ local function bosses()
     return scanBosses()
 end
 
+-- centre used for distance: root part, else primary part, else any part
+local function bossCenter(boss)
+    local r = boss:FindFirstChild("HumanoidRootPart")
+    if r and r.ClassName == "Part" then
+        local ok, p = pcall(function() return r.Position end)
+        if ok and p then return p end
+    end
+
+    local pp = boss.PrimaryPart
+    if pp then
+        local ok, p = pcall(function() return pp.Position end)
+        if ok and p then return p end
+    end
+
+    local ok, desc = pcall(function() return boss:GetDescendants() end)
+    if ok and desc then
+        for i = 1, #desc do
+            local d = desc[i]
+            if isBasePart(d) then
+                local okP, p = pcall(function() return d.Position end)
+                if okP and p then return p end
+            end
+        end
+    end
+
+    return nil
+end
+
+-- multiplier for one boss, based on how far it is from the player
+local function multFor(boss)
+    local base = HB_MULT
+    if Config.HitboxBig then base = HB_MULT_BIG end
+
+    local hrp = rootPart()
+    local c   = bossCenter(boss)
+    if not hrp or not c then return base end
+
+    local d = (c - hrp.Position).Magnitude
+    local m = base + math.floor(d / HB_PER_STUD)
+    if m > HB_MAX then m = HB_MAX end
+    if m < base then m = base end
+    return m
+end
+
 local function reportBosses()
     local list = scanBosses()
     print("[" .. NAME .. "] boss report (" .. tostring(#list) .. ")")
 
     for i = 1, #list do
-        local m = list[i]
+        local m  = list[i]
         local hp = "?"
+
         local h = m:FindFirstChild("Humanoid")
         if h and h.ClassName == "Humanoid" then
             local okH, v = pcall(function() return h.Health end)
             if okH and type(v) == "number" then hp = tostring(math.floor(v)) end
         end
-        print("  " .. m.Name .. "  parts=" .. tostring(countParts(m))
-            .. "  hp=" .. hp)
+
+        local parts = countParts(m)
+        local mult  = multFor(m)
+        local note  = ""
+        if parts == 0 then note = "  (no parts on client - cannot grow)" end
+
+        print("  " .. m.Name .. "  parts=" .. tostring(parts)
+            .. "  hp=" .. hp .. "  mult=x" .. tostring(mult) .. note)
     end
 end
 
@@ -393,12 +446,14 @@ local function growPart(d, mult, isRoot)
     return true
 end
 
-local function applyHitbox(mult)
+local function applyHitbox()
     local touched = 0
     local list = bosses()
 
     for i = 1, #list do
         local boss = list[i]
+        local mult = multFor(boss)
+
         local okD, desc = pcall(function() return boss:GetDescendants() end)
         if okD and desc then
             for j = 1, #desc do
@@ -512,7 +567,7 @@ local function buildTab(tab)
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
             addToggle(combat, "Auto Farm (hitbox + swing)", "fam_farm", "Farm", false)
-            addToggle(combat, "Huge Hitbox (x16)", "fam_hitbox_big", "HitboxBig", false)
+            addToggle(combat, "Huge Hitbox (x16 base)", "fam_hitbox_big", "HitboxBig", false)
             safeButton(combat, "Print Boss List", "fam_bosslist", function()
                 reportBosses()
                 notifyUser("Boss list printed to console", 4)
@@ -576,15 +631,13 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        local mult = hbFactor()
-
-        if mult > 0 then
+        if hbFactor() > 0 then
             pruneSaved()
-            local n = applyHitbox(mult)
-            if n > 0 and hbApplied ~= mult then
-                hbApplied = mult
-                print("[" .. NAME .. "] hitbox x" .. tostring(mult)
-                    .. " on " .. tostring(n) .. " parts (no collide, local)")
+            local n = applyHitbox()
+            if n > 0 and hbApplied == 0 then
+                hbApplied = 1
+                print("[" .. NAME .. "] hitbox on " .. tostring(n)
+                    .. " parts (distance scaled, no collide, local)")
             end
         elseif hbApplied ~= 0 then
             restoreHitbox()
