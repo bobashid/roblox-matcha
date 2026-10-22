@@ -1,40 +1,50 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v9.4  -  TP PICKUP DROPS 5 STUDS UNDER
+--  v9.5  -  WHY IT STAYED ON THE FLOOR, AND THE FIX
 --
---  One change from v9.3: TP_DEPTH is 5 instead of 3, so the trip lands
---  further under the floor while still inside the prompt's range.
---  That depth is not a guess - the live test fired at 1, 2, 3 and 5
---  studs and all four picked the egg (DEPTH 5 picked=true), so 5 is
---  the deepest value actually measured to work. 3 was the shallowest
---  that still hides you.
+--  THE CAUSE
+--    Writing a CFrame below the floor does not put you under it. Your
+--    Humanoid collides with the baseplate, and the physics step
+--    resolves the character straight back up to the surface. That is
+--    exactly what you felt: the teleport fires, the pickup works, but
+--    you end up at a normal Y level because the floor pushed you out.
+--    It also explains why every depth measured the same result - 1, 2,
+--    3 and 5 studs all "worked" because the character was standing on
+--    the floor in all four tests.
 --
---  Everything else is v9.3, which you confirmed works:
+--  THE FIX
+--    For the duration of the hop only, every part of YOUR OWN
+--    character has CanCollide turned off, and the originals are put
+--    back the moment you return. With nothing colliding, the CFrame
+--    write is not resolved away, so you actually sit under the floor.
+--
+--        save CFrame + save CanCollide of each character part
+--        CanCollide = false on those parts
+--        CFrame = under the egg (TP_DEPTH, default 10 studs)
+--        wait TP_SETTLE
+--        fire the egg's CarryPrompt
+--        wait TP_HOLD
+--        CFrame = home, CanCollide = saved values
+--
+--    Only your character is written. The map, the boss parts and the
+--    egg are never touched, so nothing about the world can break, and
+--    the collision values are restored on the same frame you come
+--    back - plus again in stop() if it is called mid-hop.
+--
+--  NOT VERIFIED YET
+--    The floor-push explanation fits every observation here, but this
+--    specific fix has not been run in your session. The console still
+--    prints the distance and whether the egg left, so it will be
+--    obvious immediately.
 --
 --  PICKUP
---      near range  - plain fireproximityprompt, instant, exactly like
---                    the version that took eggs as you walked past
---      far range   - TP Pickup on: save CFrame, drop TP_DEPTH under the
---                    egg, wait TP_SETTLE (0.15 s), fire the prompt
---                    once, wait TP_HOLD (0.2 s), restore the CFrame
---
---    The 0.15 s settle is the part that matters and the part earlier
---    builds got wrong: firing before the new position replicates makes
---    the server refuse the prompt, which is why the teleport visibly
---    worked but no egg was taken.
---
---  SAFETY
---    - one egg per pass, PICK_COOLDOWN stops the same egg retrying
---    - the CFrame is restored even if the prompt errors, and again in
---      stop() if it is called mid-teleport
---    - only your own CFrame and your own tool's AttackPart are written
+--      near range  - plain fireproximityprompt, instant
+--      far range   - the hop above, one egg per pass
 --
 --  RARITY FILTERS
 --    Read from the egg's own EggGui "Rarity" TextLabel - the text the
---    game shows in world - with the area name only as a fallback,
---    because an IceMosquitoEgg has been seen in UncommonArea labelled
---    Rare.
+--    game shows in world - with the area name only as a fallback.
 --
 --  PANELS
 --      left  PANEL_X = 300   boss name, HP bar, hp / max
@@ -42,8 +52,8 @@
 --    Game colours: 40,40,50 backdrop, white names, bold text.
 --
 --  Hit logic unchanged from v8.2:
---    - AttackPart is the only thing written: shrink to 2 studs to end
---      every contact, grow back to map size to begin a new one
+--    - AttackPart is the only thing written on the tool: shrink to 2
+--      studs to end every contact, grow back to map size for a new one
 --    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
 --      the tool's ActorId value
 --    - no mouse input, no equip or unequip, nothing reparented
@@ -58,7 +68,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v9.4"
+local VERSION = "v9.5"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -88,10 +98,10 @@ local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
 local EGG_TTL      = 1.0
 
--- pickup tuning (timings and depth from the live depth test)
+-- pickup tuning
 local PICK_RATE     = 0.35
 local PICK_COOLDOWN = 1.0
-local TP_DEPTH      = 5
+local TP_DEPTH      = 10
 local TP_SETTLE     = 0.15
 local TP_HOLD       = 0.20
 
@@ -166,8 +176,10 @@ local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
 
-local tpHome = nil
-local tpAway = false
+-- held between the two CFrame writes so stop() can put you back
+local tpHome   = nil
+local tpAway   = false
+local tpSaved  = {}   -- character part address -> { part, collide }
 
 local function restoreHome()
     if tpAway and tpHome then
@@ -181,6 +193,43 @@ local function restoreHome()
 
     tpAway = false
     tpHome = nil
+end
+
+-- character-only collision switch, restored right after the hop
+local function noClipOn()
+    tpSaved = {}
+
+    local c = LP.Character
+    if not c then return end
+
+    local ok, desc = pcall(function() return c:GetDescendants() end)
+    if not ok or not desc then return end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "Part" or d.ClassName == "MeshPart" then
+            local k = keyOf(d)
+            local okC, col = pcall(function() return d.CanCollide end)
+
+            if k ~= nil and okC and col == true then
+                tpSaved[#tpSaved + 1] = { part = d, collide = col }
+                pcall(function() d.CanCollide = false end)
+            end
+        end
+    end
+end
+
+local function noClipOff()
+    for i = 1, #tpSaved do
+        local e = tpSaved[i]
+
+        if e.part then
+            pcall(function() e.part.CanCollide = e.collide end)
+        end
+    end
+
+    tpSaved = {}
 end
 
 _G.FeedAMosquito = { stop = function() running = false end }
@@ -224,7 +273,7 @@ local function isBasePart(p)
         or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
 end
 
-local function keyOf(inst)
+function keyOf(inst)
     if inst == nil then return nil end
     local ok, a = pcall(function() return inst.Address end)
     if ok and a ~= nil then return a end
@@ -1103,7 +1152,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- EGG PICKUP  (plain fire near, teleport trip when TP is on)
+-- EGG PICKUP  (character collision off during the hop only)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasPrompt = (type(fireproximityprompt) == "function")
@@ -1157,6 +1206,12 @@ task.spawn(function()
                                             tpHome = home
                                             tpAway = true
 
+                                            -- the floor was resolving the
+                                            -- character back up; with the
+                                            -- character's own collision off
+                                            -- the write actually holds
+                                            noClipOn()
+
                                             pcall(function()
                                                 hrp.CFrame = CFrame.new(
                                                     epos.X,
@@ -1165,8 +1220,6 @@ task.spawn(function()
                                                 )
                                             end)
 
-                                            -- measured settle: fire only after
-                                            -- the new position replicated
                                             task.wait(TP_SETTLE)
 
                                             if running and Config.Pickup then
@@ -1175,14 +1228,14 @@ task.spawn(function()
                                                 end)
                                             end
 
-                                            -- and stay long enough for the
-                                            -- server to finish the pickup
                                             task.wait(TP_HOLD)
 
                                             local okR, hrp2 = pcall(function() return rootPart() end)
                                             local back = (okR and hrp2) or hrp
 
                                             pcall(function() back.CFrame = home end)
+
+                                            noClipOff()
 
                                             tpAway = false
                                             tpHome = nil
@@ -1222,7 +1275,6 @@ task.spawn(function()
                                         end
                                     end
                                 else
-                                    -- v9.0 behaviour: plain prompt fire
                                     pcall(function() fireproximityprompt(prompt) end)
                                     done = true
                                     taken = taken + 1
@@ -1257,6 +1309,7 @@ task.spawn(function()
             end
 
             pcall(restoreHome)
+            pcall(noClipOff)
             task.wait(0.2)
         end
     end
@@ -1474,6 +1527,7 @@ end)
 local function stop()
     running = false
     pcall(restoreHome)
+    pcall(noClipOff)
     pcall(stopHud)
     pcall(restoreAttackParts)
     pcall(function() fireEvent("StopTransfuseBlood") end)
@@ -1488,5 +1542,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - tp pickup drops 5 under", 5)
+notifyUser("Loaded - tp under with collision off", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
