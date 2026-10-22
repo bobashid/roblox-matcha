@@ -1,32 +1,40 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v4.5
+--  v4.6
 --
---  THE FLOOR WAS BEING GROWN  (why it flung you and why only 3 worked)
---    Workspace.SpawnAreas.<Type>Area is itself a Model. v4.3/v4.4 added
---    every Model under SpawnAreas as a "boss", so each area container
---    was treated as a boss too. That pulled in its Area part (the
---    arena FLOOR) and ChaseArea, grew them x8 and - in v4.4 - turned
---    their CanCollide off. An x8 floor with no collision is exactly
---    the drop/glitch/fling you saw, and the container being handled
---    first is why only the first few areas looked like they worked.
+--  WHAT THE LIVE SCAN SHOWED (measured in the game, not guessed)
+--    SpawnAreas has 8 areas. The boss models are named <Type>Mama and
+--    sit directly under their area:
+--      CommonArea     no Mama (only *MosquitoEgg models)
+--      UncommonArea   UncommonMama    22 parts
+--      RareArea       RareMama        22 parts
+--      EpicArea       EpicMama        23 parts
+--      LegendaryArea  LegendaryMama    0 parts   <-- no parts at all
+--      MythicalArea   no Mama
+--      DivineArea     DivineMama      (parts only when loaded)
+--      SecretArea     no Mama
+--    A model with 0 parts cannot be resized: its parts are not on the
+--    client at that moment (streamed out because it is far away) or
+--    the body lives in another model. Nothing client-side can enlarge
+--    what the client does not have. That is why the last bosses stay
+--    normal size while the near ones work.
+--    The scan now reports part counts, so the log shows exactly which
+--    boss has nothing to grow, and a boss whose parts stream in later
+--    is picked up on the next pass instead of being skipped forever.
 --
---  WHAT COUNTS AS A BOSS NOW
---    A Model is only grown if it looks like a boss itself:
---      - its name contains "Mama", or
---      - it has a DIRECT child Humanoid (the area container only has
---        one deeper down, so it no longer matches)
---    The scan walks every descendant of SpawnAreas, so bosses nested
---    at any depth are found. If SpawnAreas yields nothing it falls
---    back to every "Mama" model in Workspace.
---    Parts named "Area" and "ChaseArea" are never touched, ever.
---
---  HITBOX
---    size = first-seen size * multiplier (x8, x16 with Huge).
---    CanCollide is off while a part is grown so it cannot shove you,
---    and both size and CanCollide go back exactly as they were when
---    Auto Farm goes off or the script stops.
+--  WHAT CHANGED
+--    - Boss scan: <Type>Mama models anywhere under SpawnAreas, plus
+--      any model there with a direct Humanoid that is not an Egg and
+--      not a player character. Player characters are never touched.
+--    - HumanoidRootPart (or PrimaryPart) is grown to at least
+--      HB_ROOT_MIN studs even when the rest of the body is small, so
+--      every boss that has any parts at all gets a big hit target.
+--    - Parts named Area / ChaseArea are never resized (that was the
+--      floor being grown and flinging you in v4.3/v4.4).
+--    - "Print Boss List" button in Combat: writes every boss the scan
+--      sees, with part count and health, to the console.
+--    - CanCollide off while a part is grown, restored with the size.
 --
 --  AUTO SWING
 --    Stand still, Attack remote fired every SWING_RATE. No CFrame
@@ -34,9 +42,6 @@
 --
 --  MAIN
 --    Always Heal, Auto Collect.
---
---  The boss list is printed whenever it changes, so you can see in the
---  console exactly which models are being expanded.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -47,7 +52,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v4.5"
+local VERSION = "v4.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -68,9 +73,10 @@ local ATK_TTL      = 1.0
 local HB_RATE      = 0.5
 local BOSS_TTL     = 2.0
 
--- hitbox multipliers (plain multiply, no cap)
+-- hitbox tuning
 local HB_MULT      = 8
 local HB_MULT_BIG  = 16
+local HB_ROOT_MIN  = 14
 
 -- parts that must never be resized
 local SKIP_PART = {
@@ -124,16 +130,33 @@ local function isBasePart(p)
         or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
 end
 
--- a model that has a Humanoid as one of its OWN children
+local function countParts(m)
+    local n = 0
+    local ok, desc = pcall(function() return m:GetDescendants() end)
+    if not ok or not desc then return 0 end
+    for i = 1, #desc do
+        if isBasePart(desc[i]) then n = n + 1 end
+    end
+    return n
+end
+
+local function isPlayerChar(m)
+    if m == LP.Character then return true end
+    local ok, plr = pcall(function() return Players:GetPlayerFromCharacter(m) end)
+    return ok and plr ~= nil
+end
+
 local function hasDirectHumanoid(m)
     local h = m:FindFirstChild("Humanoid")
     return h ~= nil and h.ClassName == "Humanoid"
 end
 
--- a boss, not the area container that holds it
+-- a boss, not an area container, an egg or a player
 local function looksLikeBoss(m)
     if m.ClassName ~= "Model" then return false end
+    if isPlayerChar(m) then return false end
     if string.find(m.Name, "Mama", 1, true) then return true end
+    if string.find(m.Name, "Egg", 1, true) then return false end
     return hasDirectHumanoid(m)
 end
 
@@ -223,7 +246,7 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- BOSS SCAN  (boss models only, area containers excluded)
+-- BOSS SCAN
 --------------------------------------------------------------------
 local bossList  = {}
 local bossStamp = 0
@@ -248,14 +271,15 @@ local function scanBosses()
         end
     end
 
-    -- fallback: nothing found under SpawnAreas, look for Mama models anywhere
+    -- nothing usable under SpawnAreas: look for Mama models anywhere
     if #out == 0 then
         local ok, desc = pcall(function() return WS:GetDescendants() end)
         if ok and desc then
             for i = 1, #desc do
                 local d = desc[i]
-                if d.ClassName == "Model" and string.find(d.Name, "Mama", 1, true) then
-                    addBoss(out, d)
+                if d.ClassName == "Model" and string.find(d.Name, "Mama", 1, true)
+                    and not isPlayerChar(d) then
+                    out[#out + 1] = d
                 end
             end
         end
@@ -283,6 +307,23 @@ end
 local function bosses()
     if #bossList > 0 and (tick() - bossStamp) < BOSS_TTL then return bossList end
     return scanBosses()
+end
+
+local function reportBosses()
+    local list = scanBosses()
+    print("[" .. NAME .. "] boss report (" .. tostring(#list) .. ")")
+
+    for i = 1, #list do
+        local m = list[i]
+        local hp = "?"
+        local h = m:FindFirstChild("Humanoid")
+        if h and h.ClassName == "Humanoid" then
+            local okH, v = pcall(function() return h.Health end)
+            if okH and type(v) == "number" then hp = tostring(math.floor(v)) end
+        end
+        print("  " .. m.Name .. "  parts=" .. tostring(countParts(m))
+            .. "  hp=" .. hp)
+    end
 end
 
 --------------------------------------------------------------------
@@ -317,13 +358,12 @@ local function pruneSaved()
     return dead and #dead or 0
 end
 
-local function growPart(d, mult)
+local function growPart(d, mult, isRoot)
     if SKIP_PART[d.Name] then return false end
 
     local base = hbSaved[d]
 
     if base == nil then
-        -- save size and collision exactly once, before we change them
         local okS, s = pcall(function() return d.Size end)
         if not okS or not s then return false end
         base = s
@@ -333,8 +373,18 @@ local function growPart(d, mult)
         hbCollide[d] = (okC and c) and true or false
     end
 
+    local nx = base.X * mult
+    local ny = base.Y * mult
+    local nz = base.Z * mult
+
+    if isRoot then
+        if nx < HB_ROOT_MIN then nx = HB_ROOT_MIN end
+        if ny < HB_ROOT_MIN then ny = HB_ROOT_MIN end
+        if nz < HB_ROOT_MIN then nz = HB_ROOT_MIN end
+    end
+
     pcall(function()
-        d.Size = Vector3.new(base.X * mult, base.Y * mult, base.Z * mult)
+        d.Size = Vector3.new(nx, ny, nz)
     end)
 
     -- a grown part must not shove the player around
@@ -353,8 +403,9 @@ local function applyHitbox(mult)
         if okD and desc then
             for j = 1, #desc do
                 local d = desc[j]
-                if isBasePart(d) and growPart(d, mult) then
-                    touched = touched + 1
+                if isBasePart(d) then
+                    local isRoot = (d.Name == "HumanoidRootPart") or (boss.PrimaryPart == d)
+                    if growPart(d, mult, isRoot) then touched = touched + 1 end
                 end
             end
         end
@@ -416,6 +467,19 @@ local function safeToggle(sec, name, id, default, cb)
     return false
 end
 
+local function safeButton(sec, name, id, cb)
+    local tries = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, id, cb) end,
+        function() sec:Button(id, name, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Button failed: " .. tostring(name))
+    return false
+end
+
 local function makeSection(tab, name, side)
     local ok, sec = pcall(function() return tab:Section(name, side) end)
     if ok and type(sec) == "table" then return sec end
@@ -449,6 +513,10 @@ local function buildTab(tab)
         if combat then
             addToggle(combat, "Auto Farm (hitbox + swing)", "fam_farm", "Farm", false)
             addToggle(combat, "Huge Hitbox (x16)", "fam_hitbox_big", "HitboxBig", false)
+            safeButton(combat, "Print Boss List", "fam_bosslist", function()
+                reportBosses()
+                notifyUser("Boss list printed to console", 4)
+            end)
         end
     end)
 
@@ -625,5 +693,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Auto Farm: bosses only, no floor", 5)
+notifyUser("Loaded - Auto Farm + Print Boss List", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
