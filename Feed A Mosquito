@@ -1,44 +1,48 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v9.1  -  TP PICKUP: UNDER THE EGG, THEN STRAIGHT BACK
+--  v9.2  -  TP PICKUP: CLOSER, AND FIRED SEVERAL TIMES
 --
---  WHY TELEPORT IS NEEDED
---    Probed directly: firing an egg's CarryPrompt from 126 studs away
---    runs with no error (FIRED true nil), but the egg only leaves when
---    you are actually near it. So the refusal is server side - the
---    handler checks your real distance before handing the egg over.
---    Nothing sent from the client changes that, so the only way to
---    take a far egg is to genuinely be there for a moment.
+--  WHAT CHANGED FROM v9.1
+--    You confirmed the teleport itself works, so the CFrame write and
+--    the restore are both fine. The only part that failed is the prompt
+--    being ACCEPTED, and the one variable there is your distance from
+--    it. Two adjustments:
 --
---  THE CYCLE  (one egg per pass, never more)
---      1. save your HumanoidRootPart CFrame
---      2. move you under that egg: eggPos.Y - TP_DEPTH
---      3. wait TP_SETTLE so the position replicates
---      4. fireproximityprompt(egg.CarryPrompt)
---      5. wait TP_HOLD so the server processes while you are in range
---      6. put your CFrame back exactly where it was
+--      1. TP_DEPTH is now 3 studs instead of 5. A ProximityPrompt has
+--         a MaxActivationDistance and it measures from the prompt's
+--         attachment, which sits ABOVE the egg's root. Dropping 5
+--         studs down plus that gap can put you outside the limit,
+--         which would explain a working teleport with no pickup.
+--         3 studs still puts you under the floor if the egg sits on
+--         it, which is what keeps you out of sight.
 --
---    TP_DEPTH is 5 studs below the egg's root, which is under the
---    floor and still inside a normal prompt's activation range. The
---    hold is what makes it work: teleporting back instantly would let
---    the server check your position after you had already left.
+--      2. the prompt is fired TP_FIRES (3) times with a small gap
+--         while you are still under the egg, instead of once. Prompts
+--         can ignore a fire that arrives before your position has
+--         replicated, so repeating it across the hold covers that.
 --
---    Two CFrame writes per egg, one egg per pass at 0.35 s. That is
---    the expensive path in this VM, so it is deliberately not a loop
---    over every egg at once.
+--    The cycle per egg is now:
+--        save CFrame -> drop TP_DEPTH under the egg -> settle
+--        -> fire prompt 3x -> restore CFrame
+--    one egg per pass, still ~0.35 s apart, never a batch.
 --
---    If the character or prompt is missing the pass falls back to a
---    plain proximity fire, so nothing silently stops working.
---    stop() also restores your CFrame if it is called mid-teleport.
+--  DIAGNOSTIC
+--    On the first egg it prints the distance you were from the egg
+--    when the prompt fired, then whether the egg was still there
+--    afterwards:
+--        tp pickup on MosquitoEgg  dist 3  prompt=CarryPrompt
+--        egg still there: false
+--    false means it worked. If it says true at dist 3, then the
+--    distance is not the blocker and the prompt simply is not how this
+--    game hands eggs over - which would be the next thing to look at.
 --
 --  RARITY FILTERS
---    Read from the egg's own EggGui "Rarity" TextLabel - the text the
---    game shows in world. Area name is only a fallback, because an
+--    Read from the egg's own EggGui "Rarity" TextLabel, i.e. the text
+--    the game shows in world. Area name is only a fallback, because an
 --    IceMosquitoEgg has been seen inside UncommonArea labelled Rare.
---    Only eggs whose rarity toggle is on are taken.
 --
---  PANELS
+--  PANELS (unchanged)
 --      left  PANEL_X = 300   boss name, HP bar, hp / max
 --      right EGG_X  = 634    egg name, rarity, Price
 --    Game colours: 40,40,50 backdrop, white names, bold text.
@@ -61,7 +65,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v9.1"
+local VERSION = "v9.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -94,9 +98,11 @@ local EGG_TTL      = 1.0
 -- tp pickup tuning
 local PICK_RATE     = 0.35
 local PICK_COOLDOWN = 1.0
-local TP_DEPTH      = 5
+local TP_DEPTH      = 3      -- studs below the egg root
 local TP_SETTLE     = 0.05
-local TP_HOLD       = 0.18
+local TP_HOLD       = 0.22
+local TP_FIRES      = 3
+local TP_FIRE_GAP   = 0.06
 
 -- panel tuning
 local PANEL_ROWS   = 6
@@ -168,9 +174,8 @@ local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
 
--- held between the two CFrame writes so stop() can put you back
-local tpHome  = nil
-local tpAway  = false
+local tpHome = nil
+local tpAway = false
 
 local function restoreHome()
     if tpAway and tpHome then
@@ -1105,7 +1110,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- TP EGG PICKUP  (under the egg, hold, then back)
+-- TP EGG PICKUP  (closer, fired several times)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasPrompt = (type(fireproximityprompt) == "function")
@@ -1156,23 +1161,31 @@ task.spawn(function()
                                     tpHome = home
                                     tpAway = true
 
+                                    local under = Vector3.new(
+                                        epos.X,
+                                        epos.Y - TP_DEPTH,
+                                        epos.Z
+                                    )
+
                                     pcall(function()
-                                        hrp.CFrame = CFrame.new(
-                                            epos.X,
-                                            epos.Y - TP_DEPTH,
-                                            epos.Z
-                                        )
+                                        hrp.CFrame = CFrame.new(under)
                                     end)
 
                                     task.wait(TP_SETTLE)
 
-                                    if running and Config.Pickup then
-                                        pcall(function() fireproximityprompt(prompt) end)
-                                    end
+                                    local dist = -1
+                                    local okD, d = pcall(function()
+                                        local r = rootPart()
+                                        if not r then return -1 end
+                                        return (r.Position - epos).Magnitude
+                                    end)
+                                    if okD and type(d) == "number" then dist = d end
 
-                                    -- stay in range long enough for the
-                                    -- server to accept the prompt
-                                    task.wait(TP_HOLD)
+                                    for f = 1, TP_FIRES do
+                                        if not running or not Config.Pickup then break end
+                                        pcall(function() fireproximityprompt(prompt) end)
+                                        task.wait(TP_FIRE_GAP)
+                                    end
 
                                     local okR, hrp2 = pcall(function() return rootPart() end)
                                     local back = (okR and hrp2) or hrp
@@ -1191,12 +1204,13 @@ task.spawn(function()
                                         diag = true
                                         print("[" .. NAME .. "] tp pickup on "
                                             .. tostring(egg.name)
-                                            .. " prompt=" .. tostring(prompt.Name))
+                                            .. "  dist " .. tostring(math.floor(dist))
+                                            .. "  prompt=" .. tostring(prompt.Name))
 
                                         local model = egg.model
 
                                         task.spawn(function()
-                                            task.wait(0.8)
+                                            task.wait(0.9)
 
                                             local still = false
                                             local okQ, q = pcall(function() return model.Parent end)
@@ -1207,7 +1221,6 @@ task.spawn(function()
                                     end
                                 end
                             elseif prompt then
-                                -- no root part yet: plain proximity fire
                                 pcall(function() fireproximityprompt(prompt) end)
                                 done = true
 
@@ -1469,5 +1482,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - tp pickup under egg", 5)
+notifyUser("Loaded - tp pickup closer, 3 fires", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
