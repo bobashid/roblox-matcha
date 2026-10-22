@@ -1,32 +1,32 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v2.9
+--  v3.0
 --
---  TOGGLE NAMES describe exactly what they do:
+--  THIS BUILD
 --    Always Heal   TransfuseBlood remote. Keeps max HP climbing.
 --    Auto Collect  CollectIncome + ClaimOfflineIncome.
---    Spam Swing    Fires Attack on a cadence wherever you stand.
---                  No target, no movement. (was "Auto Farm")
---    Kill Aura     Moves to the nearest boss and swings. (was
---                  "Auto Kill")
+--    Kill Aura     Moves to the nearest boss and swings.
+--    Boss Teleport One button per boss type.
 --
---  KILL AURA FIX
---    v2.8 scanned only Workspace:GetChildren(). The bosses are Actors
---    under PlayerScripts.Runtime.Actors (Egg_RareArea_Enemy_140_4 and
---    friends), and their models sit under Workspace.SpawnAreas, so the
---    scan returned nothing and the toggle never fired a swing.
---    The scan now walks Workspace children AND every descendant of
+--  Spam Swing is removed. Kill Aura is the only attack toggle: it is
+--  the one that walks to a boss and kills it, not the stand-still
+--  swing that was mislabelled "Auto Farm" earlier.
+--
+--  KILL AURA
+--    Bosses are Actors under PlayerScripts.Runtime.Actors with models
+--    under Workspace.SpawnAreas (Egg_RareArea_Enemy_140_4 and so on),
+--    so the scan walks Workspace children AND every descendant of
 --    Workspace.SpawnAreas.
---    It also stands 2 studs ABOVE the target root instead of under the
---    map, and waits 0.1s after moving so the server resolves the hit
---    from the new position.
+--    It stands 2 studs above the target root and waits 0.1s before
+--    swinging, so the server resolves the hit from the new position.
+--    Standing under the map put the swing out of range, which is why
+--    the earlier version never landed a hit.
 --
 --  BOSS TELEPORT
---    Workspace.SpawnAreas.<Type>Area holds the real coordinates. Each
---    button reads that model at click time and uses the first part
---    that is not at the origin. If the area model has no usable part,
---    it falls back to the nearest live boss of that type.
+--    Reads Workspace.SpawnAreas.<Type>Area at click time, skipping
+--    parts still at the origin. Falls back to the nearest live boss
+--    of that type. Prints the source and coordinates it used.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -37,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.9"
+local VERSION = "v3.0"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -53,7 +53,6 @@ local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
 local HP_LOG_RATE  = 5.0
 local COLLECT_RATE = 1.5
-local SWING_RATE   = 0.3
 local AURA_RATE    = 0.3
 local ATK_TTL      = 0.5
 local MOVE_EPS2    = 4
@@ -68,7 +67,6 @@ local BOSS_TYPES = {
 local Config = {
     Heal        = false,
     AutoCollect = false,
-    SpamSwing   = false,
     Aura        = false,
 }
 
@@ -139,6 +137,9 @@ end
 
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
+--   Tool_Character_<userId>_<n>_<m>.Events.Attack
+--   <n> changes on a weapon upgrade, so the cache expires and the
+--   cached remote must still have a live parent chain.
 --------------------------------------------------------------------
 local atkCache = nil
 local atkStamp = 0
@@ -197,10 +198,6 @@ end
 
 --------------------------------------------------------------------
 -- Boss scan
---   Boss models are named <Type>Area_Enemy_<n> or
---   Egg_<Type>Area_Enemy_<n>. They are not always direct children of
---   Workspace - the live ones sit under Workspace.SpawnAreas - so the
---   scan walks both.
 --------------------------------------------------------------------
 local function modelPart(model)
     local p = model:FindFirstChild("HumanoidRootPart")
@@ -258,7 +255,6 @@ local function nearestOf(list, fromPos, bossType)
     return best, bestPos
 end
 
--- real coordinates for an area, read from Workspace.SpawnAreas
 local function areaPos(bossType)
     local areas = WS:FindFirstChild("SpawnAreas")
     if not areas then return nil end
@@ -270,7 +266,7 @@ local function areaPos(bossType)
     if not okD or not desc then return nil end
 
     for i = 1, #desc do
-        local c = desc[i]
+        local c  = desc[i]
         local cn = c.ClassName
         if cn == "Part" or cn == "MeshPart"
             or cn == "UnionOperation" or cn == "SpawnLocation" then
@@ -371,7 +367,6 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Spam Swing", "fam_swing", "SpamSwing", false)
             addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
         end
 
@@ -522,19 +517,6 @@ task.spawn(function()
             fireEvent("ClaimOfflineIncome")
         end
         task.wait(COLLECT_RATE)
-    end
-end)
-
---------------------------------------------------------------------
--- SPAM SWING
---   Swings wherever you stand, no target needed.
---------------------------------------------------------------------
-task.spawn(function()
-    while running do
-        if Config.SpamSwing then
-            swing()
-        end
-        task.wait(SWING_RATE)
     end
 end)
 
