@@ -1,44 +1,33 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.7
+--  v5.8
 --
---  WHY "BRING HITBOX TO ME" DID NOTHING
---    The boss parts are driven by Motor6D / weld joints. Writing a
---    CFrame to a jointed part is reverted by the animation on the same
---    physics step, so the box never actually appears on you. That whole
---    approach is gone.
+--  NEW: CROSS-MAP HIT (teleport swing)
+--    The server measures how far your character is from the boss when
+--    the Attack remote lands, so a client cannot just claim a hit from
+--    across the map. The one thing that always works is actually being
+--    there. This mode does that for a single frame:
 --
---  WHY x100 STILL MISSED
---    A part grows around its own centre. A 2-stud part at x100 reaches
---    about 100 studs from the boss. If you stand two arenas away, that
---    is simply not enough, so the swing resolves at your real spot and
---    misses. The multiplier is now computed per boss from the distance:
+--        save your CFrame -> jump onto the boss -> fire the Attack
+--        volley -> jump straight back to the saved CFrame
 --
---        mult = (dist + PAD) / largestHalfExtent * 1.15
+--    One boss per pass, round-robin through every type, so it costs
+--    2 CFrame writes per pass instead of one per frame. You stay put
+--    visually; the server sees you in range for the swing.
+--    Nothing is resized, so the Huge Hitbox mode is now optional and
+--    can be left off.
 --
---    so the largest grown part always spans from the boss to at least
---    your position, wherever you stand. Clamped to [50, 1500]. Near
---    bosses sit at the floor value, far bosses get huge.
---    The size is always original * mult, taken from the size saved by
---    Address the first time a part was seen, so it can never compound
---    and a game-side reset is corrected on the next pass.
+--  HUGE HITBOX (still there, off by default)
+--    Grows every boss part except HumanoidRootPart / Area / ChaseArea
+--    and anything already 40+ studs, sized from your distance each
+--    pass so a far boss gets a bigger box. Restored on toggle off.
 --
---  RAPID SWING
---    Every tool's Attack remote is fired in BURST passes per cycle
---    (default 3) with a tiny gap, then the loop repeats every 0.04 s.
---    That is roughly 75 full volleys per second across every boss tool,
---    so all of them get hit constantly instead of one per 0.1 s.
+--  AUTO FARM
+--    Fires every tool's Attack remote in bursts. Equip a weapon or the
+--    remotes do not exist yet - the script says so in the console.
 --
---  WHY THE FLOOR IS STILL SAFE
---    HumanoidRootPart is never resized (it lies on the arena floor and
---    at these multipliers it would swallow the arena), parts named
---    Area / ChaseArea are skipped, and any part whose ORIGINAL size is
---    already 40 studs on an axis is treated as scenery and left alone.
---    CanCollide is off while grown and restored with the size.
---
---  Stand still, no CFrame writes to your character, everything restored
---  when Auto Farm goes off or the script stops.
+--  Always Heal / Auto Collect are unchanged.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -49,7 +38,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.7"
+local VERSION = "v5.8"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -63,27 +52,27 @@ local built   = false
 local POLL_RATE    = 0.1
 local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
-local HP_LOG_RATE  = 5.0
 local COLLECT_RATE = 1.5
-local SWING_RATE   = 0.04
+local SWING_RATE   = 0.06
 local SWING_BURST  = 3
 local BURST_GAP    = 0.015
 local ATK_TTL      = 1.0
 local HB_RATE      = 0.2
+local REACH_RATE   = 0.15
+local REACH_HEIGHT = 2.5
 
 -- reach tuning
-local HB_PAD        = 25     -- margin past the player, in studs
+local HB_PAD        = 25
 local HB_MULT_MIN   = 50
 local HB_MULT_MAX   = 1500
-local HB_BOOST      = 2      -- Huge Hitbox
-local HB_SKIP_SIZE  = 40     -- original axis this big -> scenery
+local HB_BOOST      = 2
+local HB_SKIP_SIZE  = 40
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
     "Mythical", "Divine", "Secret", "Epic",
 }
 
--- parts that must never be resized
 local SKIP_PART = {
     Area      = true,
     ChaseArea = true,
@@ -93,6 +82,7 @@ local Config = {
     Heal        = false,
     AutoCollect = false,
     Farm        = false,
+    Reach       = false,
     HitboxBig   = false,
 }
 
@@ -140,8 +130,6 @@ local function isBasePart(p)
         or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
 end
 
--- Matcha hands back a new proxy for the same part on every scan, so the
--- instance cannot be a table key. Address is stable.
 local function keyOf(inst)
     if inst == nil then return nil end
     local ok, a = pcall(function() return inst.Address end)
@@ -199,7 +187,7 @@ local function fireEvent(name)
 end
 
 --------------------------------------------------------------------
--- Tool actor Attack remotes (re-scanned when stale)
+-- Tool actor Attack remotes
 --------------------------------------------------------------------
 local atkCache = nil
 local atkStamp = 0
@@ -280,7 +268,6 @@ local function bossOf(bossType)
     return bossModelIn(areaModel(bossType))
 end
 
--- stable centre: root part first (never grown), then any part
 local function bossCenter(boss)
     local r = boss:FindFirstChild("HumanoidRootPart")
     if r and r.ClassName == "Part" then
@@ -303,7 +290,68 @@ local function bossCenter(boss)
 end
 
 --------------------------------------------------------------------
--- BOSS HITBOX EXPANDER  (distance sized, saved once per Address)
+-- CROSS-MAP HIT (teleport swing)
+--------------------------------------------------------------------
+local reachIndex = 0
+local reachHome  = nil
+local reachAway  = false
+
+local function reachBack()
+    if reachAway and reachHome then
+        local hrp = rootPart()
+        if hrp then
+            pcall(function() hrp.CFrame = reachHome end)
+        end
+    end
+    reachAway = false
+    reachHome = nil
+end
+
+-- returns the boss it used, or nil
+local function reachPass()
+    local hrp = rootPart()
+    if not hrp then return nil end
+
+    local okH, home = pcall(function() return hrp.CFrame end)
+    if not okH or not home then return nil end
+
+    local total = #BOSS_TYPES
+    local boss  = nil
+
+    for i = 1, total do
+        reachIndex = (reachIndex % total) + 1
+        local b = bossOf(BOSS_TYPES[reachIndex])
+        if b then boss = b break end
+    end
+
+    if not boss then return nil end
+
+    local center = bossCenter(boss)
+    if not center then return nil end
+
+    reachHome = home
+    reachAway = true
+
+    pcall(function()
+        hrp.CFrame = CFrame.new(center.X, center.Y + REACH_HEIGHT, center.Z)
+    end)
+
+    swingOnce()
+
+    task.wait(BURST_GAP)
+    if running then swingOnce() end
+
+    local okR, hrp2 = pcall(function() return rootPart() end)
+    local back = (okR and hrp2) or hrp
+    pcall(function() back.CFrame = home end)
+
+    reachAway = false
+    reachHome = nil
+    return BOSS_TYPES[reachIndex]
+end
+
+--------------------------------------------------------------------
+-- BOSS HITBOX EXPANDER (distance sized, saved once per Address)
 --------------------------------------------------------------------
 local hbSaved   = {}   -- address -> { part, size, collide }
 local hbApplied = false
@@ -354,7 +402,6 @@ local function restoreHitbox()
     hbApplied = false
 end
 
--- multiplier that makes the largest grown part span the gap to you
 local function multForDistance(dist, maxHalf)
     if maxHalf < 0.5 then maxHalf = 0.5 end
     local m = ((dist + HB_PAD) / maxHalf) * 1.15
@@ -364,7 +411,6 @@ local function multForDistance(dist, maxHalf)
     return m
 end
 
--- register + grow one boss; returns parts touched
 local function growBoss(boss, myPos)
     local center = bossCenter(boss)
     if not center then return 0 end
@@ -375,7 +421,6 @@ local function growBoss(boss, myPos)
     local ok, desc = pcall(function() return boss:GetDescendants() end)
     if not ok or not desc then return 0 end
 
-    -- pass 1: register originals, find the largest half-extent
     local entries = {}
     local maxHalf = 0
 
@@ -409,7 +454,6 @@ local function growBoss(boss, myPos)
 
     if #entries == 0 then return 0 end
 
-    -- pass 2: one multiplier for the whole boss
     local mult = multForDistance(dist, maxHalf)
     local touched = 0
 
@@ -511,7 +555,8 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Farm (all bosses, spam)", "fam_farm", "Farm", false)
+            addToggle(combat, "Auto Farm (spam attack)", "fam_farm", "Farm", false)
+            addToggle(combat, "Cross-Map Hit (teleport swing)", "fam_reach", "Reach", false)
             addToggle(combat, "Huge Hitbox (x2 reach)", "fam_hitbox_big", "HitboxBig", false)
         end
     end)
@@ -568,17 +613,49 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HITBOX LOOP
+-- CROSS-MAP REACH LOOP
+--------------------------------------------------------------------
+task.spawn(function()
+    local wasOn = false
+    local warned = false
+
+    while running do
+        if Config.Reach and Config.Farm and alive() then
+            if not wasOn then
+                wasOn  = true
+                warned = false
+                print("[" .. NAME .. "] cross-map reach on")
+            end
+
+            local used = reachPass()
+            if not used and not warned then
+                warned = true
+                print("[" .. NAME .. "] reach: no boss found yet")
+            end
+
+            task.wait(REACH_RATE)
+        else
+            if wasOn then
+                wasOn = false
+                pcall(reachBack)
+                print("[" .. NAME .. "] cross-map reach off")
+            end
+            task.wait(0.1)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- HITBOX LOOP (only when Reach is off)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Farm then
+        if Config.Farm and not Config.Reach then
             pruneSaved()
             local n = applyHitbox()
             if n > 0 and not hbApplied then
                 hbApplied = true
-                print("[" .. NAME .. "] hitbox on " .. tostring(n)
-                    .. " boss parts (distance sized, root skipped, local)")
+                print("[" .. NAME .. "] hitbox on " .. tostring(n) .. " boss parts")
             end
         elseif hbApplied then
             restoreHitbox()
@@ -589,14 +666,14 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO SWING  (burst spam across every boss tool)
+-- AUTO SWING (only when Reach is off - reach does its own swings)
 --------------------------------------------------------------------
 task.spawn(function()
     local wasOn  = false
     local warned = false
 
     while running do
-        if Config.Farm and alive() then
+        if Config.Farm and not Config.Reach and alive() then
             if not wasOn then
                 wasOn  = true
                 warned = false
@@ -611,7 +688,7 @@ task.spawn(function()
             else
                 for b = 2, SWING_BURST do
                     task.wait(BURST_GAP)
-                    if not running or not Config.Farm then break end
+                    if not running or not Config.Farm or Config.Reach then break end
                     swingOnce()
                 end
             end
@@ -633,25 +710,12 @@ end)
 task.spawn(function()
     local transfusing = false
     local lastFire    = 0
-    local lastMax     = 0
-    local lastLog     = 0
 
     while running do
         if Config.Heal then
             local hum = humanoid()
             if hum then
                 local now = tick()
-                local max = math.floor(hum.MaxHealth)
-
-                if max ~= lastMax then
-                    if lastMax ~= 0 and max > lastMax
-                        and (now - lastLog) >= HP_LOG_RATE then
-                        print("[" .. NAME .. "] max health " .. tostring(max))
-                        lastLog = now
-                    end
-                    lastMax = max
-                end
-
                 if not transfusing or (now - lastFire) >= HEAL_REFIRE then
                     if fireEvent("TransfuseBlood") then
                         transfusing = true
@@ -684,6 +748,7 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
+    pcall(reachBack)
     pcall(function() restoreHitbox() end)
     pcall(function() fireEvent("StopTransfuseBlood") end)
     atkCache = nil
@@ -693,5 +758,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - distance reach + spam", 5)
+notifyUser("Loaded - cross-map reach ready", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
