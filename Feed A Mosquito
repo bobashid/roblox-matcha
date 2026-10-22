@@ -1,38 +1,51 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v3.7
+--  v3.8
 --
---  SORT FIX
---    v3.6 sorted inside buildTab, but UI.AddTab fires on the first
---    frame after load, before the boss Humanoids are readable. Every
---    max health came back nil, so the tie-break fell through to the
---    alphabet and the list was never actually ordered by HP.
---    The tab now waits until at least two bosses report a MaxHealth
---    before it builds (or 15 seconds, whichever comes first), sorts by
---    MaxHealth descending, and prints the resulting order to console
---    so it can be checked.
---    Each toggle label also shows the HP it was sorted by.
+--  WHAT CHANGED
 --
---  NO HITBOX EXPANDER (why)
---    Attack is fired with NO arguments. The server resolves the hit
---    from the character position, so it never reads any size we could
---    change on the client. Enlarging the boss parts locally changes
---    nothing on the server and the swing still misses.
---    What does work is being next to the boss for the instant the
---    swing lands. That is what Far Hit does.
+--  HP SORT (why v3.7 still came out alphabetical)
+--    v3.7 read MaxHealth through
+--    boss:FindFirstChildOfClass("Humanoid"). Matcha's IsA() always
+--    returns true, so a class lookup can hand back any child and the
+--    health reads came back nil - every boss tied at 0 and the sort
+--    fell through to the name. The Humanoid is now found by walking
+--    the children and comparing ClassName == "Humanoid", with an
+--    attribute fallback (Health/MaxHealth, HP/MaxHP) in case the
+--    game stops using a Humanoid.
+--    The tab still waits until at least two bosses report a max
+--    health before building (or 15 seconds), sorts by max health
+--    descending, prints the order it used, and each toggle label
+--    shows the max HP it was sorted by.
+--
+--  BOSS HITBOX
+--    Two toggles in Combat:
+--      Boss Hitbox Expander   x3
+--      Bigger Hitbox          x6 (only matters while the expander is on)
+--    Every BasePart of every boss model is scaled around its own
+--    centre, capped at 24 studs per axis (a part is never made
+--    smaller than it already is). Original sizes are remembered the
+--    first time a part is seen and put back when the toggle goes off
+--    or the script stops.
+--    This is a LOCAL change. The client sees a bigger boss, the
+--    server does not. The Attack remote is fired with no arguments,
+--    so the server resolves the hit from your character position -
+--    that part is what Far Hit handles. The expander helps when the
+--    hit test runs on your client (mouse/raycast based) and makes a
+--    boss easy to see and click either way.
 --
 --  FAR HIT
 --    Remembers where you were, teleports to the selected boss feet,
 --    swings, then teleports straight back. You keep your position and
---    the hit resolves from on top of the boss. Two CFrame writes per
---    pass, throttled to FARHIT_RATE.
+--    the hit resolves from on top of the boss. Throttled to
+--    FARHIT_RATE.
 --
 --  KILL AURA
 --    Multi-select, dead bosses skipped, healthiest living selected
 --    boss wins. Teleports only on target change or if you drift more
---    than 12 studs. Skipped entirely while Far Hit is on so the two do
---    not fight over your position.
+--    than 12 studs. Skipped while Far Hit is on so the two do not
+--    fight over your position.
 --
 --  NO SELECTION = NO MOVEMENT
 --
@@ -41,8 +54,8 @@
 --      Area        Part   - arena floor
 --      ChaseArea   Part   - trigger volume ~14 studs up, never used
 --      <boss>Mama  Model  - the boss, with a Humanoid
---    UncommonMama's parts span Y 3 to Y 12, so the landing point is the
---    model bounding box: centre X/Z, lowest part Y + 1 (the feet).
+--    UncommonMama's parts span Y 3 to Y 12, so the landing point is
+--    the model bounding box: centre X/Z, lowest part Y + 1 (the feet).
 --    Common -> MosquitoMama, Uncommon -> UncommonMama,
 --    Rare -> RareMama, Epic -> EpicMama, Legendary -> LegendaryMama.
 --    Mythical / Divine / Secret have no boss model.
@@ -56,7 +69,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v3.7"
+local VERSION = "v3.8"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -80,6 +93,12 @@ local MOVE_EPS2    = 1
 local FOOT_LIFT    = 1
 local STRAY_D2     = 144
 local BUILD_WAIT   = 900
+local HB_RATE      = 0.4
+
+-- hitbox tuning
+local HB_MULT_SMALL = 3
+local HB_MULT_BIG   = 6
+local HB_AXIS_CAP   = 24
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -91,6 +110,8 @@ local Config = {
     AutoCollect = false,
     Aura        = false,
     FarHit      = false,
+    Hitbox      = false,
+    HitboxBig   = false,
 }
 
 local TOGGLES     = {}
@@ -107,7 +128,10 @@ _G.FeedAMosquito = { stop = function() running = false end }
 --------------------------------------------------------------------
 local function humanoid()
     local c = LP.Character
-    return c and c:FindFirstChild("Humanoid") or nil
+    if not c then return nil end
+    local h = c:FindFirstChild("Humanoid")
+    if h and h.ClassName == "Humanoid" then return h end
+    return nil
 end
 
 local function rootPart()
@@ -142,6 +166,13 @@ local function dist2(a, b)
     local dy = a.Y - b.Y
     local dz = a.Z - b.Z
     return dx * dx + dy * dy + dz * dz
+end
+
+local function isBasePart(p)
+    local cn = p.ClassName
+    return cn == "Part" or cn == "MeshPart" or cn == "UnionOperation"
+        or cn == "WedgePart" or cn == "CornerWedgePart" or cn == "TrussPart"
+        or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
 end
 
 --------------------------------------------------------------------
@@ -255,21 +286,58 @@ local function bossOf(bossType)
     return bossModelIn(areaModel(bossType))
 end
 
+-- ClassName walk, because IsA() is always true here and
+-- FindFirstChildOfClass can return the wrong child.
+local function findHumanoid(boss)
+    if not boss then return nil end
+
+    local direct = boss:FindFirstChild("Humanoid")
+    if direct and direct.ClassName == "Humanoid" then return direct end
+
+    local ok, desc = pcall(function() return boss:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    for i = 1, #desc do
+        if desc[i].ClassName == "Humanoid" then return desc[i] end
+    end
+    return nil
+end
+
 -- returns current health, max health; both nil when not readable
 local function bossHealth(bossType)
     local boss = bossOf(bossType)
     if not boss then return nil, nil end
 
-    local hum = boss:FindFirstChildOfClass("Humanoid")
-    if not hum then return nil, nil end
+    local hum = findHumanoid(boss)
+    if hum then
+        local okH, hp = pcall(function() return hum.Health end)
+        if okH and type(hp) == "number" then
+            local okM, mx = pcall(function() return hum.MaxHealth end)
+            if not okM or type(mx) ~= "number" or mx <= 0 then mx = hp end
+            return hp, mx
+        end
+    end
 
-    local okH, hp = pcall(function() return hum.Health end)
-    if not okH or type(hp) ~= "number" then return nil, nil end
+    local pairsToTry = {
+        { "Health", "MaxHealth" },
+        { "HP",     "MaxHP" },
+        { "Hp",     "MaxHp" },
+    }
 
-    local okM, mx = pcall(function() return hum.MaxHealth end)
-    if not okM or type(mx) ~= "number" then mx = hp end
+    for i = 1, #pairsToTry do
+        local okA, hp = pcall(function()
+            return boss:GetAttribute(pairsToTry[i][1])
+        end)
+        if okA and type(hp) == "number" then
+            local okB, mx = pcall(function()
+                return boss:GetAttribute(pairsToTry[i][2])
+            end)
+            if not okB or type(mx) ~= "number" or mx <= 0 then mx = hp end
+            return hp, mx
+        end
+    end
 
-    return hp, mx
+    return nil, nil
 end
 
 -- landing point at the boss FEET: centre X/Z, lowest part Y + FOOT_LIFT
@@ -290,8 +358,7 @@ local function bossFeet(bossType)
 
     for i = 1, #desc do
         local d  = desc[i]
-        local cn = d.ClassName
-        if cn == "Part" or cn == "MeshPart" or cn == "UnionOperation" then
+        if isBasePart(d) then
             local okP, p = pcall(function() return d.Position end)
             if okP and p then
                 n = n + 1
@@ -315,14 +382,6 @@ local function bossFeet(bossType)
     return pos, boss.Name .. " feet"
 end
 
-local function bossCount()
-    local n = 0
-    for i = 1, #BOSS_TYPES do
-        if bossOf(BOSS_TYPES[i]) then n = n + 1 end
-    end
-    return n
-end
-
 local function healthReady()
     local n = 0
     for i = 1, #BOSS_TYPES do
@@ -332,7 +391,7 @@ local function healthReady()
     return n >= 2
 end
 
--- sorted by MAX health descending; unreadable bosses last
+-- sorted by MAX health descending; unreadable bosses last, name order
 local function orderedTypes()
     local arr = {}
     for i = 1, #BOSS_TYPES do arr[i] = BOSS_TYPES[i] end
@@ -408,6 +467,78 @@ local function selectBoss(bossType)
 end
 
 --------------------------------------------------------------------
+-- BOSS HITBOX EXPANDER
+--   Local scale only. Saved sizes go back on toggle off / stop.
+--------------------------------------------------------------------
+local hbSaved = {}
+local hbApplied = false
+
+local function hbFactor()
+    if Config.HitboxBig then return HB_MULT_BIG end
+    return HB_MULT_SMALL
+end
+
+local function scaleAxis(v, f)
+    local n = v * f
+    if n > HB_AXIS_CAP and v < HB_AXIS_CAP then n = HB_AXIS_CAP end
+    if n < v then n = v end
+    return n
+end
+
+local function applyHitbox()
+    local f = hbFactor()
+    local touched = 0
+
+    for i = 1, #BOSS_TYPES do
+        local boss = bossOf(BOSS_TYPES[i])
+        if boss then
+            local okD, desc = pcall(function() return boss:GetDescendants() end)
+            if okD and desc then
+                for j = 1, #desc do
+                    local d = desc[j]
+                    if isBasePart(d) then
+                        local base = hbSaved[d]
+                        if base == nil then
+                            local okS, s = pcall(function() return d.Size end)
+                            if okS and s then
+                                base = s
+                                hbSaved[d] = s
+                            end
+                        end
+                        if base then
+                            local nx = scaleAxis(base.X, f)
+                            local ny = scaleAxis(base.Y, f)
+                            local nz = scaleAxis(base.Z, f)
+                            pcall(function()
+                                d.Size = Vector3.new(nx, ny, nz)
+                            end)
+                            touched = touched + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return touched
+end
+
+local function restoreHitbox()
+    local n = 0
+    for part, size in pairs(hbSaved) do
+        if part and part.Parent then
+            pcall(function() part.Size = size end)
+            n = n + 1
+        end
+    end
+    hbSaved = {}
+    if hbApplied then
+        print("[" .. NAME .. "] hitbox restored on " .. tostring(n) .. " parts")
+    end
+    hbApplied = false
+end
+
+--------------------------------------------------------------------
 -- Toggle plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
@@ -469,6 +600,8 @@ local function buildTab(tab)
         if combat then
             addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
             addToggle(combat, "Far Hit", "fam_farhit", "FarHit", false)
+            addToggle(combat, "Boss Hitbox Expander", "fam_hitbox", "Hitbox", false)
+            addToggle(combat, "Bigger Hitbox (x6)", "fam_hitbox_big", "HitboxBig", false)
         end
 
         local pick = makeSection(tab, "Boss Select", "Right")
@@ -480,7 +613,7 @@ local function buildTab(tab)
                 local t   = ordered[i]
                 local key = "Sel" .. t
                 local id  = "fam_go_" .. string.lower(t)
-                local _, mx = bossHealth(t)
+                local hp, mx = bossHealth(t)
 
                 local label = "Go " .. t
                 if mx then
@@ -568,6 +701,25 @@ task.spawn(function()
             end
         end
         task.wait(POLL_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- BOSS HITBOX LOOP
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.Hitbox then
+            local n = applyHitbox()
+            if n > 0 and not hbApplied then
+                hbApplied = true
+                print("[" .. NAME .. "] hitbox x" .. tostring(hbFactor())
+                    .. " on " .. tostring(n) .. " parts (local)")
+            end
+        elseif hbApplied then
+            restoreHitbox()
+        end
+        task.wait(HB_RATE)
     end
 end)
 
@@ -672,8 +824,7 @@ end)
 
 --------------------------------------------------------------------
 -- FAR HIT
---   In, swing, straight back. This is the closest thing to hitting a
---   boss from a distance: the server resolves the hit from the
+--   In, swing, straight back. The server resolves the hit from the
 --   character position at the moment of the swing.
 --------------------------------------------------------------------
 task.spawn(function()
@@ -713,6 +864,7 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
+    pcall(function() restoreHitbox() end)
     pcall(function() fireEvent("StopTransfuseBlood") end)
     atkCache   = nil
     holdPos    = nil
