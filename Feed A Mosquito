@@ -1,47 +1,57 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v7.3  -  SILENT: NOTHING SWINGS ON SCREEN
+--  v7.4  -  ONE TOGGLE, AND THE SWING IS A FUNCTION CALL
 --
---  v7.2 clicked for you, which fires the real swing animation and the
---  swing sound. That is automatic but not silent, so the click is off
---  by default now. Two toggles instead of one behaviour:
+--  ONE TOGGLE
+--    Everything is behind a single switch:
 --
---      Silent (on by default)  - no mouse click at all, nothing is
---                                animated on your character
---      Visible Swing (off)     - mouse1click every pass, the old
---                                automatic swing, for when silent is
---                                not enough
+--        Enable All  ->  hit loop + reach + always heal + auto collect
 --
---  Both modes share the same core, which is what was actually landing
---  hits in v7.1:
---      1. scale AttackPart so the box covers the whole map (Reach)
---      2. alternate untouch / touch on every boss part, so each
---         second pass is a BRAND NEW contact - a contact that already
---         exists does not fire again, which is why a plain repeated
---         touch did nothing
---      3. PlaySound + Attack on the tool's LIVE actor, resolved from
---         the tool's ActorId value
---  No part of the tool is moved, equipped or unequipped, so nothing
---  can crash and nothing is reparented.
+--    Off means all four stop and AttackPart is restored. There are no
+--    other toggles to hunt for.
 --
---  WHY THE LIVE ACTOR
---    Every equip leaves a dead copy of the tool actor in
---    Runtime.Actors, and matching by name prefix picked a dead one,
---    which is why earlier Attack loops did nothing at all. ActorId
---    names the live actor and is re-resolved when it changes.
+--  NO MORE CLICKING
+--    v7.3 clicked the mouse to swing. This version calls the swing
+--    function the game itself calls. The weapon's client script
+--    (ReplicatedStorage.Scripts.Weapon.SlapActor) does this on a real
+--    swing:
 --
---  Reach
---    AttackPart is the only part ever resized:
---        side = (farthest boss + 30) * 2      [60 .. 4000]
---    Bosses are never written to - no size, no CanCollide, no CFrame -
---    so none is launched into the void and the map stays solid.
---    Original size is saved per Address and restored on toggle off.
+--        PlaySound("SwingSound")           on the tool actor
+--        Attack                            on the tool actor
+--        GetActorIface(Character):InvokeFunction(
+--            "PlayAnim", "Swing", Tool.Swing)
 --
---  Boss HP is summed every pass; one line prints if it stops dropping,
---  so you can tell silent mode is not landing and flip Visible Swing.
+--    So this script fires the same PlayAnim RemoteFunction on your
+--    character actor, with the tool's own Swing Animation, and fires
+--    the two tool-actor remotes beside it. No mouse input at all.
 --
---  Keep a weapon equipped. All toggles start OFF except Silent.
+--    PlayAnim does replicate the swing animation, so other players can
+--    see the swing - that is the same call the game makes. If you want
+--    the animation left out entirely, say so and it will be dropped,
+--    leaving only the remotes.
+--
+--  WHAT MAKES THE HITS LAND (unchanged from v7.1)
+--      1. AttackPart is scaled to the farthest boss so the box covers
+--         the map from where you stand:
+--             side = (farthest + 30) * 2        [60 .. 4000]
+--      2. the touch state is alternated every pass (untouch, then
+--         touch), because a contact that already exists does not fire
+--         again - that is why a plain repeated touch did nothing
+--      3. PlaySound + Attack on the LIVE tool actor, resolved from the
+--         tool's ActorId value, because every equip leaves a dead copy
+--         in Runtime.Actors and name matching picked a dead one
+--
+--    Nothing is ever equipped, unequipped or reparented, so the crash
+--    from the equip-spam builds cannot happen.
+--
+--  Bosses are never written to - no size, no CanCollide, no CFrame -
+--  so none is launched into the void and the map stays solid.
+--  AttackPart's original size is restored the moment you toggle off or
+--  stop the script.
+--
+--  Boss HP is summed each pass; one line prints if it stops dropping.
+--  Keep a weapon equipped. The toggle starts OFF.
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
@@ -51,7 +61,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v7.3"
+local VERSION = "v7.4"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -83,12 +93,7 @@ local SKIP_PART = {
 }
 
 local Config = {
-    Heal        = false,
-    AutoCollect = false,
-    Farm        = false,
-    Reach       = false,
-    Silent      = true,
-    Swing       = false,
+    Enabled = false,
 }
 
 local TOGGLES     = {}
@@ -223,16 +228,39 @@ local function remotesOfActor(name)
     return ev:FindFirstChild("Attack"), ev:FindFirstChild("PlaySound")
 end
 
--- only used when Visible Swing is on; this is what animates you
-local function swingClick()
-    if type(mouse1click) ~= "function" then return false end
+-- the swing function the game itself calls: PlayAnim on the character
+-- actor, with the tool's own Swing animation
+local function playAnimRemote()
+    local actors = child(RS, "Runtime", "Actors")
+    if not actors then return nil end
 
-    if type(isrbxactive) == "function" then
-        local ok, act = pcall(isrbxactive)
-        if ok and act == false then return false end
+    local prefix = "Character_" .. tostring(LP.UserId)
+    local plen   = #prefix
+    local kids   = actors:GetChildren()
+
+    for i = 1, #kids do
+        local a = kids[i]
+        if string.sub(a.Name, 1, plen) == prefix then
+            local fn = a:FindFirstChild("Functions")
+            local pa = fn and fn:FindFirstChild("PlayAnim")
+            if pa then return pa end
+        end
     end
 
-    return (pcall(mouse1click))
+    return nil
+end
+
+local function swingViaFunction(playAnim, tool)
+    if not playAnim then return false end
+    if not tool then return false end
+
+    local anim = tool:FindFirstChild("Swing")
+
+    if anim then
+        return (pcall(function() playAnim:InvokeServer("Swing", anim) end))
+    end
+
+    return (pcall(function() playAnim:InvokeServer("Swing") end))
 end
 
 --------------------------------------------------------------------
@@ -507,7 +535,7 @@ local function addToggle(sec, label, id, key, default)
 end
 
 --------------------------------------------------------------------
--- Menu
+-- Menu  (one switch)
 --------------------------------------------------------------------
 local function buildTab(tab)
     if built then return end
@@ -517,16 +545,7 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local main = makeSection(tab, "Main", "Left")
         if main then
-            addToggle(main, "Always Heal", "fam_heal", "Heal", false)
-            addToggle(main, "Auto Collect", "fam_collect", "AutoCollect", false)
-        end
-
-        local combat = makeSection(tab, "Combat", "Left")
-        if combat then
-            addToggle(combat, "Auto Hit (silent loop)", "fam_farm", "Farm", false)
-            addToggle(combat, "Reach (scale the weapon)", "fam_reach", "Reach", false)
-            addToggle(combat, "Silent (no visible swing)", "fam_silent", "Silent", true)
-            addToggle(combat, "Visible Swing (click)", "fam_swing", "Swing", false)
+            addToggle(main, "Enable All (hit, heal, collect)", "fam_all", "Enabled", false)
         end
     end)
 
@@ -582,7 +601,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HIT LOOP  (silent contact cycle; click only if you ask for it)
+-- HIT LOOP  (touch cycle + PlayAnim function, no click)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -590,12 +609,14 @@ task.spawn(function()
     local wasOn      = false
     local warnedTool = false
     local warnedAct  = false
+    local warnedAnim = false
     local staleWarn  = false
 
     local lastSum  = nil
     local stale    = 0
     local cachedId = nil
     local cachedAtk, cachedPs = nil, nil
+    local cachedAnim = nil
 
     local touching = false
 
@@ -604,7 +625,7 @@ task.spawn(function()
     end
 
     while running do
-        if Config.Farm and alive() then
+        if Config.Enabled and alive() then
             local tool = equippedTool()
 
             if not tool then
@@ -613,6 +634,7 @@ task.spawn(function()
                     print("[" .. NAME .. "] auto hit: equip a weapon")
                 end
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
+                cachedAnim = nil
                 task.wait(0.25)
             else
                 warnedTool = false
@@ -622,8 +644,21 @@ task.spawn(function()
                 if id ~= cachedId then
                     cachedId = id
                     cachedAtk, cachedPs = remotesOfActor(id)
+                    cachedAnim = nil
+
                     if cachedAtk then
                         print("[" .. NAME .. "] live actor " .. tostring(id))
+                    end
+                end
+
+                if not cachedAnim then
+                    cachedAnim = playAnimRemote()
+
+                    if cachedAnim then
+                        print("[" .. NAME .. "] swing via PlayAnim function")
+                    elseif not warnedAnim then
+                        warnedAnim = true
+                        print("[" .. NAME .. "] PlayAnim not found - remotes only")
                     end
                 end
 
@@ -639,19 +674,15 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] auto hit on ("
-                            .. (Config.Swing and "silent + click" or "silent")
-                            .. ")")
+                        print("[" .. NAME .. "] enabled - hit, heal, collect")
                     end
 
                     local ap = attackPartOf(tool)
 
-                    if Config.Reach and ap then
+                    if ap then
                         scaleAttackPart(ap)
                         reachOn = true
                     end
-
-                    local fired = false
 
                     if hasTouch and ap then
                         pruneParts()
@@ -677,8 +708,6 @@ task.spawn(function()
                                 end
                             end
                         end
-
-                        fired = true
                     end
 
                     if cachedPs then
@@ -686,7 +715,7 @@ task.spawn(function()
                     end
                     pcall(function() cachedAtk:FireServer() end)
 
-                    if Config.Swing then swingClick() end
+                    swingViaFunction(cachedAnim, tool)
 
                     local list = bossList()
                     local sum  = 0
@@ -709,7 +738,7 @@ task.spawn(function()
 
                         if stale >= STALE_LIMIT and not staleWarn then
                             staleWarn = true
-                            print("[" .. NAME .. "] boss HP not dropping - enable Visible Swing")
+                            print("[" .. NAME .. "] boss HP not dropping - hits not landing")
                         end
                     else
                         stale = 0
@@ -718,26 +747,24 @@ task.spawn(function()
 
                     if live > 0 then lastSum = sum end
 
-                    if not fired and not Config.Swing then
-                        task.wait(0.25)
-                    else
-                        task.wait(HIT_RATE)
-                    end
+                    task.wait(HIT_RATE)
                 end
             end
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto hit off")
+                print("[" .. NAME .. "] disabled")
             end
 
             warnedTool = false
             warnedAct  = false
+            warnedAnim = false
             stale      = 0
             staleWarn  = false
             lastSum    = nil
             touching   = false
             cachedId, cachedAtk, cachedPs = nil, nil, nil
+            cachedAnim = nil
 
             if reachOn then
                 restoreAttackParts()
@@ -756,7 +783,7 @@ task.spawn(function()
     local lastFire    = 0
 
     while running do
-        if Config.Heal then
+        if Config.Enabled then
             local hum = humanoid()
             if hum then
                 local now = tick()
@@ -781,7 +808,7 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.AutoCollect then
+        if Config.Enabled then
             fireEvent("CollectIncome")
             fireEvent("ClaimOfflineIncome")
         end
@@ -803,5 +830,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - silent hits, no swing", 5)
+notifyUser("Loaded - one toggle, swing via function", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
