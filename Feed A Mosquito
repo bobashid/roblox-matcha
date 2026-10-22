@@ -1,56 +1,54 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v7.0  -  THE REAL REASON THE LOOP DID NOTHING
+--  v7.1  -  REPEAT THE TOUCH, NOT THE EQUIP
 --
---  Decompiled the weapon's own client script
---  (ReplicatedStorage.Scripts.Weapon.SlapActor). Its OnToolActivated
---  does exactly three things on a swing:
+--  WHAT THE PROBES SHOWED (this is why earlier versions stalled)
+--    1. Firing Attack on the correct live actor 8 times: the boss HP
+--       stayed at 20. A bare remote is NOT the hit path.
+--    2. My earlier firetouchinterest test printed "PARTS 0" - it never
+--       touched anything, because the part read crashed first. So that
+--       path was never actually tested.
+--    3. One hit lands on every equip. The equip does not damage by
+--       itself: welding AttackPart into the hand creates a NEW physics
+--       contact, and the tool's TouchTransmitter fires once on that
+--       new contact.
+--    4. Reparenting the tool in a loop crashed the client.
 --
---      Tool.Handle.SwingSound:Play()
---      :FireServer("PlaySound", "SwingSound")
---      :FireServer("Attack")
+--  READ 1 + 3 TOGETHER
+--    The tool hits on a NEW contact, and a contact that already exists
+--    does not fire again. That is why a touch fired every pass did
+--    nothing: the parts were already touching and the engine ignores
+--    the repeat. So this build alternates the touch state instead of
+--    reparenting anything:
 --
---  and it only does that if the tool cooldown (config.CD) has passed.
---  So firing Attack IS the hit path - it never needed a click or an
---  equip. The problem was WHICH actor it was fired on.
+--        pass A:  firetouchinterest(ap, part, 1)   -- break contact
+--        pass B:  firetouchinterest(ap, part, 0)   -- new contact
+--                 + PlaySound/Attack on the LIVE actor
 --
---  Every equip makes the game create a NEW tool actor and leaves the
---  old one in Runtime.Actors as a dead copy. The old code matched
---  actors by name prefix "Tool_Character_<userId>_" and took the first
---  match, which is usually one of those dead copies, so the remote
---  went nowhere and the boss HP never moved. That is also why one hit
---  landed each time you equipped: the fresh actor was the live one.
+--    Every second pass is therefore a brand new contact, which is the
+--    exact condition that produced a hit on equip - but without ever
+--    moving, equipping or unequipping the tool.
 --
---  THE FIX
---    The tool carries ActorId, a StringValue naming its CURRENT live
---    actor. Every pass this script reads tool.ActorId, looks that
---    exact actor up in Runtime.Actors, and fires its own Attack and
---    PlaySound remotes:
---
---        PlaySound("SwingSound")  then  Attack
---
---    at ATTACK_RATE (0.12 s), which is the same pair of calls the
---    game's own swing makes, just repeated. No click, no equip, no
---    unequip, no reparenting - so nothing can crash and the tool does
---    not need to be moved.
---
---    If ActorId changes (you swap weapons) the actor is re-resolved on
---    the next pass automatically.
+--  LIVE ACTOR
+--    Every equip leaves a dead copy of the tool actor in
+--    Runtime.Actors, and matching by name prefix picks a dead one. The
+--    tool's ActorId StringValue names the live actor, so that exact
+--    name is resolved instead, and re-resolved whenever it changes.
 --
 --  REACH (optional)
---    AttackPart on the equipped tool is the only part ever resized:
+--    AttackPart is the only part ever resized:
 --        side = (farthest boss + 30) * 2      [60 .. 4000]
---    so the server's own range test passes from anywhere on the map.
---    Bosses are never written to - no size, no CanCollide, no CFrame -
---    so none is launched into the void and the map stays solid.
---    Original size is saved per Address and restored on toggle off.
+--    so the contact can happen from anywhere on the map. Bosses are
+--    never written to - no size, no CanCollide, no CFrame - so none is
+--    launched into the void and the map stays solid. Original size is
+--    saved per Address and restored on toggle off.
 --
---  The script prints each target's HP so you can see it dropping, and
---  says so once if HP stops moving instead of silently idling.
+--  Boss HP is summed every pass and one line is printed if it stops
+--  dropping, so you can tell a miss from a slow kill.
 --
---  Keep a weapon equipped - the live actor only exists while held.
---  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
+--  Keep a weapon equipped. All toggles start OFF.
+--  Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -59,7 +57,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v7.0"
+local VERSION = "v7.1"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -74,7 +72,8 @@ local POLL_RATE    = 0.1
 local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
 local COLLECT_RATE = 1.5
-local ATTACK_RATE  = 0.12
+local HIT_RATE     = 0.2
+local TOUCH_PARTS  = 4
 local STALE_LIMIT  = 25
 
 -- reach tuning
@@ -82,6 +81,12 @@ local REACH_PAD    = 30
 local REACH_MIN    = 60
 local REACH_MAX    = 4000
 local BOSS_TTL     = 0.6
+local PART_TTL     = 2.0
+
+local SKIP_PART = {
+    Area      = true,
+    ChaseArea = true,
+}
 
 local Config = {
     Heal        = false,
@@ -179,7 +184,7 @@ local function fireEvent(name)
 end
 
 --------------------------------------------------------------------
--- LIVE TOOL ACTOR  (resolved through the tool's ActorId)
+-- LIVE TOOL ACTOR (resolved through the tool's ActorId)
 --------------------------------------------------------------------
 local function equippedTool()
     local c = LP.Character
@@ -189,8 +194,7 @@ local function equippedTool()
     for i = 1, #kids do
         local t = kids[i]
         if t.ClassName == "Tool" then
-            local idv = t:FindFirstChild("ActorId")
-            if idv then return t end
+            if t:FindFirstChild("ActorId") then return t end
         end
     end
 
@@ -208,31 +212,19 @@ local function actorIdOf(tool)
     return nil
 end
 
-local function actorByName(name)
-    if not name then return nil end
+local function remotesOfActor(name)
+    if not name then return nil, nil end
 
     local actors = child(RS, "Runtime", "Actors")
-    if not actors then return nil end
+    if not actors then return nil, nil end
 
     local a = actors:FindFirstChild(name)
-    if a then return a end
-    return nil
-end
+    if not a then return nil, nil end
 
-local function remotesOf(actor)
-    if not actor then return nil, nil end
-
-    local ev = actor:FindFirstChild("Events")
+    local ev = a:FindFirstChild("Events")
     if not ev then return nil, nil end
 
     return ev:FindFirstChild("Attack"), ev:FindFirstChild("PlaySound")
-end
-
--- exactly the pair SlapActor.OnToolActivated fires
-local function attackOnce(atk, ps)
-    if ps then pcall(function() ps:FireServer("SwingSound") end) end
-    if atk then return (pcall(function() atk:FireServer() end)) end
-    return false
 end
 
 --------------------------------------------------------------------
@@ -240,6 +232,7 @@ end
 --------------------------------------------------------------------
 local bossCache = {}
 local bossStamp = 0
+local partCache = {}
 
 local function isBossModel(m)
     if not m then return false end
@@ -312,6 +305,60 @@ local function bossHealth(boss)
     return nil
 end
 
+local function bossParts(boss)
+    local k   = keyOf(boss)
+    local now = tick()
+
+    local rec = k and partCache[k]
+    if rec and (now - rec.stamp) < PART_TTL then return rec.parts end
+
+    local parts = {}
+
+    local r = boss:FindFirstChild("HumanoidRootPart")
+    if r and isBasePart(r) then parts[#parts + 1] = r end
+
+    local ok, desc = pcall(function() return boss:GetDescendants() end)
+    if ok and desc then
+        for j = 1, #desc do
+            if #parts >= TOUCH_PARTS then break end
+
+            local d = desc[j]
+            if isBasePart(d) and not SKIP_PART[d.Name] and d ~= r then
+                parts[#parts + 1] = d
+            end
+        end
+    end
+
+    if k then partCache[k] = { stamp = now, parts = parts } end
+    return parts
+end
+
+local function pruneParts()
+    local dead = nil
+
+    for k, rec in pairs(partCache) do
+        local anyAlive = false
+
+        for j = 1, #rec.parts do
+            local p = rec.parts[j]
+            local ok, parent = pcall(function() return p and p.Parent end)
+            if ok and parent ~= nil then
+                anyAlive = true
+                break
+            end
+        end
+
+        if not anyAlive then
+            dead = dead or {}
+            dead[#dead + 1] = k
+        end
+    end
+
+    if dead then
+        for i = 1, #dead do partCache[dead[i]] = nil end
+    end
+end
+
 local function farthestBoss(myPos)
     local list = bossList()
     local far  = 0
@@ -332,7 +379,7 @@ local function farthestBoss(myPos)
 end
 
 --------------------------------------------------------------------
--- ATTACKPART REACH  (size saved per Address)
+-- ATTACKPART REACH (size saved per Address)
 --------------------------------------------------------------------
 local apSaved = {}
 local reachOn = false
@@ -468,7 +515,7 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Hit (repeat attack loop)", "fam_farm", "Farm", false)
+            addToggle(combat, "Auto Hit (repeat touch cycle)", "fam_farm", "Farm", false)
             addToggle(combat, "Reach (scale the weapon)", "fam_reach", "Reach", false)
         end
     end)
@@ -525,19 +572,26 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- ATTACK LOOP  (fires the LIVE actor's own Attack remote)
+-- HIT LOOP  (alternate untouch / touch so every other pass is new)
 --------------------------------------------------------------------
 task.spawn(function()
+    local hasTouch = (type(firetouchinterest) == "function")
+
     local wasOn      = false
     local warnedTool = false
     local warnedAct  = false
     local staleWarn  = false
 
-    local lastSum = nil
-    local stale   = 0
+    local lastSum  = nil
+    local stale    = 0
     local cachedId = nil
-    local cachedAtk = nil
-    local cachedPs  = nil
+    local cachedAtk, cachedPs = nil, nil
+
+    local touching = false
+
+    if not hasTouch then
+        print("[" .. NAME .. "] firetouchinterest missing - Attack only")
+    end
 
     while running do
         if Config.Farm and alive() then
@@ -556,10 +610,8 @@ task.spawn(function()
                 local id = actorIdOf(tool)
 
                 if id ~= cachedId then
-                    cachedId  = id
-                    local actor = actorByName(id)
-                    cachedAtk, cachedPs = remotesOf(actor)
-
+                    cachedId = id
+                    cachedAtk, cachedPs = remotesOfActor(id)
                     if cachedAtk then
                         print("[" .. NAME .. "] live actor " .. tostring(id))
                     end
@@ -568,7 +620,7 @@ task.spawn(function()
                 if not cachedAtk then
                     if not warnedAct then
                         warnedAct = true
-                        print("[" .. NAME .. "] auto hit: actor not ready, re-equip once")
+                        print("[" .. NAME .. "] auto hit: actor not ready")
                     end
                     cachedId = nil
                     task.wait(0.25)
@@ -577,18 +629,50 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] auto hit on (live actor Attack loop)")
+                        print("[" .. NAME .. "] auto hit on (touch cycle)")
                     end
 
-                    if Config.Reach then
-                        local ap = attackPartOf(tool)
-                        if ap then
-                            scaleAttackPart(ap)
-                            reachOn = true
+                    local ap = attackPartOf(tool)
+
+                    if Config.Reach and ap then
+                        scaleAttackPart(ap)
+                        reachOn = true
+                    end
+
+                    if hasTouch and ap then
+                        pruneParts()
+
+                        local list = bossList()
+                        touching = not touching
+
+                        for i = 1, #list do
+                            local boss = list[i]
+                            local hp   = bossHealth(boss)
+
+                            if hp and hp > 0 then
+                                local parts = bossParts(boss)
+
+                                for j = 1, #parts do
+                                    local part = parts[j]
+
+                                    if touching then
+                                        pcall(function() firetouchinterest(ap, part, 0) end)
+                                    else
+                                        pcall(function() firetouchinterest(ap, part, 1) end)
+                                    end
+                                end
+                            end
                         end
-                    end
 
-                    attackOnce(cachedAtk, cachedPs)
+                        if touching then
+                            if cachedPs then
+                                pcall(function() cachedPs:FireServer("SwingSound") end)
+                            end
+                            pcall(function() cachedAtk:FireServer() end)
+                        end
+                    else
+                        pcall(function() cachedAtk:FireServer() end)
+                    end
 
                     local list = bossList()
                     local sum  = 0
@@ -605,12 +689,13 @@ task.spawn(function()
                     if live == 0 then
                         stale = 0
                         staleWarn = false
+                        lastSum = nil
                     elseif lastSum and sum >= lastSum then
                         stale = stale + 1
 
                         if stale >= STALE_LIMIT and not staleWarn then
                             staleWarn = true
-                            print("[" .. NAME .. "] boss HP not dropping - attack is not landing")
+                            print("[" .. NAME .. "] boss HP not dropping - touch cycle not landing")
                         end
                     else
                         stale = 0
@@ -619,7 +704,7 @@ task.spawn(function()
 
                     if live > 0 then lastSum = sum end
 
-                    task.wait(ATTACK_RATE)
+                    task.wait(HIT_RATE)
                 end
             end
         else
@@ -633,6 +718,7 @@ task.spawn(function()
             stale      = 0
             staleWarn  = false
             lastSum    = nil
+            touching   = false
             cachedId, cachedAtk, cachedPs = nil, nil, nil
 
             if reachOn then
@@ -692,11 +778,12 @@ local function stop()
     pcall(function() fireEvent("StopTransfuseBlood") end)
     bossCache = {}
     bossStamp = 0
+    partCache = {}
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - repeats the live actor's Attack", 5)
+notifyUser("Loaded - touch cycle repeats hits", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
