@@ -1,54 +1,46 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.7  -  EGG RARITY AND VALUE, READ CORRECTLY
+--  v8.8  -  AUTO PICKUP: ONE TOGGLE PER RARITY + SIZE SLIDER
 --
---  TWO WRONG ASSUMPTIONS FROM v8.6, NOW FIXED
---    1. There is no Coin field in MosquitoConfig. It does not exist.
---       The real fields are Id, Name, Rarity, Icon, Prefab, EggIcon,
---       EggBaseScale, MinScale, MaxScale, MinIncome, MaxIncome,
---       Damage, MaxBlood, Price, HatchTime.
---    2. The area is NOT the egg's rarity. Probed live: an
---       IceMosquitoEgg sat inside UncommonArea while its own billboard
---       displayed "Rare". Rarity comes from the egg itself.
+--  WHAT THE PROBE FOUND (this decides the whole approach)
+--    An egg model contains: ActorId StringValue, a BillboardGui named
+--    EggGui with Countdown + Rarity TextLabels, and parts Box, Head,
+--    Body1, Body2, EggTrail, HumanoidRootPart.
+--    It has NO ProximityPrompt, NO ClickDetector, NO TouchTransmitter,
+--    and the only egg remote on the player actor is PlaceEgg. A scan
+--    of the whole Workspace found 0 ProximityPrompts.
+--    So there is no pickup remote to fire - collection is decided on
+--    contact. This build therefore simulates the contact on the egg's
+--    root part rather than pretending a remote exists.
 --
---  WHERE THE TWO VALUES NOW COME FROM
---    RARITY  - every egg model has a BillboardGui named EggGui
---              containing a TextLabel named "Rarity". That label is
---              what the game shows you in world, so it is read
---              directly (e.g. "Uncommon", "Rare", "Epic"). If a
---              label is missing, the area name is used as a fallback.
---    VALUE   - MosquitoConfig's Price field, keyed by the mosquito id.
---              The egg model name minus its "Egg" suffix is that id:
---                  BlueMosquitoEgg  ->  BlueMosquito  ->  Price 200
---                  FireMosquitoEgg  ->  FireMosquito  ->  Price 30000
---              Prices decompiled from the config: Common 100,
---              Uncommon 200, Rare 2000, Epic 30000, Legendary 300000.
---              These are the game's own numbers, not estimates.
+--  SIZE, MEASURED NOT GUESSED
+--    Egg root sizes seen live: 3.53 and 5.30, with matching part sizes
+--    (Body2 0.88 vs 1.32). Base root is 3.53, so
 --
---  PANEL LAYOUT (unchanged from v8.5)
---      left  PANEL_X = 300   boss name, HP bar, hp / max
---      right EGG_X  = 634    egg name, rarity + price
---    Both use the game's own 40,40,50 backdrop and bold text, colour
---    coded per rarity.
+--        sizeMult = root.Size.X / 3.53
 --
---  Drawing rules followed (Matcha has no GUI objects at all)
---    - fixed pools created once: 6 boss rows, 4 egg rows, 2 backdrops.
---      Nothing is created in the render loop.
---    - ONE RenderStepped connection total.
---    - boss scan cached 0.6 s, egg scan cached 1.0 s.
---    - every Drawing removed in stop().
+--    gives 1.00 for the smallest egg and about 1.50 for the largest
+--    seen. That is the number the sliders compare against.
 --
---  Hit logic unchanged from v8.2, which works:
---    - AttackPart is the only thing written: shrink to 2 studs to end
---      every contact, grow back to map size to begin a new one, which
---      fires the tool's TouchTransmitter
---    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
---      the tool's ActorId value
---    - no mouse input, no equip or unequip, nothing reparented
---    - bosses and eggs are read only
+--  UI
+--      Auto Pickup            master switch
+--      Common / Uncommon / Rare / Epic / Legendary / Mythical /
+--      Divine / Secret        one toggle per rarity
+--      a Size slider under each rarity (1.00 .. 2.00): an egg is only
+--      taken if its rarity toggle is on AND its sizeMult is at least
+--      that rarity's slider. Each rarity filters independently.
 --
---  Auto Health / Auto Collect / Kill Farm are the three toggles.
+--    Rarity is read from the egg's own EggGui Rarity label, which is
+--    what the game displays. If a label is missing the area name is
+--    used as a fallback.
+--
+--  Everything else is unchanged from v8.5/v8.7:
+--    - boss panel and egg panel in the bottom area, game colours
+--    - Kill Farm size cycle on AttackPart only, live actor remotes
+--    - no mouse input, no equip/unequip, nothing reparented
+--    - bosses and eggs are read only; the character is never moved
+--
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players    = game:GetService("Players")
@@ -59,7 +51,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.7"
+local VERSION = "v8.8"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -89,6 +81,11 @@ local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
 local EGG_TTL      = 1.0
 
+-- pickup tuning
+local EGG_BASE_SIZE = 3.53   -- smallest egg root seen live
+local PICK_RATE     = 0.15
+local PICK_SCAN     = 1.0
+
 -- panel tuning
 local PANEL_ROWS   = 6
 local EGG_ROWS     = 4
@@ -111,35 +108,15 @@ local COL_FILL   = Color3.fromRGB(120, 190, 135)
 local COL_NAME   = Color3.fromRGB(255, 255, 255)
 local COL_HP     = Color3.fromRGB(198, 208, 200)
 
--- Price from MosquitoConfig, keyed by mosquito id (egg name minus "Egg")
 local EGG_PRICE = {
-    Mosquito         = 100,
-    BloodMosquito    = 100,
-    NerdMosquito     = 100,
-    WhiteMosquito    = 100,
-
-    VenomousMosquito = 200,
-    GlowingMosquito  = 200,
-    BlueMosquito     = 200,
-    PunkMosquito     = 200,
-
-    ClownMosquito    = 2000,
-    ChickenMosquito  = 2000,
-    IceMosquito      = 2000,
-    PirateMosquito   = 2000,
-    DrillMosquito    = 2000,
-
-    FireMosquito     = 30000,
-    PandaMosquito    = 30000,
-    RocketMosquito   = 30000,
-    GhostMosquito    = 30000,
-    BalloonMosquito  = 30000,
-    SniperMosquito   = 30000,
-
-    ShockMosquito    = 300000,
-    MammothMosquito  = 300000,
-    RainbowMosquito  = 300000,
-    SkullMosquito    = 300000,
+    Mosquito = 100, BloodMosquito = 100, NerdMosquito = 100, WhiteMosquito = 100,
+    VenomousMosquito = 200, GlowingMosquito = 200, BlueMosquito = 200, PunkMosquito = 200,
+    ClownMosquito = 2000, ChickenMosquito = 2000, IceMosquito = 2000,
+    PirateMosquito = 2000, DrillMosquito = 2000,
+    FireMosquito = 30000, PandaMosquito = 30000, RocketMosquito = 30000,
+    GhostMosquito = 30000, BalloonMosquito = 30000, SniperMosquito = 30000,
+    ShockMosquito = 300000, MammothMosquito = 300000,
+    RainbowMosquito = 300000, SkullMosquito = 300000,
 }
 
 local RARITY_COLOR = {
@@ -153,6 +130,11 @@ local RARITY_COLOR = {
     Secret    = Color3.fromRGB(255, 120, 120),
 }
 
+local RARITIES = {
+    "Common", "Uncommon", "Rare", "Epic",
+    "Legendary", "Mythical", "Divine", "Secret",
+}
+
 local SKIP_PART = {
     Area      = true,
     ChaseArea = true,
@@ -162,10 +144,21 @@ local Config = {
     Heal        = false,
     AutoCollect = false,
     Farm        = false,
+    Pickup      = false,
 }
+
+-- per rarity: enabled flag + minimum size multiplier
+local PickCfg = {}
+
+for i = 1, #RARITIES do
+    local r = RARITIES[i]
+    PickCfg[r] = { on = false, minSize = 1.0 }
+end
 
 local TOGGLES     = {}
 local getterWorks = {}
+local SLIDERS     = {}
+local sliderWorks = {}
 
 _G.FeedAMosquito = { stop = function() running = false end }
 
@@ -233,7 +226,6 @@ local function areaRarity(areaName)
     return areaName
 end
 
--- the game shows the true rarity on the egg's own billboard
 local function billboardRarity(model)
     local ok, desc = pcall(function() return model:GetDescendants() end)
     if not ok or not desc then return nil end
@@ -253,13 +245,22 @@ local function billboardRarity(model)
     return nil
 end
 
--- egg name minus "Egg" is the MosquitoConfig id
 local function mosquitoId(eggName)
     if type(eggName) ~= "string" then return nil end
     if string.sub(eggName, -3) == "Egg" then
         return string.sub(eggName, 1, #eggName - 3)
     end
     return eggName
+end
+
+local function eggSizeMult(model)
+    local r = model:FindFirstChild("HumanoidRootPart")
+    if not r then return 1 end
+
+    local ok, s = pcall(function() return r.Size end)
+    if not ok or not s then return 1 end
+
+    return s.X / EGG_BASE_SIZE
 end
 
 --------------------------------------------------------------------
@@ -384,7 +385,7 @@ local function bossList()
 end
 
 --------------------------------------------------------------------
--- Egg lookup (READ ONLY, rarity from the billboard, price from config)
+-- Egg lookup (rarity from billboard, size from root, price from config)
 --------------------------------------------------------------------
 local eggCache = {}
 local eggStamp = 0
@@ -400,7 +401,6 @@ local function collectEggs()
 
     for i = 1, #areaKids do
         local area = areaKids[i]
-
         local ok, kids = pcall(function() return area:GetChildren() end)
 
         if ok and kids then
@@ -408,19 +408,18 @@ local function collectEggs()
                 local m = kids[j]
 
                 if m.ClassName == "Model" and string.find(string.lower(m.Name), "egg", 1, true) then
-                    local shown = billboardRarity(m)
-                    local rarity = shown or areaRarity(area.Name)
-
-                    local id = mosquitoId(m.Name)
-                    local price = nil
+                    local rarity = billboardRarity(m) or areaRarity(area.Name)
+                    local id     = mosquitoId(m.Name)
+                    local price  = nil
 
                     if id then price = EGG_PRICE[id] end
 
                     out[#out + 1] = {
-                        model  = m,
-                        name   = m.Name,
+                        model = m,
+                        name  = m.Name,
                         rarity = rarity,
                         price  = price,
+                        size   = eggSizeMult(m),
                     }
                 end
             end
@@ -486,11 +485,12 @@ local function bossParts(boss)
     if rec and (now - rec.stamp) < PART_TTL then return rec.parts end
 
     local parts = {}
-
     local r = boss:FindFirstChild("HumanoidRootPart")
+
     if r and isBasePart(r) then parts[#parts + 1] = r end
 
     local ok, desc = pcall(function() return boss:GetDescendants() end)
+
     if ok and desc then
         for j = 1, #desc do
             if #parts >= TOUCH_PARTS then break end
@@ -564,6 +564,7 @@ local function attackPartOf(tool)
     if ap and isBasePart(ap) then return ap end
 
     local ok, desc = pcall(function() return tool:GetDescendants() end)
+
     if ok and desc then
         for j = 1, #desc do
             local d = desc[j]
@@ -745,7 +746,6 @@ local function startHud()
     hudConn = RunService.RenderStepped:Connect(function()
         local baseY = viewportHeight() - PANEL_LIFT
 
-        -- boss column
         local list = bossList()
         local n    = 0
 
@@ -807,7 +807,6 @@ local function startHud()
             end
         end
 
-        -- egg column
         local eggs = eggList()
         local e    = 0
 
@@ -830,9 +829,10 @@ local function startHud()
                 slot.nameTag.Visible  = true
 
                 local vtxt = egg.rarity
+                    .. "  x" .. string.format("%.2f", egg.size)
 
                 if type(egg.price) == "number" then
-                    vtxt = egg.rarity .. "  " .. tostring(egg.price) .. " coins"
+                    vtxt = vtxt .. "  " .. tostring(egg.price)
                 end
 
                 slot.valTag.Text     = vtxt
@@ -901,7 +901,7 @@ end
 startHud()
 
 --------------------------------------------------------------------
--- Toggle plumbing
+-- Toggle / slider plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -929,6 +929,19 @@ local function safeToggle(sec, name, id, default, cb)
     return false
 end
 
+local function safeSlider(sec, name, id, min, max, default, cb)
+    local tries = {
+        function() sec:Slider(name, id, min, max, default, cb) end,
+        function() sec:Slider(id, name, min, max, default, cb) end,
+        function() sec:Slider(name, min, max, default, cb) end,
+        function() sec:Slider(name, id, default, min, max, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    return false
+end
+
 local function makeSection(tab, name, side)
     local ok, sec = pcall(function() return tab:Section(name, side) end)
     if ok and type(sec) == "table" then return sec end
@@ -940,6 +953,35 @@ end
 local function addToggle(sec, label, id, key, default)
     if safeToggle(sec, label, id, default, applyBool(key)) then
         registerToggle(key, id, label)
+    end
+end
+
+local function addRarityControls(sec, rarity)
+    local cfg = PickCfg[rarity]
+    if not cfg then return end
+
+    local tid = "fam_pick_" .. string.lower(rarity)
+    local sid = tid .. "_size"
+
+    local onCb = function(a, b, c)
+        if sliderWorks[rarity] then return end
+        if type(a) == "boolean" then cfg.on = a return end
+        if type(b) == "boolean" then cfg.on = b return end
+        if type(c) == "boolean" then cfg.on = c return end
+    end
+
+    if safeToggle(sec, rarity, tid, false, onCb) then
+        SLIDERS[#SLIDERS + 1] = { rarity = rarity, id = tid, name = rarity, kind = "toggle" }
+    end
+
+    local sizeCb = function(v)
+        if type(v) == "number" then
+            cfg.minSize = v
+        end
+    end
+
+    if safeSlider(sec, rarity .. " Size", sid, 1.0, 2.0, 1.0, sizeCb) then
+        SLIDERS[#SLIDERS + 1] = { rarity = rarity, id = sid, name = rarity .. " Size", kind = "slider" }
     end
 end
 
@@ -961,6 +1003,15 @@ local function buildTab(tab)
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
             addToggle(combat, "Kill Farm (repeat hits)", "fam_farm", "Farm", false)
+        end
+
+        local pick = makeSection(tab, "Egg Pickup", "Left")
+        if pick then
+            addToggle(pick, "Auto Pickup", "fam_pickup", "Pickup", false)
+
+            for i = 1, #RARITIES do
+                addRarityControls(pick, RARITIES[i])
+            end
         end
     end)
 
@@ -987,7 +1038,7 @@ else
 end
 
 --------------------------------------------------------------------
--- TOGGLE POLLER
+-- POLLERS
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -1011,12 +1062,108 @@ task.spawn(function()
                 end
             end
         end
+
+        for i = 1, #SLIDERS do
+            local s = SLIDERS[i]
+            local cfg = PickCfg[s.rarity]
+
+            if cfg then
+                local val = nil
+
+                local ok1, v1 = pcall(function() return UI.GetValue(s.id) end)
+                if ok1 and type(v1) == "number" then
+                    val = v1
+                else
+                    local ok2, v2 = pcall(function() return UI.GetValue(s.name) end)
+                    if ok2 and type(v2) == "number" then val = v2 end
+                end
+
+                if val ~= nil then
+                    sliderWorks[s.rarity] = true
+
+                    if s.kind == "toggle" then
+                        local b = (val > 0)
+                        if cfg.on ~= b then cfg.on = b end
+                    else
+                        if cfg.minSize ~= val then cfg.minSize = val end
+                    end
+                end
+            end
+        end
+
         task.wait(POLL_RATE)
     end
 end)
 
 --------------------------------------------------------------------
--- KILL FARM  (size cycle + touch signals + live actor burst)
+-- EGG PICKUP  (contact simulated on the egg's own root)
+--------------------------------------------------------------------
+task.spawn(function()
+    local hasTouch = (type(firetouchinterest) == "function")
+    local warned   = false
+    local wasOn    = false
+    local picked   = 0
+
+    if not hasTouch then
+        print("[" .. NAME .. "] firetouchinterest missing - pickup cannot run")
+    end
+
+    while running do
+        if Config.Pickup and alive() and hasTouch then
+            local hrp = rootPart()
+
+            if not hrp then
+                task.wait(0.25)
+            else
+                if not wasOn then
+                    wasOn = true
+                    print("[" .. NAME .. "] auto pickup on")
+                end
+
+                local eggs = eggList()
+                local hit  = 0
+
+                for i = 1, #eggs do
+                    local egg = eggs[i]
+                    local cfg = PickCfg[egg.rarity]
+
+                    if cfg and cfg.on and egg.size >= cfg.minSize then
+                        local okP, parent = pcall(function() return egg.model.Parent end)
+
+                        if okP and parent ~= nil then
+                            local er = egg.model:FindFirstChild("HumanoidRootPart")
+
+                            if er then
+                                pcall(function() firetouchinterest(er, hrp, 0) end)
+                                pcall(function() firetouchinterest(er, hrp, 1) end)
+                                hit = hit + 1
+                            end
+                        end
+                    end
+                end
+
+                if hit > 0 then
+                    picked = picked + hit
+                    warned = false
+                elseif not warned then
+                    warned = true
+                    print("[" .. NAME .. "] pickup: nothing matches the filters right now")
+                end
+
+                task.wait(PICK_RATE)
+            end
+        else
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] auto pickup off (" .. tostring(picked) .. " touches)")
+            end
+            task.wait(0.2)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- KILL FARM
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -1031,10 +1178,6 @@ task.spawn(function()
     local stale    = 0
     local cachedId = nil
     local cachedAtk, cachedPs = nil, nil
-
-    if not hasTouch then
-        print("[" .. NAME .. "] firetouchinterest missing - size cycle only")
-    end
 
     while running do
         if Config.Farm and alive() then
@@ -1244,5 +1387,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - egg rarity and price panels", 5)
+notifyUser("Loaded - pickup filters + panels", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
