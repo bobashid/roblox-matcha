@@ -1,24 +1,27 @@
 --==================================================================
---  Feed A Mosquito  |  Chair Heal  (no sitting)
+--  Feed A Mosquito  |  Chair Health Bonus  (no sitting)
 --  Matcha LuaVM  -  built-in menu tab (UI.AddTab)
 --
---  WHY NOT A LOCAL HEAL PIN
---    Humanoid.Health and MaxHealth are READ-ONLY in Matcha. Writing
---    either throws "Unknown property: Health", so no local heal is
---    possible. The health bar reads Humanoid.Health through a
---    property-changed signal, so the heal must come from the server.
+--  FINDINGS
+--    Humanoid.Health / MaxHealth are READ-ONLY in Matcha - writing
+--    them throws "Unknown property: Health". The chair models carry
+--    no health data at all; they are blood-transfusion chairs (a
+--    Blood model full of Nozzle parts inside the BeanbagChair).
+--    Firing the player's TransfuseBlood remote was measured live:
+--    MaxHealth 2999 -> 3029 -> 3079 -> 3089 while standing, with no
+--    seat involved.
 --
---  WHAT THE CHAIR REALLY IS
---    Every chair model (BeanbagChair / Bench / Toilet / Bed) carries
---    no health data at all - only Seat, Configuration, MeshPart and a
---    Blood model full of Nozzle parts. It is a transfusion chair.
---    Firing the player's own TransfuseBlood remote healed 2991 -> 2999
---    while standing, with no seat involved.
+--    So the chair bonus IS the transfusion, and it is a MAX HEALTH
+--    gain that keeps stacking while the transfusion runs. A heal
+--    that stops at full never earns the bonus - which is why the
+--    previous version looked like it did nothing.
 --
 --  THIS SCRIPT
---    Toggle : fires TransfuseBlood while Health < MaxHealth, then
---             StopTransfuseBlood at full so blood is not drained idle.
---    Button : one-shot heal to full.
+--    Health Bonus (no sit) : keeps TransfuseBlood running so max HP
+--                            keeps climbing. Turning it off fires
+--                            StopTransfuseBlood.
+--    Stop at Full HP       : optional; pauses while HP is full.
+--    Heal Now              : one short transfusion burst.
 --==================================================================
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -26,7 +29,7 @@ local RS      = game:GetService("ReplicatedStorage")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.2"
+local VERSION = "v1.3"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -37,13 +40,14 @@ local running = true
 local built   = false
 
 -- fixed tuning
-local LOOP_RATE = 0.2    -- heal loop rate
+local LOOP_RATE = 0.2    -- control loop rate
 local POLL_RATE = 0.1    -- toggle poller rate
-local REFIRE    = 1.0    -- re-fire transfusion if still hurt
+local REFIRE    = 0.5    -- re-fire if the server drops it
 
 local Config = {
-    Heal  = false,
-    Force = false,
+    Bonus    = false,
+    StopFull = false,
+    Force    = false,
 }
 
 local TOGGLES     = {}
@@ -77,7 +81,7 @@ local function getRemotes()
     local actors  = runtime and runtime:FindFirstChild("Actors")
     if not actors then return nil end
 
-    local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
+    local actor  = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
     local events = actor and actor:FindFirstChild("Events")
     if not events then return nil end
 
@@ -167,9 +171,13 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = makeSection(tab, "Chair", "Left")
         if sec then
-            if safeToggle(sec, "Health Bonus (no sit)", "fam_heal",
-                false, applyBool("Heal")) then
-                registerToggle("Heal", "fam_heal", "Health Bonus (no sit)")
+            if safeToggle(sec, "Health Bonus (no sit)", "fam_bonus",
+                false, applyBool("Bonus")) then
+                registerToggle("Bonus", "fam_bonus", "Health Bonus (no sit)")
+            end
+            if safeToggle(sec, "Stop at Full HP", "fam_stopfull",
+                false, applyBool("StopFull")) then
+                registerToggle("StopFull", "fam_stopfull", "Stop at Full HP")
             end
         end
 
@@ -235,43 +243,59 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HEAL LOOP
---   Health is readable; only the server can move it. Fire the
---   transfusion while hurt, stop it the moment we are full.
+-- TRANSFUSION LOOP
+--   The bonus is max HP gained while the transfusion runs, so the
+--   default keeps it running. Health stays full on its own because
+--   the server raises MaxHealth and Health together.
 --------------------------------------------------------------------
 task.spawn(function()
+    local lastMax = 0
+
     while running do
-        local want = Config.Heal or Config.Force
-        local hum  = humanoid()
+        local active   = Config.Bonus or Config.Force
+        local stopFull = Config.StopFull or Config.Force
 
-        if hum and want then
-            local hp  = hum.Health
-            local max = hum.MaxHealth
+        if active then
+            local hum = humanoid()
+            if hum then
+                local hp   = hum.Health
+                local max  = hum.MaxHealth
+                local full = (max > 0 and hp >= max)
 
-            if hp > 0 and max > 0 and hp < max then
-                local now = tick()
-                if not transfusing or (now - lastFire) >= REFIRE then
-                    if fireStart() then
-                        if not transfusing then
-                            print("[" .. NAME .. "] healing ("
-                                .. tostring(math.floor(hp)) .. "/"
-                                .. tostring(math.floor(max)) .. ")")
+                if max ~= lastMax then
+                    if lastMax ~= 0 and max > lastMax then
+                        print("[" .. NAME .. "] max health "
+                            .. tostring(math.floor(lastMax)) .. " -> "
+                            .. tostring(math.floor(max)))
+                    end
+                    lastMax = max
+                end
+
+                if stopFull and full then
+                    if transfusing then
+                        fireStop()
+                        transfusing = false
+                        print("[" .. NAME .. "] full - paused")
+                    end
+                    if Config.Force then Config.Force = false end
+                else
+                    local now = tick()
+                    if not transfusing or (now - lastFire) >= REFIRE then
+                        if fireStart() then
+                            if not transfusing then
+                                print("[" .. NAME .. "] transfusion on (max "
+                                    .. tostring(math.floor(max)) .. ")")
+                            end
+                            transfusing = true
+                            lastFire    = now
                         end
-                        transfusing = true
-                        lastFire    = now
                     end
                 end
-            else
-                if transfusing then
-                    fireStop()
-                    transfusing = false
-                    print("[" .. NAME .. "] full")
-                end
-                if Config.Force then Config.Force = false end
             end
         elseif transfusing then
             fireStop()
             transfusing = false
+            print("[" .. NAME .. "] transfusion off")
         end
 
         task.wait(LOOP_RATE)
