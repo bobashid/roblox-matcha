@@ -1,35 +1,41 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.4  -  BOSS PANEL IN THE BOTTOM LEFT
+--  v8.5  -  PANEL MOVED RIGHT, MATCHES THE GAME UI
 --
---  The overlay is no longer drawn over the bosses in the world. It is
---  a fixed panel in the bottom-left corner, sitting above your own
---  health bar, one row per spawned boss:
+--  The panel was sitting on top of the game's own bottom-left HUD.
+--  It now starts at PANEL_X = 300 px, clear of the health bar, and
+--  every row sits on a dark backdrop so it stays readable over bright
+--  terrain.
 --
---      SecretMama
---      [##########----]   357171200 / 360000000
---      RareMama
---      [##------------]   2000 / 2000
+--  COLOURS AND FONT ARE THE GAME'S OWN (read from PlayerGui, not
+--  guessed):
+--      HealthGui.Frame       BackgroundColor3 = 44,44,54
+--      MainGui.Frame                         = 45,45,55
+--      ShopGui / ZoneGui                     = 30,30,38 .. 32,32,40
+--      HealthGui text        TextColor3 = 255,255,255
+--                            Font      = GothamBold, TextSize 18
+--  so the panel uses 40,40,50 for its backdrop, white for names, a
+--  muted green-white for numbers, and SystemBold (the closest bold
+--  sans the Drawing library exposes to GothamBold).
 --
---  Rows are stacked upwards from the bottom so the list grows away
---  from your health bar instead of over it. The panel is positioned
---  from the camera's ViewportSize every frame, so it stays in the
---  corner at any resolution or window size.
+--  READABILITY CHANGES
+--      - a filled backdrop behind the whole panel, sized to the live
+--        row count each frame, so it never draws an empty box
+--      - name 14 px bold, numbers 13 px, health bar 160 x 7
+--      - 34 px rows, stacked upward from the bottom edge
+--      - panel anchored from camera ViewportSize, so it stays in
+--        place at any resolution
 --
 --  HOW IT IS BUILT (Matcha has no GUI objects - Instance.new does not
 --  exist, so every overlay is Drawing)
---    - a FIXED pool of 6 rows, created once at load. Nothing is
---      created in the render loop, because Drawing objects have no GC
---      and per-frame creation leaks until the VM restarts.
---    - ONE RenderStepped connection total, not one per row.
---    - rows only read cached boss values, so the overlay does not walk
---      the tree every frame - the boss list is still the cached 0.6 s
---      scan.
---    - dead bosses drop out of the panel on the next scan; rows beyond
---      the live count are hidden.
---    - every Drawing is removed in stop(), so reloading leaves no
---      ghost panel behind.
+--    - a FIXED pool of 6 rows plus one backdrop, created once at load.
+--      Nothing is created in the render loop; Drawing objects have no
+--      GC and per-frame creation leaks until the VM restarts.
+--    - ONE RenderStepped connection total.
+--    - rows only read cached boss values; the boss list is still the
+--      cached 0.6 s scan, so the overlay does not walk the tree.
+--    - every Drawing is removed in stop().
 --
 --  Hit logic is unchanged from v8.2, which works:
 --    - AttackPart is the only thing written: shrink to 2 studs to end
@@ -51,7 +57,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.4"
+local VERSION = "v8.5"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -80,13 +86,24 @@ local REACH_MAX    = 4000
 local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
 
--- panel tuning (bottom left, above the player's health bar)
-local PANEL_ROWS  = 6
-local ROW_H       = 30
-local PANEL_BAR_W = 150
-local PANEL_BAR_H = 5
-local PANEL_X     = 18
-local PANEL_LIFT  = 150   -- pixels up from the bottom edge
+-- panel tuning (game colours, moved right of the health bar)
+local PANEL_ROWS   = 6
+local ROW_H        = 34
+local PANEL_BAR_W  = 160
+local PANEL_BAR_H  = 7
+local PANEL_W      = 310
+local PANEL_X      = 300   -- clear of the game's bottom-left HUD
+local PANEL_LIFT   = 150   -- pixels up from the bottom edge
+local PAD_X        = 10
+local PAD_TOP      = 12
+local PAD_BOTTOM   = 12
+
+-- colours taken from the game's own GUIs
+local COL_BACK   = Color3.fromRGB(40, 40, 50)
+local COL_BAR_BG = Color3.fromRGB(26, 26, 33)
+local COL_FILL   = Color3.fromRGB(120, 190, 135)
+local COL_NAME   = Color3.fromRGB(255, 255, 255)
+local COL_HP     = Color3.fromRGB(198, 208, 200)
 
 local SKIP_PART = {
     Area      = true,
@@ -465,41 +482,51 @@ local function restoreAttackParts()
 end
 
 --------------------------------------------------------------------
--- BOSS PANEL  (fixed bottom-left, pooled Drawings)
+-- BOSS PANEL  (game-styled, pooled Drawings, one connection)
 --------------------------------------------------------------------
 local hudPool = {}
+local panelBack = nil
 local hudConn = nil
 
 local function buildHud()
     if #hudPool > 0 then return end
 
+    panelBack = Drawing.new("Square")
+    panelBack.Filled      = true
+    panelBack.Thickness   = 0
+    panelBack.Color       = COL_BACK
+    panelBack.Transparency = 0.1
+    panelBack.Visible     = false
+
     for i = 1, PANEL_ROWS do
         local nameTag = Drawing.new("Text")
         nameTag.Text     = ""
-        nameTag.Size     = 13
+        nameTag.Size     = 14
+        nameTag.Font     = 2          -- SystemBold, closest to GothamBold
         nameTag.Center   = false
         nameTag.Outline  = true
-        nameTag.Color    = Color3.fromRGB(255, 255, 255)
+        nameTag.Color    = COL_NAME
         nameTag.Visible  = false
 
         local hpTag = Drawing.new("Text")
         hpTag.Text       = ""
-        hpTag.Size       = 12
+        hpTag.Size       = 13
+        hpTag.Font       = 2
         hpTag.Center     = false
         hpTag.Outline    = true
-        hpTag.Color      = Color3.fromRGB(185, 255, 190)
+        hpTag.Color      = COL_HP
         hpTag.Visible    = false
 
         local back = Drawing.new("Square")
         back.Filled      = true
         back.Thickness   = 0
-        back.Color       = Color3.fromRGB(20, 20, 20)
+        back.Color       = COL_BAR_BG
         back.Visible     = false
 
         local fill = Drawing.new("Square")
         fill.Filled      = true
         fill.Thickness   = 0
-        fill.Color       = Color3.fromRGB(70, 220, 90)
+        fill.Color       = COL_FILL
         fill.Visible     = false
 
         hudPool[i] = {
@@ -527,7 +554,7 @@ local function viewportHeight()
         end
     end
 
-    return 720
+    return 1080
 end
 
 local function startHud()
@@ -562,18 +589,35 @@ local function startHud()
                 slot.nameTag.Position = Vector2.new(PANEL_X, rowY)
                 slot.nameTag.Visible  = true
 
-                slot.back.Position = Vector2.new(PANEL_X, rowY + 16)
+                slot.back.Position = Vector2.new(PANEL_X, rowY + 19)
                 slot.back.Size     = Vector2.new(PANEL_BAR_W, PANEL_BAR_H)
                 slot.back.Visible  = true
 
-                slot.fill.Position = Vector2.new(PANEL_X, rowY + 16)
+                slot.fill.Position = Vector2.new(PANEL_X, rowY + 19)
                 slot.fill.Size     = Vector2.new(PANEL_BAR_W * frac, PANEL_BAR_H)
                 slot.fill.Visible  = true
 
                 slot.hpTag.Text     = tostring(math.floor(hp))
                     .. " / " .. tostring(math.floor(maxHp))
-                slot.hpTag.Position = Vector2.new(PANEL_X + PANEL_BAR_W + 8, rowY)
+                slot.hpTag.Position = Vector2.new(
+                    PANEL_X + PANEL_BAR_W + 10,
+                    rowY + 2
+                )
                 slot.hpTag.Visible  = true
+            end
+        end
+
+        -- backdrop sized to the rows actually drawn
+        if panelBack then
+            if n > 0 then
+                local topY = baseY - (n - 1) * ROW_H - PAD_TOP
+                local height = (n - 1) * ROW_H + ROW_H + PAD_TOP + PAD_BOTTOM
+
+                panelBack.Position = Vector2.new(PANEL_X - PAD_X, topY)
+                panelBack.Size     = Vector2.new(PANEL_W, height)
+                panelBack.Visible  = true
+            else
+                panelBack.Visible = false
             end
         end
 
@@ -597,6 +641,11 @@ local function stopHud()
         pcall(function() slot.hpTag:Remove() end)
         pcall(function() slot.back:Remove() end)
         pcall(function() slot.fill:Remove() end)
+    end
+
+    if panelBack then
+        pcall(function() panelBack:Remove() end)
+        panelBack = nil
     end
 
     hudPool = {}
@@ -948,5 +997,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - boss panel bottom left", 5)
+notifyUser("Loaded - boss panel moved right", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
