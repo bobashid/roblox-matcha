@@ -1,28 +1,33 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v4.1
+--  v4.2
 --
---  BACK TO HITTING FROM FAR  (no teleports anywhere)
---    v3.8 could hit bosses from across the arena because the
---    expander multiplied EVERY boss part by 6. The big parts - the
---    ones already past 24 studs - grew six times as wide, and that
---    extra width is what reached the boss from range.
---    v4.0 only lifted small parts up to 24 studs and left the big
---    ones alone, so the reach went away.
---    v4.1 multiplies again:  new size = old size * multiplier.
---    Nothing is capped and nothing is ever made smaller.
---      Boss Hitbox Expander   x6
---      Huge Hitbox            x12 (wins while both are on)
---    Original sizes are remembered the first time a part is seen and
---    put back when both toggles are off or the script stops.
---    This is a local change: the parts are bigger on your client.
+--  BACK TO THE ONE THAT WORKED
+--    Stand wherever you want, bosses get their hitboxes multiplied
+--    so the swing reaches them from range, and the Attack remote is
+--    fired on a loop. No CFrame writes anywhere, no teleports.
 --
---  AUTO SWING
---    You stand wherever you are and it fires the Attack remote on a
---    loop (SWING_RATE). Attack is fired with no arguments, so the
---    swing is resolved against the parts your client can see - the
---    enlarged ones. No CFrame is ever written.
+--  ONE COMBAT TOGGLE
+--    "Auto Farm" does both things at once:
+--      - every BasePart of every boss model is multiplied x8
+--      - every boss tool's Attack remote is fired every SWING_RATE
+--    "Huge Hitbox (x16)" only changes the multiplier while Auto Farm
+--    is on.
+--
+--  WHAT WAS BUGGED BEFORE AND IS FIXED HERE
+--    1. Saved original sizes of dead/respawned bosses were kept
+--       forever. They are now dropped as soon as the part is gone,
+--       and bosses that respawn are picked up fresh.
+--    2. Turning the expander off after a multiplier change could
+--       leave parts at the bigger size. Restore now always walks the
+--       saved table and puts every part back to its first-seen size.
+--    3. Re-applying the multiply every pass could compound if a part
+--       was ever saved after it had already been grown. The saved
+--       size is now taken once, only from a part that is not in the
+--       table yet, and is never overwritten while the toggle is on.
+--    4. Attack remotes are cached per tool and re-scanned when the
+--       cache is stale, so a weapon swap no longer kills auto swing.
 --
 --  BOSS LIST
 --    Workspace.SpawnAreas.<Type>Area holds a Model whose name
@@ -41,7 +46,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v4.1"
+local VERSION = "v4.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -58,12 +63,12 @@ local HEAL_REFIRE  = 1.0
 local HP_LOG_RATE  = 5.0
 local COLLECT_RATE = 1.5
 local SWING_RATE   = 0.1
-local ATK_TTL      = 0.5
-local HB_RATE      = 0.4
+local ATK_TTL      = 1.0
+local HB_RATE      = 0.5
 
--- hitbox tuning: plain multipliers, no cap
-local HB_MULT_SMALL = 6
-local HB_MULT_BIG   = 12
+-- hitbox multipliers (plain multiply, no cap)
+local HB_MULT      = 8
+local HB_MULT_BIG  = 16
 
 local BOSS_TYPES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -71,11 +76,10 @@ local BOSS_TYPES = {
 }
 
 local Config = {
-    Heal      = false,
+    Heal        = false,
     AutoCollect = false,
-    Swing     = false,
-    Hitbox    = false,
-    HitboxBig = false,
+    Farm        = false,
+    HitboxBig   = false,
 }
 
 local TOGGLES     = {}
@@ -145,7 +149,7 @@ local function fireEvent(name)
 end
 
 --------------------------------------------------------------------
--- Tool actor Attack remotes
+-- Tool actor Attack remotes (re-scanned when stale)
 --------------------------------------------------------------------
 local atkCache = nil
 local atkStamp = 0
@@ -154,12 +158,12 @@ local function attackRemotes()
     local now = tick()
 
     if atkCache and #atkCache > 0 and (now - atkStamp) < ATK_TTL then
-        local first = atkCache[1]
-        local p1 = first and first.Parent
-        local p2 = p1 and p1.Parent
-        if p1 and p2 then
-            return atkCache
+        local okAll = true
+        for i = 1, #atkCache do
+            local r = atkCache[i]
+            if not r or not r.Parent then okAll = false break end
         end
+        if okAll then return atkCache end
         atkCache = nil
     end
 
@@ -230,15 +234,30 @@ end
 
 --------------------------------------------------------------------
 -- BOSS HITBOX EXPANDER
---   new size = original size * multiplier. No cap, never smaller.
+--   new size = first-seen size * multiplier, around the part centre.
 --------------------------------------------------------------------
 local hbSaved   = {}
 local hbApplied = 0
 
 local function hbFactor()
+    if not Config.Farm then return 0 end
     if Config.HitboxBig then return HB_MULT_BIG end
-    if Config.Hitbox then return HB_MULT_SMALL end
-    return 0
+    return HB_MULT
+end
+
+-- forget parts that no longer exist so respawned bosses start clean
+local function pruneSaved()
+    local dead = nil
+    for part in pairs(hbSaved) do
+        if not part or not part.Parent then
+            dead = dead or {}
+            dead[#dead + 1] = part
+        end
+    end
+    if dead then
+        for i = 1, #dead do hbSaved[dead[i]] = nil end
+    end
+    return dead and #dead or 0
 end
 
 local function applyHitbox(mult)
@@ -254,6 +273,7 @@ local function applyHitbox(mult)
                     if isBasePart(d) then
                         local base = hbSaved[d]
                         if base == nil then
+                            -- save the size exactly once, before we grow it
                             local okS, s = pcall(function() return d.Size end)
                             if okS and s then
                                 base = s
@@ -288,7 +308,7 @@ local function restoreHitbox()
         end
     end
     hbSaved = {}
-    if hbApplied > 0 then
+    if hbApplied ~= 0 then
         print("[" .. NAME .. "] hitbox restored on " .. tostring(n) .. " parts")
     end
     hbApplied = 0
@@ -354,9 +374,8 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Swing", "fam_swing", "Swing", false)
-            addToggle(combat, "Boss Hitbox Expander (x6)", "fam_hitbox", "Hitbox", false)
-            addToggle(combat, "Huge Hitbox (x12)", "fam_hitbox_big", "HitboxBig", false)
+            addToggle(combat, "Auto Farm (hitbox + swing)", "fam_farm", "Farm", false)
+            addToggle(combat, "Huge Hitbox (x16)", "fam_hitbox_big", "HitboxBig", false)
         end
     end)
 
@@ -412,13 +431,14 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HITBOX LOOP
+-- HITBOX LOOP  (follows Auto Farm)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
         local mult = hbFactor()
 
         if mult > 0 then
+            pruneSaved()
             local n = applyHitbox(mult)
             if n > 0 and hbApplied ~= mult then
                 hbApplied = mult
@@ -437,27 +457,27 @@ end)
 -- AUTO SWING  (stand still, fire Attack)
 --------------------------------------------------------------------
 task.spawn(function()
-    local wasOn   = false
-    local noRemoteLogged = false
+    local wasOn = false
+    local warned = false
 
     while running do
-        if Config.Swing then
+        if Config.Farm then
             if not wasOn then
                 wasOn = true
-                noRemoteLogged = false
-                print("[" .. NAME .. "] auto swing on")
+                warned = false
+                print("[" .. NAME .. "] auto farm on (swinging)")
             end
 
-            if not swing() and not noRemoteLogged then
-                noRemoteLogged = true
-                print("[" .. NAME .. "] no Attack remote found - equip the weapon")
+            if not swing() and not warned then
+                warned = true
+                print("[" .. NAME .. "] no Attack remote - equip a weapon")
             end
 
             task.wait(SWING_RATE)
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto swing off")
+                print("[" .. NAME .. "] auto farm off")
             end
             task.wait(0.2)
         end
@@ -530,5 +550,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Auto Swing + Hitbox x6/x12", 5)
+notifyUser("Loaded - Auto Farm: big hitboxes + swing", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
