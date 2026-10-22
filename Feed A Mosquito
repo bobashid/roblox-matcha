@@ -1,39 +1,39 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v3.3
+--  v3.4
 --
---  WHAT THE GAME ACTUALLY HAS (read live, not guessed)
---    Workspace.SpawnAreas.<Type>Area is a Model holding:
---      Area        Part   - the arena floor, the spot to stand on
---      ChaseArea   Part   - a trigger volume ~14 studs UP, NOT the spot
---      <boss>Mama  Model  - the boss itself
---    Boss model names are NOT uniform:
---      Common    -> MosquitoMama      (0, 0, -75)
---      Uncommon  -> UncommonMama      (0, -1, -145)
---      Rare      -> RareMama          (0, 0, -215)
---      Legendary -> LegendaryMama     (0, -1, -375)
---      Epic      -> EpicMama          (0, 0, -290)
---      Mythical / Divine / Secret hold only Walls and eggs, no Mama
---      model, so those three fall back to the Area floor part.
---
---  BOSS TELEPORT
---    Prefers the boss model (PrimaryPart, then Head, then Root) and
---    lands exactly on it. Falls back to the Area part, never to
---    ChaseArea - that part sits 14 studs in the air, which is why the
---    old buttons dropped you above the arena instead of on the boss.
+--  BOSS SELECT (toggles, not buttons)
+--    One toggle per boss type under "Boss Select". Switching one ON
+--    selects that boss and teleports you onto it immediately.
+--    Switching it OFF clears the selection.
+--    Matcha cannot untick a widget from script, so if you leave two on,
+--    the most recently switched ON one wins - it is the one that took
+--    you there last. Turn the previous one off to keep it tidy.
 --
 --  KILL AURA
---    Swings every pass (the behaviour that landed hits before). It
---    first looks for a real boss model across all areas and moves onto
---    it; if none exists it keeps swinging where you stand rather than
---    teleporting to an empty arena floor.
+--    Swings every pass. With a boss selected it moves onto that boss
+--    and keeps hitting it. With nothing selected it targets the
+--    nearest boss model. With no boss model anywhere it just swings
+--    where you stand instead of walking to an empty arena.
+--
+--  WHAT THE GAME HAS (read live)
+--    Workspace.SpawnAreas.<Type>Area holds:
+--      Area        Part   - the arena floor (the standing spot)
+--      ChaseArea   Part   - a trigger volume ~14 studs UP, never used
+--      <boss>Mama  Model  - the boss itself
+--    Common    -> MosquitoMama   (0, 0, -75)
+--    Uncommon  -> UncommonMama   (0, -1, -145)
+--    Rare      -> RareMama       (0, 0, -215)
+--    Epic      -> EpicMama       (0, 0, -290)
+--    Legendary -> LegendaryMama  (0, -1, -375)
+--    Mythical / Divine / Secret hold only Walls and eggs, so those
+--    three land on the Area floor part.
 --
 --  Sections
 --    Main          Always Heal, Auto Collect
 --    Combat        Kill Aura
---    Boss Teleport TP Common / Uncommon / Rare / Legendary /
---                  Mythical / Divine / Secret / Epic
+--    Boss Select   one toggle per type
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -44,7 +44,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v3.3"
+local VERSION = "v3.4"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -78,6 +78,8 @@ local Config = {
 local TOGGLES     = {}
 local getterWorks = {}
 
+local selectedBoss = nil
+
 _G.FeedAMosquito = { stop = function() running = false end }
 
 --------------------------------------------------------------------
@@ -107,6 +109,12 @@ local function child(a, b, c)
     local n1 = a:FindFirstChild(b)
     if not n1 or not c then return n1 end
     return n1:FindFirstChild(c)
+end
+
+local function fmt(p)
+    return tostring(math.floor(p.X)) .. ","
+        .. tostring(math.floor(p.Y)) .. ","
+        .. tostring(math.floor(p.Z))
 end
 
 --------------------------------------------------------------------
@@ -200,17 +208,12 @@ end
 --------------------------------------------------------------------
 -- Area / boss lookup
 --------------------------------------------------------------------
-local function spawnAreas()
-    return WS:FindFirstChild("SpawnAreas")
-end
-
 local function areaModel(bossType)
-    local areas = spawnAreas()
+    local areas = WS:FindFirstChild("SpawnAreas")
     if not areas then return nil end
     return areas:FindFirstChild(bossType .. "Area")
 end
 
--- first usable point on a model: PrimaryPart, Head, then Root
 local function modelPoint(model)
     if not model then return nil, nil end
 
@@ -232,7 +235,6 @@ local function modelPoint(model)
     return nil, nil
 end
 
--- the boss model inside an area: <Type>Mama, else any model with Mama
 local function bossModelIn(area)
     if not area then return nil end
 
@@ -246,7 +248,6 @@ local function bossModelIn(area)
     return nil
 end
 
--- exact standing spot: boss model first, Area floor part second
 local function spotFor(bossType)
     local area = areaModel(bossType)
     if not area then return nil, "no area" end
@@ -266,12 +267,11 @@ local function spotFor(bossType)
     return nil, "no part"
 end
 
--- nearest real boss model across every area
 local function nearestBoss(myPos)
     local bestPos, bestLabel, bestD = nil, nil, 1e9
 
     for i = 1, #BOSS_TYPES do
-        local t   = BOSS_TYPES[i]
+        local t    = BOSS_TYPES[i]
         local area = areaModel(t)
         local boss = bossModelIn(area)
         local pos, partName = modelPoint(boss)
@@ -303,8 +303,33 @@ local function moveTo(hrp, pos)
     return true
 end
 
+-- called when a boss toggle flips ON
+local function selectBoss(bossType)
+    selectedBoss = bossType
+
+    local hrp = rootPart()
+    if not hrp or not alive() then
+        print("[" .. NAME .. "] selected " .. bossType .. " (no character)")
+        notifyUser("Selected " .. bossType, 2)
+        return
+    end
+
+    local pos, label = spotFor(bossType)
+    if not pos then
+        print("[" .. NAME .. "] selected " .. bossType
+            .. " but no spot: " .. tostring(label))
+        notifyUser("Selected " .. bossType .. " (no spot)", 3)
+        return
+    end
+
+    pcall(function() hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z) end)
+    print("[" .. NAME .. "] go " .. bossType .. " via " .. label
+        .. " " .. fmt(pos))
+    notifyUser("Go " .. bossType, 2)
+end
+
 --------------------------------------------------------------------
--- Toggle / button plumbing
+-- Toggle plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -315,8 +340,8 @@ local function applyBool(key)
     end
 end
 
-local function registerToggle(key, id, name)
-    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name }
+local function registerToggle(key, id, name, boss)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name, boss = boss }
 end
 
 local function safeToggle(sec, name, id, default, cb)
@@ -332,18 +357,6 @@ local function safeToggle(sec, name, id, default, cb)
     return false
 end
 
-local function safeButton(sec, name, cb)
-    local tries = {
-        function() sec:Button(name, cb) end,
-        function() sec:Button(name, name .. "_btn", cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    warn("[" .. NAME .. "] Button failed: " .. tostring(name))
-    return false
-end
-
 local function makeSection(tab, name, side)
     local ok, sec = pcall(function() return tab:Section(name, side) end)
     if ok and type(sec) == "table" then return sec end
@@ -352,9 +365,9 @@ local function makeSection(tab, name, side)
     return nil
 end
 
-local function addToggle(sec, label, id, key, default)
+local function addToggle(sec, label, id, key, default, boss)
     if safeToggle(sec, label, id, default, applyBool(key)) then
-        registerToggle(key, id, label)
+        registerToggle(key, id, label, boss)
     end
 end
 
@@ -378,35 +391,13 @@ local function buildTab(tab)
             addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
         end
 
-        local tp = makeSection(tab, "Boss Teleport", "Right")
-        if tp then
+        local pick = makeSection(tab, "Boss Select", "Right")
+        if pick then
             for i = 1, #BOSS_TYPES do
-                local bossType = BOSS_TYPES[i]
-                safeButton(tp, "TP " .. bossType, function()
-                    local hrp = rootPart()
-                    if not hrp or not alive() then
-                        notifyUser("No character", 3)
-                        return
-                    end
-
-                    local pos, label = spotFor(bossType)
-                    if not pos then
-                        print("[" .. NAME .. "] tp " .. bossType
-                            .. " failed: " .. tostring(label))
-                        notifyUser("No " .. bossType .. " spot", 3)
-                        return
-                    end
-
-                    pcall(function()
-                        hrp.CFrame = CFrame.new(pos.X, pos.Y, pos.Z)
-                    end)
-
-                    print("[" .. NAME .. "] tp " .. bossType .. " via " .. label
-                        .. " " .. tostring(math.floor(pos.X)) .. ","
-                        .. tostring(math.floor(pos.Y)) .. ","
-                        .. tostring(math.floor(pos.Z)))
-                    notifyUser("TP " .. bossType, 2)
-                end)
+                local t   = BOSS_TYPES[i]
+                local key = "Sel" .. t
+                local id  = "fam_go_" .. string.lower(t)
+                addToggle(pick, "Go " .. t, id, key, false, t)
             end
         end
     end)
@@ -436,6 +427,7 @@ end
 
 --------------------------------------------------------------------
 -- TOGGLE POLLER
+--   Rising edge on a boss toggle selects and teleports.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -453,9 +445,19 @@ task.spawn(function()
 
             if val ~= nil then
                 getterWorks[t.key] = true
+
                 if Config[t.key] ~= val then
                     Config[t.key] = val
                     print("[" .. NAME .. "] " .. t.key .. " = " .. tostring(val))
+
+                    if t.boss then
+                        if val then
+                            selectBoss(t.boss)
+                        elseif selectedBoss == t.boss then
+                            selectedBoss = nil
+                            print("[" .. NAME .. "] selection cleared")
+                        end
+                    end
                 end
             end
         end
@@ -519,9 +521,8 @@ end)
 
 --------------------------------------------------------------------
 -- KILL AURA
---   Swings every pass. If a real boss model exists it moves onto it
---   first; if none does, it keeps swinging where you stand instead of
---   walking to an empty arena floor.
+--   Swings every pass. Uses the selected boss if there is one,
+--   otherwise the nearest boss model, otherwise just swings here.
 --------------------------------------------------------------------
 task.spawn(function()
     local lastLabel = nil
@@ -530,13 +531,24 @@ task.spawn(function()
         if Config.Aura then
             local hrp = rootPart()
             if hrp and alive() then
-                local pos, label = nearestBoss(hrp.Position)
+                local pos, label
+
+                if selectedBoss then
+                    pos, label = spotFor(selectedBoss)
+                    if pos then
+                        label = selectedBoss .. " (" .. tostring(label) .. ")"
+                    end
+                end
+
+                if not pos then
+                    pos, label = nearestBoss(hrp.Position)
+                end
 
                 if pos then
                     moveTo(hrp, pos)
                     if label ~= lastLabel then
                         lastLabel = label
-                        print("[" .. NAME .. "] aura target " .. label)
+                        print("[" .. NAME .. "] aura -> " .. tostring(label))
                     end
                 else
                     lastLabel = nil
@@ -554,11 +566,12 @@ local function stop()
     running = false
     pcall(function() fireEvent("StopTransfuseBlood") end)
     atkCache = nil
+    selectedBoss = nil
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - all toggles start OFF", 5)
+notifyUser("Loaded - pick a boss under Boss Select", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
