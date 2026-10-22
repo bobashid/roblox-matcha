@@ -38,7 +38,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.5"
+local VERSION = "v1.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -101,6 +101,7 @@ end
 
 --------------------------------------------------------------------
 -- Player actor remotes (Events / Functions)
+--   No varargs: none of these remotes take arguments from the client.
 --------------------------------------------------------------------
 local pEvents = nil
 local pFuncs  = nil
@@ -122,18 +123,18 @@ local function playerRemotes()
     return pEvents, pFuncs
 end
 
-local function fireEvent(name, ...)
+local function fireEvent(name)
     local events = playerRemotes()
     local r = events and events:FindFirstChild(name)
     if not r then return false end
-    return (pcall(function() r:FireServer(...) end))
+    return (pcall(function() r:FireServer() end))
 end
 
-local function invokeFunc(name, ...)
+local function invokeFunc(name)
     local _, funcs = playerRemotes()
     local f = funcs and funcs:FindFirstChild(name)
     if not f then return false end
-    return (pcall(function() f:InvokeServer(...) end))
+    return (pcall(function() f:InvokeServer() end))
 end
 
 --------------------------------------------------------------------
