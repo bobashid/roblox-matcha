@@ -1,51 +1,38 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v7.1  -  REPEAT THE TOUCH, NOT THE EQUIP
+--  v7.2  -  YOU NO LONGER SLICE ANYTHING YOURSELF
 --
---  WHAT THE PROBES SHOWED (this is why earlier versions stalled)
---    1. Firing Attack on the correct live actor 8 times: the boss HP
---       stayed at 20. A bare remote is NOT the hit path.
---    2. My earlier firetouchinterest test printed "PARTS 0" - it never
---       touched anything, because the part read crashed first. So that
---       path was never actually tested.
---    3. One hit lands on every equip. The equip does not damage by
---       itself: welding AttackPart into the hand creates a NEW physics
---       contact, and the tool's TouchTransmitter fires once on that
---       new contact.
---    4. Reparenting the tool in a loop crashed the client.
+--  What v7.1 proved
+--    The touch cycle works: hits land on every boss once the reach is
+--    scaled. What it still needed was your own swing to actually deal
+--    the damage, so you had to slice the air.
 --
---  READ 1 + 3 TOGETHER
---    The tool hits on a NEW contact, and a contact that already exists
---    does not fire again. That is why a touch fired every pass did
---    nothing: the parts were already touching and the engine ignores
---    the repeat. So this build alternates the touch state instead of
---    reparenting anything:
+--  What changed here
+--    The hit loop now does the swing itself, every pass:
+--        1. scale AttackPart (Reach)
+--        2. alternate untouch / touch on every boss part, so each
+--           second pass is a brand new contact (the condition that
+--           produces a hit)
+--        3. PlaySound + Attack on the tool's LIVE actor (from ActorId)
+--        4. mouse1click, the same input your own click makes
+--    so nothing is left for you to press. Hold no key, click nothing.
 --
---        pass A:  firetouchinterest(ap, part, 1)   -- break contact
---        pass B:  firetouchinterest(ap, part, 0)   -- new contact
---                 + PlaySound/Attack on the LIVE actor
---
---    Every second pass is therefore a brand new contact, which is the
---    exact condition that produced a hit on equip - but without ever
---    moving, equipping or unequipping the tool.
---
---  LIVE ACTOR
+--  Why the live actor matters
 --    Every equip leaves a dead copy of the tool actor in
---    Runtime.Actors, and matching by name prefix picks a dead one. The
---    tool's ActorId StringValue names the live actor, so that exact
---    name is resolved instead, and re-resolved whenever it changes.
+--    Runtime.Actors. Matching by name prefix picked a dead one, which
+--    is why earlier Attack loops did nothing. The tool's ActorId names
+--    the live actor and is re-resolved whenever it changes.
 --
---  REACH (optional)
+--  Reach
 --    AttackPart is the only part ever resized:
 --        side = (farthest boss + 30) * 2      [60 .. 4000]
---    so the contact can happen from anywhere on the map. Bosses are
---    never written to - no size, no CanCollide, no CFrame - so none is
---    launched into the void and the map stays solid. Original size is
---    saved per Address and restored on toggle off.
+--    Bosses are never written to - no size, no CanCollide, no CFrame -
+--    so none is launched into the void and the map stays solid.
+--    Original size is saved per Address and restored on toggle off.
 --
---  Boss HP is summed every pass and one line is printed if it stops
---  dropping, so you can tell a miss from a slow kill.
+--  Boss HP is summed every pass; one line prints if it stops dropping
+--  so a miss is obvious instead of silent.
 --
 --  Keep a weapon equipped. All toggles start OFF.
 --  Stop with _G.FeedAMosquito.stop().
@@ -57,7 +44,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v7.1"
+local VERSION = "v7.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -225,6 +212,18 @@ local function remotesOfActor(name)
     if not ev then return nil, nil end
 
     return ev:FindFirstChild("Attack"), ev:FindFirstChild("PlaySound")
+end
+
+-- the same input your own click sends, so no hand needed
+local function swingClick()
+    if type(mouse1click) ~= "function" then return false end
+
+    if type(isrbxactive) == "function" then
+        local ok, act = pcall(isrbxactive)
+        if ok and act == false then return false end
+    end
+
+    return (pcall(mouse1click))
 end
 
 --------------------------------------------------------------------
@@ -515,7 +514,7 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Hit (repeat touch cycle)", "fam_farm", "Farm", false)
+            addToggle(combat, "Auto Hit (swings for you)", "fam_farm", "Farm", false)
             addToggle(combat, "Reach (scale the weapon)", "fam_reach", "Reach", false)
         end
     end)
@@ -572,7 +571,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HIT LOOP  (alternate untouch / touch so every other pass is new)
+-- HIT LOOP  (touch cycle + attack + click, fully automatic)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -590,7 +589,7 @@ task.spawn(function()
     local touching = false
 
     if not hasTouch then
-        print("[" .. NAME .. "] firetouchinterest missing - Attack only")
+        print("[" .. NAME .. "] firetouchinterest missing - attack only")
     end
 
     while running do
@@ -629,7 +628,7 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] auto hit on (touch cycle)")
+                        print("[" .. NAME .. "] auto hit on (swings for you)")
                     end
 
                     local ap = attackPartOf(tool)
@@ -669,9 +668,11 @@ task.spawn(function()
                                 pcall(function() cachedPs:FireServer("SwingSound") end)
                             end
                             pcall(function() cachedAtk:FireServer() end)
+                            swingClick()
                         end
                     else
                         pcall(function() cachedAtk:FireServer() end)
+                        swingClick()
                     end
 
                     local list = bossList()
@@ -695,7 +696,7 @@ task.spawn(function()
 
                         if stale >= STALE_LIMIT and not staleWarn then
                             staleWarn = true
-                            print("[" .. NAME .. "] boss HP not dropping - touch cycle not landing")
+                            print("[" .. NAME .. "] boss HP not dropping - hits are not landing")
                         end
                     else
                         stale = 0
@@ -785,5 +786,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - touch cycle repeats hits", 5)
+notifyUser("Loaded - swings for you, no clicking", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
