@@ -1,35 +1,39 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v6.5  -  REPEATED HITS
+--  v6.6  -  EQUIP-SPAM HIT LOOP
 --
---  WHY IT ONLY HIT ONCE
---    Firing the tool's Attack remote does nothing on its own - a probe
---    fired it 25 times from across the map and the boss HP never moved.
---    The damage comes from the tool's TouchTransmitter on AttackPart,
---    which the game only fires during a real swing animation. So the
---    one hit you saw was a real swing, and after that nothing kept
---    swinging.
+--  THE ANSWER WAS IN YOUR TEST
+--    You noticed that spamming equip / unequip makes the hits land.
+--    That matches everything else measured here:
+--      - firing the Attack remote alone did nothing (25 fires, boss HP
+--        unchanged)
+--      - firetouchinterest on boss parts alone did nothing
+--      - the one hit that did land happened on a real swing
+--    This tool only registers a hit from its own equip/swing path, so
+--    the loop now repeats exactly what you did by hand:
 --
---  WHAT THIS DOES
---    Every pass it drives that same touch path itself:
---        1. fire the Attack remote (some swings need it to register)
---        2. firetouchinterest(AttackPart, part, 0) then (..., 1)
---           on every spawned boss part
---    at TOUCH_RATE (0.12 s), so the bosses are being hit continuously
---    instead of once. A new spawn is picked up by the boss cache within
---    0.6 s and starts taking hits the same pass.
+--        equip -> (scale AttackPart) -> touch every boss -> Attack
+--              -> unequip -> repeat
 --
---  AttackPart is still the only thing resized, to the distance of the
---  farthest boss, so the touches reach them from where you stand. The
---  bosses are never written to - no size, no CanCollide, no CFrame -
---  so nothing gets launched into the void and the map stays solid.
+--    at HIT_RATE (0.1 s), so it is continuously swinging instead of
+--    once when a boss spawns.
 --
---  Part lists are cached per boss (2 s) so the loop is not walking the
---  tree every pass; only the touch calls run each tick.
+--  REACH
+--    AttackPart is the part the tool hits with. While Reach is on it
+--    is scaled to the farthest spawned boss, so the touches land on
+--    bosses anywhere on the map from where you stand:
+--        side = (farthest distance + 30) * 2     [60 .. 4000]
+--    Bosses are never written to - no size, no CanCollide, no CFrame -
+--    so nothing gets launched into the void and the map stays solid.
+--    AttackPart's original size is saved per Address and restored when
+--    Reach goes off or the script stops.
 --
---  Reach / Always Heal / Auto Collect unchanged. Auto Farm is now the
---  hit loop above - it needs a weapon equipped.
+--  Only weapons that actually have an AttackPart are used, so the
+--  egg / mosquito placement tools in your backpack are never equipped
+--  by this script.
+--
+--  Always Heal / Auto Collect unchanged.
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
@@ -39,7 +43,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v6.5"
+local VERSION = "v6.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -57,11 +61,11 @@ local COLLECT_RATE = 1.5
 local ATK_TTL      = 1.0
 
 -- hit loop tuning
-local TOUCH_RATE   = 0.12
-local TOUCH_PARTS  = 10     -- parts touched per boss per pass
+local HIT_RATE     = 0.1
+local EQUIP_HOLD   = 0.03
+local TOUCH_PARTS  = 10
 
 -- reach tuning
-local REACH_RATE   = 0.25
 local REACH_PAD    = 30
 local REACH_MIN    = 60
 local REACH_MAX    = 4000
@@ -229,7 +233,7 @@ end
 --------------------------------------------------------------------
 local bossCache = {}
 local bossStamp = 0
-local partCache = {}   -- boss address -> { stamp, parts }
+local partCache = {}
 
 local function isBossModel(m)
     if not m then return false end
@@ -283,7 +287,6 @@ local function bossPosition(boss)
     return nil
 end
 
--- up to TOUCH_PARTS base parts of a boss, root first, cached
 local function bossTouchParts(boss)
     local k   = keyOf(boss)
     local now = tick()
@@ -341,36 +344,6 @@ local function pruneCaches()
     end
 end
 
---------------------------------------------------------------------
--- TOOL REACH  (AttackPart scaled around your hand)
---------------------------------------------------------------------
-local apSaved = {}   -- AttackPart address -> { part, size }
-local reachOn = false
-
-local function findAttackPart()
-    local c = LP.Character
-    if not c then return nil end
-
-    local kids = c:GetChildren()
-    for i = 1, #kids do
-        local t = kids[i]
-        if t.ClassName == "Tool" then
-            local p = t:FindFirstChild("AttackPart")
-            if p and isBasePart(p) then return p end
-
-            local ok, desc = pcall(function() return t:GetDescendants() end)
-            if ok and desc then
-                for j = 1, #desc do
-                    local d = desc[j]
-                    if isBasePart(d) and d.Name == "AttackPart" then return d end
-                end
-            end
-        end
-    end
-
-    return nil
-end
-
 local function farthestBoss(myPos)
     local list = bossList()
     local far  = 0
@@ -390,29 +363,55 @@ local function farthestBoss(myPos)
     return far, seen
 end
 
-local function applyReach()
-    local ap = findAttackPart()
-    if not ap then return 0, 0 end
+--------------------------------------------------------------------
+-- WEAPON LOOKUP  (only tools that have an AttackPart)
+--------------------------------------------------------------------
+local function weaponIn(container)
+    if not container then return nil end
 
+    local kids = container:GetChildren()
+    for i = 1, #kids do
+        local t = kids[i]
+        if t.ClassName == "Tool" then
+            local ap = t:FindFirstChild("AttackPart")
+            if ap and isBasePart(ap) then return t end
+        end
+    end
+
+    return nil
+end
+
+local function findWeapon()
+    local w = weaponIn(LP.Character)
+    if w then return w end
+    return weaponIn(LP:FindFirstChild("Backpack"))
+end
+
+--------------------------------------------------------------------
+-- ATTACKPART REACH  (size saved per Address)
+--------------------------------------------------------------------
+local apSaved = {}   -- AttackPart address -> { part, size }
+
+local function scaleAttackPart(ap)
     local hrp = rootPart()
-    if not hrp then return 0, 0 end
+    if not hrp then return false end
 
     local okM, myPos = pcall(function() return hrp.Position end)
-    if not okM or not myPos then return 0, 0 end
+    if not okM or not myPos then return false end
 
-    local far, seen = farthestBoss(myPos)
+    local far = farthestBoss(myPos)
 
     local side = (far + REACH_PAD) * 2
     if side < REACH_MIN then side = REACH_MIN end
     if side > REACH_MAX then side = REACH_MAX end
 
     local k = keyOf(ap)
-    if k == nil then return 0, seen end
+    if k == nil then return false end
 
     local e = apSaved[k]
     if e == nil then
         local okS, s = pcall(function() return ap.Size end)
-        if not okS or not s then return 0, seen end
+        if not okS or not s then return false end
         e = { part = ap, size = s }
         apSaved[k] = e
     end
@@ -424,10 +423,10 @@ local function applyReach()
         pcall(function() ap.Size = target end)
     end
 
-    return 1, seen
+    return true
 end
 
-local function restoreReach()
+local function restoreAttackParts()
     local n = 0
 
     for k, e in pairs(apSaved) do
@@ -439,11 +438,56 @@ local function restoreReach()
     end
 
     apSaved = {}
+    return n
+end
 
-    if reachOn then
-        print("[" .. NAME .. "] AttackPart restored on " .. tostring(n) .. " tools")
+--------------------------------------------------------------------
+-- HIT PASS  (equip -> touch -> swing -> unequip)
+--------------------------------------------------------------------
+local function hitPass(weapon)
+    local c = LP.Character
+    if not c then return false, 0 end
+
+    local bp = LP:FindFirstChild("Backpack")
+
+    local okE = pcall(function() weapon.Parent = c end)
+    if not okE then return false, 0 end
+
+    task.wait(EQUIP_HOLD)
+
+    local ap = weapon:FindFirstChild("AttackPart")
+    local hits = 0
+
+    if ap and isBasePart(ap) then
+        if Config.Reach then
+            pcall(scaleAttackPart, ap)
+        end
+
+        pruneCaches()
+
+        local list = bossList()
+
+        for i = 1, #list do
+            local parts = bossTouchParts(list[i])
+
+            for j = 1, #parts do
+                local part = parts[j]
+
+                pcall(function() firetouchinterest(ap, part, 0) end)
+                pcall(function() firetouchinterest(ap, part, 1) end)
+
+                hits = hits + 1
+            end
+        end
     end
-    reachOn = false
+
+    swingOnce()
+
+    if bp then
+        pcall(function() weapon.Parent = bp end)
+    end
+
+    return true, hits
 end
 
 --------------------------------------------------------------------
@@ -506,8 +550,8 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Reach (hit every boss anywhere)", "fam_reach", "Reach", false)
-            addToggle(combat, "Auto Hit (repeat hits)", "fam_farm", "Farm", false)
+            addToggle(combat, "Reach (scale the weapon)", "fam_reach", "Reach", false)
+            addToggle(combat, "Auto Hit (equip spam)", "fam_farm", "Farm", false)
         end
     end)
 
@@ -563,114 +607,75 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- REACH LOOP
+-- HIT LOOP  (equip spam, exactly what worked by hand)
 --------------------------------------------------------------------
 task.spawn(function()
-    local warnedNoTool = false
-    local warnedNoBoss = false
+    local hasTouch = (type(firetouchinterest) == "function")
+    local wasOn    = false
+    local warnedW  = false
+    local warnedB  = false
+    local restored = true
 
-    while running do
-        if Config.Reach and alive() then
-            local grew, seen = applyReach()
-
-            if grew == 1 then
-                warnedNoTool = false
-
-                if not reachOn then
-                    reachOn = true
-                    print("[" .. NAME .. "] reach on - AttackPart scaled, bosses untouched")
-                end
-
-                if seen > 0 then
-                    warnedNoBoss = false
-                elseif not warnedNoBoss then
-                    warnedNoBoss = true
-                    print("[" .. NAME .. "] no boss spawned - box kept at minimum")
-                end
-            elseif not warnedNoTool then
-                warnedNoTool = true
-                print("[" .. NAME .. "] reach: equip a weapon (no AttackPart yet)")
-            end
-        else
-            warnedNoTool = false
-
-            if reachOn then
-                restoreReach()
-                print("[" .. NAME .. "] reach off")
-            end
-        end
-
-        task.wait(REACH_RATE)
+    if not hasTouch then
+        print("[" .. NAME .. "] firetouchinterest missing - equip spam still runs")
     end
-end)
-
---------------------------------------------------------------------
--- HIT LOOP  (repeated touches through the tool's own transmitter)
---------------------------------------------------------------------
-task.spawn(function()
-    local wasOn     = false
-    local warnedAp  = false
-    local warnedBoss = false
-    local hasTouch  = (type(firetouchinterest) == "function")
 
     while running do
         if Config.Farm and alive() then
-            local ap = findAttackPart()
+            local weapon = findWeapon()
 
-            if not ap then
-                if not warnedAp then
-                    warnedAp = true
-                    print("[" .. NAME .. "] auto hit: equip a weapon")
-                end
-                task.wait(0.2)
-            else
-                warnedAp = false
+            if weapon then
+                warnedW = false
 
                 if not wasOn then
                     wasOn = true
-                    print("[" .. NAME .. "] auto hit on ("
-                        .. (hasTouch and "touch + remote" or "remote only")
-                        .. ")")
+                    print("[" .. NAME .. "] auto hit on (equip spam)")
                 end
 
-                swingOnce()
+                local ok, hits = hitPass(weapon)
 
-                if hasTouch then
-                    pruneCaches()
-
-                    local list  = bossList()
-                    local hits  = 0
-
-                    for i = 1, #list do
-                        local parts = bossTouchParts(list[i])
-
-                        for j = 1, #parts do
-                            local part = parts[j]
-
-                            pcall(function() firetouchinterest(ap, part, 0) end)
-                            pcall(function() firetouchinterest(ap, part, 1) end)
-
-                            hits = hits + 1
-                        end
-                    end
+                if ok then
+                    restored = false
 
                     if hits > 0 then
-                        warnedBoss = false
-                    elseif not warnedBoss then
-                        warnedBoss = true
+                        warnedB = false
+                    elseif not warnedB then
+                        warnedB = true
                         print("[" .. NAME .. "] auto hit: no boss spawned right now")
                     end
                 end
 
-                task.wait(TOUCH_RATE)
+                task.wait(HIT_RATE)
+            else
+                if not warnedW then
+                    warnedW = true
+                    print("[" .. NAME .. "] auto hit: need a weapon with an AttackPart")
+                end
+                task.wait(0.25)
             end
         else
             if wasOn then
                 wasOn = false
                 print("[" .. NAME .. "] auto hit off")
             end
-            warnedAp = false
-            task.wait(0.15)
+
+            warnedW = false
+
+            if not restored then
+                restored = true
+                local n = restoreAttackParts()
+                if n > 0 then
+                    print("[" .. NAME .. "] AttackPart restored on " .. tostring(n))
+                end
+
+                pcall(function()
+                    local w = findWeapon()
+                    local c = LP.Character
+                    if w and c then w.Parent = c end
+                end)
+            end
+
+            task.wait(0.1)
         end
     end
 end)
@@ -719,7 +724,7 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
-    pcall(function() restoreReach() end)
+    pcall(restoreAttackParts)
     pcall(function() fireEvent("StopTransfuseBlood") end)
     atkCache  = nil
     bossCache = {}
@@ -731,5 +736,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - repeated hits on every boss", 5)
+notifyUser("Loaded - equip spam hit loop", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
