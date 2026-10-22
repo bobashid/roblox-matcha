@@ -29,7 +29,8 @@
 --    actor (Tool_Character_<userId>_*). This scans those actors and
 --    fires Attack when an enemy model is within range.
 --
---  NO VARARGS ANYWHERE - this VM rejects '...' in nested closures.
+--  ZERO VARARGS in this file - no '...' appears anywhere, so the
+--  'Cannot use ... outside of a vararg function' error cannot occur.
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
@@ -39,7 +40,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.8"
+local VERSION = "v1.9"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -75,7 +76,7 @@ _G.FeedAMosquito = { stop = function() running = false end }
 
 --------------------------------------------------------------------
 -- Helpers
---   child(a, b, c) replaces any vararg path helper on purpose.
+--   child(a, b, c) walks a fixed path; no vararg helper.
 --------------------------------------------------------------------
 local function humanoid()
     local c = LP.Character
@@ -100,7 +101,7 @@ end
 
 --------------------------------------------------------------------
 -- Player actor remotes (Events / Functions)
---   No varargs: none of these remotes take arguments from the client.
+--   No arguments are ever sent, so no varargs are needed.
 --------------------------------------------------------------------
 local pEvents = nil
 local pFuncs  = nil
@@ -158,18 +159,14 @@ end
 
 --------------------------------------------------------------------
 -- Toggle plumbing
+--   Callback takes three fixed args and picks the boolean out of them.
 --------------------------------------------------------------------
 local function applyBool(key)
-    return function(...)
+    return function(a, b, c)
         if getterWorks[key] then return end
-        local n = select("#", ...)
-        for i = 1, n do
-            local v = select(i, ...)
-            if type(v) == "boolean" then
-                Config[key] = v
-                return
-            end
-        end
+        if type(a) == "boolean" then Config[key] = a return end
+        if type(b) == "boolean" then Config[key] = b return end
+        if type(c) == "boolean" then Config[key] = c return end
     end
 end
 
