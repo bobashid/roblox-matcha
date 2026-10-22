@@ -1,0 +1,295 @@
+--==================================================================
+--  Feed A Mosquito  |  Chair Heal  (no sitting)
+--  Matcha LuaVM  -  built-in menu tab (UI.AddTab)
+--
+--  WHY NOT A LOCAL HEAL PIN
+--    Humanoid.Health and MaxHealth are READ-ONLY in Matcha. Writing
+--    either throws "Unknown property: Health", so no local heal is
+--    possible. The health bar reads Humanoid.Health through a
+--    property-changed signal, so the heal must come from the server.
+--
+--  WHAT THE CHAIR REALLY IS
+--    Every chair model (BeanbagChair / Bench / Toilet / Bed) carries
+--    no health data at all - only Seat, Configuration, MeshPart and a
+--    Blood model full of Nozzle parts. It is a transfusion chair.
+--    Firing the player's own TransfuseBlood remote healed 2991 -> 2999
+--    while standing, with no seat involved.
+--
+--  THIS SCRIPT
+--    Toggle : fires TransfuseBlood while Health < MaxHealth, then
+--             StopTransfuseBlood at full so blood is not drained idle.
+--    Button : one-shot heal to full.
+--==================================================================
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+
+local LP = Players.LocalPlayer
+
+local NAME    = "Feed A Mosquito"
+local VERSION = "v1.2"
+
+if _G.FeedAMosquito and _G.FeedAMosquito.stop then
+    pcall(_G.FeedAMosquito.stop)
+end
+print("[" .. NAME .. "] " .. VERSION)
+
+local running = true
+local built   = false
+
+-- fixed tuning
+local LOOP_RATE = 0.2    -- heal loop rate
+local POLL_RATE = 0.1    -- toggle poller rate
+local REFIRE    = 1.0    -- re-fire transfusion if still hurt
+
+local Config = {
+    Heal  = false,
+    Force = false,
+}
+
+local TOGGLES     = {}
+local getterWorks = {}
+
+local transfusing = false
+local lastFire    = 0
+
+-- remotes, resolved lazily and cached per UserId
+local remotes    = nil
+local remotesFor = nil
+
+_G.FeedAMosquito = { stop = function() running = false end }
+
+--------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------
+local function humanoid()
+    local c = LP.Character
+    return c and c:FindFirstChild("Humanoid") or nil
+end
+
+local function notifyUser(msg, dur)
+    pcall(function() notify(NAME, msg, dur or 3) end)
+end
+
+local function getRemotes()
+    if remotes and remotesFor == LP.UserId then return remotes end
+
+    local runtime = RS:FindFirstChild("Runtime")
+    local actors  = runtime and runtime:FindFirstChild("Actors")
+    if not actors then return nil end
+
+    local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
+    local events = actor and actor:FindFirstChild("Events")
+    if not events then return nil end
+
+    local startR = events:FindFirstChild("TransfuseBlood")
+    local stopR  = events:FindFirstChild("StopTransfuseBlood")
+    if not startR or not stopR then return nil end
+
+    remotes    = { start = startR, stop = stopR }
+    remotesFor = LP.UserId
+    return remotes
+end
+
+local function fireStart()
+    local r = getRemotes()
+    if not r then return false end
+    return (pcall(function() r.start:FireServer() end))
+end
+
+local function fireStop()
+    local r = getRemotes()
+    if not r then return end
+    pcall(function() r.stop:FireServer() end)
+end
+
+--------------------------------------------------------------------
+-- Toggle plumbing
+--------------------------------------------------------------------
+local function applyBool(key)
+    return function(...)
+        if getterWorks[key] then return end
+        local n = select("#", ...)
+        for i = 1, n do
+            local v = select(i, ...)
+            if type(v) == "boolean" then
+                Config[key] = v
+                return
+            end
+        end
+    end
+end
+
+local function registerToggle(key, id, name)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name }
+end
+
+local function safeToggle(sec, name, id, default, cb)
+    local tries = {
+        function() sec:Toggle(name, id, default, cb) end,
+        function() sec:Toggle(id, name, default, cb) end,
+        function() sec:Toggle(name, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function safeButton(sec, name, cb)
+    local tries = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, name .. "_btn", cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Button failed: " .. tostring(name))
+    return false
+end
+
+local function makeSection(tab, name, side)
+    local ok, sec = pcall(function() return tab:Section(name, side) end)
+    if ok and type(sec) == "table" then return sec end
+    ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and type(sec) == "table" then return sec end
+    return nil
+end
+
+--------------------------------------------------------------------
+-- Menu
+--------------------------------------------------------------------
+local function buildTab(tab)
+    if built then return end
+    if type(tab) ~= "table" then return end
+    built = true
+
+    local ok, err = pcall(function()
+        local sec = makeSection(tab, "Chair", "Left")
+        if sec then
+            if safeToggle(sec, "Health Bonus (no sit)", "fam_heal",
+                false, applyBool("Heal")) then
+                registerToggle("Heal", "fam_heal", "Health Bonus (no sit)")
+            end
+        end
+
+        local tools = makeSection(tab, "Tools", "Right")
+        if tools then
+            safeButton(tools, "Heal Now", function()
+                print("[" .. NAME .. "] heal now pressed")
+                Config.Force = true
+            end)
+        end
+    end)
+
+    if not ok then
+        warn("[" .. NAME .. "] build error: " .. tostring(err))
+    end
+    print("[" .. NAME .. "] tab widgets built")
+end
+
+local HAS_UI = type(UI) == "table" and type(UI.AddTab) == "function"
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab(NAME, function(tab)
+            if built then return end
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn("[" .. NAME .. "] UI.AddTab failed: " .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn("[" .. NAME .. "] no UI table - menu unavailable")
+end
+
+--------------------------------------------------------------------
+-- TOGGLE POLLER - single source of truth
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t = TOGGLES[i]
+            local val = nil
+
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == "boolean" then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                if ok2 and type(v2) == "boolean" then val = v2 end
+            end
+
+            if val ~= nil then
+                getterWorks[t.key] = true
+                if Config[t.key] ~= val then
+                    Config[t.key] = val
+                    print("[" .. NAME .. "] " .. t.key .. " = " .. tostring(val))
+                end
+            end
+        end
+        task.wait(POLL_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- HEAL LOOP
+--   Health is readable; only the server can move it. Fire the
+--   transfusion while hurt, stop it the moment we are full.
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        local want = Config.Heal or Config.Force
+        local hum  = humanoid()
+
+        if hum and want then
+            local hp  = hum.Health
+            local max = hum.MaxHealth
+
+            if hp > 0 and max > 0 and hp < max then
+                local now = tick()
+                if not transfusing or (now - lastFire) >= REFIRE then
+                    if fireStart() then
+                        if not transfusing then
+                            print("[" .. NAME .. "] healing ("
+                                .. tostring(math.floor(hp)) .. "/"
+                                .. tostring(math.floor(max)) .. ")")
+                        end
+                        transfusing = true
+                        lastFire    = now
+                    end
+                end
+            else
+                if transfusing then
+                    fireStop()
+                    transfusing = false
+                    print("[" .. NAME .. "] full")
+                end
+                if Config.Force then Config.Force = false end
+            end
+        elseif transfusing then
+            fireStop()
+            transfusing = false
+        end
+
+        task.wait(LOOP_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+local function stop()
+    running = false
+    if transfusing then
+        fireStop()
+        transfusing = false
+    end
+    _G.FeedAMosquito = nil
+    print("[" .. NAME .. "] stopped")
+end
+
+_G.FeedAMosquito = { stop = stop, version = VERSION }
+
+notifyUser("Loaded - toggle Health Bonus (no sit)", 5)
+print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
