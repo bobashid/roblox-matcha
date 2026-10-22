@@ -1,32 +1,28 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v2.5
---    - Kill Aura is now ONE toggle, no sliders. It teleports to the
---      nearest enabled enemy anywhere in the map, swings, repeats.
---      Attack has no client-side range, so the only way to reach
---      something far away is to be next to it when the swing lands.
---      Under Map / Depth decide where you sit relative to the target.
---    - Auto Farm fix: the Attack remote cache now checks that the
---      cached remote still has a live parent before reusing it. A
---      weapon upgrade destroys the old Tool_Character actor, and the
---      old build kept firing that dead remote.
---    - "Test Swing" button prints exactly what Auto Farm sees:
---      alive, equipped tool, actor count, remote count, swing result.
---      Press it once if Farm looks inert - it names the failing step.
---    - Menu regrouped: Main, Combat, Position, Auto Kill, Bosses.
+--  v2.6  MINIMAL MENU - four toggles, no sliders
 --
---  Always Heal
---    TransfuseBlood remote. Humanoid.Health is READ-ONLY in Matcha
---    (a write throws), so the server remote is the only heal path.
---
---  Auto Collect
---    CollectIncome + ClaimOfflineIncome.
+--    Always Heal   TransfuseBlood remote. Humanoid.Health is
+--                  READ-ONLY in Matcha (a write throws), so the
+--                  server remote is the only heal path.
+--    Auto Collect  CollectIncome + ClaimOfflineIncome.
+--    Auto Farm     Swings on a cadence, no target needed.
+--    Kill Aura     Finds the nearest enemy anywhere on the map, moves
+--                  to the slot under it, swings, repeats.
 --
 --  Swing
 --    Fires Runtime.Actors.Tool_Character_<userId>_*..Events.Attack.
---    Attack takes no arguments; the server resolves the hit from the
---    character position.
+--    Attack takes no arguments, the server resolves the hit from the
+--    character position, so there is no client-side hitbox to grow.
+--    The remote cache expires every 0.5s and the cached remote must
+--    still have a live parent chain, so a weapon upgrade is picked up.
+--
+--  Fixed values (no UI on purpose)
+--    AURA_DEPTH = 8   studs below the target, so you swing from under
+--                     the map. Edit the constant to change it.
+--    MOVE_EPS2  = 4   only write CFrame when more than 2 studs away.
+--    No CFrame writes while Health is 0.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -37,7 +33,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.5"
+local VERSION = "v2.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -54,44 +50,20 @@ local HEAL_REFIRE  = 1.0    -- seconds between TransfuseBlood fires
 local COLLECT_RATE = 1.5    -- income collection
 local FARM_RATE    = 0.3    -- auto farm swing cadence
 local AURA_RATE    = 0.25   -- kill aura pass
-local AFAR_RATE    = 0.7    -- touch-and-return pass
-local KILL_RATE    = 0.25   -- stay-attached kill pass
 local ATK_TTL      = 0.5    -- attack remote cache lifetime
 local MOVE_EPS2    = 4      -- 2 studs squared
-local AURA_MAX     = 1000000 -- kill aura reaches the whole map
-
-local BOSS_NAMES = {
-    "Common", "Uncommon", "Rare", "Legendary",
-    "Mythical", "Divine", "Secret", "Epic",
-}
+local AURA_DEPTH   = 8      -- studs below the target
+local AURA_MAX     = 1000000 -- reaches the whole map
 
 local Config = {
     Heal        = false,
     AutoCollect = false,
     Farm        = false,
     Aura        = false,
-    Afar        = false,
-    AfarRange   = 300,
-    Under       = true,
-    Depth       = 8,
-    Kill        = false,
-    KillRange   = 1500,
-
-    BossCommon    = true,
-    BossUncommon  = true,
-    BossRare      = true,
-    BossLegendary = true,
-    BossMythical  = true,
-    BossDivine    = true,
-    BossSecret    = true,
-    BossEpic      = true,
 }
 
 local TOGGLES     = {}
 local getterWorks = {}
-
-local savedCF = nil
-local killing = false
 
 _G.FeedAMosquito = { stop = function() running = false end }
 
@@ -125,30 +97,27 @@ local function child(a, b, c)
 end
 
 --------------------------------------------------------------------
--- Player actor remotes (Events / Functions)
+-- Player actor remotes
 --------------------------------------------------------------------
 local pEvents = nil
-local pFuncs  = nil
 local pFor    = nil
 
-local function playerRemotes()
-    if pFor == LP.UserId and pEvents then return pEvents, pFuncs end
+local function playerEvents()
+    if pFor == LP.UserId and pEvents then return pEvents end
 
     local actors = child(RS, "Runtime", "Actors")
-    if not actors then return nil, nil end
+    if not actors then return nil end
 
     local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
-    if not actor then return nil, nil end
+    if not actor then return nil end
 
     pEvents = actor:FindFirstChild("Events")
-    pFuncs  = actor:FindFirstChild("Functions")
     pFor    = LP.UserId
-
-    return pEvents, pFuncs
+    return pEvents
 end
 
 local function fireEvent(name)
-    local events = playerRemotes()
+    local events = playerEvents()
     local r = events and events:FindFirstChild(name)
     if not r then return false end
     return (pcall(function() r:FireServer() end))
@@ -157,17 +126,11 @@ end
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
 --   Tool_Character_<userId>_<n>_<m>.Events.Attack
---   The <n> changes when a weapon is upgraded, so the cache expires
---   AND the cached remote must still have a live parent chain.
+--   <n> changes on a weapon upgrade, so the cache expires and the
+--   cached remote must still have a live parent chain.
 --------------------------------------------------------------------
 local atkCache = nil
 local atkStamp = 0
-
-local function equippedToolName()
-    local c = LP.Character
-    local t = c and c:FindFirstChildOfClass("Tool")
-    return t and t.Name or nil
-end
 
 local function attackRemotes()
     local now = tick()
@@ -210,24 +173,21 @@ local function attackRemotes()
 end
 
 local function swing()
-    if not alive() then return false, "dead" end
+    if not alive() then return false end
 
     local list = attackRemotes()
-    if not list then return false, "no remote" end
+    if not list then return false end
 
     for i = 1, #list do
         pcall(function() list[i]:FireServer() end)
     end
-
-    return true, tostring(#list)
+    return true
 end
 
 --------------------------------------------------------------------
--- Enemy lookup
---   Names seen live: CommonArea_Enemy_129, RareArea_Enemy_114,
---   LegendaryArea_Enemy_99, MythicalArea_Enemy_21,
---   DivineArea_Enemy_9, SecretArea_Enemy_4,
---   Egg_EpicArea_Enemy_132_0, UncommonArea_Enemy_126.
+-- Nearest enemy
+--   Models are named <Area>Area_Enemy_<n>, e.g. CommonArea_Enemy_129,
+--   Egg_EpicArea_Enemy_132_0, DivineArea_Enemy_9.
 --------------------------------------------------------------------
 local function enemyPart(model)
     return model:FindFirstChild("HumanoidRootPart")
@@ -235,42 +195,19 @@ local function enemyPart(model)
         or model.PrimaryPart
 end
 
-local function enabledPrefixes()
-    local out = {}
-    for i = 1, #BOSS_NAMES do
-        local n = BOSS_NAMES[i]
-        if Config["Boss" .. n] then out[#out + 1] = n end
-    end
-    return out
-end
-
-local function nearestEnemyOf(fromPos, prefixes, maxDist)
-    if not prefixes or #prefixes == 0 then return nil, nil end
-
+local function nearestEnemy(fromPos, maxDist)
     local best, bestDist, bestPos = nil, maxDist, nil
     local kids = WS:GetChildren()
 
     for i = 1, #kids do
-        local d  = kids[i]
-        local nm = d.Name
-
-        if string.find(nm, "Area_Enemy", 1, true) then
-            local picked = false
-            for j = 1, #prefixes do
-                if string.find(nm, prefixes[j] .. "Area_Enemy", 1, true) then
-                    picked = true
-                    break
-                end
-            end
-
-            if picked then
-                local part = enemyPart(d)
-                if part then
-                    local pos  = part.Position
-                    local dist = (pos - fromPos).Magnitude
-                    if dist <= bestDist then
-                        best, bestDist, bestPos = d, dist, pos
-                    end
+        local d = kids[i]
+        if string.find(d.Name, "Area_Enemy", 1, true) then
+            local part = enemyPart(d)
+            if part then
+                local pos  = part.Position
+                local dist = (pos - fromPos).Magnitude
+                if dist <= bestDist then
+                    best, bestDist, bestPos = d, dist, pos
                 end
             end
         end
@@ -279,7 +216,6 @@ local function nearestEnemyOf(fromPos, prefixes, maxDist)
     return best, bestPos
 end
 
--- moves only if further than 2 studs from the slot
 local function moveTo(hrp, x, y, z)
     if not hrp or not hrp.Parent then return false end
     if not alive() then return false end
@@ -297,16 +233,8 @@ local function moveTo(hrp, x, y, z)
     return true
 end
 
--- where to sit relative to a target position
-local function slotFor(pos)
-    local depth = tonumber(Config.Depth) or 8
-    local ty = pos.Y + 3
-    if Config.Under then ty = pos.Y - depth end
-    return pos.X, ty, pos.Z
-end
-
 --------------------------------------------------------------------
--- Toggle / slider plumbing
+-- Toggle plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -331,31 +259,6 @@ local function safeToggle(sec, name, id, default, cb)
         if pcall(tries[i]) then return true end
     end
     warn("[" .. NAME .. "] Toggle failed: " .. tostring(name))
-    return false
-end
-
-local function safeSlider(sec, name, id, min, max, default, cb)
-    local tries = {
-        function() sec:SliderInt(name, id, min, max, default, cb) end,
-        function() sec:SliderInt(id, name, min, max, default, cb) end,
-        function() sec:SliderInt(name, min, max, default, cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    warn("[" .. NAME .. "] Slider failed: " .. tostring(name))
-    return false
-end
-
-local function safeButton(sec, name, cb)
-    local tries = {
-        function() sec:Button(name, cb) end,
-        function() sec:Button(name, name .. "_btn", cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    warn("[" .. NAME .. "] Button failed: " .. tostring(name))
     return false
 end
 
@@ -392,53 +295,6 @@ local function buildTab(tab)
         if combat then
             addToggle(combat, "Auto Farm", "fam_farm", "Farm", false)
             addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
-            safeButton(combat, "Test Swing", function()
-                local hum = humanoid()
-                print("[" .. NAME .. "] alive", tostring(alive()),
-                    "hp", tostring(hum and hum.Health))
-                print("[" .. NAME .. "] tool", tostring(equippedToolName()))
-                local actors = child(RS, "Runtime", "Actors")
-                print("[" .. NAME .. "] actors",
-                    tostring(actors and #actors:GetChildren() or -1))
-                local list = attackRemotes()
-                print("[" .. NAME .. "] remotes",
-                    tostring(list and #list or 0))
-                local okSwing, info = swing()
-                print("[" .. NAME .. "] swing", tostring(okSwing),
-                    tostring(info))
-            end)
-        end
-
-        local pos = makeSection(tab, "Position", "Right")
-        if pos then
-            addToggle(pos, "Under Map", "fam_under", "Under", true)
-            safeSlider(pos, "Depth", "fam_depth", 0, 40, 8,
-                function(v)
-                    if type(v) == "number" then Config.Depth = v end
-                end)
-            addToggle(pos, "Attack From Afar", "fam_afar", "Afar", false)
-            safeSlider(pos, "Afar Range", "fam_afarrange", 50, 2000, 300,
-                function(v)
-                    if type(v) == "number" then Config.AfarRange = v end
-                end)
-        end
-
-        local kill = makeSection(tab, "Auto Kill", "Right")
-        if kill then
-            addToggle(kill, "Auto Kill", "fam_kill", "Kill", false)
-            safeSlider(kill, "Kill Range", "fam_killrange", 50, 5000, 1500,
-                function(v)
-                    if type(v) == "number" then Config.KillRange = v end
-                end)
-        end
-
-        local bosses = makeSection(tab, "Bosses", "Right")
-        if bosses then
-            for i = 1, #BOSS_NAMES do
-                local n = BOSS_NAMES[i]
-                local id = "fam_boss_" .. string.lower(n)
-                addToggle(bosses, n, id, "Boss" .. n, true)
-            end
         end
     end)
 
@@ -466,7 +322,7 @@ else
 end
 
 --------------------------------------------------------------------
--- TOGGLE POLLER - single source of truth
+-- TOGGLE POLLER
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -547,7 +403,7 @@ end)
 
 --------------------------------------------------------------------
 -- AUTO FARM
---   Fixed cadence, no target required. Swings wherever you stand.
+--   Fixed cadence, no target required.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -559,21 +415,17 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- KILL AURA  (one toggle, no sliders)
---   Finds the nearest enabled enemy anywhere in the map, moves to the
---   Under Map / Depth slot, swings. Repeats. Skipped while Auto Kill
---   owns the movement so the two never fight each other.
+-- KILL AURA
+--   Nearest enemy anywhere on the map, sit AURA_DEPTH below it, swing.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Aura and not Config.Kill then
+        if Config.Aura then
             local hrp = rootPart()
             if hrp and alive() then
-                local target, pos = nearestEnemyOf(hrp.Position,
-                    enabledPrefixes(), AURA_MAX)
+                local target, pos = nearestEnemy(hrp.Position, AURA_MAX)
                 if target and pos then
-                    local tx, ty, tz = slotFor(pos)
-                    moveTo(hrp, tx, ty, tz)
+                    moveTo(hrp, pos.X, pos.Y - AURA_DEPTH, pos.Z)
                     swing()
                 end
             end
@@ -583,97 +435,10 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- ATTACK FROM AFAR  (touch and return)
---------------------------------------------------------------------
-task.spawn(function()
-    while running do
-        if Config.Afar and not Config.Kill and not Config.Aura then
-            local hrp = rootPart()
-            if hrp and alive() then
-                local range = tonumber(Config.AfarRange) or 300
-                local target, pos = nearestEnemyOf(hrp.Position,
-                    enabledPrefixes(), range)
-
-                if target and pos then
-                    local back = hrp.CFrame
-                    local tx, ty, tz = slotFor(pos)
-
-                    if moveTo(hrp, tx, ty, tz) then
-                        task.wait(0.06)
-                        swing()
-                        task.wait(0.06)
-                        pcall(function()
-                            if hrp and hrp.Parent then hrp.CFrame = back end
-                        end)
-                    else
-                        swing()
-                    end
-                end
-            end
-        end
-        task.wait(AFAR_RATE)
-    end
-end)
-
---------------------------------------------------------------------
--- AUTO KILL  (stay attached to the chosen boss)
---   First pass saves your CFrame; switching the toggle off puts you
---   back. Position is only written when you drift more than 2 studs.
---------------------------------------------------------------------
-task.spawn(function()
-    while running do
-        if Config.Kill then
-            local hrp = rootPart()
-            if hrp and alive() then
-                local range = tonumber(Config.KillRange) or 1500
-                local target, pos = nearestEnemyOf(hrp.Position,
-                    enabledPrefixes(), range)
-
-                if target and pos then
-                    if not killing then
-                        savedCF = hrp.CFrame
-                        killing = true
-                        print("[" .. NAME .. "] auto kill on " .. target.Name)
-                    end
-
-                    local tx, ty, tz = slotFor(pos)
-                    moveTo(hrp, tx, ty, tz)
-                    swing()
-                elseif killing then
-                    if savedCF then
-                        pcall(function() hrp.CFrame = savedCF end)
-                    end
-                    killing = false
-                    print("[" .. NAME .. "] no target in range")
-                end
-            end
-        elseif killing then
-            if savedCF then
-                pcall(function()
-                    local hrp = rootPart()
-                    if hrp and hrp.Parent then hrp.CFrame = savedCF end
-                end)
-            end
-            killing = false
-        end
-        task.wait(KILL_RATE)
-    end
-end)
-
---------------------------------------------------------------------
 local function stop()
     running = false
     pcall(function() fireEvent("StopTransfuseBlood") end)
-
-    if killing and savedCF then
-        pcall(function()
-            local hrp = rootPart()
-            if hrp and hrp.Parent then hrp.CFrame = savedCF end
-        end)
-    end
-    killing = false
     atkCache = nil
-
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
