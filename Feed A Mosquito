@@ -1,37 +1,42 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.6  -  EGG VALUE BEFORE YOU PICK IT UP
+--  v8.7  -  EGG RARITY AND VALUE, READ CORRECTLY
 --
---  WHERE THE VALUE COMES FROM (decompiled, not guessed)
---    ReplicatedStorage.Scripts.Configs.MosquitoConfig is a table of
---    rarity -> { Coin, Damage, HP }:
+--  TWO WRONG ASSUMPTIONS FROM v8.6, NOW FIXED
+--    1. There is no Coin field in MosquitoConfig. It does not exist.
+--       The real fields are Id, Name, Rarity, Icon, Prefab, EggIcon,
+--       EggBaseScale, MinScale, MaxScale, MinIncome, MaxIncome,
+--       Damage, MaxBlood, Price, HatchTime.
+--    2. The area is NOT the egg's rarity. Probed live: an
+--       IceMosquitoEgg sat inside UncommonArea while its own billboard
+--       displayed "Rare". Rarity comes from the egg itself.
 --
---        Common 1    Uncommon 3   Rare 8      Legendary 25
---        Mythical 60 Divine 120   Secret 600  Epic 8
+--  WHERE THE TWO VALUES NOW COME FROM
+--    RARITY  - every egg model has a BillboardGui named EggGui
+--              containing a TextLabel named "Rarity". That label is
+--              what the game shows you in world, so it is read
+--              directly (e.g. "Uncommon", "Rare", "Epic"). If a
+--              label is missing, the area name is used as a fallback.
+--    VALUE   - MosquitoConfig's Price field, keyed by the mosquito id.
+--              The egg model name minus its "Egg" suffix is that id:
+--                  BlueMosquitoEgg  ->  BlueMosquito  ->  Price 200
+--                  FireMosquitoEgg  ->  FireMosquito  ->  Price 30000
+--              Prices decompiled from the config: Common 100,
+--              Uncommon 200, Rare 2000, Epic 30000, Legendary 300000.
+--              These are the game's own numbers, not estimates.
 --
---    and every egg model sits inside SpawnAreas/<Rarity>Area, so the
---    area name gives the rarity and the config gives the coin value.
---    That is all known before pickup - nothing is read from the egg
---    itself, because the egg model carries no value field (only an
---    ActorId StringValue for the server-side actor).
---
---  SO THE PANEL NOW HAS TWO COLUMNS
---      left  (PANEL_X = 300)   boss name, HP bar, hp / max
---      right (EGG_X)           egg name, rarity, coin value
---
---    Rows are colour coded by rarity so an egg is identifiable at a
---    glance: white Common, green Uncommon, blue Rare, purple Epic,
---    orange Legendary, pink Mythical, yellow Divine, red Secret.
---    Both columns use the game's own 40,40,50 backdrop and bold text.
+--  PANEL LAYOUT (unchanged from v8.5)
+--      left  PANEL_X = 300   boss name, HP bar, hp / max
+--      right EGG_X  = 634    egg name, rarity + price
+--    Both use the game's own 40,40,50 backdrop and bold text, colour
+--    coded per rarity.
 --
 --  Drawing rules followed (Matcha has no GUI objects at all)
---    - fixed pools created once at load: 6 boss rows, 4 egg rows, two
---      backdrops. Nothing is created in the render loop, because
---      Drawing objects have no GC.
+--    - fixed pools created once: 6 boss rows, 4 egg rows, 2 backdrops.
+--      Nothing is created in the render loop.
 --    - ONE RenderStepped connection total.
---    - both scans are cached at 0.6 s, so neither the boss nor the egg
---      list walks the tree per frame.
+--    - boss scan cached 0.6 s, egg scan cached 1.0 s.
 --    - every Drawing removed in stop().
 --
 --  Hit logic unchanged from v8.2, which works:
@@ -54,7 +59,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.6"
+local VERSION = "v8.7"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -82,7 +87,7 @@ local REACH_MIN    = 60
 local REACH_MAX    = 4000
 local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
-local EGG_TTL      = 0.6
+local EGG_TTL      = 1.0
 
 -- panel tuning
 local PANEL_ROWS   = 6
@@ -106,16 +111,35 @@ local COL_FILL   = Color3.fromRGB(120, 190, 135)
 local COL_NAME   = Color3.fromRGB(255, 255, 255)
 local COL_HP     = Color3.fromRGB(198, 208, 200)
 
--- rarity -> coin, straight from MosquitoConfig
-local RARITY_COIN = {
-    Common    = 1,
-    Uncommon  = 3,
-    Rare      = 8,
-    Epic      = 8,
-    Legendary = 25,
-    Mythical  = 60,
-    Divine    = 120,
-    Secret    = 600,
+-- Price from MosquitoConfig, keyed by mosquito id (egg name minus "Egg")
+local EGG_PRICE = {
+    Mosquito         = 100,
+    BloodMosquito    = 100,
+    NerdMosquito     = 100,
+    WhiteMosquito    = 100,
+
+    VenomousMosquito = 200,
+    GlowingMosquito  = 200,
+    BlueMosquito     = 200,
+    PunkMosquito     = 200,
+
+    ClownMosquito    = 2000,
+    ChickenMosquito  = 2000,
+    IceMosquito      = 2000,
+    PirateMosquito   = 2000,
+    DrillMosquito    = 2000,
+
+    FireMosquito     = 30000,
+    PandaMosquito    = 30000,
+    RocketMosquito   = 30000,
+    GhostMosquito    = 30000,
+    BalloonMosquito  = 30000,
+    SniperMosquito   = 30000,
+
+    ShockMosquito    = 300000,
+    MammothMosquito  = 300000,
+    RainbowMosquito  = 300000,
+    SkullMosquito    = 300000,
 }
 
 local RARITY_COLOR = {
@@ -207,6 +231,35 @@ local function areaRarity(areaName)
         return string.sub(areaName, 1, #areaName - 4)
     end
     return areaName
+end
+
+-- the game shows the true rarity on the egg's own billboard
+local function billboardRarity(model)
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "TextLabel" and d.Name == "Rarity" then
+            local okT, t = pcall(function() return d.Text end)
+
+            if okT and type(t) == "string" and #t > 0 then
+                return t
+            end
+        end
+    end
+
+    return nil
+end
+
+-- egg name minus "Egg" is the MosquitoConfig id
+local function mosquitoId(eggName)
+    if type(eggName) ~= "string" then return nil end
+    if string.sub(eggName, -3) == "Egg" then
+        return string.sub(eggName, 1, #eggName - 3)
+    end
+    return eggName
 end
 
 --------------------------------------------------------------------
@@ -331,7 +384,7 @@ local function bossList()
 end
 
 --------------------------------------------------------------------
--- Egg lookup (READ ONLY, cached, value from the area's rarity)
+-- Egg lookup (READ ONLY, rarity from the billboard, price from config)
 --------------------------------------------------------------------
 local eggCache = {}
 local eggStamp = 0
@@ -347,7 +400,6 @@ local function collectEggs()
 
     for i = 1, #areaKids do
         local area = areaKids[i]
-        local rarity = areaRarity(area.Name)
 
         local ok, kids = pcall(function() return area:GetChildren() end)
 
@@ -356,11 +408,19 @@ local function collectEggs()
                 local m = kids[j]
 
                 if m.ClassName == "Model" and string.find(string.lower(m.Name), "egg", 1, true) then
+                    local shown = billboardRarity(m)
+                    local rarity = shown or areaRarity(area.Name)
+
+                    local id = mosquitoId(m.Name)
+                    local price = nil
+
+                    if id then price = EGG_PRICE[id] end
+
                     out[#out + 1] = {
                         model  = m,
                         name   = m.Name,
                         rarity = rarity,
-                        coin   = RARITY_COIN[rarity],
+                        price  = price,
                     }
                 end
             end
@@ -769,11 +829,10 @@ local function startHud()
                 slot.nameTag.Position = Vector2.new(EGG_X, rowY)
                 slot.nameTag.Visible  = true
 
-                local coin = egg.coin
                 local vtxt = egg.rarity
 
-                if type(coin) == "number" then
-                    vtxt = egg.rarity .. "  " .. tostring(coin) .. " coins"
+                if type(egg.price) == "number" then
+                    vtxt = egg.rarity .. "  " .. tostring(egg.price) .. " coins"
                 end
 
                 slot.valTag.Text     = vtxt
@@ -1185,5 +1244,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - boss and egg value panels", 5)
+notifyUser("Loaded - egg rarity and price panels", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
