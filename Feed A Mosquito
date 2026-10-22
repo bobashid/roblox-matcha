@@ -1,47 +1,47 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.2  -  THE v4.2 YOU LIKED, TWEAKED
+--  v5.3
 --
---  Same feel as v4.2: stand still, bosses get big hitboxes, Attack is
---  fired on a loop. No CFrame writes, no teleports, two toggles.
---  Three things were changed so it works better.
+--  "IT REMOVED THE FLOORS"
+--    The boss's HumanoidRootPart sits at its feet. At x8-x40 it turns
+--    into an enormous flat slab lying right on top of the arena floor,
+--    and CanCollide is off on it, so the arena looks like it has lost
+--    its floor and you can drop through where the slab is.
+--    The root part is now never multiplied. It is only nudged up to a
+--    small fixed size (HB_ROOT_MAX = 16 studs) so it stays a hit
+--    target, and it keeps its original CanCollide. The visible body
+--    parts are what get grown.
+--    As a second guard, any part whose ORIGINAL size is already 40
+--    studs or more on any axis (arena geometry, walls, big props) is
+--    skipped entirely - it is scenery, not a boss hitbox.
 --
---  1. BOSS LIST IS READ FROM THE GAME, NOT HARDCODED
---     v4.2 had a fixed list of eight area names and assumed Mythical,
---     Divine and Secret had no boss. Your log proved that wrong:
---     DivineMama, MythicalMama and SecretMama all exist, with 20-22
---     parts each. The scan now walks Workspace.SpawnAreas and takes
---     every Model that has a direct Humanoid and "Mama" in its name.
---     Eggs, players, pets (UUID names) and the area containers are
---     rejected, so the floor is never resized.
+--  "IT STOPPED WORKING AFTER A WHILE"
+--    v5.2 only wrote a size when the multiplier changed. If the game
+--    itself reset a part's size (respawn, streaming, replication), the
+--    multiplier was unchanged so nothing was rewritten and the boss
+--    silently went back to normal size while the script still thought
+--    it was grown.
+--    Now every pass compares the part's CURRENT size with the size it
+--    should have and rewrites it only when they differ. The expected
+--    size is always original * multiplier, taken from the size saved
+--    by Address the first time the part was seen, so this cannot
+--    compound.
 --
---  2. SIZES ARE SAVED BY Address, NOT BY INSTANCE
---     Matcha hands back a fresh proxy for the same part on every scan.
---     A table keyed by the instance therefore re-saved and re-grew the
---     same part every pass (x8 -> x64 -> x512 ...) which is what made
---     the client choke after a few seconds. Keyed by Address, each
---     part's original size is saved once and only recomputed when the
---     multiplier actually changes. No compounding, ever.
+--  Everything else is the v5.2 you were happy with:
+--    - live scan of SpawnAreas for <Type>Mama models with a Humanoid
+--      (Divine, Mythical and Secret included - they do exist)
+--    - eggs, players, pets (UUID names) and area containers excluded
+--    - multiplier scales with distance: base x8 (x16 with Huge),
+--      +1 per 12 studs, capped x40
+--    - Area / ChaseArea parts are never resized
+--    - stand still, Attack fired every SWING_RATE, no CFrame writes
+--    - size and CanCollide restored exactly on toggle off / stop
 --
---  3. FAR BOSSES GET A BIGGER MULTIPLIER
---     This is the fix for "only the first four die". Flat x8 reached
---     the near arenas but not the far ones. Now:
---         mult = base + floor(distance / 12), capped at 40
---     with base x8, or x16 while Huge Hitbox is on. Near bosses stay
---     close to what you had; far bosses grow enough to be reachable.
+--  "Print Boss List" prints what the scan accepted, with part count,
+--  HP and the multiplier each boss would get right now.
 --
---  Also kept from v4.2 / fixed:
---    - HumanoidRootPart is never smaller than 14 studs on any axis
---    - Area / ChaseArea parts are skipped by name as well
---    - CanCollide is off on any grown part (a huge part with collide
---      on is what shoved you around before) and the original value is
---      restored with the size on toggle off or stop
---    - Attack remotes are re-scanned when the cache goes stale, so a
---      weapon swap does not kill auto swing
---
---  MAIN: Always Heal, Auto Collect. All toggles start OFF.
---  Stop with _G.FeedAMosquito.stop().
+--  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -50,7 +50,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.2"
+local VERSION = "v5.3"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -79,7 +79,8 @@ local HB_MULT      = 8
 local HB_MULT_BIG  = 16
 local HB_MAX       = 40
 local HB_PER_STUD  = 12
-local HB_ROOT_MIN  = 14
+local HB_ROOT_MAX  = 16    -- root part is never multiplied past this
+local HB_SKIP_SIZE = 40    -- scenery: any original axis this big is left alone
 
 -- parts that must never be resized
 local SKIP_PART = {
@@ -172,6 +173,17 @@ local function countParts(m)
         if isBasePart(desc[i]) then n = n + 1 end
     end
     return n
+end
+
+-- true when two Vector3 sizes differ on any axis by more than eps
+local function sizeDiffers(a, b, eps)
+    if not a or not b then return false end
+    eps = eps or 0.05
+    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
+    if dx < 0 then dx = -dx end
+    if dy < 0 then dy = -dy end
+    if dz < 0 then dz = -dz end
+    return dx > eps or dy > eps or dz > eps
 end
 
 --------------------------------------------------------------------
@@ -388,7 +400,6 @@ local function allBosses()
     return scanBosses()
 end
 
--- centre for the distance bonus: root part, else primary, else any part
 local function bossCenter(boss)
     local r = boss:FindFirstChild("HumanoidRootPart")
     if r and r.ClassName == "Part" then
@@ -473,9 +484,9 @@ end
 
 --------------------------------------------------------------------
 -- BOSS HITBOX EXPANDER
---   size = first-seen size * multiplier, saved once per Address.
+--   Root part capped, scenery skipped, sizes re-applied on drift.
 --------------------------------------------------------------------
-local hbSaved   = {}   -- address -> { part, size, collide, mult }
+local hbSaved   = {}   -- address -> { part, size, collide, root }
 local hbApplied = false
 
 local function hbFactor()
@@ -516,9 +527,13 @@ local function growPart(d, mult, isRoot)
     local e = hbSaved[k]
 
     if e == nil then
-        -- save the ORIGINAL size exactly once, before anything is changed
         local okS, s = pcall(function() return d.Size end)
         if not okS or not s then return false end
+
+        -- arena geometry, walls and other scenery: never touched
+        if s.X >= HB_SKIP_SIZE or s.Y >= HB_SKIP_SIZE or s.Z >= HB_SKIP_SIZE then
+            return false
+        end
 
         local okC, c = pcall(function() return d.CanCollide end)
 
@@ -526,26 +541,39 @@ local function growPart(d, mult, isRoot)
             part    = d,
             size    = s,
             collide = (okC and c) and true or false,
-            mult    = 0,
+            root    = isRoot and true or false,
         }
         hbSaved[k] = e
     end
 
-    if e.mult ~= mult then
-        local nx = e.size.X * mult
-        local ny = e.size.Y * mult
-        local nz = e.size.Z * mult
+    -- the root part sits on the floor: keep it small so it cannot
+    -- swallow the arena, and leave its collision alone
+    local target
+    if e.root then
+        local base = e.size
+        local rx, ry, rz = base.X, base.Y, base.Z
+        if rx > HB_ROOT_MAX then rx = HB_ROOT_MAX end
+        if ry > HB_ROOT_MAX then ry = HB_ROOT_MAX end
+        if rz > HB_ROOT_MAX then rz = HB_ROOT_MAX end
+        if rx < 6 then rx = 6 end
+        if ry < 6 then ry = 6 end
+        if rz < 6 then rz = 6 end
+        target = Vector3.new(rx, ry, rz)
+    else
+        target = Vector3.new(e.size.X * mult, e.size.Y * mult, e.size.Z * mult)
+    end
 
-        if isRoot then
-            if nx < HB_ROOT_MIN then nx = HB_ROOT_MIN end
-            if ny < HB_ROOT_MIN then ny = HB_ROOT_MIN end
-            if nz < HB_ROOT_MIN then nz = HB_ROOT_MIN end
-        end
+    -- rewrite only when the part is not already the size it should be
+    local okCur, cur = pcall(function() return d.Size end)
+    if okCur and cur and not sizeDiffers(cur, target) then
+        return true
+    end
 
-        pcall(function() d.Size = Vector3.new(nx, ny, nz) end)
+    pcall(function() d.Size = target end)
+
+    if not e.root then
+        -- a grown body part must not shove the player around
         pcall(function() d.CanCollide = false end)
-
-        e.mult = mult
     end
 
     return true
@@ -753,7 +781,7 @@ task.spawn(function()
             if n > 0 and not hbApplied then
                 hbApplied = true
                 print("[" .. NAME .. "] hitbox on " .. tostring(n)
-                    .. " boss parts (distance scaled, no collide, local)")
+                    .. " boss parts (distance scaled, root capped, local)")
             end
         elseif hbApplied then
             restoreHitbox()
