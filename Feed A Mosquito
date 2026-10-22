@@ -1,40 +1,45 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v7.5  -  THREE TOGGLES, KILL FARM SWINGS IN GAME
+--  v7.6  -  NO MOUSE INPUT AT ALL
+--
+--  Why the click is gone for good
+--    Every version that sent mouse1press/mouse1click looked and felt
+--    like you were pressing M1, because that is exactly what it was:
+--    the same input path, just fired by the script. There is no
+--    "silent" variant of that - it either goes through the input path
+--    or it does not.
+--
+--    So it does not. This build sends NO mouse input of any kind, no
+--    PlayAnim call, and no equip or unequip. The damage comes only
+--    from the two things that were measurably landing:
+--
+--      1. the contact cycle on AttackPart
+--             pass A:  untouch every live boss part
+--             pass B:  touch every live boss part
+--         A contact that already exists does not fire again, which is
+--         why a plain repeated touch did nothing - alternating is what
+--         makes every second pass a brand new hit.
+--
+--      2. PlaySound("SwingSound") + Attack fired on the tool's LIVE
+--         actor, resolved from the tool's ActorId StringValue. Name
+--         matching picks a dead copy (every equip leaves one behind in
+--         Runtime.Actors), which is why earlier remote loops did
+--         nothing at all.
+--
+--  REACH
+--    AttackPart is scaled to the farthest spawned boss so those
+--    contacts happen from anywhere on the map:
+--        side = (farthest + 30) * 2        [60 .. 4000]
+--    Bosses are never written to - no size, no CanCollide, no CFrame -
+--    so none is launched into the void and the map stays solid.
+--    AttackPart's original size is saved per Address and restored the
+--    moment Kill Farm goes off or the script stops.
 --
 --  TOGGLES
---      Auto Health      - TransfuseBlood loop (own switch)
---      Auto Collect     - CollectIncome / ClaimOfflineIncome (own switch)
---      Kill Farm        - the hit loop below, one switch for all of it
---
---  WHY PlayAnim IS GONE
---    v7.4 called the character actor's PlayAnim function. It resolved
---    fine but dealt no damage and did not drive the weapon, so it is
---    removed. What DID work in v7.3 was this core:
---
---      1. scale AttackPart so the box covers the map from where you
---         stand:  side = (farthest boss + 30) * 2   [60 .. 4000]
---      2. alternate the touch state every pass (untouch, then touch),
---         because a contact that already exists does not fire again -
---         that is why a plain repeated touch did nothing
---      3. PlaySound + Attack on the tool's LIVE actor, resolved from
---         the tool's ActorId value (name matching picks a dead copy,
---         since every equip leaves one behind in Runtime.Actors)
---
---  THE SWING, WITHOUT YOU CLICKING
---    Kill Farm sends the swing through the game's own input path with
---    mouse1press + mouse1release instead of a click at the cursor, so
---    the weapon actually swings in game and the animation plays for
---    real. You never touch the mouse. If the game window is not the
---    focused window it does not send anything, so it will not click
---    around your desktop.
---
---  Nothing is ever equipped, unequipped or reparented, so the crash
---  from the equip-spam builds cannot happen. Bosses are never written
---  to either - no size, no CanCollide, no CFrame - so none is launched
---  into the void and the map stays solid. AttackPart's original size
---  is restored the moment Kill Farm goes off or the script stops.
+--      Auto Health   - TransfuseBlood loop
+--      Auto Collect  - CollectIncome / ClaimOfflineIncome
+--      Kill Farm     - contact cycle above, every 0.12 s
 --
 --  Boss HP is summed each pass; one line prints if it stops dropping.
 --  Keep a weapon equipped. All toggles start OFF.
@@ -47,7 +52,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v7.5"
+local VERSION = "v7.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -143,31 +148,6 @@ local function sizeDiffers(a, b)
     if dy < 0 then dy = -dy end
     if dz < 0 then dz = -dz end
     return dx > eps or dy > eps or dz > eps
-end
-
-local function windowFocused()
-    if type(isrbxactive) ~= "function" then return true end
-
-    local ok, act = pcall(isrbxactive)
-    if ok and act == false then return false end
-    return true
-end
-
--- swing through the game's own input path, no click at the cursor
-local function swingInGame()
-    if not windowFocused() then return false end
-
-    if type(mouse1press) == "function" and type(mouse1release) == "function" then
-        local okP = pcall(mouse1press)
-        pcall(mouse1release)
-        if okP then return true end
-    end
-
-    if type(mouse1click) == "function" then
-        return (pcall(mouse1click))
-    end
-
-    return false
 end
 
 --------------------------------------------------------------------
@@ -513,7 +493,7 @@ local function addToggle(sec, label, id, key, default)
 end
 
 --------------------------------------------------------------------
--- Menu  (heal and collect separate, farm on its own)
+-- Menu
 --------------------------------------------------------------------
 local function buildTab(tab)
     if built then return end
@@ -529,7 +509,7 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Kill Farm (reach + swings)", "fam_farm", "Farm", false)
+            addToggle(combat, "Kill Farm (contact cycle)", "fam_farm", "Farm", false)
         end
     end)
 
@@ -585,7 +565,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- KILL FARM  (touch cycle + live actor remotes + real in-game swing)
+-- KILL FARM  (contact cycle + live actor remotes, no input)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -603,7 +583,7 @@ task.spawn(function()
     local touching = false
 
     if not hasTouch then
-        print("[" .. NAME .. "] firetouchinterest missing - remotes + swing only")
+        print("[" .. NAME .. "] firetouchinterest missing - remotes only")
     end
 
     while running do
@@ -643,7 +623,7 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] kill farm on (swings in game)")
+                        print("[" .. NAME .. "] kill farm on (no mouse input)")
                     end
 
                     local ap = attackPartOf(tool)
@@ -684,8 +664,6 @@ task.spawn(function()
                     end
                     pcall(function() cachedAtk:FireServer() end)
 
-                    if touching then swingInGame() end
-
                     local list = bossList()
                     local sum  = 0
                     local live = 0
@@ -707,7 +685,7 @@ task.spawn(function()
 
                         if stale >= STALE_LIMIT and not staleWarn then
                             staleWarn = true
-                            print("[" .. NAME .. "] boss HP not dropping - hits not landing")
+                            print("[" .. NAME .. "] boss HP not dropping - contact not landing")
                         end
                     else
                         stale = 0
@@ -797,5 +775,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - heal, collect, kill farm", 5)
+notifyUser("Loaded - no mouse input, contact cycle", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
