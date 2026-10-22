@@ -2,41 +2,47 @@
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
 --  Always Heal
---    Keeps TransfuseBlood running. Measured live: MaxHealth climbed
---    2999 -> 3029 -> 3079 -> 3089 while standing, no seat involved.
---    Humanoid.Health is READ-ONLY in Matcha (a write throws), so the
---    server remote is the only heal path.
+--    Keeps TransfuseBlood running. Humanoid.Health is READ-ONLY in
+--    Matcha (a write throws), so the server remote is the only path.
+--    Refire slowed to 1s to cut remote volume.
 --
 --  Auto Feed
---    Each mosquito model carries FeedProgress / Feeding / ActorId and
---    owns a FeedMosquito remote under Runtime.Actors.
+--    FeedMosquito remote per mosquito model, skipped when full/busy.
 --
 --  Auto Collect
---    Fires CollectIncome and ClaimOfflineIncome.
+--    CollectIncome + ClaimOfflineIncome.
 --
 --  Auto Attack
---    Fires the tool actor's Attack remote directly:
+--    Fires the tool actor's Attack remote:
 --      Runtime.Actors.Tool_Character_<userId>_<n>_<m>.Events.Attack
---    Attack takes NO arguments, so the server resolves the hit from
---    the character's position. No client-side hitbox exists to grow.
+--    Attack takes NO arguments, the server resolves the hit.
 --
---  Attack From Afar
---    Teleports onto the nearest enemy, swings, teleports back.
+--  WEAPON SWAP FIX (v2.3)
+--    The old build cached the Attack remote list forever. Upgrading a
+--    weapon destroys the old Tool_Character_<id>_<n>_<m> actor and
+--    creates a new one, so the cache kept firing a dead remote and
+--    auto kill silently stopped. The cache now expires every 0.75s and
+--    is also dropped when the equipped tool name changes.
+--
+--  CRASH MITIGATION (v2.3)
+--    - CFrame is only written when you are more than 2 studs from the
+--      target slot, instead of every pass. CFrame writes are the
+--      expensive operation here (thousands of internal writes each).
+--    - No CFrame writes while Health is 0 (dead / respawning).
+--    - All remote and position calls stay inside pcall.
+--    - Swing rates reduced (0.3s normal, 0.25s kill, 1s heal refire).
+--    - Actor folder is scanned at most every 0.75s, not per swing.
 --
 --  Auto Kill
---    Stays attached to the chosen boss instead of bouncing back. Locks
---    your CFrame under it every pass and swings. The original CFrame is
---    saved on the first pass and restored when you switch it off.
+--    Stays attached to the chosen boss, swings, restores your CFrame
+--    when switched off.
 --
 --  Under Map
---    Places you Depth studs BELOW the boss instead of above it. Kept
---    separate from Auto Kill so you can test it with normal Auto Attack
---    first. Depth 0 puts you level with the boss.
+--    Places you Depth studs BELOW the boss. Depth 0 = level with it.
 --
 --  Bosses
---    One toggle per area prefix. Enemy models are named
---    <Area>Area_Enemy_<n> in Workspace, so Common matches
---    CommonArea_Enemy_129 and Epic matches Egg_EpicArea_Enemy_132_0.
+--    One toggle per area prefix (Common, Uncommon, Rare, Legendary,
+--    Mythical, Divine, Secret, Epic).
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -47,7 +53,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.2"
+local VERSION = "v2.3"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -59,12 +65,15 @@ local built   = false
 
 -- fixed tuning
 local POLL_RATE    = 0.1    -- toggle poller
-local HEAL_RATE    = 0.2    -- transfusion control
-local FEED_RATE    = 0.3    -- mosquito feed pass
+local HEAL_RATE    = 0.25   -- transfusion control loop
+local HEAL_REFIRE  = 1.0    -- seconds between TransfuseBlood fires
+local FEED_RATE    = 0.35   -- mosquito feed pass
 local COLLECT_RATE = 1.5    -- income collection
-local ATTACK_RATE  = 0.25   -- normal weapon swings
-local AFAR_RATE    = 0.7    -- teleport swing pass
-local KILL_RATE    = 0.2    -- stay-attached kill pass
+local ATTACK_RATE  = 0.3    -- normal weapon swings
+local AFAR_RATE    = 0.7    -- touch-and-return pass
+local KILL_RATE    = 0.25   -- stay-attached kill pass
+local ATK_TTL      = 0.75   -- attack remote cache lifetime
+local MOVE_EPS2    = 4      -- 2 studs squared
 
 local BOSS_NAMES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -112,6 +121,12 @@ end
 local function rootPart()
     local c = LP.Character
     return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+
+-- alive check: blocks position writes while dead or respawning
+local function alive()
+    local hum = humanoid()
+    return hum ~= nil and hum.Health > 0
 end
 
 local function notifyUser(msg, dur)
@@ -177,14 +192,31 @@ end
 
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
+--   Tool_Character_<userId>_<n>_<m>.Events.Attack
+--   The <n> changes when you upgrade a weapon, so this list EXPIRES.
 --------------------------------------------------------------------
 local atkCache = nil
 local atkFor   = nil
+local atkStamp = 0
+local atkTool  = nil
+
+local function equippedToolName()
+    local c = LP.Character
+    local t = c and c:FindFirstChildOfClass("Tool")
+    return t and t.Name or nil
+end
 
 local function attackRemotes()
-    if atkCache and atkFor == LP.UserId and #atkCache > 0 then
-        return atkCache
-    end
+    local now  = tick()
+    local tool = equippedToolName()
+
+    local fresh = atkCache
+        and atkFor == LP.UserId
+        and #atkCache > 0
+        and (now - atkStamp) < ATK_TTL
+        and tool == atkTool
+
+    if fresh then return atkCache end
 
     local actors = child(RS, "Runtime", "Actors")
     if not actors then return nil end
@@ -203,19 +235,24 @@ local function attackRemotes()
         end
     end
 
-    if #out == 0 then return nil end
+    if #out == 0 then
+        atkCache = nil
+        return nil
+    end
 
     atkCache = out
     atkFor   = LP.UserId
+    atkStamp = now
+    atkTool  = tool
     return out
 end
 
 local function swing()
+    if not alive() then return false end
+
     local list = attackRemotes()
-    if not list then
-        atkCache = nil
-        return false
-    end
+    if not list then return false end
+
     for i = 1, #list do
         pcall(function() list[i]:FireServer() end)
     end
@@ -277,6 +314,24 @@ local function nearestEnemyOf(fromPos, prefixes, maxDist)
     end
 
     return best, bestPos
+end
+
+-- moves only if further than 2 studs from the slot, returns the delta
+local function moveTo(hrp, x, y, z)
+    if not hrp or not hrp.Parent then return false end
+    if not alive() then return false end
+
+    local p  = hrp.Position
+    local dx = p.X - x
+    local dy = p.Y - y
+    local dz = p.Z - z
+
+    if (dx * dx + dy * dy + dz * dz) <= MOVE_EPS2 then
+        return false
+    end
+
+    pcall(function() hrp.CFrame = CFrame.new(x, y, z) end)
+    return true
 end
 
 --------------------------------------------------------------------
@@ -459,7 +514,7 @@ task.spawn(function()
                 end
 
                 local now = tick()
-                if not transfusing or (now - lastFire) >= 0.5 then
+                if not transfusing or (now - lastFire) >= HEAL_REFIRE then
                     if fireEvent("TransfuseBlood") then
                         transfusing = true
                         lastFire    = now
@@ -545,23 +600,27 @@ task.spawn(function()
     while running do
         if Config.AutoAttack and Config.Afar and not Config.Kill then
             local hrp = rootPart()
-            if hrp then
+            if hrp and alive() then
                 local range = tonumber(Config.AfarRange) or 300
                 local target, pos = nearestEnemyOf(hrp.Position,
                     enabledPrefixes(), range)
 
                 if target and pos then
-                    local back = hrp.CFrame
-                    local under = Config.Under
+                    local back  = hrp.CFrame
                     local depth = tonumber(Config.Depth) or 8
-                    local ty = pos.Y + 3
-                    if under then ty = pos.Y - depth end
+                    local ty    = pos.Y + 3
+                    if Config.Under then ty = pos.Y - depth end
 
-                    pcall(function() hrp.CFrame = CFrame.new(pos.X, ty, pos.Z) end)
-                    task.wait(0.06)
-                    swing()
-                    task.wait(0.06)
-                    pcall(function() hrp.CFrame = back end)
+                    if moveTo(hrp, pos.X, ty, pos.Z) then
+                        task.wait(0.06)
+                        swing()
+                        task.wait(0.06)
+                        pcall(function()
+                            if hrp and hrp.Parent then hrp.CFrame = back end
+                        end)
+                    else
+                        swing()
+                    end
                 end
             end
         end
@@ -572,13 +631,14 @@ end)
 --------------------------------------------------------------------
 -- AUTO KILL  (stay attached to the chosen boss)
 --   First pass saves your CFrame; switching the toggle off puts you
---   back. Every pass re-locks position, so a moving boss is followed.
+--   back. Position is only written when you drift more than 2 studs,
+--   which keeps the expensive CFrame writes rare.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
         if Config.Kill then
             local hrp = rootPart()
-            if hrp then
+            if hrp and alive() then
                 local range = tonumber(Config.KillRange) or 1500
                 local target, pos = nearestEnemyOf(hrp.Position,
                     enabledPrefixes(), range)
@@ -591,12 +651,10 @@ task.spawn(function()
                     end
 
                     local depth = tonumber(Config.Depth) or 8
-                    local ty = pos.Y + 3
+                    local ty    = pos.Y + 3
                     if Config.Under then ty = pos.Y - depth end
 
-                    pcall(function()
-                        hrp.CFrame = CFrame.new(pos.X, ty, pos.Z)
-                    end)
+                    moveTo(hrp, pos.X, ty, pos.Z)
                     swing()
                 elseif killing then
                     if savedCF then
@@ -610,7 +668,7 @@ task.spawn(function()
             if savedCF then
                 pcall(function()
                     local hrp = rootPart()
-                    if hrp then hrp.CFrame = savedCF end
+                    if hrp and hrp.Parent then hrp.CFrame = savedCF end
                 end)
             end
             killing = false
@@ -627,10 +685,11 @@ local function stop()
     if killing and savedCF then
         pcall(function()
             local hrp = rootPart()
-            if hrp then hrp.CFrame = savedCF end
+            if hrp and hrp.Parent then hrp.CFrame = savedCF end
         end)
     end
     killing = false
+    atkCache = nil
 
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
