@@ -1,13 +1,20 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v2.4
---    - Auto Feed removed (toggle, loop and myBase helper deleted).
---    - Two attack toggles:
---        Auto Farm : swings on a fixed cadence, no target needed.
---        Kill Aura : swings only while an enemy is inside Aura Range.
---    - Auto Attack removed; Auto Farm replaces it.
---    - Attack From Afar and Auto Kill no longer depend on Auto Attack.
+--  v2.5
+--    - Kill Aura is now ONE toggle, no sliders. It teleports to the
+--      nearest enabled enemy anywhere in the map, swings, repeats.
+--      Attack has no client-side range, so the only way to reach
+--      something far away is to be next to it when the swing lands.
+--      Under Map / Depth decide where you sit relative to the target.
+--    - Auto Farm fix: the Attack remote cache now checks that the
+--      cached remote still has a live parent before reusing it. A
+--      weapon upgrade destroys the old Tool_Character actor, and the
+--      old build kept firing that dead remote.
+--    - "Test Swing" button prints exactly what Auto Farm sees:
+--      alive, equipped tool, actor count, remote count, swing result.
+--      Press it once if Farm looks inert - it names the failing step.
+--    - Menu regrouped: Main, Combat, Position, Auto Kill, Bosses.
 --
 --  Always Heal
 --    TransfuseBlood remote. Humanoid.Health is READ-ONLY in Matcha
@@ -19,14 +26,7 @@
 --  Swing
 --    Fires Runtime.Actors.Tool_Character_<userId>_*..Events.Attack.
 --    Attack takes no arguments; the server resolves the hit from the
---    character position. No client-side hitbox exists to enlarge.
---    The remote list expires every 0.75s and also resets when the
---    equipped tool name changes, so a weapon upgrade is picked up.
---
---  Auto Kill
---    Teleports onto the chosen boss and stays there. Under Map places
---    you Depth studs below it. CFrame is written only when more than
---    2 studs from the slot, and never while Health is 0.
+--    character position.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -37,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.4"
+local VERSION = "v2.5"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -53,11 +53,12 @@ local HEAL_RATE    = 0.25   -- transfusion control loop
 local HEAL_REFIRE  = 1.0    -- seconds between TransfuseBlood fires
 local COLLECT_RATE = 1.5    -- income collection
 local FARM_RATE    = 0.3    -- auto farm swing cadence
-local AURA_RATE    = 0.2    -- kill aura check cadence
+local AURA_RATE    = 0.25   -- kill aura pass
 local AFAR_RATE    = 0.7    -- touch-and-return pass
 local KILL_RATE    = 0.25   -- stay-attached kill pass
-local ATK_TTL      = 0.75   -- attack remote cache lifetime
+local ATK_TTL      = 0.5    -- attack remote cache lifetime
 local MOVE_EPS2    = 4      -- 2 studs squared
+local AURA_MAX     = 1000000 -- kill aura reaches the whole map
 
 local BOSS_NAMES = {
     "Common", "Uncommon", "Rare", "Legendary",
@@ -69,12 +70,11 @@ local Config = {
     AutoCollect = false,
     Farm        = false,
     Aura        = false,
-    AuraRange   = 30,
     Afar        = false,
     AfarRange   = 300,
-    Kill        = false,
     Under       = true,
     Depth       = 8,
+    Kill        = false,
     KillRange   = 1500,
 
     BossCommon    = true,
@@ -108,7 +108,6 @@ local function rootPart()
     return c and c:FindFirstChild("HumanoidRootPart") or nil
 end
 
--- alive check: blocks position writes while dead or respawning
 local function alive()
     local hum = humanoid()
     return hum ~= nil and hum.Health > 0
@@ -158,12 +157,11 @@ end
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
 --   Tool_Character_<userId>_<n>_<m>.Events.Attack
---   The <n> changes when a weapon is upgraded, so this list EXPIRES.
+--   The <n> changes when a weapon is upgraded, so the cache expires
+--   AND the cached remote must still have a live parent chain.
 --------------------------------------------------------------------
 local atkCache = nil
-local atkFor   = nil
 local atkStamp = 0
-local atkTool  = nil
 
 local function equippedToolName()
     local c = LP.Character
@@ -172,16 +170,17 @@ local function equippedToolName()
 end
 
 local function attackRemotes()
-    local now  = tick()
-    local tool = equippedToolName()
+    local now = tick()
 
-    local fresh = atkCache
-        and atkFor == LP.UserId
-        and #atkCache > 0
-        and (now - atkStamp) < ATK_TTL
-        and tool == atkTool
-
-    if fresh then return atkCache end
+    if atkCache and #atkCache > 0 and (now - atkStamp) < ATK_TTL then
+        local first = atkCache[1]
+        local p1 = first and first.Parent
+        local p2 = p1 and p1.Parent
+        if p1 and p2 then
+            return atkCache
+        end
+        atkCache = nil
+    end
 
     local actors = child(RS, "Runtime", "Actors")
     if not actors then return nil end
@@ -206,22 +205,21 @@ local function attackRemotes()
     end
 
     atkCache = out
-    atkFor   = LP.UserId
     atkStamp = now
-    atkTool  = tool
     return out
 end
 
 local function swing()
-    if not alive() then return false end
+    if not alive() then return false, "dead" end
 
     local list = attackRemotes()
-    if not list then return false end
+    if not list then return false, "no remote" end
 
     for i = 1, #list do
         pcall(function() list[i]:FireServer() end)
     end
-    return true
+
+    return true, tostring(#list)
 end
 
 --------------------------------------------------------------------
@@ -299,6 +297,14 @@ local function moveTo(hrp, x, y, z)
     return true
 end
 
+-- where to sit relative to a target position
+local function slotFor(pos)
+    local depth = tonumber(Config.Depth) or 8
+    local ty = pos.Y + 3
+    if Config.Under then ty = pos.Y - depth end
+    return pos.X, ty, pos.Z
+end
+
 --------------------------------------------------------------------
 -- Toggle / slider plumbing
 --------------------------------------------------------------------
@@ -341,6 +347,18 @@ local function safeSlider(sec, name, id, min, max, default, cb)
     return false
 end
 
+local function safeButton(sec, name, cb)
+    local tries = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, name .. "_btn", cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Button failed: " .. tostring(name))
+    return false
+end
+
 local function makeSection(tab, name, side)
     local ok, sec = pcall(function() return tab:Section(name, side) end)
     if ok and type(sec) == "table" then return sec end
@@ -374,12 +392,32 @@ local function buildTab(tab)
         if combat then
             addToggle(combat, "Auto Farm", "fam_farm", "Farm", false)
             addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
-            safeSlider(combat, "Aura Range", "fam_aurarange", 5, 200, 30,
+            safeButton(combat, "Test Swing", function()
+                local hum = humanoid()
+                print("[" .. NAME .. "] alive", tostring(alive()),
+                    "hp", tostring(hum and hum.Health))
+                print("[" .. NAME .. "] tool", tostring(equippedToolName()))
+                local actors = child(RS, "Runtime", "Actors")
+                print("[" .. NAME .. "] actors",
+                    tostring(actors and #actors:GetChildren() or -1))
+                local list = attackRemotes()
+                print("[" .. NAME .. "] remotes",
+                    tostring(list and #list or 0))
+                local okSwing, info = swing()
+                print("[" .. NAME .. "] swing", tostring(okSwing),
+                    tostring(info))
+            end)
+        end
+
+        local pos = makeSection(tab, "Position", "Right")
+        if pos then
+            addToggle(pos, "Under Map", "fam_under", "Under", true)
+            safeSlider(pos, "Depth", "fam_depth", 0, 40, 8,
                 function(v)
-                    if type(v) == "number" then Config.AuraRange = v end
+                    if type(v) == "number" then Config.Depth = v end
                 end)
-            addToggle(combat, "Attack From Afar", "fam_afar", "Afar", false)
-            safeSlider(combat, "Afar Range", "fam_afarrange", 50, 2000, 300,
+            addToggle(pos, "Attack From Afar", "fam_afar", "Afar", false)
+            safeSlider(pos, "Afar Range", "fam_afarrange", 50, 2000, 300,
                 function(v)
                     if type(v) == "number" then Config.AfarRange = v end
                 end)
@@ -388,11 +426,6 @@ local function buildTab(tab)
         local kill = makeSection(tab, "Auto Kill", "Right")
         if kill then
             addToggle(kill, "Auto Kill", "fam_kill", "Kill", false)
-            addToggle(kill, "Under Map", "fam_under", "Under", true)
-            safeSlider(kill, "Depth", "fam_depth", 0, 40, 8,
-                function(v)
-                    if type(v) == "number" then Config.Depth = v end
-                end)
             safeSlider(kill, "Kill Range", "fam_killrange", 50, 5000, 1500,
                 function(v)
                     if type(v) == "number" then Config.KillRange = v end
@@ -526,19 +559,21 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- KILL AURA
---   Swings only while an enabled enemy is inside Aura Range.
---   No movement, no teleport - just attacks what is already near.
+-- KILL AURA  (one toggle, no sliders)
+--   Finds the nearest enabled enemy anywhere in the map, moves to the
+--   Under Map / Depth slot, swings. Repeats. Skipped while Auto Kill
+--   owns the movement so the two never fight each other.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Aura then
+        if Config.Aura and not Config.Kill then
             local hrp = rootPart()
             if hrp and alive() then
-                local range = tonumber(Config.AuraRange) or 30
-                local target = nearestEnemyOf(hrp.Position,
-                    enabledPrefixes(), range)
-                if target then
+                local target, pos = nearestEnemyOf(hrp.Position,
+                    enabledPrefixes(), AURA_MAX)
+                if target and pos then
+                    local tx, ty, tz = slotFor(pos)
+                    moveTo(hrp, tx, ty, tz)
                     swing()
                 end
             end
@@ -552,7 +587,7 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Afar and not Config.Kill then
+        if Config.Afar and not Config.Kill and not Config.Aura then
             local hrp = rootPart()
             if hrp and alive() then
                 local range = tonumber(Config.AfarRange) or 300
@@ -560,12 +595,10 @@ task.spawn(function()
                     enabledPrefixes(), range)
 
                 if target and pos then
-                    local back  = hrp.CFrame
-                    local depth = tonumber(Config.Depth) or 8
-                    local ty    = pos.Y + 3
-                    if Config.Under then ty = pos.Y - depth end
+                    local back = hrp.CFrame
+                    local tx, ty, tz = slotFor(pos)
 
-                    if moveTo(hrp, pos.X, ty, pos.Z) then
+                    if moveTo(hrp, tx, ty, tz) then
                         task.wait(0.06)
                         swing()
                         task.wait(0.06)
@@ -603,11 +636,8 @@ task.spawn(function()
                         print("[" .. NAME .. "] auto kill on " .. target.Name)
                     end
 
-                    local depth = tonumber(Config.Depth) or 8
-                    local ty    = pos.Y + 3
-                    if Config.Under then ty = pos.Y - depth end
-
-                    moveTo(hrp, pos.X, ty, pos.Z)
+                    local tx, ty, tz = slotFor(pos)
+                    moveTo(hrp, tx, ty, tz)
                     swing()
                 elseif killing then
                     if savedCF then
