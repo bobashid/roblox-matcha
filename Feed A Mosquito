@@ -4,32 +4,32 @@
 --  Always Heal
 --    Keeps TransfuseBlood running. Measured live: MaxHealth climbed
 --    2999 -> 3029 -> 3079 -> 3089 while standing, no seat involved.
---    Humanoid.Health is READ-ONLY in Matcha (write throws), so the
+--    Humanoid.Health is READ-ONLY in Matcha (a write throws), so the
 --    server remote is the only heal path.
 --
 --  Auto Feed
---    Every mosquito actor owns a FeedMosquito remote. Fires it for
---    each mosquito whose FeedProgress is below full and not already
---    Feeding. This is the game's main income action.
+--    Each mosquito model carries FeedProgress / Feeding / ActorId and
+--    owns a FeedMosquito remote under Runtime.Actors. Fires it for any
+--    mosquito below full that is not already feeding. Main income.
 --
 --  Auto Collect
---    Fires the player's CollectIncome event, and ClaimOfflineIncome
---    when it exists. Server decides what is ready, so a slow loop is
---    enough.
+--    Fires CollectIncome and ClaimOfflineIncome. The server decides
+--    what is ready, so a slow loop is enough.
 --
 --  Auto Upgrade
---    Fires UpgradeSpeed / UpgradeDamage / UpgradeBase on a slow loop.
---    The server rejects purchases you cannot afford, so this is safe.
+--    Fires UpgradeSpeed / UpgradeDamage / UpgradeBase. The server
+--    rejects anything you cannot afford, so this cannot overspend.
 --
 --  Auto Sell
---    SellAllEggs / SellAllMosquitoes are RemoteFunctions; they are
---    only invoked when their toggle is on. Default off.
+--    SellAllEggs / SellAllMosquitoes are RemoteFunctions, invoked on
+--    the economy tick. Default off.
 --
 --  Auto Attack
---    Fires the equipped tool's Attack remote when an enemy model is
---    close. Enemy logic itself is server-side.
+--    SlapActor fires its Attack remote with no arguments on the tool
+--    actor (Tool_Character_<userId>_*). This scans those actors and
+--    fires Attack when an enemy model is within range.
 --
---  All toggles default OFF. Stop with _G.FeedAMosquito.stop().
+--  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
@@ -38,7 +38,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.4"
+local VERSION = "v1.5"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -49,13 +49,14 @@ local running = true
 local built   = false
 
 -- fixed tuning
-local POLL_RATE   = 0.1    -- toggle poller
-local HEAL_RATE   = 0.2    -- transfusion control
-local FEED_RATE   = 0.3    -- mosquito feed pass
-local COLLECT_RATE= 1.5    -- income collection
-local UPGRADE_RATE= 1.0    -- upgrades
-local SELL_RATE   = 5.0    -- selling
-local ATTACK_RATE = 0.25   -- weapon attacks
+local POLL_RATE    = 0.1    -- toggle poller
+local HEAL_RATE    = 0.2    -- transfusion control
+local FEED_RATE    = 0.3    -- mosquito feed pass
+local COLLECT_RATE = 1.5    -- income collection
+local UPGRADE_RATE = 1.0    -- upgrades
+local SELL_RATE    = 5.0    -- selling
+local ATTACK_RATE  = 0.25   -- weapon attacks
+local ATTACK_RANGE = 60
 
 local Config = {
     Heal        = false,
@@ -136,7 +137,7 @@ local function invokeFunc(name, ...)
 end
 
 --------------------------------------------------------------------
--- My base (Base<N> whose ActorId mentions my UserId)
+-- My base: the Base<N> whose ActorId mentions my UserId
 --------------------------------------------------------------------
 local function myBase()
     local bases = find(WS, "SafeZone", "Bases")
@@ -255,7 +256,7 @@ else
 end
 
 --------------------------------------------------------------------
--- TOGGLE POLLER
+-- TOGGLE POLLER - single source of truth
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -285,8 +286,6 @@ end)
 
 --------------------------------------------------------------------
 -- ALWAYS HEAL
---   Health/MaxHealth are read-only here; the server remote does the
---   work and also raises MaxHealth while it runs.
 --------------------------------------------------------------------
 task.spawn(function()
     local transfusing = false
@@ -325,30 +324,30 @@ end)
 
 --------------------------------------------------------------------
 -- AUTO FEED
---   Per-mosquito remote. Skip full ones and ones already feeding.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
         if Config.AutoFeed then
-            local base = myBase()
+            local base   = myBase()
             local folder = base and base:FindFirstChild("Mosquitoes")
             if folder then
                 local actors = find(RS, "Runtime", "Actors")
-                local kids = folder:GetChildren()
+                local kids   = folder:GetChildren()
 
                 for i = 1, #kids do
-                    local m = kids[i]
-                    local fp = m:FindFirstChild("FeedProgress")
-                    local fg = m:FindFirstChild("Feeding")
+                    local m    = kids[i]
+                    local fp   = m:FindFirstChild("FeedProgress")
+                    local fg   = m:FindFirstChild("Feeding")
                     local prog = (fp and tonumber(fp.Value)) or 1
                     local busy = (fg and fg.Value) or false
 
                     if prog < 0.99 and not busy then
-                        local aid = m:FindFirstChild("ActorId")
-                        local id  = aid and aid.Value
-                        local actor = id and actors and actors:FindFirstChild(tostring(id))
-                        local ev = actor and actor:FindFirstChild("Events")
-                        local rem = ev and ev:FindFirstChild("FeedMosquito")
+                        local aid   = m:FindFirstChild("ActorId")
+                        local id    = aid and aid.Value
+                        local actor = id and actors
+                            and actors:FindFirstChild(tostring(id))
+                        local ev    = actor and actor:FindFirstChild("Events")
+                        local rem   = ev and ev:FindFirstChild("FeedMosquito")
                         if rem then
                             pcall(function() rem:FireServer() end)
                         end
@@ -375,7 +374,6 @@ end)
 
 --------------------------------------------------------------------
 -- AUTO UPGRADE
---   Server rejects what you cannot afford.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
@@ -403,25 +401,39 @@ end)
 
 --------------------------------------------------------------------
 -- AUTO ATTACK
---   Uses the equipped tool's own Attack remote; range checked here.
+--   Tool actors are named Tool_Character_<userId>_<n>_<m>. SlapActor
+--   fires its Attack remote with no arguments, so do the same.
 --------------------------------------------------------------------
 task.spawn(function()
-    local RANGE = 40
+    local function attackRemotes()
+        local actors = find(RS, "Runtime", "Actors")
+        if not actors then return nil end
+
+        local prefix = "Tool_Character_" .. tostring(LP.UserId) .. "_"
+        local plen   = #prefix
+        local out    = {}
+        local kids   = actors:GetChildren()
+
+        for i = 1, #kids do
+            local a = kids[i]
+            if string.sub(a.Name, 1, plen) == prefix then
+                local ev  = a:FindFirstChild("Events")
+                local atk = ev and ev:FindFirstChild("Attack")
+                if atk then out[#out + 1] = atk end
+            end
+        end
+
+        return out
+    end
 
     while running do
         if Config.AutoAttack then
             local me = rootPart()
-            local char = LP.Character
-            local tool = char and char:FindFirstChildOfClass("Tool")
-            local actorId = tool and tool:FindFirstChild("ActorId")
-            local actors = find(RS, "Runtime", "Actors")
-            local actor = actorId and actors
-                and actors:FindFirstChild(tostring(actorId.Value))
-            local ev = actor and actor:FindFirstChild("Events")
-            local atk = ev and ev:FindFirstChild("Attack")
+            if me then
+                local target = nil
+                local best   = ATTACK_RANGE
+                local kids   = WS:GetChildren()
 
-            if me and atk then
-                local kids = WS:GetChildren()
                 for i = 1, #kids do
                     local d = kids[i]
                     if string.find(d.Name, "Enemy", 1, true) then
@@ -430,10 +442,19 @@ task.spawn(function()
                             or d.PrimaryPart
                         if part then
                             local dist = (part.Position - me.Position).Magnitude
-                            if dist <= RANGE then
-                                pcall(function() atk:FireServer(d) end)
-                                break
+                            if dist <= best then
+                                best   = dist
+                                target = d
                             end
+                        end
+                    end
+                end
+
+                if target then
+                    local list = attackRemotes()
+                    if list then
+                        for i = 1, #list do
+                            pcall(function() list[i]:FireServer() end)
                         end
                     end
                 end
