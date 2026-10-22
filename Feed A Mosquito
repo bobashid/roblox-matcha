@@ -1,50 +1,47 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.5  -  PANEL MOVED RIGHT, MATCHES THE GAME UI
+--  v8.6  -  EGG VALUE BEFORE YOU PICK IT UP
 --
---  The panel was sitting on top of the game's own bottom-left HUD.
---  It now starts at PANEL_X = 300 px, clear of the health bar, and
---  every row sits on a dark backdrop so it stays readable over bright
---  terrain.
+--  WHERE THE VALUE COMES FROM (decompiled, not guessed)
+--    ReplicatedStorage.Scripts.Configs.MosquitoConfig is a table of
+--    rarity -> { Coin, Damage, HP }:
 --
---  COLOURS AND FONT ARE THE GAME'S OWN (read from PlayerGui, not
---  guessed):
---      HealthGui.Frame       BackgroundColor3 = 44,44,54
---      MainGui.Frame                         = 45,45,55
---      ShopGui / ZoneGui                     = 30,30,38 .. 32,32,40
---      HealthGui text        TextColor3 = 255,255,255
---                            Font      = GothamBold, TextSize 18
---  so the panel uses 40,40,50 for its backdrop, white for names, a
---  muted green-white for numbers, and SystemBold (the closest bold
---  sans the Drawing library exposes to GothamBold).
+--        Common 1    Uncommon 3   Rare 8      Legendary 25
+--        Mythical 60 Divine 120   Secret 600  Epic 8
 --
---  READABILITY CHANGES
---      - a filled backdrop behind the whole panel, sized to the live
---        row count each frame, so it never draws an empty box
---      - name 14 px bold, numbers 13 px, health bar 160 x 7
---      - 34 px rows, stacked upward from the bottom edge
---      - panel anchored from camera ViewportSize, so it stays in
---        place at any resolution
+--    and every egg model sits inside SpawnAreas/<Rarity>Area, so the
+--    area name gives the rarity and the config gives the coin value.
+--    That is all known before pickup - nothing is read from the egg
+--    itself, because the egg model carries no value field (only an
+--    ActorId StringValue for the server-side actor).
 --
---  HOW IT IS BUILT (Matcha has no GUI objects - Instance.new does not
---  exist, so every overlay is Drawing)
---    - a FIXED pool of 6 rows plus one backdrop, created once at load.
---      Nothing is created in the render loop; Drawing objects have no
---      GC and per-frame creation leaks until the VM restarts.
+--  SO THE PANEL NOW HAS TWO COLUMNS
+--      left  (PANEL_X = 300)   boss name, HP bar, hp / max
+--      right (EGG_X)           egg name, rarity, coin value
+--
+--    Rows are colour coded by rarity so an egg is identifiable at a
+--    glance: white Common, green Uncommon, blue Rare, purple Epic,
+--    orange Legendary, pink Mythical, yellow Divine, red Secret.
+--    Both columns use the game's own 40,40,50 backdrop and bold text.
+--
+--  Drawing rules followed (Matcha has no GUI objects at all)
+--    - fixed pools created once at load: 6 boss rows, 4 egg rows, two
+--      backdrops. Nothing is created in the render loop, because
+--      Drawing objects have no GC.
 --    - ONE RenderStepped connection total.
---    - rows only read cached boss values; the boss list is still the
---      cached 0.6 s scan, so the overlay does not walk the tree.
---    - every Drawing is removed in stop().
+--    - both scans are cached at 0.6 s, so neither the boss nor the egg
+--      list walks the tree per frame.
+--    - every Drawing removed in stop().
 --
---  Hit logic is unchanged from v8.2, which works:
+--  Hit logic unchanged from v8.2, which works:
 --    - AttackPart is the only thing written: shrink to 2 studs to end
 --      every contact, grow back to map size to begin a new one, which
---      is what fires the tool's TouchTransmitter
+--      fires the tool's TouchTransmitter
 --    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
 --      the tool's ActorId value
 --    - no mouse input, no equip or unequip, nothing reparented
---    - bosses are read only: no size, no CanCollide, no CFrame
+--    - bosses and eggs are read only
 --
 --  Auto Health / Auto Collect / Kill Farm are the three toggles.
 --  Stop with _G.FeedAMosquito.stop().
@@ -57,7 +54,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.5"
+local VERSION = "v8.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -78,32 +75,59 @@ local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
 -- size cycle tuning
-local AP_SMALL     = 2      -- studs; small enough that no contact remains
-local AP_HOLD      = 0.03   -- one frame between the two writes
+local AP_SMALL     = 2
+local AP_HOLD      = 0.03
 local REACH_PAD    = 30
 local REACH_MIN    = 60
 local REACH_MAX    = 4000
 local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
+local EGG_TTL      = 0.6
 
--- panel tuning (game colours, moved right of the health bar)
+-- panel tuning
 local PANEL_ROWS   = 6
+local EGG_ROWS     = 4
 local ROW_H        = 34
 local PANEL_BAR_W  = 160
 local PANEL_BAR_H  = 7
 local PANEL_W      = 310
-local PANEL_X      = 300   -- clear of the game's bottom-left HUD
-local PANEL_LIFT   = 150   -- pixels up from the bottom edge
+local PANEL_X      = 300
+local PANEL_LIFT   = 150
+local EGG_X        = 634
+local EGG_BACK_W   = 250
 local PAD_X        = 10
 local PAD_TOP      = 12
 local PAD_BOTTOM   = 12
 
--- colours taken from the game's own GUIs
+-- colours from the game's own GUIs
 local COL_BACK   = Color3.fromRGB(40, 40, 50)
 local COL_BAR_BG = Color3.fromRGB(26, 26, 33)
 local COL_FILL   = Color3.fromRGB(120, 190, 135)
 local COL_NAME   = Color3.fromRGB(255, 255, 255)
 local COL_HP     = Color3.fromRGB(198, 208, 200)
+
+-- rarity -> coin, straight from MosquitoConfig
+local RARITY_COIN = {
+    Common    = 1,
+    Uncommon  = 3,
+    Rare      = 8,
+    Epic      = 8,
+    Legendary = 25,
+    Mythical  = 60,
+    Divine    = 120,
+    Secret    = 600,
+}
+
+local RARITY_COLOR = {
+    Common    = Color3.fromRGB(235, 235, 235),
+    Uncommon  = Color3.fromRGB(140, 230, 150),
+    Rare      = Color3.fromRGB(130, 190, 250),
+    Epic      = Color3.fromRGB(190, 150, 250),
+    Legendary = Color3.fromRGB(255, 190, 110),
+    Mythical  = Color3.fromRGB(255, 140, 210),
+    Divine    = Color3.fromRGB(255, 235, 120),
+    Secret    = Color3.fromRGB(255, 120, 120),
+}
 
 local SKIP_PART = {
     Area      = true,
@@ -177,6 +201,14 @@ local function sizeDiffers(a, b)
     return dx > eps or dy > eps or dz > eps
 end
 
+local function areaRarity(areaName)
+    if type(areaName) ~= "string" then return "Common" end
+    if string.sub(areaName, -4) == "Area" then
+        return string.sub(areaName, 1, #areaName - 4)
+    end
+    return areaName
+end
+
 --------------------------------------------------------------------
 -- Player actor remotes
 --------------------------------------------------------------------
@@ -205,7 +237,7 @@ local function fireEvent(name)
 end
 
 --------------------------------------------------------------------
--- LIVE TOOL ACTOR (resolved through the tool's ActorId)
+-- LIVE TOOL ACTOR
 --------------------------------------------------------------------
 local function equippedTool()
     local c = LP.Character
@@ -296,6 +328,55 @@ local function bossList()
     bossCache = collectBosses()
     bossStamp = now
     return bossCache
+end
+
+--------------------------------------------------------------------
+-- Egg lookup (READ ONLY, cached, value from the area's rarity)
+--------------------------------------------------------------------
+local eggCache = {}
+local eggStamp = 0
+
+local function collectEggs()
+    local out = {}
+
+    local areas = WS:FindFirstChild("SpawnAreas")
+    if not areas then return out end
+
+    local okA, areaKids = pcall(function() return areas:GetChildren() end)
+    if not okA or not areaKids then return out end
+
+    for i = 1, #areaKids do
+        local area = areaKids[i]
+        local rarity = areaRarity(area.Name)
+
+        local ok, kids = pcall(function() return area:GetChildren() end)
+
+        if ok and kids then
+            for j = 1, #kids do
+                local m = kids[j]
+
+                if m.ClassName == "Model" and string.find(string.lower(m.Name), "egg", 1, true) then
+                    out[#out + 1] = {
+                        model  = m,
+                        name   = m.Name,
+                        rarity = rarity,
+                        coin   = RARITY_COIN[rarity],
+                    }
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+local function eggList()
+    local now = tick()
+    if (now - eggStamp) < EGG_TTL then return eggCache end
+
+    eggCache = collectEggs()
+    eggStamp = now
+    return eggCache
 end
 
 local function bossPosition(boss)
@@ -482,27 +563,36 @@ local function restoreAttackParts()
 end
 
 --------------------------------------------------------------------
--- BOSS PANEL  (game-styled, pooled Drawings, one connection)
+-- HUD  (boss column + egg column, pooled Drawings)
 --------------------------------------------------------------------
-local hudPool = {}
+local hudPool   = {}
+local eggPool   = {}
 local panelBack = nil
-local hudConn = nil
+local eggBack   = nil
+local hudConn   = nil
 
 local function buildHud()
     if #hudPool > 0 then return end
 
     panelBack = Drawing.new("Square")
-    panelBack.Filled      = true
-    panelBack.Thickness   = 0
-    panelBack.Color       = COL_BACK
+    panelBack.Filled       = true
+    panelBack.Thickness    = 0
+    panelBack.Color        = COL_BACK
     panelBack.Transparency = 0.1
-    panelBack.Visible     = false
+    panelBack.Visible      = false
+
+    eggBack = Drawing.new("Square")
+    eggBack.Filled       = true
+    eggBack.Thickness    = 0
+    eggBack.Color        = COL_BACK
+    eggBack.Transparency = 0.1
+    eggBack.Visible      = false
 
     for i = 1, PANEL_ROWS do
         local nameTag = Drawing.new("Text")
         nameTag.Text     = ""
         nameTag.Size     = 14
-        nameTag.Font     = 2          -- SystemBold, closest to GothamBold
+        nameTag.Font     = 2
         nameTag.Center   = false
         nameTag.Outline  = true
         nameTag.Color    = COL_NAME
@@ -536,6 +626,31 @@ local function buildHud()
             fill    = fill,
         }
     end
+
+    for i = 1, EGG_ROWS do
+        local eggName = Drawing.new("Text")
+        eggName.Text     = ""
+        eggName.Size     = 14
+        eggName.Font     = 2
+        eggName.Center   = false
+        eggName.Outline  = true
+        eggName.Color    = COL_NAME
+        eggName.Visible  = false
+
+        local eggVal = Drawing.new("Text")
+        eggVal.Text      = ""
+        eggVal.Size      = 13
+        eggVal.Font      = 2
+        eggVal.Center    = false
+        eggVal.Outline   = true
+        eggVal.Color     = COL_HP
+        eggVal.Visible   = false
+
+        eggPool[i] = {
+            nameTag = eggName,
+            valTag  = eggVal,
+        }
+    end
 end
 
 local function hideSlot(slot)
@@ -543,6 +658,11 @@ local function hideSlot(slot)
     slot.hpTag.Visible   = false
     slot.back.Visible    = false
     slot.fill.Visible    = false
+end
+
+local function hideEgg(slot)
+    slot.nameTag.Visible = false
+    slot.valTag.Visible  = false
 end
 
 local function viewportHeight()
@@ -563,9 +683,11 @@ local function startHud()
     buildHud()
 
     hudConn = RunService.RenderStepped:Connect(function()
-        local list  = bossList()
         local baseY = viewportHeight() - PANEL_LIFT
-        local n     = 0
+
+        -- boss column
+        local list = bossList()
+        local n    = 0
 
         for i = 1, #list do
             if n >= PANEL_ROWS then break end
@@ -607,10 +729,14 @@ local function startHud()
             end
         end
 
-        -- backdrop sized to the rows actually drawn
+        for i = n + 1, PANEL_ROWS do
+            local slot = hudPool[i]
+            if slot then hideSlot(slot) end
+        end
+
         if panelBack then
             if n > 0 then
-                local topY = baseY - (n - 1) * ROW_H - PAD_TOP
+                local topY   = baseY - (n - 1) * ROW_H - PAD_TOP
                 local height = (n - 1) * ROW_H + ROW_H + PAD_TOP + PAD_BOTTOM
 
                 panelBack.Position = Vector2.new(PANEL_X - PAD_X, topY)
@@ -621,9 +747,58 @@ local function startHud()
             end
         end
 
-        for i = n + 1, PANEL_ROWS do
-            local slot = hudPool[i]
-            if slot then hideSlot(slot) end
+        -- egg column
+        local eggs = eggList()
+        local e    = 0
+
+        for i = 1, #eggs do
+            if e >= EGG_ROWS then break end
+
+            local egg = eggs[i]
+            local okP, parent = pcall(function() return egg.model.Parent end)
+
+            if okP and parent ~= nil then
+                e = e + 1
+
+                local slot = eggPool[e]
+                local rowY = baseY - (e - 1) * ROW_H
+                local col  = RARITY_COLOR[egg.rarity] or COL_NAME
+
+                slot.nameTag.Text     = egg.name
+                slot.nameTag.Color    = col
+                slot.nameTag.Position = Vector2.new(EGG_X, rowY)
+                slot.nameTag.Visible  = true
+
+                local coin = egg.coin
+                local vtxt = egg.rarity
+
+                if type(coin) == "number" then
+                    vtxt = egg.rarity .. "  " .. tostring(coin) .. " coins"
+                end
+
+                slot.valTag.Text     = vtxt
+                slot.valTag.Color    = col
+                slot.valTag.Position = Vector2.new(EGG_X, rowY + 18)
+                slot.valTag.Visible  = true
+            end
+        end
+
+        for i = e + 1, EGG_ROWS do
+            local slot = eggPool[i]
+            if slot then hideEgg(slot) end
+        end
+
+        if eggBack then
+            if e > 0 then
+                local topY   = baseY - (e - 1) * ROW_H - PAD_TOP
+                local height = (e - 1) * ROW_H + ROW_H + PAD_TOP + PAD_BOTTOM
+
+                eggBack.Position = Vector2.new(EGG_X - PAD_X, topY)
+                eggBack.Size     = Vector2.new(EGG_BACK_W, height)
+                eggBack.Visible  = true
+            else
+                eggBack.Visible = false
+            end
         end
     end)
 end
@@ -643,12 +818,25 @@ local function stopHud()
         pcall(function() slot.fill:Remove() end)
     end
 
+    for i = 1, #eggPool do
+        local slot = eggPool[i]
+
+        pcall(function() slot.nameTag:Remove() end)
+        pcall(function() slot.valTag:Remove() end)
+    end
+
     if panelBack then
         pcall(function() panelBack:Remove() end)
         panelBack = nil
     end
 
+    if eggBack then
+        pcall(function() eggBack:Remove() end)
+        eggBack = nil
+    end
+
     hudPool = {}
+    eggPool = {}
 end
 
 startHud()
@@ -835,14 +1023,12 @@ task.spawn(function()
 
                     local big, seen = mapSize()
 
-                    -- 1. shrink: every contact with every boss ends
                     pcall(function()
                         ap.Size = Vector3.new(AP_SMALL, AP_SMALL, AP_SMALL)
                     end)
 
                     task.wait(AP_HOLD)
 
-                    -- 2. grow back: every boss part is a brand new contact
                     if big then
                         pcall(function() ap.Size = big end)
                         reachOn = true
@@ -990,6 +1176,8 @@ local function stop()
     pcall(function() fireEvent("StopTransfuseBlood") end)
     bossCache = {}
     bossStamp = 0
+    eggCache  = {}
+    eggStamp  = 0
     partCache = {}
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
@@ -997,5 +1185,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - boss panel moved right", 5)
+notifyUser("Loaded - boss and egg value panels", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
