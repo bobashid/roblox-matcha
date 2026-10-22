@@ -10,27 +10,20 @@
 --  Auto Feed
 --    Each mosquito model carries FeedProgress / Feeding / ActorId and
 --    owns a FeedMosquito remote under Runtime.Actors. Fires it for any
---    mosquito below full that is not already feeding. Main income.
+--    mosquito below full that is not already feeding.
 --
 --  Auto Collect
---    Fires CollectIncome and ClaimOfflineIncome. The server decides
---    what is ready, so a slow loop is enough.
---
---  Auto Upgrade
---    Fires UpgradeSpeed / UpgradeDamage / UpgradeBase. The server
---    rejects anything you cannot afford, so this cannot overspend.
---
---  Auto Sell
---    SellAllEggs / SellAllMosquitoes are RemoteFunctions, invoked on
---    the economy tick. Default off.
+--    Fires CollectIncome and ClaimOfflineIncome.
 --
 --  Auto Attack
---    SlapActor fires its Attack remote with no arguments on the tool
---    actor (Tool_Character_<userId>_*). This scans those actors and
---    fires Attack when an enemy model is within range.
+--    Fires the equipped tool actor's Attack remote directly, the same
+--    call the client makes on swing:
+--      Runtime.Actors.Tool_Character_<userId>_<n>_<m>.Events.Attack
+--    The server resolves the hit, so no target scan is needed. The
+--    earlier version only fired when it found an Enemy model inside
+--    Workspace, and those are absent most of the time, so it never
+--    called the remote at all.
 --
---  ZERO VARARGS in this file - no '...' appears anywhere, so the
---  'Cannot use ... outside of a vararg function' error cannot occur.
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
@@ -40,7 +33,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.9"
+local VERSION = "v2.0"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -55,17 +48,12 @@ local POLL_RATE    = 0.1    -- toggle poller
 local HEAL_RATE    = 0.2    -- transfusion control
 local FEED_RATE    = 0.3    -- mosquito feed pass
 local COLLECT_RATE = 1.5    -- income collection
-local UPGRADE_RATE = 1.0    -- upgrades
-local SELL_RATE    = 5.0    -- selling
-local ATTACK_RATE  = 0.25   -- weapon attacks
-local ATTACK_RANGE = 60
+local ATTACK_RATE  = 0.25   -- weapon swings
 
 local Config = {
     Heal        = false,
     AutoFeed    = false,
     AutoCollect = false,
-    AutoUpgrade = false,
-    AutoSell    = false,
     AutoAttack  = false,
 }
 
@@ -76,16 +64,10 @@ _G.FeedAMosquito = { stop = function() running = false end }
 
 --------------------------------------------------------------------
 -- Helpers
---   child(a, b, c) walks a fixed path; no vararg helper.
 --------------------------------------------------------------------
 local function humanoid()
     local c = LP.Character
     return c and c:FindFirstChild("Humanoid") or nil
-end
-
-local function rootPart()
-    local c = LP.Character
-    return c and c:FindFirstChild("HumanoidRootPart") or nil
 end
 
 local function notifyUser(msg, dur)
@@ -101,7 +83,6 @@ end
 
 --------------------------------------------------------------------
 -- Player actor remotes (Events / Functions)
---   No arguments are ever sent, so no varargs are needed.
 --------------------------------------------------------------------
 local pEvents = nil
 local pFuncs  = nil
@@ -130,13 +111,6 @@ local function fireEvent(name)
     return (pcall(function() r:FireServer() end))
 end
 
-local function invokeFunc(name)
-    local _, funcs = playerRemotes()
-    local f = funcs and funcs:FindFirstChild(name)
-    if not f then return false end
-    return (pcall(function() f:InvokeServer() end))
-end
-
 --------------------------------------------------------------------
 -- My base: the Base<N> whose ActorId mentions my UserId
 --------------------------------------------------------------------
@@ -158,8 +132,44 @@ local function myBase()
 end
 
 --------------------------------------------------------------------
+-- Tool actor Attack remotes
+--   Actors are named Tool_Character_<userId>_<n>_<m>. Matched by the
+--   Tool_Character_<userId>_ prefix so every equipped tool counts.
+--------------------------------------------------------------------
+local atkCache = nil
+local atkFor   = nil
+
+local function attackRemotes()
+    if atkCache and atkFor == LP.UserId and #atkCache > 0 then
+        return atkCache
+    end
+
+    local actors = child(RS, "Runtime", "Actors")
+    if not actors then return nil end
+
+    local prefix = "Tool_Character_" .. tostring(LP.UserId) .. "_"
+    local plen   = #prefix
+    local out    = {}
+    local kids   = actors:GetChildren()
+
+    for i = 1, #kids do
+        local a = kids[i]
+        if string.sub(a.Name, 1, plen) == prefix then
+            local ev  = a:FindFirstChild("Events")
+            local atk = ev and ev:FindFirstChild("Attack")
+            if atk then out[#out + 1] = atk end
+        end
+    end
+
+    if #out == 0 then return nil end
+
+    atkCache = out
+    atkFor   = LP.UserId
+    return out
+end
+
+--------------------------------------------------------------------
 -- Toggle plumbing
---   Callback takes three fixed args and picks the boolean out of them.
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -215,12 +225,6 @@ local function buildTab(tab)
             addToggle(main, "Always Heal", "fam_heal", "Heal", false)
             addToggle(main, "Auto Feed", "fam_feed", "AutoFeed", false)
             addToggle(main, "Auto Collect", "fam_collect", "AutoCollect", false)
-        end
-
-        local econ = makeSection(tab, "Economy", "Left")
-        if econ then
-            addToggle(econ, "Auto Upgrade", "fam_upgrade", "AutoUpgrade", false)
-            addToggle(econ, "Auto Sell", "fam_sell", "AutoSell", false)
         end
 
         local combat = makeSection(tab, "Combat", "Right")
@@ -370,91 +374,20 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO UPGRADE
---------------------------------------------------------------------
-task.spawn(function()
-    while running do
-        if Config.AutoUpgrade then
-            fireEvent("UpgradeSpeed")
-            fireEvent("UpgradeDamage")
-            fireEvent("UpgradeBase")
-        end
-        task.wait(UPGRADE_RATE)
-    end
-end)
-
---------------------------------------------------------------------
--- AUTO SELL
---------------------------------------------------------------------
-task.spawn(function()
-    while running do
-        if Config.AutoSell then
-            invokeFunc("SellAllEggs")
-            invokeFunc("SellAllMosquitoes")
-        end
-        task.wait(SELL_RATE)
-    end
-end)
-
---------------------------------------------------------------------
 -- AUTO ATTACK
---   Tool actors are named Tool_Character_<userId>_<n>_<m>. SlapActor
---   fires its Attack remote with no arguments, so do the same.
+--   Same call the client makes on swing, no target scan:
+--   Tool_Character_<userId>_<n>_<m>.Events.Attack:FireServer()
 --------------------------------------------------------------------
 task.spawn(function()
-    local function attackRemotes()
-        local actors = child(RS, "Runtime", "Actors")
-        if not actors then return nil end
-
-        local prefix = "Tool_Character_" .. tostring(LP.UserId) .. "_"
-        local plen   = #prefix
-        local out    = {}
-        local kids   = actors:GetChildren()
-
-        for i = 1, #kids do
-            local a = kids[i]
-            if string.sub(a.Name, 1, plen) == prefix then
-                local ev  = a:FindFirstChild("Events")
-                local atk = ev and ev:FindFirstChild("Attack")
-                if atk then out[#out + 1] = atk end
-            end
-        end
-
-        return out
-    end
-
     while running do
         if Config.AutoAttack then
-            local me = rootPart()
-            if me then
-                local target = nil
-                local best   = ATTACK_RANGE
-                local kids   = WS:GetChildren()
-
-                for i = 1, #kids do
-                    local d = kids[i]
-                    if string.find(d.Name, "Enemy", 1, true) then
-                        local part = d:FindFirstChild("HumanoidRootPart")
-                            or d:FindFirstChild("Head")
-                            or d.PrimaryPart
-                        if part then
-                            local dist = (part.Position - me.Position).Magnitude
-                            if dist <= best then
-                                best   = dist
-                                target = d
-                            end
-                        end
-                    end
+            local list = attackRemotes()
+            if list then
+                for i = 1, #list do
+                    pcall(function() list[i]:FireServer() end)
                 end
-
-                if target then
-                    local list = attackRemotes()
-                    if list then
-                        for i = 1, #list do
-                            pcall(function() list[i]:FireServer() end)
-                        end
-                    end
-                end
+            else
+                atkCache = nil
             end
         end
         task.wait(ATTACK_RATE)
