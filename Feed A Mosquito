@@ -1,32 +1,32 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v2.7  MINIMAL MENU - four toggles, no sliders
+--  v2.8
 --
---    Always Heal   TransfuseBlood remote. Humanoid.Health is
---                  READ-ONLY in Matcha (a write throws), so the
---                  server remote is the only heal path.
+--  TOGGLE NAMES now describe what they actually do:
+--    Always Heal   TransfuseBlood remote, keeps max HP climbing.
 --    Auto Collect  CollectIncome + ClaimOfflineIncome.
---    Auto Farm     Swings on a cadence, no target needed.
---    Kill Aura     Finds the nearest enemy anywhere on the map, moves
---                  to the slot under it, swings, repeats.
+--    Spam Swing    Fires Attack on a fixed cadence wherever you stand.
+--                  No target, no movement. This is what used to be
+--                  called "Auto Farm".
+--    Kill Aura     Finds the nearest boss of any type, moves to it,
+--                  swings, repeats. This is what used to be called
+--                  "Auto Kill".
 --
---  v2.7 change
---    The max-health log used to print on every increase, which floods
---    the console while Always Heal runs. It now prints at most once
---    every 5 seconds, and always shows the current value.
+--  KILL AURA FIX
+--    The old version parked you AURA_DEPTH studs BELOW the target,
+--    which put you out of the server's hit range, so the swing landed
+--    on nothing. It now stands LEVEL with the target (2 studs above
+--    its root) and waits 0.1s after the move before swinging, so the
+--    server sees the new position before the hit is resolved.
 --
---  Swing
---    Fires Runtime.Actors.Tool_Character_<userId>_*..Events.Attack.
---    Attack takes no arguments, the server resolves the hit from the
---    character position, so there is no client-side hitbox to grow.
---    The remote cache expires every 0.5s and the cached remote must
---    still have a live parent chain, so a weapon upgrade is picked up.
---
---  Fixed values (no UI on purpose)
---    AURA_DEPTH = 8   studs below the target. Edit the constant.
---    MOVE_EPS2  = 4   only write CFrame when more than 2 studs away.
---    No CFrame writes while Health is 0.
+--  BOSS TELEPORT BUTTONS
+--    One button per boss type. They do NOT use hardcoded coordinates:
+--    the area models under Workspace.SafeZone.SafeZone carry no usable
+--    position at runtime (every part reads 0,0,0) and bosses are
+--    spawned by the server. Each button instead looks up the nearest
+--    live boss of that type and teleports you to it, or tells you
+--    none is spawned.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -37,7 +37,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.7"
+local VERSION = "v2.8"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -48,22 +48,27 @@ local running = true
 local built   = false
 
 -- fixed tuning
-local POLL_RATE    = 0.1    -- toggle poller
-local HEAL_RATE    = 0.25   -- transfusion control loop
-local HEAL_REFIRE  = 1.0    -- seconds between TransfuseBlood fires
-local HP_LOG_RATE  = 5.0    -- max seconds between health log lines
-local COLLECT_RATE = 1.5    -- income collection
-local FARM_RATE    = 0.3    -- auto farm swing cadence
-local AURA_RATE    = 0.25   -- kill aura pass
-local ATK_TTL      = 0.5    -- attack remote cache lifetime
-local MOVE_EPS2    = 4      -- 2 studs squared
-local AURA_DEPTH   = 8      -- studs below the target
-local AURA_MAX     = 1000000 -- reaches the whole map
+local POLL_RATE    = 0.1
+local HEAL_RATE    = 0.25
+local HEAL_REFIRE  = 1.0
+local HP_LOG_RATE  = 5.0
+local COLLECT_RATE = 1.5
+local SWING_RATE   = 0.3    -- spam swing cadence
+local AURA_RATE    = 0.3    -- kill aura pass
+local ATK_TTL      = 0.5
+local MOVE_EPS2    = 4
+local AURA_UP      = 2      -- studs above the target root
+local AURA_MAX     = 1000000
+
+local BOSS_TYPES = {
+    "Common", "Uncommon", "Rare", "Legendary",
+    "Mythical", "Divine", "Secret", "Epic",
+}
 
 local Config = {
     Heal        = false,
     AutoCollect = false,
-    Farm        = false,
+    SpamSwing   = false,
     Aura        = false,
 }
 
@@ -130,9 +135,6 @@ end
 
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
---   Tool_Character_<userId>_<n>_<m>.Events.Attack
---   <n> changes on a weapon upgrade, so the cache expires and the
---   cached remote must still have a live parent chain.
 --------------------------------------------------------------------
 local atkCache = nil
 local atkStamp = 0
@@ -190,9 +192,8 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- Nearest enemy
---   Models are named <Area>Area_Enemy_<n>, e.g. CommonArea_Enemy_129,
---   Egg_EpicArea_Enemy_132_0, DivineArea_Enemy_9.
+-- Boss lookup
+--   Models are named <Type>Area_Enemy_<n> or Egg_<Type>Area_Enemy_<n>.
 --------------------------------------------------------------------
 local function enemyPart(model)
     return model:FindFirstChild("HumanoidRootPart")
@@ -200,7 +201,32 @@ local function enemyPart(model)
         or model.PrimaryPart
 end
 
-local function nearestEnemy(fromPos, maxDist)
+local function matchesType(nm, bossType)
+    return string.find(nm, bossType .. "Area_Enemy", 1, true) ~= nil
+end
+
+local function nearestBossOfType(fromPos, bossType, maxDist)
+    local best, bestDist, bestPos = nil, maxDist, nil
+    local kids = WS:GetChildren()
+
+    for i = 1, #kids do
+        local d = kids[i]
+        if matchesType(d.Name, bossType) then
+            local part = enemyPart(d)
+            if part then
+                local pos  = part.Position
+                local dist = (pos - fromPos).Magnitude
+                if dist <= bestDist then
+                    best, bestDist, bestPos = d, dist, pos
+                end
+            end
+        end
+    end
+
+    return best, bestPos
+end
+
+local function nearestBoss(fromPos, maxDist)
     local best, bestDist, bestPos = nil, maxDist, nil
     local kids = WS:GetChildren()
 
@@ -239,7 +265,7 @@ local function moveTo(hrp, x, y, z)
 end
 
 --------------------------------------------------------------------
--- Toggle plumbing
+-- Toggle / button plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -264,6 +290,18 @@ local function safeToggle(sec, name, id, default, cb)
         if pcall(tries[i]) then return true end
     end
     warn("[" .. NAME .. "] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function safeButton(sec, name, cb)
+    local tries = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, name .. "_btn", cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Button failed: " .. tostring(name))
     return false
 end
 
@@ -298,8 +336,41 @@ local function buildTab(tab)
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Auto Farm", "fam_farm", "Farm", false)
+            addToggle(combat, "Spam Swing", "fam_swing", "SpamSwing", false)
             addToggle(combat, "Kill Aura", "fam_aura", "Aura", false)
+        end
+
+        local tp = makeSection(tab, "Boss Teleport", "Right")
+        if tp then
+            for i = 1, #BOSS_TYPES do
+                local bossType = BOSS_TYPES[i]
+                safeButton(tp, "TP " .. bossType, function()
+                    local hrp = rootPart()
+                    if not hrp or not alive() then
+                        notifyUser("No character", 3)
+                        return
+                    end
+
+                    local target, pos = nearestBossOfType(
+                        hrp.Position, bossType, AURA_MAX)
+
+                    if not target or not pos then
+                        print("[" .. NAME .. "] no " .. bossType
+                            .. " boss spawned")
+                        notifyUser("No " .. bossType .. " boss", 3)
+                        return
+                    end
+
+                    pcall(function()
+                        hrp.CFrame = CFrame.new(pos.X, pos.Y + AURA_UP, pos.Z)
+                    end)
+                    print("[" .. NAME .. "] tp " .. target.Name
+                        .. " " .. tostring(math.floor(pos.X)) .. ","
+                        .. tostring(math.floor(pos.Y)) .. ","
+                        .. tostring(math.floor(pos.Z)))
+                    notifyUser("TP " .. bossType, 2)
+                end)
+            end
         end
     end)
 
@@ -357,7 +428,6 @@ end)
 
 --------------------------------------------------------------------
 -- ALWAYS HEAL
---   Health log is throttled: at most one line every HP_LOG_RATE.
 --------------------------------------------------------------------
 task.spawn(function()
     local transfusing = false
@@ -411,30 +481,32 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO FARM
---   Fixed cadence, no target required.
+-- SPAM SWING  (was Auto Farm)
+--   Swings wherever you stand, no target needed.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Farm then
+        if Config.SpamSwing then
             swing()
         end
-        task.wait(FARM_RATE)
+        task.wait(SWING_RATE)
     end
 end)
 
 --------------------------------------------------------------------
 -- KILL AURA
---   Nearest enemy anywhere on the map, sit AURA_DEPTH below it, swing.
+--   Nearest boss of any type, stand LEVEL with it, then swing.
+--   The 0.1s wait lets the server see the new position first.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
         if Config.Aura then
             local hrp = rootPart()
             if hrp and alive() then
-                local target, pos = nearestEnemy(hrp.Position, AURA_MAX)
+                local target, pos = nearestBoss(hrp.Position, AURA_MAX)
                 if target and pos then
-                    moveTo(hrp, pos.X, pos.Y - AURA_DEPTH, pos.Z)
+                    moveTo(hrp, pos.X, pos.Y + AURA_UP, pos.Z)
+                    task.wait(0.1)
                     swing()
                 end
             end
