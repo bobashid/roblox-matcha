@@ -1,58 +1,55 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.2  -  BOSS GROWTH IS GONE FOR GOOD
+--  v8.3  -  BOSS NAME + HEALTH HUD
 --
---  WHY v8.1 BROKE AFTER THE FIRST RUN
---    Boss growth saved a part's size the first time it saw it. On the
---    next run those parts were still grown (or had been grown by the
---    previous run), so the grown size was saved as the "original" and
---    multiplied again. Each reload made the bosses bigger, until the
---    physics gave out and it stopped working. That is the "worked
---    once then broke" you saw.
+--  Same hit logic as v8.2 (which works), plus a screen overlay:
 --
---    So nothing on a boss is written any more. No size, no CanCollide,
---    no CFrame. The boss models are only ever READ.
+--      NAME                 <- boss model name
+--      [##########----]     <- health bar, fill = HP / MaxHP
+--      12345 / 20000        <- exact numbers
 --
---  WHAT RESTARTS THE CONTACT INSTEAD
---    Only our own AttackPart is touched, which is why it cannot
---    compound and cannot break anything:
+--    drawn above every boss that is on screen, at its root position
+--    lifted by its own height, so it sits over the model rather than
+--    at its feet. Bars are hidden the moment a boss is dead, gone
+--    from the tree, or behind the camera.
 --
---        Size = 2 studs      -> every contact with every boss ends
---        (one frame)
---        Size = map size     -> every boss part is a NEW contact and
---                               the tool's TouchTransmitter fires
+--  HOW IT IS BUILT (Matcha has no GUI objects at all - Instance.new
+--  does not exist, so everything visual is Drawing)
+--    - a FIXED pool of 8 slots, created once at load. 8 covers every
+--      boss type in the game at the same time. Nothing is created in
+--      the render loop, because Drawing objects have no GC and
+--      creating them per frame leaks until the VM restarts.
+--    - ONE RenderStepped connection total, not one per boss.
+--    - the renderer only reads cached values and calls WorldToScreen.
+--      WorldToScreen is only reliable inside a render callback, which
+--      is exactly where it runs.
+--    - the boss list itself is still the cached 0.6 s scan, so the
+--      overlay does not walk the tree every frame.
+--    - every Drawing is removed in stop(), so reloading the script
+--      does not leave a ghost overlay behind.
 --
---    One pair per pass at 0.12 s = one fresh hit per boss per pass.
---    The map size is recomputed from the farthest spawned boss:
---        side = (farthest + 30) * 2      [60 .. 4000]
---    Original size saved per Address and restored on toggle off.
+--  The HUD needs no toggle: it is purely visual and draws nothing
+--  when no boss is spawned. Stop with _G.FeedAMosquito.stop().
 --
---  Everything else is v7.6, which you said was right:
---    - touch signals on the boss parts every pass
---    - PlaySound("SwingSound") + Attack fired on the LIVE tool actor,
---      resolved from the tool's ActorId value (name matching picks a
---      dead copy, because every equip leaves one behind)
---    - no mouse input of any kind, no click, no press, no PlayAnim, no
---      equip or unequip, nothing reparented, so nothing can crash
---
---  TOGGLES
---      Auto Health   - TransfuseBlood loop
---      Auto Collect  - CollectIncome / ClaimOfflineIncome
---      Kill Farm     - the size cycle + touch + burst above
---
---  Boss HP is summed each pass; one line prints if it stops dropping.
---  Keep a weapon equipped. All toggles start OFF.
---  Stop with _G.FeedAMosquito.stop().
+--  Hit logic (unchanged from v8.2):
+--    - AttackPart is the only thing written: shrink to 2 studs to end
+--      every contact, grow back to map size to begin a new one, which
+--      is what fires the tool's TouchTransmitter
+--    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
+--      the tool's ActorId value
+--    - no mouse input, no equip or unequip, nothing reparented
+--    - bosses are read only: no size, no CanCollide, no CFrame
 --==================================================================
-local Players = game:GetService("Players")
-local RS      = game:GetService("ReplicatedStorage")
-local WS      = game:GetService("Workspace")
+local Players    = game:GetService("Players")
+local RS         = game:GetService("ReplicatedStorage")
+local WS         = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.2"
+local VERSION = "v8.3"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -80,6 +77,12 @@ local REACH_MIN    = 60
 local REACH_MAX    = 4000
 local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
+
+-- HUD tuning
+local DRAW_POOL    = 8      -- one slot per boss type, created once
+local BAR_W        = 110
+local BAR_H        = 6
+local HUD_LIFT     = 6      -- studs above the root, plus half its height
 
 local SKIP_PART = {
     Area      = true,
@@ -447,6 +450,158 @@ local function restoreAttackParts()
 end
 
 --------------------------------------------------------------------
+-- BOSS HUD  (pooled Drawings, one render connection)
+--------------------------------------------------------------------
+local hudPool = {}
+local hudConn = nil
+
+local function buildHud()
+    if #hudPool > 0 then return end
+
+    for i = 1, DRAW_POOL do
+        local nameTag = Drawing.new("Text")
+        nameTag.Text     = ""
+        nameTag.Size     = 14
+        nameTag.Center   = true
+        nameTag.Outline  = true
+        nameTag.Color    = Color3.fromRGB(255, 255, 255)
+        nameTag.Visible  = false
+
+        local hpTag = Drawing.new("Text")
+        hpTag.Text       = ""
+        hpTag.Size       = 12
+        hpTag.Center     = true
+        hpTag.Outline    = true
+        hpTag.Color      = Color3.fromRGB(190, 255, 190)
+        hpTag.Visible    = false
+
+        local back = Drawing.new("Square")
+        back.Filled      = true
+        back.Thickness   = 0
+        back.Color       = Color3.fromRGB(15, 15, 15)
+        back.Visible     = false
+
+        local fill = Drawing.new("Square")
+        fill.Filled      = true
+        fill.Thickness   = 0
+        fill.Color       = Color3.fromRGB(70, 220, 90)
+        fill.Visible     = false
+
+        hudPool[i] = {
+            nameTag = nameTag,
+            hpTag   = hpTag,
+            back    = back,
+            fill    = fill,
+        }
+    end
+end
+
+local function hideSlot(slot)
+    slot.nameTag.Visible = false
+    slot.hpTag.Visible   = false
+    slot.back.Visible    = false
+    slot.fill.Visible    = false
+end
+
+local function startHud()
+    if hudConn then return end
+
+    buildHud()
+
+    hudConn = RunService.RenderStepped:Connect(function()
+        local list = bossList()
+        local n    = 0
+
+        for i = 1, #list do
+            if n >= DRAW_POOL then break end
+
+            local boss = list[i]
+            local hp   = bossHealth(boss)
+            local pos  = bossPosition(boss)
+
+            if hp and hp > 0 and pos then
+                local root = boss:FindFirstChild("HumanoidRootPart")
+                local lift = HUD_LIFT
+
+                if root then
+                    local okS, s = pcall(function() return root.Size end)
+                    if okS and s and type(s.Y) == "number" then
+                        lift = lift + s.Y * 0.5
+                    end
+                end
+
+                local point = pos + Vector3.new(0, lift, 0)
+                local sp, vis = WorldToScreen(point)
+
+                if vis then
+                    n = n + 1
+                    local slot = hudPool[n]
+
+                    local maxHp = 1
+                    local hum   = boss:FindFirstChild("Humanoid")
+
+                    if hum then
+                        local okM, mv = pcall(function() return hum.MaxHealth end)
+                        if okM and type(mv) == "number" and mv > 0 then
+                            maxHp = mv
+                        end
+                    end
+
+                    local frac = hp / maxHp
+                    if frac < 0 then frac = 0 end
+                    if frac > 1 then frac = 1 end
+
+                    local x = sp.X - BAR_W * 0.5
+                    local y = sp.Y
+
+                    slot.nameTag.Text     = boss.Name
+                    slot.nameTag.Position = Vector2.new(sp.X, y - 18)
+                    slot.nameTag.Visible  = true
+
+                    slot.back.Position = Vector2.new(x, y)
+                    slot.back.Size     = Vector2.new(BAR_W, BAR_H)
+                    slot.back.Visible  = true
+
+                    slot.fill.Position = Vector2.new(x, y)
+                    slot.fill.Size     = Vector2.new(BAR_W * frac, BAR_H)
+                    slot.fill.Visible  = true
+
+                    slot.hpTag.Text     = tostring(math.floor(hp))
+                        .. " / " .. tostring(math.floor(maxHp))
+                    slot.hpTag.Position = Vector2.new(sp.X, y + BAR_H + 2)
+                    slot.hpTag.Visible  = true
+                end
+            end
+        end
+
+        for i = n + 1, DRAW_POOL do
+            local slot = hudPool[i]
+            if slot then hideSlot(slot) end
+        end
+    end)
+end
+
+local function stopHud()
+    if hudConn then
+        pcall(function() hudConn:Disconnect() end)
+        hudConn = nil
+    end
+
+    for i = 1, #hudPool do
+        local slot = hudPool[i]
+
+        pcall(function() slot.nameTag:Remove() end)
+        pcall(function() slot.hpTag:Remove() end)
+        pcall(function() slot.back:Remove() end)
+        pcall(function() slot.fill:Remove() end)
+    end
+
+    hudPool = {}
+end
+
+startHud()
+
+--------------------------------------------------------------------
 -- Toggle plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
@@ -778,6 +933,7 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
+    pcall(stopHud)
     pcall(restoreAttackParts)
     pcall(function() fireEvent("StopTransfuseBlood") end)
     bossCache = {}
@@ -789,5 +945,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - no boss writes, size cycle hits", 5)
+notifyUser("Loaded - boss HUD + size cycle hits", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
