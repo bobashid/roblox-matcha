@@ -1,51 +1,51 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v8.9  -  PICKUP VIA THE EGG'S OWN PROMPT
+--  v9.0  -  PICKUP WITHOUT THE SLIDER, AND IT TELLS YOU WHY
 --
---  WHAT v8.8 GOT WRONG
---    v8.8 assumed an egg had no prompt and simulated a touch on its
---    root part. That was based on an incomplete scan. A full scan found
---    52 ProximityPrompts in the Workspace, and every egg carries one:
+--  SLIDER REMOVED
+--    The size slider is gone, so the size filter is gone with it. What
+--    is left is the part that matters: a master switch, one toggle per
+--    rarity, and pickup by firing the egg's own prompt.
 --
---        Egg model
---          PromptAttachment
---            ProximityPrompt named "CarryPrompt"
+--  PICKUP
+--    Every egg carries a ProximityPrompt named "CarryPrompt" under
+--    PromptAttachment, so pickup is:
 --
---    So the correct silent, no-teleport pickup is firing that prompt:
---    fireproximityprompt(egg.CarryPrompt). No movement, no touch hack.
+--        fireproximityprompt(egg.CarryPrompt)
 --
---  PICKUP ORDER OF ATTEMPTS
---      1. fireproximityprompt(prompt)      <- what v8.9 uses
---      2. firetouchinterest fallback       <- only if no prompt found
---    If fireproximityprompt is nil the script says so once and does not
---    pretend it worked.
+--    No teleport, no movement, no mouse input.
 --
---  UI
---      Auto Pickup            master switch
---      one toggle per rarity  Common .. Secret
---      a Size slider under each rarity (1.00 .. 2.00)
+--  WHY IT MAY DO NOTHING, AND HOW THIS BUILD TELLS YOU
+--    fireproximityprompt runs locally, but the server that handles the
+--    prompt can still refuse it when you are not actually near the
+--    egg - the same distance check that stopped cross-map boss hits.
+--    So on the first attempt this build prints:
 --
---    An egg is taken only if its rarity toggle is ON and its measured
---    size multiplier is at least that rarity's slider value. Each
---    rarity filters independently, so e.g. "Rare only, size >= 1.40"
---    is Rare on with slider 1.40 and every other rarity off.
+--        trying <eggname>  prompt=<promptname>
+--        egg still there: true / false
 --
---  SIZE (measured, not guessed)
---    Egg root parts seen live: 3.53 (smallest) and 5.30 (largest).
---        sizeMult = root.Size.X / 3.53      -> 1.00 .. ~1.50
---    The panel shows this as x1.42 next to each egg.
+--    false means the pickup went through. true means the server
+--    refused it from that distance, which is the honest answer and
+--    means pickup only works within the game's own range.
 --
---  RARITY comes from the egg's own EggGui "Rarity" TextLabel, which is
---  what the game displays. The area name is only a fallback. This
---  matters: an IceMosquitoEgg was seen inside UncommonArea labelled
---  Rare.
+--  RARITY
+--    Read from the egg's own EggGui "Rarity" TextLabel, i.e. the text
+--    the game shows in world. Area name is only a fallback, because an
+--    IceMosquitoEgg has been seen inside UncommonArea labelled Rare.
 --
---  Everything else is unchanged:
---    - boss panel (name, HP bar, hp/max) and egg panel, game colours
---    - Kill Farm size cycle on AttackPart only, live actor remotes
---    - no mouse input, no equip/unequip, nothing reparented
---    - bosses and eggs are read only; the character never moves
+--  PANELS
+--      left  PANEL_X = 300   boss name, HP bar, hp / max
+--      right EGG_X  = 634    egg name, rarity, Price
+--    Game colours: 40,40,50 backdrop, white names, bold text.
+--
+--  Hit logic unchanged from v8.2, which works:
+--    - AttackPart is the only thing written: shrink to 2 studs to end
+--      every contact, grow back to map size to begin a new one
+--    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
+--      the tool's ActorId value
+--    - no mouse input, no equip or unequip, nothing reparented
+--    - bosses and eggs are read only
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -57,7 +57,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v8.9"
+local VERSION = "v9.0"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -88,9 +88,8 @@ local PART_TTL     = 2.0
 local EGG_TTL      = 1.0
 
 -- pickup tuning
-local EGG_BASE_SIZE = 3.53
-local PICK_RATE     = 0.2
-local PICK_COOLDOWN = 0.5
+local PICK_RATE     = 0.25
+local PICK_COOLDOWN = 0.6
 
 -- panel tuning
 local PANEL_ROWS   = 6
@@ -155,14 +154,12 @@ local Config = {
 local PickCfg = {}
 
 for i = 1, #RARITIES do
-    local r = RARITIES[i]
-    PickCfg[r] = { on = false, minSize = 1.0 }
+    PickCfg[RARITIES[i]] = false
 end
 
 local TOGGLES     = {}
 local getterWorks = {}
-local SLIDERS     = {}
-local sliderWorks = {}
+local RARITY_IDS  = {}
 
 _G.FeedAMosquito = { stop = function() running = false end }
 
@@ -257,38 +254,22 @@ local function mosquitoId(eggName)
     return eggName
 end
 
-local function eggSizeMult(model)
-    local r = model:FindFirstChild("HumanoidRootPart")
-    if not r then return 1 end
-
-    local ok, s = pcall(function() return r.Size end)
-    if not ok or not s then return 1 end
-
-    return s.X / EGG_BASE_SIZE
-end
-
--- the egg's own prompt, CarryPrompt under PromptAttachment
 local function eggPrompt(model)
     local ok, desc = pcall(function() return model:GetDescendants() end)
     if not ok or not desc then return nil end
 
-    for i = 1, #desc do
-        local d = desc[i]
-
-        if d.ClassName == "ProximityPrompt" and d.Name == "CarryPrompt" then
-            return d
-        end
-    end
+    local first = nil
 
     for i = 1, #desc do
         local d = desc[i]
 
         if d.ClassName == "ProximityPrompt" then
-            return d
+            if d.Name == "CarryPrompt" then return d end
+            if first == nil then first = d end
         end
     end
 
-    return nil
+    return first
 end
 
 --------------------------------------------------------------------
@@ -447,7 +428,6 @@ local function collectEggs()
                         name   = m.Name,
                         rarity = rarity,
                         price  = price,
-                        size   = eggSizeMult(m),
                     }
                 end
             end
@@ -857,7 +837,6 @@ local function startHud()
                 slot.nameTag.Visible  = true
 
                 local vtxt = egg.rarity
-                    .. "  x" .. string.format("%.2f", egg.size)
 
                 if type(egg.price) == "number" then
                     vtxt = vtxt .. "  " .. tostring(egg.price)
@@ -929,7 +908,7 @@ end
 startHud()
 
 --------------------------------------------------------------------
--- Toggle / slider plumbing
+-- Toggle plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -957,19 +936,6 @@ local function safeToggle(sec, name, id, default, cb)
     return false
 end
 
-local function safeSlider(sec, name, id, min, max, default, cb)
-    local tries = {
-        function() sec:Slider(name, id, min, max, default, cb) end,
-        function() sec:Slider(id, name, min, max, default, cb) end,
-        function() sec:Slider(name, min, max, default, cb) end,
-        function() sec:Slider(name, id, default, min, max, cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    return false
-end
-
 local function makeSection(tab, name, side)
     local ok, sec = pcall(function() return tab:Section(name, side) end)
     if ok and type(sec) == "table" then return sec end
@@ -984,32 +950,18 @@ local function addToggle(sec, label, id, key, default)
     end
 end
 
-local function addRarityControls(sec, rarity)
-    local cfg = PickCfg[rarity]
-    if not cfg then return end
+local function addRarity(sec, rarity)
+    local id = "fam_pick_" .. string.lower(rarity)
 
-    local tid = "fam_pick_" .. string.lower(rarity)
-    local sid = tid .. "_size"
-
-    local onCb = function(a, b, c)
-        if sliderWorks[rarity] then return end
-        if type(a) == "boolean" then cfg.on = a return end
-        if type(b) == "boolean" then cfg.on = b return end
-        if type(c) == "boolean" then cfg.on = c return end
+    local cb = function(a, b, c)
+        if getterWorks[rarity] then return end
+        if type(a) == "boolean" then PickCfg[rarity] = a return end
+        if type(b) == "boolean" then PickCfg[rarity] = b return end
+        if type(c) == "boolean" then PickCfg[rarity] = c return end
     end
 
-    if safeToggle(sec, rarity, tid, false, onCb) then
-        SLIDERS[#SLIDERS + 1] = { rarity = rarity, id = tid, name = rarity, kind = "toggle" }
-    end
-
-    local sizeCb = function(v)
-        if type(v) == "number" then
-            cfg.minSize = v
-        end
-    end
-
-    if safeSlider(sec, rarity .. " Size", sid, 1.0, 2.0, 1.0, sizeCb) then
-        SLIDERS[#SLIDERS + 1] = { rarity = rarity, id = sid, name = rarity .. " Size", kind = "slider" }
+    if safeToggle(sec, rarity, id, false, cb) then
+        RARITY_IDS[#RARITY_IDS + 1] = { rarity = rarity, id = id, name = rarity }
     end
 end
 
@@ -1038,7 +990,7 @@ local function buildTab(tab)
             addToggle(pick, "Auto Pickup", "fam_pickup", "Pickup", false)
 
             for i = 1, #RARITIES do
-                addRarityControls(pick, RARITIES[i])
+                addRarity(pick, RARITIES[i])
             end
         end
     end)
@@ -1091,30 +1043,23 @@ task.spawn(function()
             end
         end
 
-        for i = 1, #SLIDERS do
-            local s = SLIDERS[i]
-            local cfg = PickCfg[s.rarity]
+        for i = 1, #RARITY_IDS do
+            local r = RARITY_IDS[i]
+            local val = nil
 
-            if cfg then
-                local val = nil
+            local ok1, v1 = pcall(function() return UI.GetValue(r.id) end)
+            if ok1 and type(v1) == "boolean" then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(r.name) end)
+                if ok2 and type(v2) == "boolean" then val = v2 end
+            end
 
-                local ok1, v1 = pcall(function() return UI.GetValue(s.id) end)
-                if ok1 and type(v1) == "number" then
-                    val = v1
-                else
-                    local ok2, v2 = pcall(function() return UI.GetValue(s.name) end)
-                    if ok2 and type(v2) == "number" then val = v2 end
-                end
-
-                if val ~= nil then
-                    sliderWorks[s.rarity] = true
-
-                    if s.kind == "toggle" then
-                        local b = (val > 0)
-                        if cfg.on ~= b then cfg.on = b end
-                    else
-                        if cfg.minSize ~= val then cfg.minSize = val end
-                    end
+            if val ~= nil then
+                getterWorks[r.rarity] = true
+                if PickCfg[r.rarity] ~= val then
+                    PickCfg[r.rarity] = val
+                    print("[" .. NAME .. "] pick " .. r.rarity .. " = " .. tostring(val))
                 end
             end
         end
@@ -1124,16 +1069,16 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- EGG PICKUP  (fireproximityprompt on the egg's CarryPrompt)
+-- EGG PICKUP  (CarryPrompt + one-time diagnosis)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasPrompt = (type(fireproximityprompt) == "function")
-    local hasTouch  = (type(firetouchinterest) == "function")
 
     local warned  = false
     local wasOn   = false
-    local picked  = 0
+    local tried   = 0
     local lastAt  = {}
+    local diag    = false
 
     if not hasPrompt then
         print("[" .. NAME .. "] fireproximityprompt missing - re-run the Matcha loader")
@@ -1142,14 +1087,13 @@ task.spawn(function()
     while running do
         if Config.Pickup and hasPrompt then
             local eggs = eggList()
-            local hit  = 0
             local now  = tick()
+            local hit  = 0
 
             for i = 1, #eggs do
                 local egg = eggs[i]
-                local cfg = PickCfg[egg.rarity]
 
-                if cfg and cfg.on and egg.size >= cfg.minSize then
+                if PickCfg[egg.rarity] == true then
                     local okP, parent = pcall(function() return egg.model.Parent end)
 
                     if okP and parent ~= nil then
@@ -1168,18 +1112,25 @@ task.spawn(function()
                             if prompt then
                                 pcall(function() fireproximityprompt(prompt) end)
                                 hit = hit + 1
+                                tried = tried + 1
 
                                 if k ~= nil then lastAt[k] = now end
-                            elseif hasTouch then
-                                local hrp = rootPart()
-                                local er  = egg.model:FindFirstChild("HumanoidRootPart")
 
-                                if hrp and er then
-                                    pcall(function() firetouchinterest(er, hrp, 0) end)
-                                    pcall(function() firetouchinterest(er, hrp, 1) end)
-                                    hit = hit + 1
+                                if not diag then
+                                    diag = true
+                                    print("[" .. NAME .. "] trying " .. tostring(egg.name)
+                                        .. "  prompt=" .. tostring(prompt.Name))
 
-                                    if k ~= nil then lastAt[k] = now end
+                                    local model = egg.model
+
+                                    task.spawn(function()
+                                        task.wait(0.6)
+                                        local still = false
+                                        local okQ, q = pcall(function() return model.Parent end)
+                                        if okQ and q ~= nil then still = true end
+
+                                        print("[" .. NAME .. "] egg still there: " .. tostring(still))
+                                    end)
                                 end
                             end
                         end
@@ -1188,23 +1139,22 @@ task.spawn(function()
             end
 
             if hit > 0 then
-                picked = picked + hit
                 warned = false
 
                 if not wasOn then
                     wasOn = true
-                    print("[" .. NAME .. "] auto pickup on (prompt)")
+                    print("[" .. NAME .. "] auto pickup on (CarryPrompt)")
                 end
             elseif not warned then
                 warned = true
-                print("[" .. NAME .. "] pickup: nothing matches the filters right now")
+                print("[" .. NAME .. "] pickup: no egg matched an enabled rarity")
             end
 
             task.wait(PICK_RATE)
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto pickup off (" .. tostring(picked) .. " fired)")
+                print("[" .. NAME .. "] auto pickup off (" .. tostring(tried) .. " fired)")
             end
             task.wait(0.2)
         end
@@ -1436,5 +1386,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - pickup via CarryPrompt", 5)
+notifyUser("Loaded - pickup with diagnosis", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
