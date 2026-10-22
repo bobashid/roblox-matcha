@@ -1,54 +1,45 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v5.1  -  BACK TO BOSSES ONLY
+--  v5.2  -  BOSSES ONLY, AND RESTORE ACTUALLY RESTORES
 --
---  WHAT BROKE IN v5.0 (read from your own log)
---    21:09:28  hitbox x40 on 1071 parts
---    21:09:29  Hothead_2100 -8, Robloxpapi382 -8,
---              blondemanpizza17 -8
---    21:09:52  targets 56, report full of UUID models, eggs,
---              and player names
---    "Every model with a Humanoid" meant PLAYER CHARACTERS too. The
---    filter used Players:GetPlayerFromCharacter and a == compare,
---    which does not hold here: Matcha hands back a different proxy
---    each call, so the equality check is always false and every
---    player got grown x40 and swung at. 1071 parts at x40 with
---    collision off is what tanked the game.
+--  v5.1 fixes carried over
+--    Only models under Workspace.SpawnAreas that have a DIRECT
+--    Humanoid, are not named *Egg and are not under a player get
+--    grown. Player characters are excluded by NAME (every name in
+--    Players:GetPlayers() plus your own), never by instance compare,
+--    because instance equality does not hold in this VM.
+--    That is what tanked the game in v5.0: players were matched, so
+--    1071 parts went x40 with collision off.
 --
---  THE RULE NOW
---    Only boss models are targets:
---      Workspace.SpawnAreas  ->  <Type>Area  ->  <Type>Mama
---    A model counts if it sits under SpawnAreas, has a direct
---    Humanoid, and its name does not contain "Egg".
---    Player characters are excluded by NAME: every name in
---    Players:GetPlayers() is skipped, and so is anything with a
---    player's name as an ancestor. No equality compare is used for
---    that test, so the proxy problem cannot sneak players back in.
---    Models named Rig are skipped.
+--  v5.2 FIXES
+--    1. restoreHitbox read part.Parent inside pcall WITHOUT return,
+--       so the parent always came back nil and nothing was ever put
+--       back. It now returns the parent properly, so turning Auto
+--       Farm off (or stop) really does restore every part's original
+--       size and CanCollide.
+--    2. The off branch of the swing loop logged "auto farm on".
+--    3. stop() printed the version twice.
 --
---  WHY THIS STILL HITS THEM FROM WHERE YOU STAND
---    Every BasePart of every boss is set to its first-seen size x40.
---    Distance maths and the Huge Hitbox toggle are gone - x40 is the
---    only multiplier, applied once.
---
---  NO COMPOUNDING (the v4.8 slowdown)
+--  NO COMPOUNDING
 --    Matcha returns a fresh proxy for the same part on every scan, so
---    a table keyed by the instance re-saved and re-multiplied the
---    part every pass: x40, x1600, x64000... Both tables are keyed by
---    part.Address / model.Address, the original size is saved exactly
---    once, and a part is only re-sized when its multiplier changes.
+--    both tables are keyed by part.Address / model.Address. The
+--    original size is saved exactly once and a part is re-sized only
+--    when its multiplier changes - so no x40, x1600, x64000 runaway.
 --
---  NEVER RESIZED
---    parts named Area / ChaseArea (that was the floor being grown),
---    player characters, eggs, Rig models.
+--  HITBOX
+--    Every BasePart of every boss: first-seen size * 40, once.
+--    Root part never smaller than 14 studs on any axis.
+--    CanCollide off while grown so the part cannot shove you.
+--    Parts named Area / ChaseArea are never touched (that was the
+--    floor being grown and flinging you).
 --
 --  AUTO SWING
 --    Stand still, Attack remote fired every SWING_RATE. No CFrame
 --    writes anywhere, no teleports.
 --
---  Turning Auto Farm off (or stopping) puts every part back to its
---  original size and original CanCollide.
+--  Console is throttled: the boss list prints at most once every 5
+--  seconds and the report collapses duplicates into one line each.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -59,7 +50,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v5.1"
+local VERSION = "v5.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -70,18 +61,18 @@ local running = true
 local built   = false
 
 -- fixed tuning
-local POLL_RATE    = 0.1
-local HEAL_RATE    = 0.25
-local HEAL_REFIRE  = 1.0
-local HP_LOG_RATE  = 5.0
-local COLLECT_RATE = 1.5
-local SWING_RATE   = 0.1
-local ATK_TTL      = 1.0
-local HB_RATE      = 0.25
-local SCAN_TTL     = 2.0
+local POLL_RATE     = 0.1
+local HEAL_RATE     = 0.25
+local HEAL_REFIRE   = 1.0
+local HP_LOG_RATE   = 5.0
+local COLLECT_RATE  = 1.5
+local SWING_RATE    = 0.1
+local ATK_TTL       = 1.0
+local HB_RATE       = 0.25
+local SCAN_TTL      = 2.0
 local TARGET_MEMORY = 20.0
-local TARGET_CAP   = 40
-local TRACK_LOG    = 5.0
+local TARGET_CAP    = 40
+local TRACK_LOG     = 5.0
 
 -- one multiplier
 local HB_MULT      = 40
@@ -143,8 +134,7 @@ local function isBasePart(p)
         or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
 end
 
--- Stable identity: Matcha returns fresh proxies, so the instance is
--- useless as a table key and Address is not.
+-- stable identity; Matcha hands back a fresh proxy each call
 local function keyOf(inst)
     if inst == nil then return nil end
     local ok, a = pcall(function() return inst.Address end)
@@ -168,8 +158,14 @@ local function bossHumanoid(m)
     return nil
 end
 
--- player names, rebuilt each scan. Compared as strings, never as
--- instances, because instance equality does not hold in this VM.
+local function parentOf(inst)
+    if inst == nil then return nil end
+    local ok, p = pcall(function() return inst.Parent end)
+    if ok then return p end
+    return nil
+end
+
+-- player names, rebuilt each scan; compared as strings only
 local function playerNames()
     local set = {}
 
@@ -193,14 +189,13 @@ local function underPlayer(m, names)
         if not node then return false end
         local ok, n = pcall(function() return node.Name end)
         if ok and type(n) == "string" and names[n] then return true end
-        local okP, parent = pcall(function() return node.Parent end)
-        if not okP then return false end
-        node = parent
+        node = parentOf(node)
+        if not node then return false end
     end
     return false
 end
 
--- boss = under SpawnAreas, direct Humanoid, not an egg, not a player
+-- boss = direct Humanoid, not an egg, not a player, not a rig
 local function looksLikeBoss(m, names)
     if m.ClassName ~= "Model" then return false end
     if SKIP_MODEL[m.Name] then return false end
@@ -295,9 +290,9 @@ local function swing()
 end
 
 --------------------------------------------------------------------
--- BOSS SCAN  (SpawnAreas only, Address keyed, capped, throttled)
+-- BOSS SCAN
 --------------------------------------------------------------------
-local targets     = {}   -- address -> { model, t }
+local targets     = {}
 local targetStamp = 0
 local trackCount  = -1
 local trackLogged = 0
@@ -317,12 +312,11 @@ local function pruneTargets()
 
         if not e.model then
             gone = true
-        else
-            local ok, parent = pcall(function() return e.model.Parent end)
-            if not ok or parent == nil then gone = true end
+        elseif parentOf(e.model) == nil then
+            gone = true
+        elseif (now - e.t) > TARGET_MEMORY then
+            gone = true
         end
-
-        if not gone and (now - e.t) > TARGET_MEMORY then gone = true end
 
         if gone then
             dead = dead or {}
@@ -393,12 +387,12 @@ local function scanTargets()
     pruneTargets()
     targetStamp = now
 
-    local out   = {}
+    local out    = {}
     local labels = {}
 
     for k, e in pairs(targets) do
         if e.model then
-            out[#out + 1]    = e.model
+            out[#out + 1]       = e.model
             labels[#labels + 1] = e.model.Name
         end
     end
@@ -469,24 +463,15 @@ local function reportTargets()
 end
 
 --------------------------------------------------------------------
--- HITBOX EXPANDER  (Address keyed, saved once per part)
+-- HITBOX EXPANDER
 --------------------------------------------------------------------
-local hbSaved   = {}   -- address -> { part, size, collide, mult }
+local hbSaved   = {}
 local hbApplied = false
 
 local function pruneSaved()
     local dead = nil
     for k, e in pairs(hbSaved) do
-        local gone = false
-
-        if not e.part then
-            gone = true
-        else
-            local ok, parent = pcall(function() return e.part.Parent end)
-            if not ok or parent == nil then gone = true end
-        end
-
-        if gone then
+        if not e.part or parentOf(e.part) == nil then
             dead = dead or {}
             dead[#dead + 1] = k
         end
@@ -540,6 +525,18 @@ local function growPart(d, mult, isRoot)
     return true
 end
 
+local function isRootPart(boss, d)
+    if d.Name == "HumanoidRootPart" then return true end
+
+    local okP, pp = pcall(function() return boss.PrimaryPart end)
+    if not okP or pp == nil then return false end
+
+    local okA, addrPP = pcall(function() return pp.Address end)
+    local okB, addrD  = pcall(function() return d.Address end)
+
+    return okA and okB and addrPP ~= nil and addrPP == addrD
+end
+
 local function applyHitbox()
     local touched = 0
     local list    = allTargets()
@@ -552,21 +549,9 @@ local function applyHitbox()
                 for j = 1, #desc do
                     local d = desc[j]
                     if isBasePart(d) then
-                        local isRoot = false
-                        if d.Name == "HumanoidRootPart" then
-                            isRoot = true
-                        else
-                            local okP, pp = pcall(function() return boss.PrimaryPart end)
-                            if okP and pp ~= nil then
-                                local okA, addrPP = pcall(function() return pp.Address end)
-                                local okB, addrD  = pcall(function() return d.Address end)
-                                if okA and okB and addrPP ~= nil and addrPP == addrD then
-                                    isRoot = true
-                                end
-                            end
+                        if growPart(d, HB_MULT, isRootPart(boss, d)) then
+                            touched = touched + 1
                         end
-
-                        if growPart(d, HB_MULT, isRoot) then touched = touched + 1 end
                     end
                 end
             end
@@ -581,13 +566,10 @@ local function restoreHitbox()
 
     for k, e in pairs(hbSaved) do
         local p = e.part
-        if p then
-            local ok, parent = pcall(function() return p.Parent end)
-            if ok and parent ~= nil then
-                pcall(function() p.Size = e.size end)
-                pcall(function() p.CanCollide = e.collide end)
-                n = n + 1
-            end
+        if p and parentOf(p) ~= nil then
+            pcall(function() p.Size = e.size end)
+            pcall(function() p.CanCollide = e.collide end)
+            n = n + 1
         end
     end
 
@@ -884,7 +866,7 @@ local function stop()
     targets  = {}
     lastHp   = {}
     _G.FeedAMosquito = nil
-    print("[" .. NAME .. "] stopped")
+    print("[" .. NAME .. "] " .. VERSION .. " stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
