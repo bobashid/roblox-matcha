@@ -1,36 +1,29 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v4.3
+--  v4.4
 --
---  ALL BOSSES, NOT JUST FOUR
---    v4.2 only grew bosses found through a hardcoded list of eight
---    area names (Common / Uncommon / Rare / Legendary / Mythical /
---    Divine / Secret / Epic). Any boss whose area or model name did
---    not match that exact list was never grown, so it stayed its
---    normal size and the swing rarely reached it.
---    v4.3 scans Workspace.SpawnAreas live instead: every Model inside
---    every area child is grown, whether or not its name was on the
---    old list. A model also counts if it has a Humanoid descendant or
---    its name contains "Mama". The scan is re-run every BOSS_TTL and
---    the names it found are printed whenever the set changes, so it
---    is easy to see whether a boss is covered.
---    If SpawnAreas cannot be read at all it falls back to scanning
---    Workspace for "Mama" models.
+--  WHY YOU GOT MOVED  (no CFrame is written anywhere in this script)
+--    Nothing here sets your position. The push comes from the parts
+--    themselves: at x8 a boss part grows around its own centre, and
+--    any part that still has CanCollide on shoves your character out
+--    of it on the next physics step. With v4.3 growing every boss on
+--    the map (not just four), more of those huge parts overlap you,
+--    so the shoving shows up as being teleported somewhere.
 --
---  HITBOX
---    new size = first-seen size * multiplier (x8, x16 with Huge).
---    Saved sizes are dropped as soon as a part is gone, so a boss
---    that respawns is measured fresh and never double-multiplied.
---    Restoring puts every saved part back to its first-seen size.
---    Local change only.
+--  THE FIX
+--    Every part this script grows has its CanCollide turned OFF at
+--    the same moment, and the original value is remembered. When
+--    Auto Farm goes off or the script stops, size AND CanCollide go
+--    back exactly as they were. Enlarged parts can no longer push
+--    you, so you stay where you stand.
 --
---  AUTO SWING
---    Stand still, Attack remote fired every SWING_RATE. No CFrame
---    writes anywhere, no teleports.
---
---  MAIN
---    Always Heal, Auto Collect.
+--  Everything else is unchanged from v4.3:
+--    - every Model in Workspace.SpawnAreas is covered, no name list
+--    - new size = first-seen size * multiplier (x8, x16 with Huge)
+--    - saved sizes dropped when a part disappears (clean respawn)
+--    - stand still, Attack remote fired every SWING_RATE
+--    - Always Heal, Auto Collect
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -41,7 +34,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v4.3"
+local VERSION = "v4.4"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -234,7 +227,6 @@ local function scanBosses()
         for i = 1, #kids do
             local a = kids[i]
 
-            -- an area child that is itself the boss model
             if a.ClassName == "Model" then addBoss(out, a) end
 
             local ck = a:GetChildren()
@@ -249,7 +241,6 @@ local function scanBosses()
         end
     end
 
-    -- fallback: nothing found, look for "Mama" models anywhere
     if #out == 0 then
         local ok, desc = pcall(function() return WS:GetDescendants() end)
         if ok and desc then
@@ -288,9 +279,10 @@ end
 
 --------------------------------------------------------------------
 -- BOSS HITBOX EXPANDER
---   new size = first-seen size * multiplier, around the part centre.
+--   size = first-seen size * multiplier, CanCollide off while grown.
 --------------------------------------------------------------------
-local hbSaved   = {}
+local hbSaved   = {}   -- part -> original Size
+local hbCollide = {}   -- part -> original CanCollide
 local hbApplied = 0
 
 local function hbFactor()
@@ -309,9 +301,36 @@ local function pruneSaved()
         end
     end
     if dead then
-        for i = 1, #dead do hbSaved[dead[i]] = nil end
+        for i = 1, #dead do
+            hbSaved[dead[i]]   = nil
+            hbCollide[dead[i]] = nil
+        end
     end
     return dead and #dead or 0
+end
+
+local function growPart(d, mult)
+    local base = hbSaved[d]
+
+    if base == nil then
+        -- save size and collision exactly once, before we change them
+        local okS, s = pcall(function() return d.Size end)
+        if not okS or not s then return false end
+        base = s
+        hbSaved[d] = s
+
+        local okC, c = pcall(function() return d.CanCollide end)
+        hbCollide[d] = (okC and c) and true or false
+    end
+
+    pcall(function()
+        d.Size = Vector3.new(base.X * mult, base.Y * mult, base.Z * mult)
+    end)
+
+    -- a grown part must not shove the player around
+    pcall(function() d.CanCollide = false end)
+
+    return true
 end
 
 local function applyHitbox(mult)
@@ -324,26 +343,8 @@ local function applyHitbox(mult)
         if okD and desc then
             for j = 1, #desc do
                 local d = desc[j]
-                if isBasePart(d) then
-                    local base = hbSaved[d]
-                    if base == nil then
-                        -- save the size exactly once, before we grow it
-                        local okS, s = pcall(function() return d.Size end)
-                        if okS and s then
-                            base = s
-                            hbSaved[d] = s
-                        end
-                    end
-                    if base then
-                        pcall(function()
-                            d.Size = Vector3.new(
-                                base.X * mult,
-                                base.Y * mult,
-                                base.Z * mult
-                            )
-                        end)
-                        touched = touched + 1
-                    end
+                if isBasePart(d) and growPart(d, mult) then
+                    touched = touched + 1
                 end
             end
         end
@@ -354,13 +355,22 @@ end
 
 local function restoreHitbox()
     local n = 0
+
     for part, size in pairs(hbSaved) do
         if part and part.Parent then
             pcall(function() part.Size = size end)
+
+            local c = hbCollide[part]
+            if c ~= nil then
+                pcall(function() part.CanCollide = c end)
+            end
             n = n + 1
         end
     end
-    hbSaved = {}
+
+    hbSaved   = {}
+    hbCollide = {}
+
     if hbApplied ~= 0 then
         print("[" .. NAME .. "] hitbox restored on " .. tostring(n) .. " parts")
     end
@@ -496,7 +506,7 @@ task.spawn(function()
             if n > 0 and hbApplied ~= mult then
                 hbApplied = mult
                 print("[" .. NAME .. "] hitbox x" .. tostring(mult)
-                    .. " on " .. tostring(n) .. " parts (local)")
+                    .. " on " .. tostring(n) .. " parts (no collide, local)")
             end
         elseif hbApplied ~= 0 then
             restoreHitbox()
@@ -596,14 +606,14 @@ local function stop()
     running = false
     pcall(function() restoreHitbox() end)
     pcall(function() fireEvent("StopTransfuseBlood") end)
-    atkCache  = nil
-    bossList  = {}
-    bossKey   = ""
+    atkCache = nil
+    bossList = {}
+    bossKey  = ""
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Auto Farm: every boss, big hitboxes", 5)
+notifyUser("Loaded - Auto Farm: every boss, big hitboxes, no shoving", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
