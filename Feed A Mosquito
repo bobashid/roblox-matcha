@@ -29,6 +29,7 @@
 --    actor (Tool_Character_<userId>_*). This scans those actors and
 --    fires Attack when an enemy model is within range.
 --
+--  NO VARARGS ANYWHERE - this VM rejects '...' in nested closures.
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
 local Players = game:GetService("Players")
@@ -38,7 +39,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v1.6"
+local VERSION = "v1.7"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -74,6 +75,7 @@ _G.FeedAMosquito = { stop = function() running = false end }
 
 --------------------------------------------------------------------
 -- Helpers
+--   child(a, b, c) replaces any vararg path helper on purpose.
 --------------------------------------------------------------------
 local function humanoid()
     local c = LP.Character
@@ -89,14 +91,11 @@ local function notifyUser(msg, dur)
     pcall(function() notify(NAME, msg, dur or 3) end)
 end
 
-local function find(base, ...)
-    local node = base
-    local args = { ... }
-    for i = 1, #args do
-        if not node then return nil end
-        node = node:FindFirstChild(args[i])
-    end
-    return node
+local function child(a, b, c)
+    if not a or not b then return nil end
+    local n1 = a:FindFirstChild(b)
+    if not n1 or not c then return n1 end
+    return n1:FindFirstChild(c)
 end
 
 --------------------------------------------------------------------
@@ -110,7 +109,7 @@ local pFor    = nil
 local function playerRemotes()
     if pFor == LP.UserId and pEvents then return pEvents, pFuncs end
 
-    local actors = find(RS, "Runtime", "Actors")
+    local actors = child(RS, "Runtime", "Actors")
     if not actors then return nil, nil end
 
     local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
@@ -141,7 +140,7 @@ end
 -- My base: the Base<N> whose ActorId mentions my UserId
 --------------------------------------------------------------------
 local function myBase()
-    local bases = find(WS, "SafeZone", "Bases")
+    local bases = child(WS, "SafeZone", "Bases")
     if not bases then return nil end
 
     local tag = tostring(LP.UserId)
@@ -332,7 +331,7 @@ task.spawn(function()
             local base   = myBase()
             local folder = base and base:FindFirstChild("Mosquitoes")
             if folder then
-                local actors = find(RS, "Runtime", "Actors")
+                local actors = child(RS, "Runtime", "Actors")
                 local kids   = folder:GetChildren()
 
                 for i = 1, #kids do
@@ -407,7 +406,7 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     local function attackRemotes()
-        local actors = find(RS, "Runtime", "Actors")
+        local actors = child(RS, "Runtime", "Actors")
         if not actors then return nil end
 
         local prefix = "Tool_Character_" .. tostring(LP.UserId) .. "_"
@@ -468,7 +467,7 @@ end)
 --------------------------------------------------------------------
 local function stop()
     running = false
-    pcall(function() fireEvent("StopTransfuseBlood") end)
+    pcall(function() fireStopEvent() end)
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
