@@ -1,43 +1,34 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v9.3  -  TP PICKUP, WITH THE TIMING MEASURED ONCE AND FOR ALL
+--  v9.4  -  TP PICKUP DROPS 5 STUDS UNDER
 --
---  THE MEASUREMENT THAT SETTLED IT
---    Four eggs, four depths, one fire each, with 0.15 s between the
---    teleport and the fire:
+--  One change from v9.3: TP_DEPTH is 5 instead of 3, so the trip lands
+--  further under the floor while still inside the prompt's range.
+--  That depth is not a guess - the live test fired at 1, 2, 3 and 5
+--  studs and all four picked the egg (DEPTH 5 picked=true), so 5 is
+--  the deepest value actually measured to work. 3 was the shallowest
+--  that still hides you.
 --
---        DEPTH 1  picked=true
---        DEPTH 2  picked=true
---        DEPTH 3  picked=true
---        DEPTH 5  picked=true
+--  Everything else is v9.3, which you confirmed works:
 --
---    Every depth worked. So "too far under the map" was never the
---    problem - my earlier guess was wrong. The difference between that
---    test and v9.2 is TIMING: the test waited 0.15 s after moving
---    before firing, and 0.4 s after firing before restoring. v9.2
---    settled for only 0.05 s, so the prompt was fired before the new
---    position had replicated and the server refused it.
+--  PICKUP
+--      near range  - plain fireproximityprompt, instant, exactly like
+--                    the version that took eggs as you walked past
+--      far range   - TP Pickup on: save CFrame, drop TP_DEPTH under the
+--                    egg, wait TP_SETTLE (0.15 s), fire the prompt
+--                    once, wait TP_HOLD (0.2 s), restore the CFrame
 --
---  WHAT THIS BUILD DOES
---      near range  - plain fireproximityprompt, exactly like v9.0, so
---                    eggs you walk past are taken instantly
---      far range   - with TP Pickup on: save CFrame, drop TP_DEPTH
---                    under the egg, wait TP_SETTLE (0.15 s), fire the
---                    prompt once, wait TP_HOLD (0.2 s) so the server
---                    processes it while you are in range, restore the
---                    CFrame
---
---    TP_DEPTH is 3 studs, which is under the floor for an egg sitting
---    on it and still well inside the range that the measurement proved
---    works.
+--    The 0.15 s settle is the part that matters and the part earlier
+--    builds got wrong: firing before the new position replicates makes
+--    the server refuse the prompt, which is why the teleport visibly
+--    worked but no egg was taken.
 --
 --  SAFETY
 --    - one egg per pass, PICK_COOLDOWN stops the same egg retrying
 --    - the CFrame is restored even if the prompt errors, and again in
---      stop() in case it is called mid-teleport
---    - no boss or egg property is ever written, only your own CFrame
---      and your own tool's AttackPart
+--      stop() if it is called mid-teleport
+--    - only your own CFrame and your own tool's AttackPart are written
 --
 --  RARITY FILTERS
 --    Read from the egg's own EggGui "Rarity" TextLabel - the text the
@@ -45,12 +36,12 @@
 --    because an IceMosquitoEgg has been seen in UncommonArea labelled
 --    Rare.
 --
---  PANELS (unchanged)
+--  PANELS
 --      left  PANEL_X = 300   boss name, HP bar, hp / max
 --      right EGG_X  = 634    egg name, rarity, Price
 --    Game colours: 40,40,50 backdrop, white names, bold text.
 --
---  Hit logic unchanged from v8.2, which works:
+--  Hit logic unchanged from v8.2:
 --    - AttackPart is the only thing written: shrink to 2 studs to end
 --      every contact, grow back to map size to begin a new one
 --    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
@@ -67,7 +58,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v9.3"
+local VERSION = "v9.4"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -97,10 +88,10 @@ local BOSS_TTL     = 0.6
 local PART_TTL     = 2.0
 local EGG_TTL      = 1.0
 
--- pickup tuning (timings from the live depth test)
+-- pickup tuning (timings and depth from the live depth test)
 local PICK_RATE     = 0.35
 local PICK_COOLDOWN = 1.0
-local TP_DEPTH      = 3
+local TP_DEPTH      = 5
 local TP_SETTLE     = 0.15
 local TP_HOLD       = 0.20
 
@@ -1174,9 +1165,8 @@ task.spawn(function()
                                                 )
                                             end)
 
-                                            -- the measured settle: 0.15 s
-                                            -- before firing, or the
-                                            -- server sees the old position
+                                            -- measured settle: fire only after
+                                            -- the new position replicated
                                             task.wait(TP_SETTLE)
 
                                             if running and Config.Pickup then
@@ -1185,8 +1175,8 @@ task.spawn(function()
                                                 end)
                                             end
 
-                                            -- and 0.2 s after, so the server
-                                            -- finishes while in range
+                                            -- and stay long enough for the
+                                            -- server to finish the pickup
                                             task.wait(TP_HOLD)
 
                                             local okR, hrp2 = pcall(function() return rootPart() end)
@@ -1498,5 +1488,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - tp pickup with measured timing", 5)
+notifyUser("Loaded - tp pickup drops 5 under", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
