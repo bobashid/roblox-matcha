@@ -9,20 +9,27 @@
 --
 --  Auto Feed
 --    Each mosquito model carries FeedProgress / Feeding / ActorId and
---    owns a FeedMosquito remote under Runtime.Actors. Fires it for any
---    mosquito below full that is not already feeding.
+--    owns a FeedMosquito remote under Runtime.Actors.
 --
 --  Auto Collect
 --    Fires CollectIncome and ClaimOfflineIncome.
 --
 --  Auto Attack
---    Fires the equipped tool actor's Attack remote directly, the same
---    call the client makes on swing:
+--    Fires the tool actor's Attack remote directly:
 --      Runtime.Actors.Tool_Character_<userId>_<n>_<m>.Events.Attack
---    The server resolves the hit, so no target scan is needed. The
---    earlier version only fired when it found an Enemy model inside
---    Workspace, and those are absent most of the time, so it never
---    called the remote at all.
+--    Attack takes NO arguments, so the server resolves the hit from
+--    the character's position. There is no client-side hitbox to
+--    enlarge, which is why range cannot be spoofed directly.
+--
+--  Attack From Afar
+--    Works on top of Auto Attack. Finds the nearest enemy model, saves
+--    your CFrame, teleports onto it, fires Attack, teleports back.
+--    Same call the client makes, just from closer. Range slider caps
+--    how far it will reach. Teleports are throttled - each one is a
+--    heavy write, so the pass runs at AFAR_RATE, not per frame.
+--
+--  Enemy models are named *Area_Enemy_* in Workspace (Common, Rare,
+--  Legendary, Mythical, Divine, Secret, Epic...). They come and go.
 --
 --  All toggles start OFF. Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -33,7 +40,7 @@ local WS      = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v2.0"
+local VERSION = "v2.1"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -48,13 +55,16 @@ local POLL_RATE    = 0.1    -- toggle poller
 local HEAL_RATE    = 0.2    -- transfusion control
 local FEED_RATE    = 0.3    -- mosquito feed pass
 local COLLECT_RATE = 1.5    -- income collection
-local ATTACK_RATE  = 0.25   -- weapon swings
+local ATTACK_RATE  = 0.25   -- normal weapon swings
+local AFAR_RATE    = 0.7    -- teleport swing pass (heavy writes)
 
 local Config = {
     Heal        = false,
     AutoFeed    = false,
     AutoCollect = false,
     AutoAttack  = false,
+    Afar        = false,
+    AfarRange   = 300,
 }
 
 local TOGGLES     = {}
@@ -68,6 +78,11 @@ _G.FeedAMosquito = { stop = function() running = false end }
 local function humanoid()
     local c = LP.Character
     return c and c:FindFirstChild("Humanoid") or nil
+end
+
+local function rootPart()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
 end
 
 local function notifyUser(msg, dur)
@@ -133,8 +148,7 @@ end
 
 --------------------------------------------------------------------
 -- Tool actor Attack remotes
---   Actors are named Tool_Character_<userId>_<n>_<m>. Matched by the
---   Tool_Character_<userId>_ prefix so every equipped tool counts.
+--   Tool_Character_<userId>_<n>_<m>.Events.Attack
 --------------------------------------------------------------------
 local atkCache = nil
 local atkFor   = nil
@@ -168,8 +182,52 @@ local function attackRemotes()
     return out
 end
 
+local function swing()
+    local list = attackRemotes()
+    if not list then
+        atkCache = nil
+        return false
+    end
+    for i = 1, #list do
+        pcall(function() list[i]:FireServer() end)
+    end
+    return true
+end
+
 --------------------------------------------------------------------
--- Toggle plumbing
+-- Nearest enemy model in Workspace
+--   Names seen: CommonArea_Enemy_129, RareArea_Enemy_114,
+--   Egg_EpicArea_Enemy_132_0, ... all contain "Enemy".
+--------------------------------------------------------------------
+local function enemyPart(model)
+    return model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("Head")
+        or model.PrimaryPart
+end
+
+local function nearestEnemy(fromPos, maxDist)
+    local best, bestDist, bestPos = nil, maxDist, nil
+    local kids = WS:GetChildren()
+
+    for i = 1, #kids do
+        local d = kids[i]
+        if string.find(d.Name, "Enemy", 1, true) then
+            local part = enemyPart(d)
+            if part then
+                local pos = part.Position
+                local dist = (pos - fromPos).Magnitude
+                if dist <= bestDist then
+                    best, bestDist, bestPos = d, dist, pos
+                end
+            end
+        end
+    end
+
+    return best, bestPos, bestDist
+end
+
+--------------------------------------------------------------------
+-- Toggle / slider plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -194,6 +252,19 @@ local function safeToggle(sec, name, id, default, cb)
         if pcall(tries[i]) then return true end
     end
     warn("[" .. NAME .. "] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function safeSlider(sec, name, id, min, max, default, cb)
+    local tries = {
+        function() sec:SliderInt(name, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, name, min, max, default, cb) end,
+        function() sec:SliderInt(name, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Slider failed: " .. tostring(name))
     return false
 end
 
@@ -230,6 +301,11 @@ local function buildTab(tab)
         local combat = makeSection(tab, "Combat", "Right")
         if combat then
             addToggle(combat, "Auto Attack", "fam_attack", "AutoAttack", false)
+            addToggle(combat, "Attack From Afar", "fam_afar", "Afar", false)
+            safeSlider(combat, "Afar Range", "fam_afarrange", 50, 2000, 300,
+                function(v)
+                    if type(v) == "number" then Config.AfarRange = v end
+                end)
         end
     end)
 
@@ -374,23 +450,45 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO ATTACK
---   Same call the client makes on swing, no target scan:
---   Tool_Character_<userId>_<n>_<m>.Events.Attack:FireServer()
+-- AUTO ATTACK  (normal reach)
+--   Only runs when Attack From Afar is off, so the two never overlap.
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.AutoAttack then
-            local list = attackRemotes()
-            if list then
-                for i = 1, #list do
-                    pcall(function() list[i]:FireServer() end)
-                end
-            else
-                atkCache = nil
-            end
+        if Config.AutoAttack and not Config.Afar then
+            swing()
         end
         task.wait(ATTACK_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- ATTACK FROM AFAR
+--   Teleport onto the nearest enemy, swing, teleport back.
+--   The CFrame restore runs in a pcall so a mid-swing respawn cannot
+--   leave the loop stuck.
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoAttack and Config.Afar then
+            local hrp = rootPart()
+            if hrp then
+                local range = tonumber(Config.AfarRange) or 300
+                local target, pos, dist = nearestEnemy(hrp.Position, range)
+
+                if target and pos then
+                    local back = hrp.CFrame
+                    local tx, ty, tz = pos.X, pos.Y + 3, pos.Z
+
+                    pcall(function() hrp.CFrame = CFrame.new(tx, ty, tz) end)
+                    task.wait(0.06)
+                    swing()
+                    task.wait(0.06)
+                    pcall(function() hrp.CFrame = back end)
+                end
+            end
+        end
+        task.wait(AFAR_RATE)
     end
 end)
 
