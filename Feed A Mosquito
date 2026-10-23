@@ -1,42 +1,21 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v9.5  -  WHY IT STAYED ON THE FLOOR, AND THE FIX
+--  v9.6  -  egg HUD removed; toggle ids no longer carry the fam_ prefix
 --
---  THE CAUSE
---    Writing a CFrame below the floor does not put you under it. Your
---    Humanoid collides with the baseplate, and the physics step
---    resolves the character straight back up to the surface. That is
---    exactly what you felt: the teleport fires, the pickup works, but
---    you end up at a normal Y level because the floor pushed you out.
---    It also explains why every depth measured the same result - 1, 2,
---    3 and 5 studs all "worked" because the character was standing on
---    the floor in all four tests.
+--  v9.5 note (still true): writing a CFrame below the floor does not
+--    put you under it - the Humanoid collides with the baseplate and
+--    the physics step resolves you straight back up. The TP pickup
+--    turns CanCollide off on YOUR OWN character parts for the hop
+--    only, restores them on return, and stop() restores them too.
 --
---  THE FIX
---    For the duration of the hop only, every part of YOUR OWN
---    character has CanCollide turned off, and the originals are put
---    back the moment you return. With nothing colliding, the CFrame
---    write is not resolved away, so you actually sit under the floor.
---
---        save CFrame + save CanCollide of each character part
+--        save CFrame + CanCollide of each character part
 --        CanCollide = false on those parts
 --        CFrame = under the egg (TP_DEPTH, default 10 studs)
 --        wait TP_SETTLE
 --        fire the egg's CarryPrompt
 --        wait TP_HOLD
 --        CFrame = home, CanCollide = saved values
---
---    Only your character is written. The map, the boss parts and the
---    egg are never touched, so nothing about the world can break, and
---    the collision values are restored on the same frame you come
---    back - plus again in stop() if it is called mid-hop.
---
---  NOT VERIFIED YET
---    The floor-push explanation fits every observation here, but this
---    specific fix has not been run in your session. The console still
---    prints the distance and whether the egg left, so it will be
---    obvious immediately.
 --
 --  PICKUP
 --      near range  - plain fireproximityprompt, instant
@@ -46,10 +25,8 @@
 --    Read from the egg's own EggGui "Rarity" TextLabel - the text the
 --    game shows in world - with the area name only as a fallback.
 --
---  PANELS
+--  PANEL
 --      left  PANEL_X = 300   boss name, HP bar, hp / max
---      right EGG_X  = 634    egg name, rarity, Price
---    Game colours: 40,40,50 backdrop, white names, bold text.
 --
 --  Hit logic unchanged from v8.2:
 --    - AttackPart is the only thing written on the tool: shrink to 2
@@ -68,7 +45,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v9.5"
+local VERSION = "v9.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -107,15 +84,12 @@ local TP_HOLD       = 0.20
 
 -- panel tuning
 local PANEL_ROWS   = 6
-local EGG_ROWS     = 4
 local ROW_H        = 34
 local PANEL_BAR_W  = 160
 local PANEL_BAR_H  = 7
 local PANEL_W      = 310
 local PANEL_X      = 300
 local PANEL_LIFT   = 150
-local EGG_X        = 634
-local EGG_BACK_W   = 250
 local PAD_X        = 10
 local PAD_TOP      = 12
 local PAD_BOTTOM   = 12
@@ -714,12 +688,10 @@ local function restoreAttackParts()
 end
 
 --------------------------------------------------------------------
--- HUD
+-- HUD  (boss panel only)
 --------------------------------------------------------------------
 local hudPool   = {}
-local eggPool   = {}
 local panelBack = nil
-local eggBack   = nil
 local hudConn   = nil
 
 local function buildHud()
@@ -731,13 +703,6 @@ local function buildHud()
     panelBack.Color        = COL_BACK
     panelBack.Transparency = 0.1
     panelBack.Visible      = false
-
-    eggBack = Drawing.new("Square")
-    eggBack.Filled       = true
-    eggBack.Thickness    = 0
-    eggBack.Color        = COL_BACK
-    eggBack.Transparency = 0.1
-    eggBack.Visible      = false
 
     for i = 1, PANEL_ROWS do
         local nameTag = Drawing.new("Text")
@@ -777,31 +742,6 @@ local function buildHud()
             fill    = fill,
         }
     end
-
-    for i = 1, EGG_ROWS do
-        local eggName = Drawing.new("Text")
-        eggName.Text     = ""
-        eggName.Size     = 14
-        eggName.Font     = 2
-        eggName.Center   = false
-        eggName.Outline  = true
-        eggName.Color    = COL_NAME
-        eggName.Visible  = false
-
-        local eggVal = Drawing.new("Text")
-        eggVal.Text      = ""
-        eggVal.Size      = 13
-        eggVal.Font      = 2
-        eggVal.Center    = false
-        eggVal.Outline   = true
-        eggVal.Color     = COL_HP
-        eggVal.Visible   = false
-
-        eggPool[i] = {
-            nameTag = eggName,
-            valTag  = eggVal,
-        }
-    end
 end
 
 local function hideSlot(slot)
@@ -809,11 +749,6 @@ local function hideSlot(slot)
     slot.hpTag.Visible   = false
     slot.back.Visible    = false
     slot.fill.Visible    = false
-end
-
-local function hideEgg(slot)
-    slot.nameTag.Visible = false
-    slot.valTag.Visible  = false
 end
 
 local function viewportHeight()
@@ -896,58 +831,6 @@ local function startHud()
                 panelBack.Visible = false
             end
         end
-
-        local eggs = eggList()
-        local e    = 0
-
-        for i = 1, #eggs do
-            if e >= EGG_ROWS then break end
-
-            local egg = eggs[i]
-            local okP, parent = pcall(function() return egg.model.Parent end)
-
-            if okP and parent ~= nil then
-                e = e + 1
-
-                local slot = eggPool[e]
-                local rowY = baseY - (e - 1) * ROW_H
-                local col  = RARITY_COLOR[egg.rarity] or COL_NAME
-
-                slot.nameTag.Text     = egg.name
-                slot.nameTag.Color    = col
-                slot.nameTag.Position = Vector2.new(EGG_X, rowY)
-                slot.nameTag.Visible  = true
-
-                local vtxt = egg.rarity
-
-                if type(egg.price) == "number" then
-                    vtxt = vtxt .. "  " .. tostring(egg.price)
-                end
-
-                slot.valTag.Text     = vtxt
-                slot.valTag.Color    = col
-                slot.valTag.Position = Vector2.new(EGG_X, rowY + 18)
-                slot.valTag.Visible  = true
-            end
-        end
-
-        for i = e + 1, EGG_ROWS do
-            local slot = eggPool[i]
-            if slot then hideEgg(slot) end
-        end
-
-        if eggBack then
-            if e > 0 then
-                local topY   = baseY - (e - 1) * ROW_H - PAD_TOP
-                local height = (e - 1) * ROW_H + ROW_H + PAD_TOP + PAD_BOTTOM
-
-                eggBack.Position = Vector2.new(EGG_X - PAD_X, topY)
-                eggBack.Size     = Vector2.new(EGG_BACK_W, height)
-                eggBack.Visible  = true
-            else
-                eggBack.Visible = false
-            end
-        end
     end)
 end
 
@@ -966,25 +849,12 @@ local function stopHud()
         pcall(function() slot.fill:Remove() end)
     end
 
-    for i = 1, #eggPool do
-        local slot = eggPool[i]
-
-        pcall(function() slot.nameTag:Remove() end)
-        pcall(function() slot.valTag:Remove() end)
-    end
-
     if panelBack then
         pcall(function() panelBack:Remove() end)
         panelBack = nil
     end
 
-    if eggBack then
-        pcall(function() eggBack:Remove() end)
-        eggBack = nil
-    end
-
     hudPool = {}
-    eggPool = {}
 end
 
 startHud()
@@ -1033,7 +903,7 @@ local function addToggle(sec, label, id, key, default)
 end
 
 local function addRarity(sec, rarity)
-    local id = "fam_pick_" .. string.lower(rarity)
+    local id = "pick_" .. string.lower(rarity)
 
     local cb = function(a, b, c)
         if getterWorks[rarity] then return end
@@ -1058,19 +928,19 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local main = makeSection(tab, "Main", "Left")
         if main then
-            addToggle(main, "Auto Health", "fam_heal", "Heal", false)
-            addToggle(main, "Auto Collect", "fam_collect", "AutoCollect", false)
+            addToggle(main, "Auto Health", "heal", "Heal", false)
+            addToggle(main, "Auto Collect", "collect", "AutoCollect", false)
         end
 
         local combat = makeSection(tab, "Combat", "Left")
         if combat then
-            addToggle(combat, "Kill Farm (repeat hits)", "fam_farm", "Farm", false)
+            addToggle(combat, "Kill Farm (repeat hits)", "farm", "Farm", false)
         end
 
         local pick = makeSection(tab, "Egg Pickup", "Left")
         if pick then
-            addToggle(pick, "Auto Pickup", "fam_pickup", "Pickup", false)
-            addToggle(pick, "TP Pickup (under egg)", "fam_tppickup", "TPPickup", false)
+            addToggle(pick, "Auto Pickup", "pickup", "Pickup", false)
+            addToggle(pick, "TP Pickup (under egg)", "tppickup", "TPPickup", false)
 
             for i = 1, #RARITIES do
                 addRarity(pick, RARITIES[i])
