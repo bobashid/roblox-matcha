@@ -1,19 +1,30 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.5  -  weapon auto-equip removed, back to the v10.1 behaviour
+--  v10.11  -  weapon re-equip, but only when your hand is empty
 --
---  REVERTED
---    v10.2 / v10.3 / v10.4 all tried to put a weapon back in your
---    hands for you. The last one backed off when your hands were not
---    empty and gave up after five tries, and it still broke pulling
---    the weapon out by hand and auto hatch with it. All of that is
---    gone: this file is the v10.1 script again (commit 39abbf5a),
---    with only the version stamp changed.
+--  WHAT YOU FOUND
+--    After a reset or a death the game puts the weapon back in your
+--    hand by itself - it simply re-parents the Tool into the new
+--    Character. There is no equip remote in the Events list, so
+--    re-parenting IS the game's own mechanism.
 --
---    Farm Kill is back to using whatever weapon you are holding. If
---    an egg pickup takes it away, equip it yourself and the hits
---    resume - nothing in here touches your Tools.
+--  WHAT THIS ADDS  (inside Farm Kill, no separate toggle)
+--    The other case: picking up an egg takes the weapon away and your
+--    hand stays empty afterwards. Farm Kill now puts back the exact
+--    Tool you were last holding, from the Backpack.
+--
+--  SAFETY RULES  (v10.2-v10.4 broke manual equipping, so these are
+--  much stricter than that)
+--    - only when the Character holds NO Tool at all. A carried egg is
+--      a Tool, so this can never fire in the middle of a pickup
+--    - only after the hand has been empty for EQUIP_SETTLE (0.5 s),
+--      so the game's own respawn equip gets to finish first
+--    - one attempt per EQUIP_RETRY (1 s), at most EQUIP_FAIL_MAX (3)
+--      in a row, then it stops until you re-toggle Farm Kill
+--    - it restores the Tool NAME you were last holding - no guessing
+--      between weapons, nothing else is touched
+--    - counters reset on respawn and whenever Farm Kill is toggled
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -24,23 +35,18 @@
 --    AttackPart is the only thing written on the tool: shrink to 2
 --    studs to end every contact, grow back to map size for a new one,
 --    then PlaySound("SwingSound") + Attack on the LIVE tool actor from
---    the tool's ActorId value. No mouse input, nothing reparented.
+--    the tool's ActorId value. No mouse input.
 --
 --  AUTO HATCH
 --    For every Runtime.Actors child named Egg_<uuid>:
 --        .Events.Hatch:FireServer()
---    on a HATCH_RATE loop. The egg actors are rebuilt every pass, so a
---    newly placed egg is picked up on the next tick. Enemy_* actors
---    have no Hatch remote and are skipped.
---
---    Readiness cannot be read from here: HatchReady is a RemoteEvent,
---    not a value, and hooking is not available. So every Hatch is fired
---    on each pass and the server ignores the ones that are not ready.
+--    on a HATCH_RATE loop. Readiness cannot be read from here
+--    (HatchReady is a RemoteEvent, not a value), so the server ignores
+--    the passes that are not ready yet.
 --
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
---    EQUIP_RATE loop. The path is built from LocalPlayer.UserId, so it
---    works on any account, not just the one it was tested on.
+--    EQUIP_RATE loop. The path is built from LocalPlayer.UserId.
 --
 --  AUTO PICKUP / TP PICKUP
 --    near range  - plain fireproximityprompt, instant
@@ -63,7 +69,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.5"
+local VERSION = "v10.11"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -84,8 +90,11 @@ local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
 -- equip / hatch tuning
-local EQUIP_RATE   = 1.5
-local HATCH_RATE   = 0.6
+local EQUIP_RATE     = 1.5
+local HATCH_RATE     = 0.6
+local EQUIP_SETTLE   = 0.5
+local EQUIP_RETRY    = 1.0
+local EQUIP_FAIL_MAX = 3
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -425,6 +434,41 @@ local function equippedTool()
         if t.ClassName == "Tool" then
             if t:FindFirstChild("ActorId") then return t end
         end
+    end
+
+    return nil
+end
+
+-- every Tool in the Character, weapon or not. A carried egg is a Tool
+-- too, which is exactly what the recovery below must not fight.
+local function toolsInCharacter()
+    local c = LP.Character
+    if not c then return {} end
+
+    local ok, kids = pcall(function() return c:GetChildren() end)
+    if not ok or not kids then return {} end
+
+    local out = {}
+
+    for i = 1, #kids do
+        if kids[i].ClassName == "Tool" then out[#out + 1] = kids[i] end
+    end
+
+    return out
+end
+
+local function findToolInBackpack(name)
+    if type(name) ~= "string" then return nil end
+
+    local bp = LP:FindFirstChild("Backpack")
+    if not bp then return nil end
+
+    local ok, kids = pcall(function() return bp:GetChildren() end)
+    if not ok or not kids then return nil end
+
+    for i = 1, #kids do
+        local t = kids[i]
+        if t.ClassName == "Tool" and t.Name == name then return t end
     end
 
     return nil
@@ -1308,7 +1352,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL
+-- FARM KILL  (puts your weapon back when the hand is empty)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -1324,9 +1368,73 @@ task.spawn(function()
     local cachedId = nil
     local cachedAtk, cachedPs = nil, nil
 
+    -- weapon recovery state
+    local lastChar    = nil
+    local lastWeapon  = nil
+    local emptySince  = nil
+    local nextTry     = 0
+    local fails       = 0
+    local gaveUp      = false
+
     while running do
         if Config.Farm and alive() then
+            -- a new Character (respawn) resets everything; the game
+            -- puts the weapon back itself and we must not race it
+            if LP.Character ~= lastChar then
+                lastChar   = LP.Character
+                emptySince = nil
+                nextTry    = 0
+                fails      = 0
+                gaveUp     = false
+            end
+
             local tool = equippedTool()
+            local held = toolsInCharacter()
+
+            if tool then
+                lastWeapon = tool.Name
+                emptySince = nil
+                fails      = 0
+                gaveUp     = false
+            elseif #held == 0 and lastWeapon and not gaveUp then
+                -- hand is completely empty: no egg carried, nothing
+                -- mid-equip. Wait a moment before acting.
+                local now = tick()
+                if emptySince == nil then emptySince = now end
+
+                if (now - emptySince) >= EQUIP_SETTLE
+                    and now >= nextTry
+                    and fails < EQUIP_FAIL_MAX then
+                    nextTry = now + EQUIP_RETRY
+
+                    local back = findToolInBackpack(lastWeapon)
+                    local c    = LP.Character
+
+                    if back and c then
+                        pcall(function() back.Parent = c end)
+
+                        if back.Parent == c then
+                            tool       = back
+                            emptySince = nil
+                            fails      = 0
+                            print("[" .. NAME .. "] farm kill: put "
+                                .. lastWeapon .. " back in hand")
+                        else
+                            fails = fails + 1
+                        end
+                    else
+                        fails = fails + 1
+                    end
+
+                    if fails >= EQUIP_FAIL_MAX and not gaveUp then
+                        gaveUp = true
+                        print("[" .. NAME .. "] farm kill: could not restore "
+                            .. tostring(lastWeapon) .. " - leaving your tools alone")
+                    end
+                end
+            else
+                emptySince = nil
+            end
 
             if not tool then
                 if not warnedTool then
@@ -1465,6 +1573,13 @@ task.spawn(function()
             lastSum    = nil
             cachedId, cachedAtk, cachedPs = nil, nil, nil
 
+            -- toggling Farm Kill off and on gives it a fresh budget
+            lastChar   = nil
+            emptySince = nil
+            nextTry    = 0
+            fails      = 0
+            gaveUp     = false
+
             if reachOn then
                 restoreAttackParts()
             end
@@ -1534,5 +1649,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - weapon auto-equip removed", 5)
+notifyUser("Loaded - weapon goes back when your hand is empty", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
