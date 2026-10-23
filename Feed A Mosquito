@@ -1,13 +1,22 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.7  -  Vector3 constructor fixed, auto place eggs loads
+--  v10.8  -  auto place eggs uses ONE spot, no scatter
 --
---  THE CRASH
---    v10.6 died on load with "attempt to call a table value". The
---    offsets table was built with Vector3(gx * 3, 0, gz * 3), but in
---    this VM Vector3 is a table and only Vector3.new is callable.
---    Both places now use Vector3.new.
+--  WHAT WAS WRONG IN v10.7
+--    It walked a 5x5 grid of offsets up to 6 studs away from the
+--    base centre. The server checks the placement position with the
+--    game's own isValidBasePart rule (part.Name == "BasePart", parent
+--    Model name contains "Base", that Model's "Player" ObjectValue is
+--    you), so any offset that lands off the BasePart is refused and no
+--    egg leaves the Backpack. Stacking on a single valid point is
+--    allowed, so that is now the only position used.
+--
+--    It also reports what happened instead of staying silent:
+--        first accepted egg  -> "auto place eggs: placed <uid>"
+--        six passes in a row with no egg leaving the Backpack
+--                            -> one line saying the position is being
+--                               refused, so it is obvious either way
 --
 --  AUTO PLACE EGGS
 --    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor, the
@@ -16,20 +25,9 @@
 --        local hit = raycast onto a BasePart in your own base
 --        PlayerActorIface:FireServer("PlaceEgg", itemUid, hit.Position)
 --
---    and its isValidBasePart check is: part.Name == "BasePart", the
---    parent Model name contains "Base", and that Model's "Player"
---    ObjectValue equals you. So the whole call reduces to the egg
---    Tool's ItemUid plus a point on your BasePart - no mouse, no
---    raycast, no keypress.
---
---    Verified live: firing PlaceEgg once took the Backpack egg count
---    from 10 to 9.
---
---    One egg per PLACE_RATE pass, using the first Egg Tool found in the
---    Backpack. Positions walk a 5x5 grid over your BasePart so the eggs
---    do not all stack on one point; the index advances every pass, so a
---    position the server refuses costs nothing - the next pass simply
---    tries a different one and the same egg.
+--    So the whole call reduces to the egg Tool's ItemUid plus a point
+--    on your BasePart - no mouse, no raycast, no keypress. One egg per
+--    PLACE_RATE pass, always the first Egg Tool in the Backpack.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -79,7 +77,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.7"
+local VERSION = "v10.8"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -103,6 +101,7 @@ local STALE_LIMIT  = 40
 local EQUIP_RATE   = 1.5
 local HATCH_RATE   = 0.6
 local PLACE_RATE   = 0.5
+local PLACE_STALL  = 6
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -435,17 +434,11 @@ end
 --------------------------------------------------------------------
 -- EggToolActor.OnToolActivated ends with exactly:
 --     PlayerActorIface:FireServer("PlaceEgg", itemUid, hitPosition)
--- and its isValidBasePart check is: part.Name == "BasePart", parent
--- Model name contains "Base", and that Model's "Player" ObjectValue is
--- you. Verified live - one call took the Backpack egg count 10 -> 9.
-local PLACE_OFFSETS = {}
-
-for gx = -2, 2 do
-    for gz = -2, 2 do
-        PLACE_OFFSETS[#PLACE_OFFSETS + 1] = Vector3.new(gx * 3, 0, gz * 3)
-    end
-end
-
+-- and isValidBasePart requires the hit to be a part named "BasePart"
+-- inside a Model whose name contains "Base" and whose "Player"
+-- ObjectValue is you. An offset off that part is refused, which is why
+-- the grid in v10.7 placed nothing. Stacking on one valid point works,
+-- so the position is fixed at the top centre of your BasePart.
 local function myBasePart()
     local ok, desc = pcall(function() return WS:GetDescendants() end)
     if not ok or not desc then return nil end
@@ -1211,13 +1204,14 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO PLACE EGGS  (PlaceEgg remote, one egg per pass)
+-- AUTO PLACE EGGS  (PlaceEgg remote, one fixed spot)
 --------------------------------------------------------------------
 task.spawn(function()
     local wasOn   = false
     local lastSay = false
-    local idx     = 1
     local placed  = 0
+    local lastN   = nil
+    local stalls  = 0
 
     while running do
         if Config.AutoPlace then
@@ -1235,15 +1229,31 @@ task.spawn(function()
                 local remote = events and events:FindFirstChild("PlaceEgg")
 
                 if okP and pos and remote then
-                    local off = PLACE_OFFSETS[idx]
-                    idx = idx + 1
-                    if idx > #PLACE_OFFSETS then idx = 1 end
+                    -- one fixed point on the top of your own BasePart;
+                    -- stacking there is allowed, an offset off the part
+                    -- is refused by the server's own validity check
+                    local target = pos + Vector3.new(0, topY, 0)
 
-                    local target = pos + Vector3.new(off.X, topY, off.Z)
+                    if lastN and #eggs < lastN then
+                        placed = placed + 1
+                        stalls = 0
+
+                        if placed == 1 then
+                            print("[" .. NAME .. "] auto place eggs: first egg placed")
+                        end
+                    elseif lastN then
+                        stalls = stalls + 1
+                    end
+
+                    lastN = #eggs
 
                     pcall(function() remote:FireServer(eggs[1], target) end)
 
-                    placed = placed + 1
+                    if stalls == PLACE_STALL then
+                        print("[" .. NAME .. "] auto place eggs: server is refusing "
+                            .. tostring(#eggs) .. " eggs at " .. tostring(target))
+                    end
+
                     lastSay = false
 
                     if not wasOn then
@@ -1257,6 +1267,8 @@ task.spawn(function()
                 end
             elseif not lastSay then
                 lastSay = true
+                lastN   = nil
+                stalls  = 0
                 print("[" .. NAME .. "] auto place eggs: no egg Tools in Backpack")
             end
 
@@ -1268,7 +1280,8 @@ task.spawn(function()
             end
 
             lastSay = false
-            idx     = 1
+            lastN   = nil
+            stalls  = 0
             placed  = 0
             task.wait(0.2)
         end
@@ -1694,5 +1707,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - auto place eggs fixed", 5)
+notifyUser("Loaded - auto place eggs on one spot", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
