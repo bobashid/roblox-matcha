@@ -1,10 +1,11 @@
--- Plus 1 Upgrade Per Kill - reach: hit everyone in the arena - Matcha LuauVM
--- Fires the game's Remotes.Attack at every combatant with the swing origin
--- spoofed onto the target, so the hit lands from anywhere on the map.
+-- Plus 1 Upgrade Per Kill - kill aura - Matcha LuauVM
+-- One toggle. Every pass it hits every alive player inside RANGE, then waits
+-- 0.01s. Uses the game's Remotes.Attack with the swing aimed at the target,
+-- so the server's own distance check still passes.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v1.1'
+local VERSION = 'v1.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -21,13 +22,15 @@ if not Attack then
     warn('[' .. NAME .. '] Remotes.Attack not found - script idle')
 end
 
+-- kill aura radius in studs
+local RANGE = 12
+
 local running = true
 local built   = false
+local targets = {}
 
 local cfg = {
-    enabled   = true,
-    arenaOnly = true,
-    aps       = 80,
+    aura = true,
 }
 
 local function setBool(key, v)
@@ -37,42 +40,32 @@ local function setBool(key, v)
     end
 end
 
-local function setNum(key, v)
-    if cfg[key] ~= v then
-        cfg[key] = v
-        print('[' .. NAME .. '] ' .. key .. ' = ' .. tostring(v))
-    end
-end
-
-local function getChar(plr)
+local function aliveTarget(plr)
+    if plr == lp then return nil end
     local c = plr.Character
     if not c then return nil end
     local hrp = c:FindFirstChild('HumanoidRootPart')
     if not hrp then return nil end
-    return c, hrp
-end
-
-local function isTarget(plr)
-    if plr == lp then return false end
-    local c, hrp = getChar(plr)
-    if not c then return false end
     local cid = c:GetAttribute('CombatantId')
-    if type(cid) ~= 'number' then return false end
+    if type(cid) ~= 'number' then return nil end
     local hp = c:GetAttribute('Health')
-    if type(hp) == 'number' and hp <= 0 then return false end
-    local zone = c:GetAttribute('Zone')
-    if zone == 'Dead' then return false end
-    if cfg.arenaOnly and zone ~= 'Arena' then return false end
-    return true, c, hrp
+    if type(hp) == 'number' and hp <= 0 then return nil end
+    if c:GetAttribute('Zone') ~= 'Arena' then return nil end
+    return { char = c, root = hrp }
 end
 
-local function fireAt(char, hrp)
-    local eye = hrp.Position + Vector3.new(0, 1.5, 0)
+local function fireAt(char, eye, targetPos)
+    local dir = targetPos - eye
+    if dir.Magnitude < 0.001 then
+        dir = Vector3.new(0, -1, 0)
+    else
+        dir = dir.Unit
+    end
     local payload = {
         sprint = false,
         crit   = false,
         eye    = eye,
-        dir    = Vector3.new(0, -1, 0),
+        dir    = dir,
         block  = false,
         charge = 1,
         t      = os.clock(),
@@ -91,14 +84,6 @@ local function firstBool(...)
     for i = 1, select('#', ...) do
         local v = select(i, ...)
         if type(v) == 'boolean' then return v end
-    end
-    return nil
-end
-
-local function firstNumber(...)
-    for i = 1, select('#', ...) do
-        local v = select(i, ...)
-        if type(v) == 'number' then return v end
     end
     return nil
 end
@@ -132,32 +117,13 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
-local function mkSlider(sec, label, id, min, max, default, apply)
-    local cb = function(...)
-        local v = firstNumber(...)
-        if v ~= nil then apply(v) end
-    end
-    local tries = {
-        function() sec:SliderInt(label, id, min, max, default, cb) end,
-        function() sec:SliderInt(id, label, min, max, default, cb) end,
-        function() sec:SliderInt(label, min, max, default, cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    warn('[' .. NAME .. '] slider failed: ' .. label)
-    return false
-end
-
 local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
-        local sec = mkSection(tab, 'Reach')
+        local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Enabled',    'he_enabled', true,  function(v) setBool('enabled', v) end)
-        mkToggle(sec, 'Arena Only', 'he_arena',   true,  function(v) setBool('arenaOnly', v) end)
-        mkSlider(sec, 'Hits / Sec', 'he_aps',     1, 200, 80, function(v) setNum('aps', v) end)
+        mkToggle(sec, 'Kill Aura', 'he_aura', true, function(v) setBool('aura', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -167,7 +133,7 @@ end
 
 if HAS_UI then
     local ok, err = pcall(function()
-        UI.AddTab('Reach All', function(tab)
+        UI.AddTab('Kill Aura', function(tab)
             if built then return end
             print('[' .. NAME .. '] tab opened - building widgets')
             pcall(buildTab, tab)
@@ -187,47 +153,51 @@ task.spawn(function()
     while running do
         if HAS_UI and type(UI.GetValue) == 'function' then
             pcall(function()
-                local v = UI.GetValue('he_enabled')
-                if type(v) ~= 'boolean' then v = UI.GetValue('Enabled') end
-                if type(v) == 'boolean' then cfg.enabled = v end
-
-                local a = UI.GetValue('he_arena')
-                if type(a) ~= 'boolean' then a = UI.GetValue('Arena Only') end
-                if type(a) == 'boolean' then cfg.arenaOnly = a end
-
-                local s = UI.GetValue('he_aps')
-                if type(s) ~= 'number' then s = UI.GetValue('Hits / Sec') end
-                if type(s) == 'number' then cfg.aps = math.clamp(s, 1, 200) end
+                local v = UI.GetValue('he_aura')
+                if type(v) ~= 'boolean' then v = UI.GetValue('Kill Aura') end
+                if type(v) == 'boolean' then cfg.aura = v end
             end)
         end
         task.wait(0.2)
     end
 end)
 
--- attack loop --------------------------------------------------------
--- One burst per pass: every target gets hit, then we wait 1/aps before
--- the next pass. That makes each target's hit rate equal to aps, instead
--- of aps divided by the number of players.
+-- collector: resolves characters a few times a second -----------------
 
 task.spawn(function()
     while running do
-        if cfg.enabled and Attack then
-            local interval = 1 / math.max(1, cfg.aps)
-            local list = Players:GetPlayers()
-            local sent = 0
-            for i = 1, #list do
-                if not running or not cfg.enabled then break end
-                local hit, c, hrp = isTarget(list[i])
-                if hit then
-                    fireAt(c, hrp)
-                    sent = sent + 1
+        local out = {}
+        local list = Players:GetPlayers()
+        for i = 1, #list do
+            local t = aliveTarget(list[i])
+            if t then out[#out + 1] = t end
+        end
+        targets = out
+        task.wait(0.2)
+    end
+end)
+
+-- kill aura loop: one sweep every 0.01s -------------------------------
+
+task.spawn(function()
+    while running do
+        if cfg.aura and Attack then
+            local char = lp.Character
+            local myRoot = char and char:FindFirstChild('HumanoidRootPart')
+            if myRoot then
+                local myPos = myRoot.Position
+                local eye = myPos + Vector3.new(0, 1.5, 0)
+                local list = targets
+                for i = 1, #list do
+                    if not running or not cfg.aura then break end
+                    local t = list[i]
+                    local pos = t.root.Position
+                    if (pos - myPos).Magnitude <= RANGE then
+                        fireAt(t.char, eye, pos)
+                    end
                 end
             end
-            if sent > 0 then
-                task.wait(interval)
-            else
-                task.wait(0.1)
-            end
+            task.wait(0.01)
         else
             task.wait(0.1)
         end
@@ -238,13 +208,13 @@ end)
 
 local function stop()
     running = false
-    cfg.enabled = false
+    cfg.aura = false
     if HAS_UI then
-        pcall(function() UI.RemoveTab('Reach All') end)
+        pcall(function() UI.RemoveTab('Kill Aura') end)
     end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - open the Reach All tab')
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - open the Kill Aura tab')
