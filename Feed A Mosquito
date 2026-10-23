@@ -1,24 +1,17 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v9.8  -  best mosquito is ranked on INCOME, equip fixed
+--  v9.9  -  auto equip is the game's own PlaceBest remote
 --
---  WHAT THE PROBE SHOWED (v9.7 was wrong on both counts)
---    - Humanoid.EquipTool reads as nil in this VM, so the v9.7 equip
---      path never fired. The tool is now re-parented instead:
---          other Tools  -> Backpack
---          best Tool    -> Character
---      which is what an equip actually is, and it replicates.
---    - ItemId is blank on most tools (only some have it), and
---      ItemInfo is an empty string, so neither can rank anything.
---      The MosquitoToolInfoGui labels DO read fine here:
---          Rarity  "Mythical"   Income  "336K/s"
---      so ranking is: Income (K/M/B expanded), then Rarity,
---      then ItemId name rank, then id length. Probe output agreed
---      with the eye: Tank 336K > 270K > 121K > 112K > 108K ...
+--  AUTO EQUIP BEST
+--    No ranking, no re-parenting. The toggle fires
+--        Runtime.Actors.Player_<UserId>.Events.PlaceBest:FireServer()
+--    once when it turns on and then every EQUIP_RATE seconds, so a
+--    newly hatched mosquito is picked up on the next pass.
 --
---    It only re-equips when the winner's tool name changes, so it
---    does not fight your own clicks.
+--    The v9.7 / v9.8 guesses are gone: Humanoid.EquipTool reads nil
+--    in this VM, and ItemId / ItemInfo are blank on most tools, so
+--    neither could rank or equip anything.
 --
 --  v9.5 note (still true): writing a CFrame below the floor does not
 --    put you under it - the Humanoid collides with the baseplate and
@@ -49,7 +42,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v9.8"
+local VERSION = "v9.9"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -116,19 +109,6 @@ local EGG_PRICE = {
     GhostMosquito = 30000, BalloonMosquito = 30000, SniperMosquito = 30000,
     ShockMosquito = 300000, MammothMosquito = 300000,
     RainbowMosquito = 300000, SkullMosquito = 300000,
-}
-
--- secondary tie-break only; income is the real ranking
-local MOSQUITO_RANK = {
-    DemonMosquito = 100, AngelMosquito = 100, TankMosquito = 98,
-    KrakenMosquito = 96, SecretMosquito = 95, DivineMosquito = 90,
-    MythicalMosquito = 80, LegendaryMosquito = 70, EpicMosquito = 60,
-    RareMosquito = 50, UncommonMosquito = 40, CommonMosquito = 30,
-}
-
-local RARITY_RANK = {
-    Common = 1, Uncommon = 2, Rare = 3, Epic = 4,
-    Legendary = 5, Mythical = 6, Divine = 7, Secret = 8,
 }
 
 local RARITY_COLOR = {
@@ -362,6 +342,16 @@ end
 local function fireEvent(name)
     local events = playerEvents()
     local r = events and events:FindFirstChild(name)
+    if not r then return false end
+    return (pcall(function() r:FireServer() end))
+end
+
+--------------------------------------------------------------------
+-- BEST MOSQUITO  (the game's own PlaceBest remote)
+--------------------------------------------------------------------
+local function placeBest()
+    local events = playerEvents()
+    local r = events and events:FindFirstChild("PlaceBest")
     if not r then return false end
     return (pcall(function() r:FireServer() end))
 end
@@ -696,150 +686,6 @@ local function restoreAttackParts()
     end
     reachOn = false
     return n
-end
-
---------------------------------------------------------------------
--- BEST MOSQUITO  (income first, the labels that actually read)
---------------------------------------------------------------------
-local function labelOf(tool, want)
-    local gui  = tool and tool:FindFirstChild("MosquitoToolInfoGui")
-    local main = gui and gui:FindFirstChild("MainFrame")
-    local info = main and main:FindFirstChild("InfoFrame")
-    local lbl  = info and info:FindFirstChild(want)
-    if not lbl then return nil end
-
-    local ok, t = pcall(function() return lbl.Text end)
-    if ok and type(t) == "string" then return t end
-    return nil
-end
-
--- "336K/s" -> 336000, "1.2M/s" -> 1200000
-local function incomeOf(tool)
-    local txt = labelOf(tool, "Income")
-    if type(txt) ~= "string" then return 0 end
-
-    local num, suf = string.match(txt, "([%d%.]+)%s*([KkMmBb]?)")
-    local n = tonumber(num)
-    if not n then return 0 end
-
-    if suf == "K" or suf == "k" then
-        n = n * 1000
-    elseif suf == "M" or suf == "m" then
-        n = n * 1000000
-    elseif suf == "B" or suf == "b" then
-        n = n * 1000000000
-    end
-
-    return n
-end
-
-local function rarityOf(tool)
-    local txt = labelOf(tool, "Rarity")
-    if type(txt) == "string" then return txt end
-    return nil
-end
-
-local function itemIdOf(tool)
-    local v = tool and tool:FindFirstChild("ItemId")
-    if not v then return nil end
-
-    local ok, id = pcall(function() return v.Value end)
-    if ok and type(id) == "string" and #id > 0 then return id end
-    return nil
-end
-
-local function isMosquitoTool(t)
-    if not t or t.ClassName ~= "Tool" then return false end
-
-    local it = t:FindFirstChild("ItemType")
-    if it then
-        local ok, v = pcall(function() return it.Value end)
-        if ok and type(v) == "string" and v ~= "Mosquito" then return false end
-    end
-
-    return labelOf(t, "Income") ~= nil or itemIdOf(t) ~= nil
-end
-
-local function rankOf(id)
-    if type(id) ~= "string" then return 0 end
-    return MOSQUITO_RANK[id] or 0
-end
-
-local function pickBest()
-    local bp   = LP:FindFirstChild("Backpack")
-    local char = LP.Character
-    local pool = {}
-
-    if bp then
-        for i, t in ipairs(bp:GetChildren()) do
-            if isMosquitoTool(t) then pool[#pool + 1] = t end
-        end
-    end
-
-    if char then
-        for i, t in ipairs(char:GetChildren()) do
-            if isMosquitoTool(t) then pool[#pool + 1] = t end
-        end
-    end
-
-    local best = nil
-    local bestInc, bestRar, bestRank, bestLen = -1, -1, -1, -1
-
-    for i = 1, #pool do
-        local t   = pool[i]
-        local id  = itemIdOf(t) or ""
-        local inc = incomeOf(t)
-        local rar = RARITY_RANK[rarityOf(t) or ""] or 0
-        local rk  = rankOf(id)
-        local len = #id
-
-        local wins = false
-
-        if inc > bestInc then
-            wins = true
-        elseif inc == bestInc then
-            if rar > bestRar then
-                wins = true
-            elseif rar == bestRar then
-                if rk > bestRank then
-                    wins = true
-                elseif rk == bestRank and len > bestLen then
-                    wins = true
-                end
-            end
-        end
-
-        if wins then
-            best     = t
-            bestInc  = inc
-            bestRar  = rar
-            bestRank = rk
-            bestLen  = len
-        end
-    end
-
-    return best, bestInc, #pool
-end
-
--- Humanoid.EquipTool is nil here, so this is the equip: re-parent.
-local function equipTool(tool)
-    local char = LP.Character
-    local bp   = LP:FindFirstChild("Backpack")
-
-    if not tool or not char then return false end
-    if tool.Parent == char then return true end
-
-    local held = char:GetChildren()
-    for i = 1, #held do
-        local t = held[i]
-
-        if t.ClassName == "Tool" and t ~= tool and bp then
-            pcall(function() t.Parent = bp end)
-        end
-    end
-
-    pcall(function() tool.Parent = char end)
-    return tool.Parent == char
 end
 
 --------------------------------------------------------------------
@@ -1178,46 +1024,41 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO EQUIP BEST MOSQUITO
+-- AUTO EQUIP BEST  (PlaceBest remote)
 --------------------------------------------------------------------
 task.spawn(function()
-    local wasOn   = false
-    local held    = nil
-    local lastSay = false
+    local wasOn    = false
+    local warned   = false
+    local lastFire = 0
 
     while running do
         if Config.BestEquip and alive() then
-            local best, inc, count = pickBest()
+            local now = tick()
 
-            if best then
-                if best.Name ~= held then
-                    if equipTool(best) then
-                        held = best.Name
-                        print("[" .. NAME .. "] equipped "
-                            .. tostring(itemIdOf(best) or best.Name)
-                            .. "  income " .. tostring(inc)
-                            .. "  (" .. tostring(count) .. " owned)")
+            if not wasOn or (now - lastFire) >= EQUIP_RATE then
+                lastFire = now
+
+                if placeBest() then
+                    if not wasOn then
+                        print("[" .. NAME .. "] auto equip on (PlaceBest)")
                     end
+                    wasOn  = true
+                    warned = false
+                elseif not warned then
+                    warned = true
+                    print("[" .. NAME .. "] auto equip: PlaceBest remote not found")
                 end
-
-                if not wasOn then
-                    wasOn = true
-                    print("[" .. NAME .. "] auto equip on")
-                end
-                lastSay = false
-            elseif not lastSay then
-                lastSay = true
-                print("[" .. NAME .. "] auto equip: no mosquito tools in Backpack")
             end
 
-            task.wait(EQUIP_RATE)
+            task.wait(0.3)
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto equip off (" .. tostring(held) .. ")")
+                print("[" .. NAME .. "] auto equip off")
             end
-            held    = nil
-            lastSay = false
+
+            warned   = false
+            lastFire = 0
             task.wait(0.2)
         end
     end
