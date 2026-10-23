@@ -1,45 +1,25 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.9  -  Hatch Now / Place Eggs Now buttons
+--  v10.10  -  farm kill picks the WEAPON, not the mosquito
 --
---  WHY BUTTONS
---    A probe showed UI.GetValue returns nil for EVERY id, including
---    farm_kill - which does work. So the flags are set by the widget
---    callback, not by the poller, and I could not reproduce which line
---    leaves Auto Hatch / Auto Place Eggs dead. Instead of guessing a
---    fourth time, both features now also have a button that calls the
---    exact same function with no toggle in the path:
+--  THE BUG (probe on the live game)
+--    The Tool you were holding was a mosquito:
+--        ActorId = present but EMPTY, AttackPart = absent
+--    equippedTool() returned the FIRST Tool carrying an ActorId, and
+--    mosquitoes carry one too - so farm kill was handed the mosquito,
+--    read an empty ActorId, found no actor folder, got no Attack
+--    remote, and fired nothing. Silent, exactly as you saw.
 --
---        Hatch Now        -> hatchAll()
---        Place Eggs Now   -> placeOne(next grid offset)
+--  THE FIX
+--    equippedTool() now returns the first Tool that actually has an
+--    AttackPart - the thing the farm loop swings - and only falls back
+--    to an ActorId-only Tool when no weapon is held. Nothing is
+--    reparented and no key is pressed, so this cannot disturb your
+--    tools the way the v10.2-v10.4 auto-equip did.
 --
---    Press them once. If the action happens, the call is good and the
---    problem is only the toggle plumbing. If nothing happens, the
---    message it prints says which piece is missing.
---
---  AUTO HATCH
---    For every Runtime.Actors child named Egg_<uuid>:
---        .Events.Hatch:FireServer()
---    Probe: 19 such actors, all 19 have a Hatch remote.
---    Readiness cannot be read from here (HatchReady is a RemoteEvent,
---    not a value), so the server ignores passes that are not ready.
---
---  AUTO PLACE EGGS
---    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor, the
---    game itself only does this when you activate the egg Tool:
---
---        local hit = raycast onto a BasePart in your own base
---        PlayerActorIface:FireServer("PlaceEgg", itemUid, hit.Position)
---
---    and isValidBasePart is: part.Name == "BasePart", an ancestor whose
---    name contains "Base", and that ancestor's "Player" ObjectValue is
---    you. Verified live: one call took the Backpack count 10 -> 9.
---
---    An occupied spot refuses the egg, so the grid starts at the CENTRE
---    (0,0) - the verified position - steps PLACE_SPACING (6) studs, and
---    is clamped inside your BasePart. Probe found five parts matching
---    you; the largest (60 x 0.2 x 90) is used.
+--    A weapon's ActorId reads fine; it was the mosquito's empty one
+--    that broke the lookup.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -51,7 +31,22 @@
 --    AttackPart is the only thing written on the tool: shrink to 2
 --    studs to end every contact, grow back to map size for a new one,
 --    then PlaySound("SwingSound") + Attack on the LIVE tool actor from
---    the tool's ActorId value. No mouse input, nothing reparented.
+--    the tool's ActorId value.
+--
+--  AUTO HATCH
+--    For every Runtime.Actors child named Egg_<uuid>:
+--        .Events.Hatch:FireServer()
+--    Readiness cannot be read from here (HatchReady is a RemoteEvent,
+--    not a value), so the server ignores passes that are not ready.
+--
+--  AUTO PLACE EGGS
+--    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor:
+--        PlayerActorIface:FireServer("PlaceEgg", itemUid, hitPosition)
+--    isValidBasePart: part.Name == "BasePart", an ancestor whose name
+--    contains "Base", and that ancestor's "Player" ObjectValue is you.
+--    Verified live: one call took the Backpack count 10 -> 9.
+--    Grid starts at the CENTRE, steps PLACE_SPACING studs, clamped
+--    inside your BasePart (the largest matching part is used).
 --
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
@@ -78,7 +73,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.9"
+local VERSION = "v10.10"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -585,19 +580,41 @@ end
 --------------------------------------------------------------------
 -- LIVE TOOL ACTOR
 --------------------------------------------------------------------
+-- true when the Tool actually carries the part the farm loop swings.
+-- Mosquito Tools have an ActorId but no AttackPart, and the empty
+-- ActorId on a mosquito is what broke the old lookup.
+local function hasAttackPart(tool)
+    if not tool then return false end
+    if tool:FindFirstChild("AttackPart") then return true end
+
+    local ok, desc = pcall(function() return tool:GetDescendants() end)
+    if ok and desc then
+        for i = 1, #desc do
+            if desc[i].Name == "AttackPart" then return true end
+        end
+    end
+
+    return false
+end
+
+-- the weapon first, an ActorId-only Tool only as a fallback
 local function equippedTool()
     local c = LP.Character
     if not c then return nil end
 
     local kids = c:GetChildren()
+    local fallback = nil
+
     for i = 1, #kids do
         local t = kids[i]
-        if t.ClassName == "Tool" then
-            if t:FindFirstChild("ActorId") then return t end
+
+        if t.ClassName == "Tool" and t:FindFirstChild("ActorId") then
+            if hasAttackPart(t) then return t end
+            if fallback == nil then fallback = t end
         end
     end
 
-    return nil
+    return fallback
 end
 
 local function actorIdOf(tool)
@@ -607,7 +624,7 @@ local function actorIdOf(tool)
     if not idv then return nil end
 
     local ok, id = pcall(function() return idv.Value end)
-    if ok and type(id) == "string" then return id end
+    if ok and type(id) == "string" and #id > 0 then return id end
     return nil
 end
 
@@ -1605,7 +1622,7 @@ task.spawn(function()
             if not tool then
                 if not warnedTool then
                     warnedTool = true
-                    print("[" .. NAME .. "] farm kill: equip a weapon")
+                    print("[" .. NAME .. "] farm kill: hold a weapon")
                 end
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
                 task.wait(0.25)
@@ -1628,7 +1645,7 @@ task.spawn(function()
                 if not ap then
                     if not warnedAct then
                         warnedAct = true
-                        print("[" .. NAME .. "] farm kill: no AttackPart on this tool")
+                        print("[" .. NAME .. "] farm kill: held tool has no AttackPart")
                     end
                     cachedId = nil
                     task.wait(0.25)
@@ -1808,5 +1825,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Hatch Now / Place Eggs Now buttons added", 5)
+notifyUser("Loaded - farm kill picks the weapon", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
