@@ -1,57 +1,43 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.17  -  four fixes from your report
+--  v10.18  -  farm kill only accepts a weapon, hatch loops all eggs
 --
---  1) IT CYCLED TWO MOSQUITOS IN YOUR INVENTORY
---     Auto Equip Best fired PlaceBest every EQUIP_RATE (1.5 s) no
---     matter what. When two mosquitoes are near-equal the server keeps
---     swapping which one is "best", and you see it flipping.
+--  WHY IT SAID "no AttackPart on this tool" AND SPAMMED live actor
+--    equippedTool() preferred a Tool with an AttackPart but fell back
+--    to any Tool carrying an ActorId. A mosquito Tool has an ActorId
+--    and no AttackPart, so the loop was handed the mosquito, failed
+--    the AttackPart test, and set cachedId = nil - which made it
+--    re-resolve and print "live actor ..." every pass, forever.
 --
---     It now fires only when the set of Mosquito Tools in your
---     Backpack actually changes (a hatch, a purchase), plus once when
---     you enable it. No change, no call, no cycling.
+--    equippedTool() now returns ONLY a Tool that has an AttackPart.
+--    No fallback. If nothing in your hand can swing, the loop says so
+--    once and waits, and the reset logic takes over.
 --
---  2) FARM KILL STOPPED UNTIL YOU RE-TOGGLED
---     The Attack remote was resolved only when the ActorId changed.
---     If the first resolve came back empty - which happens while a Tool
---     is still initialising - cachedAtk stayed nil forever and the loop
---     never fired again.
+--  WHY HATCH BARELY FIRED
+--    It tried a ProximityPrompt that is not where I looked, and the
+--    remote fallback fired one egg per second with a 5 s per-egg
+--    cooldown - far too slow when there are dozens of eggs.
 --
---     It now retries the resolve whenever cachedAtk is nil, so it
---     recovers on its own instead of needing a toggle. The hit block
---     itself is still the v10.5 one, untouched.
---
---  3) TP PICKUP WENT TOO DEEP
---     TP_DEPTH was 10 studs below the egg. The prompt's reach is 10,
---     so being exactly 10 under it was borderline and sometimes out of
---     range. It is now 3 studs, comfortably inside.
---
---  4) AUTO HATCH DID NOT WORK
---     It fired the actor's Events.Hatch RemoteEvent directly. The game
---     only hatches when the ProximityPrompt it creates on the egg (the
---     one whose ActionText becomes "Hatch" when ready) is triggered -
---     that is what EggActor.onPromptTriggered reacts to.
---
---     It now looks for that prompt on your egg models and fires it with
---     fireproximityprompt, falling back to the remote only when no
---     enabled Hatch prompt exists. One egg per pass, each at most once
---     per HATCH_COOLDOWN.
---
---  ALSO STILL IN
---    Reset needs 3 s of a steady weaponless hand (any Tool moving in or
---    out restarts the timer) and 30 s between resets, so the inventory
---    shuffle cannot trip it. It uses memory_write at the fetched health
---    offset (0x184 fallback, verified this session) and puts you back
---    on your saved CFrame.
+--    It now loops the remote you gave me over every Egg_<uuid> actor
+--    in one pass, with a short per-egg cooldown so the same egg is not
+--    hammered:
+--        Egg_<uuid>.Events.Hatch:FireServer()
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
 --      Farm       Farm Kill, Auto Hatch, Auto Equip Best
 --      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
 --
---  PANEL
---      left  PANEL_X = 300   boss name, HP bar, hp / max
+--  FARM KILL  (hit block unchanged from v10.5)
+--    shrink AttackPart to 2 studs, grow it back to map size,
+--    firetouchinterest every boss part, then the Attack + PlaySound
+--    burst on the live tool actor.
+--
+--  AUTO RESET
+--    memory_write("float", hum.Address + offset, -10) at the fetched
+--    health offset (0x184 fallback, verified in game). 3 s of a steady
+--    weaponless hand, 30 s between resets, saved CFrame restored.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -63,7 +49,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.17"
+local VERSION = "v10.18"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -86,7 +72,8 @@ local STALE_LIMIT  = 40
 -- equip / hatch tuning
 local EQUIP_RATE     = 1.5
 local HATCH_RATE     = 1.0
-local HATCH_COOLDOWN = 5.0
+local HATCH_COOLDOWN = 2.0
+local HATCH_GAP      = 0.02
 
 -- respawn tuning
 local FAST_SETTLE   = 3.0
@@ -131,10 +118,6 @@ local COL_HP     = Color3.fromRGB(198, 208, 200)
 --------------------------------------------------------------------
 -- HEALTH OFFSET
 --------------------------------------------------------------------
--- Verified this session: writing a float of -10 at
--- Humanoid.Address + 0x184 took health from 17116448 to -10 and the
--- character died. A scan of Address + 0..4096 found the health float
--- at offset 388 = 0x184, so the constant and theo's offsets agree.
 local OFFSETS_URL     = "https://offsets.imtheo.lol/version-9ac8595712b447a7/offsets.hpp"
 local HEALTH_FALLBACK = 0x184
 
@@ -157,13 +140,6 @@ end
 
 print("[" .. NAME .. "] health offset " .. string.format("0x%X", healthOffset)
     .. " (" .. healthOffsetSource .. ")")
-
-pcall(function()
-    local rt = Players.RespawnTime
-    if type(rt) == "number" then
-        print("[" .. NAME .. "] game respawn time " .. tostring(rt) .. "s (server-side)")
-    end
-end)
 
 local EGG_PRICE = {
     Mosquito = 100, BloodMosquito = 100, NerdMosquito = 100, WhiteMosquito = 100,
@@ -217,16 +193,12 @@ local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
 
--- last time an egg pickup actually fired
 local lastPickupAt = 0
+local hatchFired   = {}
 
--- per-egg hatch timestamps, so one egg is not fired twice in a row
-local hatchFired = {}
-
--- held between the two CFrame writes so stop() can put you back
 local tpHome   = nil
 local tpAway   = false
-local tpSaved  = {}   -- character part address -> { part, collide }
+local tpSaved  = {}
 
 local function restoreHome()
     if tpAway and tpHome then
@@ -242,7 +214,6 @@ local function restoreHome()
     tpHome = nil
 end
 
--- character-only collision switch, restored right after the hop
 local function noClipOn()
     tpSaved = {}
 
@@ -325,6 +296,38 @@ function keyOf(inst)
     local ok, a = pcall(function() return inst.Address end)
     if ok and a ~= nil then return a end
     return inst
+end
+
+local function itemTypeOf(tool)
+    if not tool then return nil end
+
+    local it = tool:FindFirstChild("ItemType")
+    if not it then return nil end
+
+    local ok, v = pcall(function() return it.Value end)
+    if ok and type(v) == "string" then return v end
+    return nil
+end
+
+-- the only thing that counts as a weapon: a Tool carrying an
+-- AttackPart base part. A mosquito Tool has an ActorId and no
+-- AttackPart, which is what used to be picked by mistake.
+local function attackPartOf(tool)
+    if not tool then return nil end
+
+    local ap = tool:FindFirstChild("AttackPart")
+    if ap and isBasePart(ap) then return ap end
+
+    local ok, desc = pcall(function() return tool:GetDescendants() end)
+
+    if ok and desc then
+        for j = 1, #desc do
+            local d = desc[j]
+            if isBasePart(d) and d.Name == "AttackPart" then return d end
+        end
+    end
+
+    return nil
 end
 
 local function areaRarity(areaName)
@@ -418,9 +421,6 @@ local function fireEvent(name)
     return (pcall(function() r:FireServer() end))
 end
 
---------------------------------------------------------------------
--- BEST MOSQUITO  (the game's own PlaceBest remote)
---------------------------------------------------------------------
 local function placeBest()
     local events = playerEvents()
     local r = events and events:FindFirstChild("PlaceBest")
@@ -428,173 +428,25 @@ local function placeBest()
     return (pcall(function() r:FireServer() end))
 end
 
--- a fingerprint of the Mosquito Tools you own. PlaceBest is only sent
--- when this changes, so the server is not asked to re-pick a "best"
--- between two near-equal mosquitoes over and over.
-local function itemTypeOf(tool)
-    if not tool then return nil end
-
-    local it = tool:FindFirstChild("ItemType")
-    if not it then return nil end
-
-    local ok, v = pcall(function() return it.Value end)
-    if ok and type(v) == "string" then return v end
-    return nil
-end
-
-local function mosquitoSignature()
-    local bp = LP:FindFirstChild("Backpack")
-    if not bp then return "" end
-
-    local ok, kids = pcall(function() return bp:GetChildren() end)
-    if not ok or not kids then return "" end
-
-    local s = ""
-
-    for i = 1, #kids do
-        local t = kids[i]
-
-        if t.ClassName == "Tool" and itemTypeOf(t) == "Mosquito" then
-            s = s .. t.Name .. "|"
-        end
-    end
-
-    return s
-end
-
---------------------------------------------------------------------
--- AUTO HATCH  (the egg's own Hatch prompt first)
---------------------------------------------------------------------
--- EggActor only hatches from its ProximityPrompt, whose ActionText
--- becomes "Hatch" and Enabled turns true when the server says ready.
--- Firing the Events.Hatch RemoteEvent directly is what did nothing.
-local function hatchViaPrompt()
-    local areas = WS:FindFirstChild("SpawnAreas")
-    if not areas then return 0 end
-    if type(fireproximityprompt) ~= "function" then return 0 end
-
-    local okA, areaKids = pcall(function() return areas:GetChildren() end)
-    if not okA or not areaKids then return 0 end
-
-    local now = tick()
-
-    for i = 1, #areaKids do
-        local okK, kids = pcall(function() return areaKids[i]:GetChildren() end)
-
-        if okK and kids then
-            for j = 1, #kids do
-                local m = kids[j]
-
-                if m.ClassName == "Model"
-                    and string.find(string.lower(m.Name), "egg", 1, true) then
-                    local key  = keyOf(m)
-                    local last = key and hatchFired[key]
-
-                    if key ~= nil and (last == nil or (now - last) >= HATCH_COOLDOWN) then
-                        local okD, desc = pcall(function() return m:GetDescendants() end)
-
-                        if okD and desc then
-                            for k = 1, #desc do
-                                local d = desc[k]
-
-                                if d.ClassName == "ProximityPrompt" then
-                                    local okAct, act = pcall(function() return d.ActionText end)
-                                    local okEn, en   = pcall(function() return d.Enabled end)
-
-                                    if okAct and act == "Hatch" and (not okEn or en ~= false) then
-                                        if pcall(function() fireproximityprompt(d) end) then
-                                            hatchFired[key] = now
-                                            return 1
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return 0
-end
-
--- fallback: the actor's Hatch remote, one egg per pass
-local function hatchViaRemote()
-    local actors = child(RS, "Runtime", "Actors")
-    if not actors then return 0, 0 end
-
-    local ok, kids = pcall(function() return actors:GetChildren() end)
-    if not ok or not kids then return 0, 0 end
-
-    local now   = tick()
-    local found = 0
-
-    for i = 1, #kids do
-        local a  = kids[i]
-        local nm = a.Name
-
-        if type(nm) == "string"
-            and string.sub(nm, 1, 4) == "Egg_"
-            and string.find(nm, "-", 1, true) then
-            found = found + 1
-
-            local last = hatchFired[nm]
-
-            if last == nil or (now - last) >= HATCH_COOLDOWN then
-                local ev = a:FindFirstChild("Events")
-                local h  = ev and ev:FindFirstChild("Hatch")
-
-                if h then
-                    if pcall(function() h:FireServer() end) then
-                        hatchFired[nm] = now
-                        return 1, found
-                    end
-                end
-            end
-        end
-    end
-
-    return 0, found
-end
-
 --------------------------------------------------------------------
 -- LIVE TOOL ACTOR
 --------------------------------------------------------------------
--- a weapon is any Tool that carries an AttackPart. A mosquito Tool has
--- an ActorId but no AttackPart.
-local function hasAttackPart(tool)
-    if not tool then return false end
-    if tool:FindFirstChild("AttackPart") then return true end
-
-    local ok, desc = pcall(function() return tool:GetDescendants() end)
-    if ok and desc then
-        for i = 1, #desc do
-            if desc[i].Name == "AttackPart" then return true end
-        end
-    end
-
-    return false
-end
-
--- the weapon first, an ActorId-only Tool only as a fallback
+-- ONLY a Tool with an AttackPart. No fallback: handing the farm loop a
+-- mosquito is what produced "no AttackPart on this tool" and the
+-- endless live-actor re-resolve.
 local function equippedTool()
     local c = LP.Character
     if not c then return nil end
 
-    local kids = c:GetChildren()
-    local fallback = nil
+    local ok, kids = pcall(function() return c:GetChildren() end)
+    if not ok or not kids then return nil end
 
     for i = 1, #kids do
         local t = kids[i]
-
-        if t.ClassName == "Tool" and t:FindFirstChild("ActorId") then
-            if hasAttackPart(t) then return t end
-            if fallback == nil then fallback = t end
-        end
+        if t.ClassName == "Tool" and attackPartOf(t) then return t end
     end
 
-    return fallback
+    return nil
 end
 
 local function actorIdOf(tool)
@@ -840,28 +692,10 @@ local function farthestBoss(myPos)
 end
 
 --------------------------------------------------------------------
--- ATTACKPART  (the only thing ever written on the tool)
+-- ATTACKPART size cycle
 --------------------------------------------------------------------
 local apSaved = {}
 local reachOn = false
-
-local function attackPartOf(tool)
-    if not tool then return nil end
-
-    local ap = tool:FindFirstChild("AttackPart")
-    if ap and isBasePart(ap) then return ap end
-
-    local ok, desc = pcall(function() return tool:GetDescendants() end)
-
-    if ok and desc then
-        for j = 1, #desc do
-            local d = desc[j]
-            if isBasePart(d) and d.Name == "AttackPart" then return d end
-        end
-    end
-
-    return nil
-end
 
 local function mapSize()
     local hrp = rootPart()
@@ -911,7 +745,9 @@ local function restoreAttackParts()
     return n
 end
 
--- true when the Character holds no weapon and is not carrying an egg.
+--------------------------------------------------------------------
+-- Reset helpers
+--------------------------------------------------------------------
 local function needsWeapon()
     local c = LP.Character
     if not c then return false end
@@ -923,7 +759,7 @@ local function needsWeapon()
         local t = kids[i]
 
         if t.ClassName == "Tool" then
-            if hasAttackPart(t) then return false end
+            if attackPartOf(t) then return false end
             if itemTypeOf(t) == "Egg" then return false end
         end
     end
@@ -940,14 +776,12 @@ local function backpackHasWeapon()
 
     for i = 1, #kids do
         local t = kids[i]
-        if t.ClassName == "Tool" and hasAttackPart(t) then return true end
+        if t.ClassName == "Tool" and attackPartOf(t) then return true end
     end
 
     return false
 end
 
--- a cheap fingerprint of what is in your hands, so inventory churn
--- restarts the reset timer instead of triggering a kill
 local function handSignature()
     local c = LP.Character
     if not c then return "" end
@@ -966,8 +800,6 @@ local function handSignature()
     return s
 end
 
--- writes -10 into the health field itself, the one thing measured to
--- actually kill here.
 local function killCharacter()
     if type(memory_write) ~= "function" then return false, "no memory_write" end
 
@@ -1322,32 +1154,67 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO HATCH  (prompt first, remote as fallback)
+-- AUTO HATCH  (loops every Egg_<uuid> actor's Hatch remote)
 --------------------------------------------------------------------
+local function hatchAll()
+    local actors = child(RS, "Runtime", "Actors")
+    if not actors then return 0, 0 end
+
+    local ok, kids = pcall(function() return actors:GetChildren() end)
+    if not ok or not kids then return 0, 0 end
+
+    local now   = tick()
+    local found = 0
+    local fired = 0
+
+    for i = 1, #kids do
+        local a  = kids[i]
+        local nm = a.Name
+
+        if type(nm) == "string"
+            and string.sub(nm, 1, 4) == "Egg_"
+            and string.find(nm, "-", 1, true) then
+            found = found + 1
+
+            local last = hatchFired[nm]
+
+            if last == nil or (now - last) >= HATCH_COOLDOWN then
+                local ev = a:FindFirstChild("Events")
+                local h  = ev and ev:FindFirstChild("Hatch")
+
+                if h then
+                    if pcall(function() h:FireServer() end) then
+                        hatchFired[nm] = now
+                        fired = fired + 1
+
+                        if HATCH_GAP > 0 then task.wait(HATCH_GAP) end
+                    end
+                end
+            end
+        end
+    end
+
+    return fired, found
+end
+
 task.spawn(function()
     local wasOn   = false
     local lastSay = false
 
     while running do
         if Config.AutoHatch then
-            local fired = hatchViaPrompt()
-            local found = nil
-
-            if fired == 0 then
-                local f, n = hatchViaRemote()
-                fired = f
-                found = n
-            end
+            local fired, found = hatchAll()
 
             if fired > 0 then
                 if not wasOn then
                     wasOn = true
-                    print("[" .. NAME .. "] auto hatch on (one egg per pass)")
+                    print("[" .. NAME .. "] auto hatch on ("
+                        .. tostring(found) .. " eggs found)")
                 end
                 lastSay = false
             elseif found == 0 and not lastSay then
                 lastSay = true
-                print("[" .. NAME .. "] auto hatch: no egg actor or hatch prompt found")
+                print("[" .. NAME .. "] auto hatch: no Egg_ actor with a Hatch remote")
             end
 
             task.wait(HATCH_RATE)
@@ -1367,6 +1234,26 @@ end)
 --------------------------------------------------------------------
 -- AUTO EQUIP BEST  (only when your mosquito list changes)
 --------------------------------------------------------------------
+local function mosquitoSignature()
+    local bp = LP:FindFirstChild("Backpack")
+    if not bp then return "" end
+
+    local ok, kids = pcall(function() return bp:GetChildren() end)
+    if not ok or not kids then return "" end
+
+    local s = ""
+
+    for i = 1, #kids do
+        local t = kids[i]
+
+        if t.ClassName == "Tool" and itemTypeOf(t) == "Mosquito" then
+            s = s .. t.Name .. "|"
+        end
+    end
+
+    return s
+end
+
 task.spawn(function()
     local wasOn    = false
     local warned   = false
@@ -1416,7 +1303,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- EGG PICKUP  (character collision off during the hop only)
+-- EGG PICKUP
 --------------------------------------------------------------------
 task.spawn(function()
     local hasPrompt = (type(fireproximityprompt) == "function")
@@ -1470,10 +1357,6 @@ task.spawn(function()
                                             tpHome = home
                                             tpAway = true
 
-                                            -- the floor was resolving the
-                                            -- character back up; with the
-                                            -- character's own collision off
-                                            -- the write actually holds
                                             noClipOn()
 
                                             pcall(function()
@@ -1569,7 +1452,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO RESET  (steady empty hand only, then back to the same spot)
+-- AUTO RESET
 --------------------------------------------------------------------
 task.spawn(function()
     local lastKill   = 0
@@ -1589,7 +1472,6 @@ task.spawn(function()
             local now = tick()
             local sig = handSignature()
 
-            -- anything moving in or out of the hand restarts the clock
             if sig ~= lastSig then
                 lastSig    = sig
                 emptySince = nil
@@ -1668,7 +1550,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL  (hit block unchanged from v10.5, recovers its own remote)
+-- FARM KILL
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -1682,6 +1564,7 @@ task.spawn(function()
     local lastSum  = nil
     local stale    = 0
     local cachedId = nil
+    local printedId = nil
     local cachedAtk, cachedPs = nil, nil
 
     while running do
@@ -1691,26 +1574,23 @@ task.spawn(function()
             if not tool then
                 if not warnedTool then
                     warnedTool = true
-                    print("[" .. NAME .. "] farm kill: equip a weapon")
+                    print("[" .. NAME .. "] farm kill: no weapon with an AttackPart in hand")
                 end
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
+                printedId = nil
                 task.wait(0.25)
             else
                 warnedTool = false
 
                 local id = actorIdOf(tool)
 
-                -- retry whenever the remote is missing, not only when
-                -- the ActorId changes: a Tool that was still loading on
-                -- the first look would otherwise stay silent forever
                 if id ~= cachedId or cachedAtk == nil then
                     cachedId = id
                     cachedAtk, cachedPs = remotesOfActor(id)
 
-                    if cachedAtk then
+                    if cachedAtk and id ~= printedId then
+                        printedId = id
                         print("[" .. NAME .. "] live actor " .. tostring(id))
-                    else
-                        cachedId = nil
                     end
                 end
 
@@ -1719,9 +1599,8 @@ task.spawn(function()
                 if not ap then
                     if not warnedAct then
                         warnedAct = true
-                        print("[" .. NAME .. "] farm kill: no AttackPart on this tool")
+                        print("[" .. NAME .. "] farm kill: that weapon has no usable AttackPart")
                     end
-                    cachedId = nil
                     task.wait(0.25)
                 else
                     warnedAct = false
@@ -1829,6 +1708,7 @@ task.spawn(function()
             noBossWarn = false
             lastSum    = nil
             cachedId, cachedAtk, cachedPs = nil, nil, nil
+            printedId  = nil
 
             if reachOn then
                 restoreAttackParts()
@@ -1900,5 +1780,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - hatch via prompt, no mosquito cycling", 5)
+notifyUser("Loaded - weapon only farm kill, hatch loops all eggs", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
