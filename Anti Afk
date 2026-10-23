@@ -1,39 +1,54 @@
 -- Anti Afk - Matcha LuauVM
--- Keeps the client active without moving, jumping or touching your mouse.
--- Keys are injected into Roblox only, never into another window.
--- Roblox's own 20 minute timer is client input based: whether an unfocused
--- client still counts injected input varies by build, so this script reports
--- what it sees instead of assuming.
+-- Built to work while the Roblox window is NOT focused.
+-- Probed on this build: keypress / mouse1click / setrobloxinput reach an
+-- unfocused client 0 times, so the keepalive uses the two things that do
+-- work without focus - the client's own activity remote and a camera
+-- micro-drift. Neither moves the character, so nothing is visible to others.
 
 local NAME    = 'AntiAfk'
-local VERSION = 'v2.0'
+local VERSION = 'v3.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 print('[' .. NAME .. '] ' .. VERSION)
 
-local UIS     = game:GetService('UserInputService')
-local running = true
-local built   = false
-local fires   = 0
-local seen    = 0
-local skipped = 0
-local nextAt  = 0
-local works   = nil
+local UIS = game:GetService('UserInputService')
+local RRS = game:GetService('RobloxReplicatedStorage')
+local RS  = game:GetService('ReplicatedStorage')
+
+local running     = true
+local built       = false
+local fires       = 0
+local remoteFires = 0
+local camDrifts   = 0
+local skipped     = 0
+local nextAt      = 0
+local works       = nil
 
 local cfg = {
-    enabled   = true,
-    interval  = 55,
-    jitter    = 15,
-    unfocused = true,
+    enabled  = true,
+    interval = 60,
+    jitter   = 15,
+    keys     = true,
+    camera   = true,
+    remote   = true,
 }
 
-local VK = 0x13
+local VK      = 0x13
 local remotes = {}
+local seen    = 0
 
 local function log(...)
     print('[' .. NAME .. ']', ...)
+end
+
+local function isActive()
+    if type(isrbxactive) == 'function' then
+        local ok, v = pcall(isrbxactive)
+        if ok then return v == true end
+    end
+    return false
 end
 
 local function schedule()
@@ -50,25 +65,86 @@ local connIn = UIS.InputBegan:Connect(function(input)
     seen = seen + 1
 end)
 
+-- remotes ------------------------------------------------------------
+
+local function addRemote(obj, args)
+    if obj == nil then return false end
+    for i = 1, #remotes do
+        if remotes[i].name == obj.Name then return false end
+    end
+    remotes[#remotes + 1] = { obj = obj, name = obj.Name, args = args or { true } }
+    log('remote registered: ' .. tostring(obj.Name) .. ' (total ' .. #remotes .. ')')
+    return true
+end
+
 local function pingRemotes()
+    if not cfg.remote then return 0 end
     local n = 0
     for i = 1, #remotes do
         local r = remotes[i]
         local ok = pcall(function()
             r.obj:FireServer(table.unpack(r.args))
         end)
-        if ok then n = n + 1 end
+        if ok then
+            n = n + 1
+            remoteFires = remoteFires + 1
+        end
     end
     return n
 end
 
-local function inject()
-    if not cfg.enabled then return false end
-    local active = true
-    if type(isrbxactive) == 'function' then
-        active = isrbxactive()
+local function scanRemotes()
+    local found = {}
+    local roots = { RRS, RS }
+    for i = 1, #roots do
+        local root = roots[i]
+        if root then
+            local ok, kids = pcall(function() return root:GetChildren() end)
+            if ok and kids then
+                for k = 1, #kids do
+                    local c = kids[k]
+                    if c.ClassName == 'RemoteEvent' then
+                        local n = string.lower(c.Name)
+                        if string.find(n, 'active', 1, true) or string.find(n, 'idle', 1, true) or string.find(n, 'presence', 1, true) then
+                            found[#found + 1] = c.Name
+                        end
+                    end
+                end
+            end
+        end
     end
-    if not active and not cfg.unfocused then
+    if #found == 0 then
+        log('scan: no activity remotes found')
+    else
+        log('scan: ' .. table.concat(found, ', '))
+    end
+    return found
+end
+
+-- camera -------------------------------------------------------------
+
+local function driftCamera()
+    if not cfg.camera then return false end
+    local cam = workspace.CurrentCamera
+    if cam == nil then return false end
+    local ok = pcall(function()
+        for i = 1, 4 do
+            cam.CFrame = cam.CFrame * CFrame.Angles(0, math.rad(0.3), 0)
+            task.wait(0.03)
+        end
+    end)
+    if ok then
+        camDrifts = camDrifts + 1
+        return true
+    end
+    return false
+end
+
+-- keys (only land while the window is focused) -----------------------
+
+local function injectKeys()
+    if not cfg.keys then return false end
+    if not isActive() then
         skipped = skipped + 1
         return false
     end
@@ -81,12 +157,7 @@ local function inject()
         task.wait(0.05)
         pcall(keyrelease, VK)
     end
-    if type(setrobloxinput) == 'function' then
-        pcall(setrobloxinput, true, VK)
-        task.wait(0.02)
-        pcall(setrobloxinput, false, VK)
-    end
-    task.wait(0.12)
+    task.wait(0.08)
     fires = fires + 1
     if seen > before then
         works = true
@@ -96,24 +167,39 @@ local function inject()
     return true
 end
 
-local function addRemote(remote, args)
-    if remote == nil then return false end
-    remotes[#remotes + 1] = { obj = remote, args = args or {} }
-    log('remote added, total ' .. #remotes)
-    return true
+local function pass()
+    if not cfg.enabled then return end
+    local active = isActive()
+    local r = pingRemotes()
+    driftCamera()
+    if active then
+        injectKeys()
+    else
+        skipped = skipped + 1
+    end
+    log('pass: focus=' .. tostring(active) .. ' remotes=' .. r ..
+        ' cam=' .. camDrifts .. ' keys=' .. fires .. ' skipped=' .. skipped)
+end
+
+-- boot ---------------------------------------------------------------
+
+do
+    local sua = RRS and RRS:FindFirstChild('SetUserActive')
+    if sua then
+        addRemote(sua, { true })
+    else
+        log('SetUserActive not found in this game')
+    end
+    pcall(function() scanRemotes() end)
 end
 
 task.spawn(function()
     schedule()
+    task.wait(0.2)
+    pcall(pingRemotes)
     while running do
         if tick() >= nextAt then
-            local sent = inject()
-            local r = pingRemotes()
-            if sent and r > 0 then
-                log('key sent and ' .. r .. ' remote pinged')
-            elseif sent then
-                log('key sent, total ' .. fires)
-            end
+            pcall(pass)
             schedule()
         end
         task.wait(1)
@@ -194,15 +280,15 @@ local function mkButton(sec, label, cb)
 end
 
 local function statusLine()
-    local a = false
-    if type(isrbxactive) == 'function' then a = isrbxactive() end
     local w = 'unknown'
-    if works == true then w = 'client sees it'
-    elseif works == false then w = 'client does not see it'
-    end
-    return 'enabled=' .. tostring(cfg.enabled) .. ' fires=' .. fires ..
-        ' seen=' .. seen .. ' skipped=' .. skipped ..
-        ' window=' .. tostring(a) .. ' input=' .. w .. ' remotes=' .. #remotes
+    if works == true then w = 'keys seen'
+    elseif works == false then w = 'keys not seen' end
+    return 'enabled=' .. tostring(cfg.enabled) ..
+        ' focus=' .. tostring(isActive()) ..
+        ' remotes=' .. #remotes .. '/' .. remoteFires ..
+        ' cam=' .. camDrifts ..
+        ' keys=' .. fires .. ' skipped=' .. skipped ..
+        ' input=' .. w
 end
 
 local function buildTab(tab)
@@ -215,11 +301,19 @@ local function buildTab(tab)
             cfg.enabled = v
             log('enabled = ' .. tostring(v))
         end)
-        mkToggle(sec, 'Try While Unfocused', 'aa_unfocused', true, function(v)
-            cfg.unfocused = v
-            log('unfocused attempts = ' .. tostring(v))
+        mkToggle(sec, 'Remote Ping', 'aa_remote', true, function(v)
+            cfg.remote = v
+            log('remote ping = ' .. tostring(v))
         end)
-        mkSlider(sec, 'Interval (s)', 'aa_interval', 20, 300, 55, function(v)
+        mkToggle(sec, 'Camera Drift', 'aa_camera', true, function(v)
+            cfg.camera = v
+            log('camera drift = ' .. tostring(v))
+        end)
+        mkToggle(sec, 'Keys When Focused', 'aa_keys', true, function(v)
+            cfg.keys = v
+            log('keys = ' .. tostring(v))
+        end)
+        mkSlider(sec, 'Interval (s)', 'aa_interval', 20, 300, 60, function(v)
             cfg.interval = v
             schedule()
         end)
@@ -227,17 +321,16 @@ local function buildTab(tab)
             cfg.jitter = v
         end)
         mkButton(sec, 'Send now', function()
-            local sent = inject()
-            log('manual send ' .. tostring(sent) .. ', total ' .. fires)
+            pcall(pass)
+            log('manual pass, status: ' .. statusLine())
             if type(notify) == 'function' then
-                notify('Anti Afk', sent and 'key sent' or 'skipped', 2)
+                notify('Anti Afk', 'pass sent', 2)
             end
         end)
-        mkButton(sec, 'Ping remotes', function()
-            local n = pingRemotes()
-            log('pinged ' .. n .. ' remotes')
+        mkButton(sec, 'Scan remotes', function()
+            local f = scanRemotes()
             if type(notify) == 'function' then
-                notify('Anti Afk', 'pinged ' .. n .. ' remotes', 2)
+                notify('Anti Afk', #f .. ' candidates in log', 3)
             end
         end)
         mkButton(sec, 'Status', function()
@@ -264,6 +357,8 @@ if HAS_UI then
         warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
         HAS_UI = false
     end
+else
+    warn('[' .. NAME .. '] no UI table, running with defaults')
 end
 
 local function stop()
@@ -276,5 +371,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, version = VERSION, addRemote = addRemote }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI))
+_G[NAME] = { stop = stop, addRemote = addRemote, scan = scanRemotes, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, remotes=' .. #remotes .. ' menu=' .. tostring(HAS_UI))
