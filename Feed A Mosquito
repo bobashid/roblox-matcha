@@ -1,22 +1,30 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.2  -  Farm Kill re-equips your weapon itself
+--  v10.3  -  farm kill re-equips the WEAPON, not a mosquito
+--
+--  WHY v10.2 DID NOTHING (probe on the live game)
+--    The Tools in your Character were Sickle, Sickle and FirebrandSword.
+--    Only FirebrandSword has an AttackPart and an ActorId. The 26
+--    mosquito Tools in the Backpack have ActorId but NO AttackPart - a
+--    mosquito is a placed unit, not a weapon you swing. So v10.2 was
+--    picking a mosquito out of the Backpack and calling that "equip",
+--    while the farm loop kept reporting "no AttackPart on this tool".
 --
 --  AUTO WEAPON  (inside Farm Kill, no separate toggle)
---    Picking up an egg puts the egg Tool in your Character and drops
---    the mosquito Tool back into the Backpack, which is why the hits
---    stopped mid-farm. Every pass of the farm loop now checks for a
---    held mosquito Tool and, if there is none, re-parents one from the
---    Backpack into the Character.
+--    The weapon is identified by the thing the farm loop actually needs:
+--    a Tool that contains an AttackPart. Order of preference:
+--        1. a Tool already in the Character with an AttackPart  -> use it
+--        2. otherwise the last weapon we used, from the Backpack
+--        3. otherwise any Backpack Tool with an AttackPart
+--    Equipping is a re-parent of that Tool into the Character. No key,
+--    no input, no Humanoid.EquipTool (it reads nil in this VM). A
+--    re-parent replicates on its own, so it keeps working while the
+--    game window is not focused.
 --
---    That is what an equip is - no hotkey, no input, no EquipTool call
---    (Humanoid.EquipTool reads nil in this VM). It replicates on its
---    own, so it keeps working while the game window is not focused.
---
---    It never steals a mosquito Tool that is still initialising (a
---    held one without an ActorId is left alone), and it does nothing
---    while the toggle is off.
+--    That is what fixes the egg pickup: the game takes the weapon away
+--    when you carry an egg, and the next farm pass (0.12 s) puts the
+--    same weapon straight back and the hits resume.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -38,8 +46,8 @@
 --
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
---    EQUIP_RATE loop. The path is built from LocalPlayer.UserId, so it
---    works on any account.
+--    EQUIP_RATE loop. That one places your best MOSQUITO - it is not the
+--    farm weapon, and the two do not fight each other.
 --
 --  AUTO PICKUP / TP PICKUP
 --    near range  - plain fireproximityprompt, instant
@@ -62,7 +70,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.2"
+local VERSION = "v10.3"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -270,6 +278,26 @@ local function isBasePart(p)
         or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
 end
 
+-- a weapon is any Tool that carries an AttackPart. Mosquito Tools do
+-- not have one, which is why v10.2 "equipped" the wrong thing.
+local function attackPartOf(tool)
+    if not tool then return nil end
+
+    local ap = tool:FindFirstChild("AttackPart")
+    if ap and isBasePart(ap) then return ap end
+
+    local ok, desc = pcall(function() return tool:GetDescendants() end)
+
+    if ok and desc then
+        for j = 1, #desc do
+            local d = desc[j]
+            if isBasePart(d) and d.Name == "AttackPart" then return d end
+        end
+    end
+
+    return nil
+end
+
 function keyOf(inst)
     if inst == nil then return nil end
     local ok, a = pcall(function() return inst.Address end)
@@ -412,99 +440,74 @@ local function hatchAll()
 end
 
 --------------------------------------------------------------------
--- LIVE TOOL ACTOR
+-- WEAPON  (used by Farm Kill only)
 --------------------------------------------------------------------
-local function equippedTool()
+local lastWeapon = nil
+
+local function characterKids()
     local c = LP.Character
     if not c then return nil end
-
-    local kids = c:GetChildren()
-    for i = 1, #kids do
-        local t = kids[i]
-        if t.ClassName == "Tool" then
-            if t:FindFirstChild("ActorId") then return t end
-        end
-    end
-
-    return nil
-end
-
---------------------------------------------------------------------
--- AUTO WEAPON  (used by Farm Kill only)
---------------------------------------------------------------------
-local function isMosquitoTool(t)
-    if not t or t.ClassName ~= "Tool" then return false end
-
-    local it = t:FindFirstChild("ItemType")
-    if it then
-        local ok, v = pcall(function() return it.Value end)
-        if ok and type(v) == "string" then return v == "Mosquito" end
-    end
-
-    return t:FindFirstChild("ActorId") ~= nil
-end
-
-local function heldMosquito()
-    local c = LP.Character
-    if not c then return nil end
-
     local ok, kids = pcall(function() return c:GetChildren() end)
     if not ok or not kids then return nil end
+    return kids
+end
+
+-- the weapon is whatever Tool actually has an AttackPart
+local function weaponInCharacter()
+    local kids = characterKids()
+    if not kids then return nil end
 
     for i = 1, #kids do
         local t = kids[i]
-        if isMosquitoTool(t) then return t end
+        if t.ClassName == "Tool" and attackPartOf(t) ~= nil then return t end
     end
 
     return nil
 end
 
-local function backpackMosquito()
+local function weaponInBackpack(preferred)
     local bp = LP:FindFirstChild("Backpack")
     if not bp then return nil end
 
     local ok, kids = pcall(function() return bp:GetChildren() end)
     if not ok or not kids then return nil end
 
-    local best = nil
+    local fallback = nil
 
     for i = 1, #kids do
         local t = kids[i]
 
-        if isMosquitoTool(t) then
-            if best == nil then
-                best = t
-            elseif best:FindFirstChild("ActorId") == nil
-                and t:FindFirstChild("ActorId") ~= nil then
-                best = t
-            end
+        if t.ClassName == "Tool" and attackPartOf(t) ~= nil then
+            if preferred and t.Name == preferred then return t end
+            if fallback == nil then fallback = t end
         end
     end
 
-    return best
+    return fallback
 end
 
 -- the whole "equip" is this re-parent; it replicates on its own and
 -- needs no keypress, so it also works while the window is not focused
 local function equipWeapon()
-    local char = LP.Character
-    if not char then return nil end
-
-    local held = heldMosquito()
+    local held = weaponInCharacter()
 
     if held then
-        -- a held mosquito that has no ActorId yet is still loading;
-        -- swapping now would just thrash the tool back and forth
-        if held:FindFirstChild("ActorId") then return held end
-        return nil
+        lastWeapon = held.Name
+        return held
     end
 
-    local tool = backpackMosquito()
-    if not tool then return nil end
+    local tool = weaponInBackpack(lastWeapon)
+    local char = LP.Character
+
+    if not tool or not char then return nil end
 
     pcall(function() tool.Parent = char end)
 
-    if tool.Parent == char then return tool end
+    if tool.Parent == char then
+        lastWeapon = tool.Name
+        return tool
+    end
+
     return nil
 end
 
@@ -755,24 +758,6 @@ end
 --------------------------------------------------------------------
 local apSaved = {}
 local reachOn = false
-
-local function attackPartOf(tool)
-    if not tool then return nil end
-
-    local ap = tool:FindFirstChild("AttackPart")
-    if ap and isBasePart(ap) then return ap end
-
-    local ok, desc = pcall(function() return tool:GetDescendants() end)
-
-    if ok and desc then
-        for j = 1, #desc do
-            local d = desc[j]
-            if isBasePart(d) and d.Name == "AttackPart" then return d end
-        end
-    end
-
-    return nil
-end
 
 local function mapSize()
     local hrp = rootPart()
@@ -1405,11 +1390,11 @@ task.spawn(function()
 
     while running do
         if Config.Farm and alive() then
-            local tool = equippedTool()
+            local tool = weaponInCharacter()
 
             if not tool then
-                -- the egg you just picked up replaced the mosquito, so
-                -- put a mosquito back in the Character ourselves
+                -- the egg you just picked up took the weapon away, so
+                -- put the same weapon back in the Character ourselves
                 tool = equipWeapon()
 
                 if tool and tool.Name ~= equippedName then
@@ -1421,7 +1406,7 @@ task.spawn(function()
             if not tool then
                 if not warnedTool then
                     warnedTool = true
-                    print("[" .. NAME .. "] farm kill: no mosquito tool in Backpack")
+                    print("[" .. NAME .. "] farm kill: no weapon with an AttackPart in Backpack")
                 end
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
                 task.wait(0.25)
