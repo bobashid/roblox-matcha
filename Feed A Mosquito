@@ -1,23 +1,29 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.0  -  place eggs picks a BUILDABLE part, not a prop
+--  v10.9  -  Hatch Now / Place Eggs Now buttons
 --
---  WHAT THE PROBES SHOWED
---    v10.8 chose the biggest BasePart -> the 60x90 plate at Y~1.1 and
---    the server refused every attempt ("a full lap of 49 spots was
---    refused").
---    v10.9 chose the nearest BasePart -> a 0.2x0.2x0.2 decoration 67
---    studs away, and a direct PlaceEgg at it placed 0 eggs.
---    The only part that ever accepted an egg is the 40x40 at Y~6 - the
---    build plate on your own plot.
+--  WHY BUTTONS
+--    A probe showed UI.GetValue returns nil for EVERY id, including
+--    farm_kill - which does work. So the flags are set by the widget
+--    callback, not by the poller, and I could not reproduce which line
+--    leaves Auto Hatch / Auto Place Eggs dead. Instead of guessing a
+--    fourth time, both features now also have a button that calls the
+--    exact same function with no toggle in the path:
 --
---  THE RULE NOW
---    A part only counts if its X*Z area is at least MIN_BASE_AREA
---    (100), which throws out every tiny prop, and among those the one
---    CLOSEST to your character wins. Stand on your plot and that is the
---    40x40. The first time the toggle runs it prints the part it chose
---    (size and position) so the log says exactly what was targeted.
+--        Hatch Now        -> hatchAll()
+--        Place Eggs Now   -> placeOne(next grid offset)
+--
+--    Press them once. If the action happens, the call is good and the
+--    problem is only the toggle plumbing. If nothing happens, the
+--    message it prints says which piece is missing.
+--
+--  AUTO HATCH
+--    For every Runtime.Actors child named Egg_<uuid>:
+--        .Events.Hatch:FireServer()
+--    Probe: 19 such actors, all 19 have a Hatch remote.
+--    Readiness cannot be read from here (HatchReady is a RemoteEvent,
+--    not a value), so the server ignores passes that are not ready.
 --
 --  AUTO PLACE EGGS
 --    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor, the
@@ -26,15 +32,19 @@
 --        local hit = raycast onto a BasePart in your own base
 --        PlayerActorIface:FireServer("PlaceEgg", itemUid, hit.Position)
 --
---    and its isValidBasePart check is: part.Name == "BasePart", the
---    parent Model name contains "Base", and that Model's "Player"
---    ObjectValue equals you. One egg per PLACE_RATE pass, grid stepping
---    outward from the centre, every point clamped inside the part.
---    A placement is counted only when the Backpack egg count drops.
+--    and isValidBasePart is: part.Name == "BasePart", an ancestor whose
+--    name contains "Base", and that ancestor's "Player" ObjectValue is
+--    you. Verified live: one call took the Backpack count 10 -> 9.
+--
+--    An occupied spot refuses the egg, so the grid starts at the CENTRE
+--    (0,0) - the verified position - steps PLACE_SPACING (6) studs, and
+--    is clamped inside your BasePart. Probe found five parts matching
+--    you; the largest (60 x 0.2 x 90) is used.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
---      Farm       Farm Kill, Auto Hatch, Auto Equip Best, Auto Place Eggs
+--      Farm       Farm Kill, Auto Hatch, Auto Equip Best,
+--                 Auto Place Eggs, Hatch Now, Place Eggs Now
 --      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
 --
 --  FARM KILL
@@ -43,17 +53,9 @@
 --    then PlaySound("SwingSound") + Attack on the LIVE tool actor from
 --    the tool's ActorId value. No mouse input, nothing reparented.
 --
---  AUTO HATCH
---    For every Runtime.Actors child named Egg_<uuid>:
---        .Events.Hatch:FireServer()
---    on a HATCH_RATE loop. The calls go out (log says 17 eggs) but
---    whether the server acts on them is NOT confirmed - the game only
---    enables that prompt after its own HatchReady fires for you.
---
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
---    EQUIP_RATE loop. The path is built from LocalPlayer.UserId, so it
---    works on any account, not just the one it was tested on.
+--    EQUIP_RATE loop. The path is built from LocalPlayer.UserId.
 --
 --  AUTO PICKUP / TP PICKUP
 --    near range  - plain fireproximityprompt, instant
@@ -76,7 +78,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v11.0"
+local VERSION = "v10.9"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -97,12 +99,11 @@ local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
 -- equip / hatch / place tuning
-local EQUIP_RATE     = 1.5
-local HATCH_RATE     = 0.6
-local PLACE_RATE     = 0.5
-local PLACE_SPACING  = 4
-local PLACE_RINGS    = 3
-local MIN_BASE_AREA  = 100
+local EQUIP_RATE    = 1.5
+local HATCH_RATE    = 0.6
+local PLACE_RATE    = 0.5
+local PLACE_SPACING = 6
+local PLACE_RINGS   = 3
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -439,51 +440,33 @@ end
 -- Model name contains "Base", and that Model's "Player" ObjectValue is
 -- you. Verified live - one call took the Backpack egg count 10 -> 9.
 --
--- Two failed heuristics before this one:
---   biggest  -> 60x90 plate at Y~1.1, server refused every position
---   nearest  -> a 0.2 stud prop 67 studs away, placed 0
--- So: ignore anything with an X*Z area under MIN_BASE_AREA, then take
--- the closest of what is left. On your plot that is the 40x40 plate.
+-- An occupied spot refuses the egg, so the grid below starts at the
+-- centre and steps PLACE_SPACING studs, clamped inside your BasePart.
 local PLACE_OFFSETS = { { x = 0, z = 0 } }
 
-for r = 1, PLACE_RINGS do
-    for gx = -r, r do
-        for gz = -r, r do
+for ring = 1, PLACE_RINGS do
+    for gx = -ring, ring do
+        for gz = -ring, ring do
             local mx = gx
             if mx < 0 then mx = -mx end
 
             local mz = gz
             if mz < 0 then mz = -mz end
 
-            if mx == r or mz == r then
+            if mx == ring or mz == ring then
                 PLACE_OFFSETS[#PLACE_OFFSETS + 1] = { x = gx, z = gz }
             end
         end
     end
 end
 
-local lastGoodBase = nil
-
+-- mirrors the game's isValidBasePart, then keeps the biggest match
 local function myBasePart()
-    if lastGoodBase then
-        local okP = pcall(function() return lastGoodBase.Parent end)
-        if okP and lastGoodBase.Parent ~= nil then return lastGoodBase end
-        lastGoodBase = nil
-    end
-
     local ok, desc = pcall(function() return WS:GetDescendants() end)
     if not ok or not desc then return nil end
 
-    local hrp = rootPart()
-    local myPos = nil
-
-    if hrp then
-        local okM, p = pcall(function() return hrp.Position end)
-        if okM and p then myPos = p end
-    end
-
     local best     = nil
-    local bestDist = 1e12
+    local bestArea = -1
 
     for i = 1, #desc do
         local d = desc[i]
@@ -515,21 +498,9 @@ local function myBasePart()
                     area = sz.X * sz.Z
                 end
 
-                if area >= MIN_BASE_AREA then
-                    local dist = 0
-
-                    if myPos then
-                        local okP2, p2 = pcall(function() return d.Position end)
-                        if okP2 and p2 then
-                            local okD, dd = pcall(function() return (p2 - myPos).Magnitude end)
-                            if okD and type(dd) == "number" then dist = dd end
-                        end
-                    end
-
-                    if dist < bestDist then
-                        bestDist = dist
-                        best     = d
-                    end
+                if area > bestArea then
+                    bestArea = area
+                    best     = d
                 end
             end
         end
@@ -566,6 +537,49 @@ local function backpackEggs()
     end
 
     return out
+end
+
+-- fires one egg at one grid offset. Returns false when there is no
+-- BasePart, no egg Tool or no PlaceEgg remote to talk to.
+local function placeOne(off)
+    local part = myBasePart()
+    if not part then return false end
+
+    local eggs = backpackEggs()
+    if #eggs == 0 then return false end
+
+    local okP, pos = pcall(function() return part.Position end)
+    local okS, sz  = pcall(function() return part.Size end)
+
+    if not okP or not pos then return false end
+
+    local topY  = 1
+    local halfX = 12
+    local halfZ = 12
+
+    if okS and sz and type(sz.Y) == "number" then
+        topY  = sz.Y / 2
+        halfX = sz.X / 2 - 2
+        halfZ = sz.Z / 2 - 2
+
+        if halfX < 0 then halfX = 0 end
+        if halfZ < 0 then halfZ = 0 end
+    end
+
+    local events = playerEvents()
+    local remote = events and events:FindFirstChild("PlaceEgg")
+    if not remote then return false end
+
+    local ox = (off and off.x or 0) * PLACE_SPACING
+    local oz = (off and off.z or 0) * PLACE_SPACING
+
+    if ox > halfX then ox = halfX elseif ox < -halfX then ox = -halfX end
+    if oz > halfZ then oz = halfZ elseif oz < -halfZ then oz = -halfZ end
+
+    local target = pos + Vector3.new(ox, topY, oz)
+
+    pcall(function() remote:FireServer(eggs[1], target) end)
+    return true
 end
 
 --------------------------------------------------------------------
@@ -1073,7 +1087,7 @@ end
 startHud()
 
 --------------------------------------------------------------------
--- Toggle plumbing
+-- Toggle / button plumbing
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
@@ -1098,6 +1112,19 @@ local function safeToggle(sec, name, id, default, cb)
         if pcall(tries[i]) then return true end
     end
     warn("[" .. NAME .. "] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function safeButton(sec, label, cb)
+    local tries = {
+        function() sec:Button(label, cb) end,
+        function() sec:Button(cb, label) end,
+        function() sec:Button(label) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Button failed: " .. tostring(label))
     return false
 end
 
@@ -1151,6 +1178,26 @@ local function buildTab(tab)
             addToggle(farm, "Auto Hatch", "auto_hatch", "AutoHatch", false)
             addToggle(farm, "Auto Equip Best", "auto_equip_best", "BestEquip", false)
             addToggle(farm, "Auto Place Eggs", "auto_place_eggs", "AutoPlace", false)
+
+            local btnIdx = 1
+
+            safeButton(farm, "Hatch Now", function()
+                local fired = hatchAll()
+                print("[" .. NAME .. "] hatch now: fired on " .. tostring(fired) .. " eggs")
+            end)
+
+            safeButton(farm, "Place Eggs Now", function()
+                local off = PLACE_OFFSETS[btnIdx]
+                btnIdx = btnIdx + 1
+                if btnIdx > #PLACE_OFFSETS then btnIdx = 1 end
+
+                if placeOne(off) then
+                    print("[" .. NAME .. "] place eggs now: fired at offset "
+                        .. tostring(off.x) .. "," .. tostring(off.z))
+                else
+                    print("[" .. NAME .. "] place eggs now: no BasePart, egg Tool or PlaceEgg remote")
+                end
+            end)
         end
 
         local pick = makeSection(tab, "Egg Pickup", "Left")
@@ -1282,14 +1329,12 @@ task.spawn(function()
     local placed    = 0
     local lastCount = nil
     local misses    = 0
-    local saidPart  = false
 
     while running do
         if Config.AutoPlace then
-            local part = myBasePart()
             local eggs = backpackEggs()
 
-            if part and #eggs > 0 then
+            if #eggs > 0 then
                 local count = #eggs
 
                 if not wasOn then
@@ -1298,20 +1343,9 @@ task.spawn(function()
                         .. tostring(count) .. " egg Tools in Backpack)")
                 end
 
-                if not saidPart then
-                    saidPart = true
-
-                    local okS, sz = pcall(function() return part.Size end)
-                    local okP, ps = pcall(function() return part.Position end)
-
-                    print("[" .. NAME .. "] placing on "
-                        .. tostring(okS and sz) .. " at " .. tostring(okP and ps))
-                end
-
                 if lastCount and count < lastCount then
                     placed = placed + (lastCount - count)
                     misses = 0
-                    lastGoodBase = part
                 elseif lastCount then
                     misses = misses + 1
 
@@ -1325,42 +1359,13 @@ task.spawn(function()
                 lastCount = count
                 lastSay   = false
 
-                local okP, pos = pcall(function() return part.Position end)
-                local okS, sz  = pcall(function() return part.Size end)
+                local off = PLACE_OFFSETS[idx]
+                idx = idx + 1
+                if idx > #PLACE_OFFSETS then idx = 1 end
 
-                local topY  = 1
-                local halfX = 12
-                local halfZ = 12
-
-                if okS and sz and type(sz.Y) == "number" then
-                    topY  = sz.Y / 2
-                    halfX = sz.X / 2 - 2
-                    halfZ = sz.Z / 2 - 2
-
-                    if halfX < 0 then halfX = 0 end
-                    if halfZ < 0 then halfZ = 0 end
-                end
-
-                local events = playerEvents()
-                local remote = events and events:FindFirstChild("PlaceEgg")
-
-                if okP and pos and remote then
-                    local off = PLACE_OFFSETS[idx]
-                    idx = idx + 1
-                    if idx > #PLACE_OFFSETS then idx = 1 end
-
-                    local ox = off.x * PLACE_SPACING
-                    local oz = off.z * PLACE_SPACING
-
-                    if ox > halfX then ox = halfX elseif ox < -halfX then ox = -halfX end
-                    if oz > halfZ then oz = halfZ elseif oz < -halfZ then oz = -halfZ end
-
-                    local target = pos + Vector3.new(ox, topY, oz)
-
-                    pcall(function() remote:FireServer(eggs[1], target) end)
-                elseif not lastSay then
+                if not placeOne(off) and not lastSay then
                     lastSay = true
-                    print("[" .. NAME .. "] auto place eggs: no buildable BasePart of yours or no PlaceEgg remote")
+                    print("[" .. NAME .. "] auto place eggs: no BasePart of yours or no PlaceEgg remote")
                 end
             elseif not lastSay then
                 lastSay = true
@@ -1379,7 +1384,6 @@ task.spawn(function()
             placed    = 0
             lastCount = nil
             misses    = 0
-            saidPart  = false
             task.wait(0.2)
         end
     end
@@ -1804,5 +1808,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - place eggs on your build plate", 5)
+notifyUser("Loaded - Hatch Now / Place Eggs Now buttons added", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
