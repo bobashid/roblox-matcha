@@ -6,9 +6,11 @@
 --    ProximityPrompt -> fireproximityprompt(prompt)
 --    ClickDetector   -> fireclickdetector(cd, 0, "MouseClick")
 --
---  The Items section is built once from the real prompts in the
---  place: one button per item name, each button fires every prompt
---  that belongs to that name, no matter how far away it is.
+--  NAMING
+--    Matcha reads ObjectText / ActionText as nil, so a real item
+--    like "Big Coffee Cup" is named from the model it sits in,
+--    not from the prompt text. Model names win over part names,
+--    generic names (Part, Model, Pickup...) are skipped.
 --
 --  MENU: Auto Pickup All toggle, Pick Up Everything, Rescan World,
 --        and one button per discovered item.
@@ -18,7 +20,7 @@ local Workspace = game:GetService("Workspace")
 
 local LP = Players.LocalPlayer
 
-local VERSION       = "1.0.0"
+local VERSION       = "1.1.0"
 local NAME          = "CleanEverything"
 local MAX_BUTTONS   = 30
 local SCAN_EVERY    = 2
@@ -98,10 +100,16 @@ end
 --------------------------------------------------------------------
 -- NAMING
 --------------------------------------------------------------------
-local SKIP_NAMES = {
+local GENERIC = {
     Prompt = true, Prompts = true, ProximityPrompt = true,
     ClickDetector = true, Detector = true, Interact = true,
-    Interactables = true, Items = true, Folder = true,
+    Interactables = true, Interactions = true, Items = true, Item = true,
+    Folder = true, Folders = true, Part = true, Model = true,
+    MeshPart = true, Union = true, UnionOperation = true, Wedge = true,
+    Hitbox = true, Click = true, Pickup = true, PickUp = true,
+    Pickups = true, Collect = true, Collectable = true, Collectible = true,
+    Spawn = true, Spawner = true, Decoration = true, Decor = true,
+    Handle = true, Main = true, Root = true, Base = true,
 }
 
 local function readProp(inst, prop)
@@ -118,20 +126,42 @@ local function cleanName(v)
     return v
 end
 
+local function meaningful(v)
+    local s = cleanName(v)
+    if not s then return nil end
+    if GENERIC[s] then return nil end
+    if s:match("^%d+$") then return nil end
+    if s:match("^%d+%s*") and #s < 4 then return nil end
+    return s
+end
+
+-- Matcha returns nil for ObjectText / ActionText, so the real item
+-- name comes from the instance chain. A Model name wins, then the
+-- nearest ancestor that is not a generic placeholder.
 local function nameFor(inst)
-    local obj = cleanName(readProp(inst, "ObjectText"))
+    local obj = meaningful(readProp(inst, "ObjectText"))
     if obj then return obj end
-    local act = cleanName(readProp(inst, "ActionText"))
+    local act = meaningful(readProp(inst, "ActionText"))
     if act then return act end
 
-    local node  = inst.Parent
-    local depth = 0
-    while node and node ~= Workspace and depth < 5 do
-        local n = cleanName(readProp(node, "Name"))
-        if n and not SKIP_NAMES[n] then return n end
+    local node     = inst.Parent
+    local depth    = 0
+    local nearest  = nil
+    local own      = meaningful(readProp(inst, "Name"))
+
+    while node and node ~= Workspace and depth < 6 do
+        local n = meaningful(readProp(node, "Name"))
+        if n then
+            local cn = node.ClassName
+            if cn == "Model" then return n end
+            if nearest == nil then nearest = n end
+        end
         node  = node.Parent
         depth = depth + 1
     end
+
+    if nearest then return nearest end
+    if own then return own end
     return "Item"
 end
 
@@ -148,6 +178,7 @@ local function scan()
 
     local fresh = {}
     local order = {}
+    local seen  = {}
 
     for i = 1, #list do
         local inst = list[i]
@@ -167,7 +198,10 @@ local function scan()
                 fresh[key] = g
                 order[#order + 1] = key
             end
-            g.entries[#g.entries + 1] = { inst = inst, kind = kind }
+            if not seen[inst] then
+                seen[inst] = true
+                g.entries[#g.entries + 1] = { inst = inst, kind = kind }
+            end
         end
     end
 
@@ -286,7 +320,8 @@ local function buildTab(tab)
                     local id    = "ce_item_" .. tostring(shown)
                     local label = key .. "  x" .. tostring(#g.entries)
                     safeButton(secI, label, id, function()
-                        fireGroup(key)
+                        local n = fireGroup(key)
+                        print("[Clean Everything] " .. key .. " -> " .. tostring(n))
                     end)
                 end
             end
