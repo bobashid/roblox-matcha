@@ -1,0 +1,371 @@
+--==================================================================
+--  Clean Everything  |  Crossmap Pickup Menu
+--  Matcha LuaVM  -  built-in Matcha menu tab (UI.AddTab)
+--
+--  NO TELEPORTING. Every pickup is fired from where you stand:
+--    ProximityPrompt -> fireproximityprompt(prompt)
+--    ClickDetector   -> fireclickdetector(cd, 0, "MouseClick")
+--
+--  The Items section is built once from the real prompts in the
+--  place: one button per item name, each button fires every prompt
+--  that belongs to that name, no matter how far away it is.
+--
+--  MENU: Auto Pickup All toggle, Pick Up Everything, Rescan World,
+--        and one button per discovered item.
+--==================================================================
+local Players   = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+
+local LP = Players.LocalPlayer
+
+local VERSION       = "1.0.0"
+local NAME          = "CleanEverything"
+local MAX_BUTTONS   = 30
+local SCAN_EVERY    = 2
+local FIRE_COOLDOWN = 0.35
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+
+local running  = true
+local conns    = {}
+local drawings = {}
+
+local function stop()
+    running = false
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    conns = {}
+    for i = 1, #drawings do
+        pcall(function() drawings[i]:Remove() end)
+    end
+    drawings = {}
+    print("[Clean Everything] stopped")
+end
+
+local Config = { AutoAll = false }
+
+local TOGGLES     = {}
+local getterWorks = {}
+
+local function applyBool(key)
+    return function(...)
+        if getterWorks[key] then return end
+        local n = select("#", ...)
+        for i = 1, n do
+            local v = select(i, ...)
+            if type(v) == "boolean" then
+                Config[key] = v
+                return
+            end
+        end
+    end
+end
+
+local function registerToggle(key, id, name)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name }
+end
+
+local function safeToggle(sec, name, id, default, cb)
+    local v = {
+        function() sec:Toggle(name, id, default, cb) end,
+        function() sec:Toggle(id, name, default, cb) end,
+    }
+    for i = 1, #v do if pcall(v[i]) then return true end end
+    warn("[Clean Everything] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function safeButton(sec, name, id, cb)
+    local v = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, id, cb) end,
+        function() sec:Button(id, name, cb) end,
+    }
+    for i = 1, #v do if pcall(v[i]) then return true end end
+    warn("[Clean Everything] Button failed: " .. tostring(name))
+    return false
+end
+
+local function makeSection(tab, name, side)
+    local ok, sec = pcall(function() return tab:Section(name, side) end)
+    if ok and type(sec) == "table" then return sec end
+    ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and type(sec) == "table" then return sec end
+    return nil
+end
+
+--------------------------------------------------------------------
+-- NAMING
+--------------------------------------------------------------------
+local SKIP_NAMES = {
+    Prompt = true, Prompts = true, ProximityPrompt = true,
+    ClickDetector = true, Detector = true, Interact = true,
+    Interactables = true, Items = true, Folder = true,
+}
+
+local function readProp(inst, prop)
+    local ok, v = pcall(function() return inst[prop] end)
+    if ok then return v end
+    return nil
+end
+
+local function cleanName(v)
+    if type(v) ~= "string" then return nil end
+    v = v:gsub("^%s+", "")
+    v = v:gsub("%s+$", "")
+    if v == "" then return nil end
+    return v
+end
+
+local function nameFor(inst)
+    local obj = cleanName(readProp(inst, "ObjectText"))
+    if obj then return obj end
+    local act = cleanName(readProp(inst, "ActionText"))
+    if act then return act end
+
+    local node  = inst.Parent
+    local depth = 0
+    while node and node ~= Workspace and depth < 5 do
+        local n = cleanName(readProp(node, "Name"))
+        if n and not SKIP_NAMES[n] then return n end
+        node  = node.Parent
+        depth = depth + 1
+    end
+    return "Item"
+end
+
+--------------------------------------------------------------------
+-- SCAN
+--------------------------------------------------------------------
+local groups     = {}
+local groupOrder = {}
+local lastFired  = {}
+
+local function scan()
+    local ok, list = pcall(function() return Workspace:GetDescendants() end)
+    if not ok or type(list) ~= "table" then return end
+
+    local fresh = {}
+    local order = {}
+
+    for i = 1, #list do
+        local inst = list[i]
+        local cn   = inst.ClassName
+        local kind = nil
+        if cn == "ProximityPrompt" then
+            kind = "prompt"
+        elseif cn == "ClickDetector" then
+            kind = "click"
+        end
+
+        if kind then
+            local key = nameFor(inst)
+            local g   = fresh[key]
+            if not g then
+                g = { name = key, entries = {} }
+                fresh[key] = g
+                order[#order + 1] = key
+            end
+            g.entries[#g.entries + 1] = { inst = inst, kind = kind }
+        end
+    end
+
+    table.sort(order, function(a, b) return a < b end)
+
+    groups     = fresh
+    groupOrder = order
+end
+
+--------------------------------------------------------------------
+-- FIRE
+--------------------------------------------------------------------
+local warnedPrompt = false
+local warnedClick  = false
+
+local function fireEntry(e)
+    if not e or not e.inst then return false end
+
+    local now  = os.clock()
+    local last = lastFired[e.inst]
+    if last and (now - last) < FIRE_COOLDOWN then return false end
+
+    if e.kind == "prompt" then
+        if type(fireproximityprompt) ~= "function" then
+            if not warnedPrompt then
+                warnedPrompt = true
+                print("[Clean Everything] fireproximityprompt missing - re-run the Matcha loader (Pro)")
+            end
+            return false
+        end
+        lastFired[e.inst] = now
+        pcall(fireproximityprompt, e.inst)
+        return true
+    end
+
+    if type(fireclickdetector) ~= "function" then
+        if not warnedClick then
+            warnedClick = true
+            print("[Clean Everything] fireclickdetector missing - re-run the Matcha loader (Pro)")
+        end
+        return false
+    end
+    lastFired[e.inst] = now
+    pcall(fireclickdetector, e.inst, 0, "MouseClick")
+    return true
+end
+
+local function fireGroup(key)
+    local g = groups[key]
+    if not g then return 0 end
+    local n = 0
+    for i = 1, #g.entries do
+        if fireEntry(g.entries[i]) then n = n + 1 end
+    end
+    return n
+end
+
+local function fireAll()
+    local n = 0
+    for i = 1, #groupOrder do
+        n = n + fireGroup(groupOrder[i])
+    end
+    return n
+end
+
+local function printList()
+    local parts = {}
+    for i = 1, #groupOrder do
+        local g = groups[groupOrder[i]]
+        if g then
+            parts[#parts + 1] = g.name .. " (" .. tostring(#g.entries) .. ")"
+        end
+    end
+    local msg = "none"
+    if #parts > 0 then msg = table.concat(parts, ", ") end
+    print("[Clean Everything] items: " .. msg)
+end
+
+--------------------------------------------------------------------
+-- MENU
+--------------------------------------------------------------------
+local tabBuilt      = false
+local firstScanDone = false
+
+local function buildTab(tab)
+    if tabBuilt then return end
+    if not firstScanDone then return end
+    if type(tab) ~= "table" then return end
+    tabBuilt = true
+
+    pcall(function()
+        local secA = makeSection(tab, "Auto", "Left")
+        if secA then
+            if safeToggle(secA, "Auto Pickup All", "ce_auto_all", false, applyBool("AutoAll")) then
+                registerToggle("AutoAll", "ce_auto_all", "Auto Pickup All")
+            end
+            safeButton(secA, "Pick Up Everything Now", "ce_pick_all", function()
+                local n = fireAll()
+                print("[Clean Everything] fired " .. tostring(n) .. " pickups")
+            end)
+            safeButton(secA, "Rescan World", "ce_rescan", function()
+                scan()
+                printList()
+            end)
+        end
+
+        local secI = makeSection(tab, "Items", "Right")
+        if secI then
+            local shown = 0
+            for i = 1, #groupOrder do
+                if shown >= MAX_BUTTONS then break end
+                local key = groupOrder[i]
+                local g   = groups[key]
+                if g and #g.entries > 0 then
+                    shown = shown + 1
+                    local id    = "ce_item_" .. tostring(shown)
+                    local label = key .. "  x" .. tostring(#g.entries)
+                    safeButton(secI, label, id, function()
+                        fireGroup(key)
+                    end)
+                end
+            end
+            if shown == 0 then
+                safeButton(secI, "No prompts found - press Rescan", "ce_item_none", function()
+                    scan()
+                    printList()
+                end)
+            end
+        end
+    end)
+end
+
+pcall(function()
+    UI.AddTab("Clean Everything", function(tab) buildTab(tab) end)
+end)
+
+--------------------------------------------------------------------
+-- TOGGLE POLLER - single source of truth
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t   = TOGGLES[i]
+            local val = nil
+
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == "boolean" then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                if ok2 and type(v2) == "boolean" then val = v2 end
+            end
+
+            if val ~= nil then
+                getterWorks[t.key] = true
+                if Config[t.key] ~= val then
+                    Config[t.key] = val
+                    print("[Clean Everything] " .. t.key .. " = " .. tostring(val))
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+--------------------------------------------------------------------
+-- SCAN LOOP
+--------------------------------------------------------------------
+task.spawn(function()
+    local started = os.clock()
+    while running do
+        scan()
+        if not firstScanDone then
+            if #groupOrder > 0 or (os.clock() - started) > 8 then
+                firstScanDone = true
+                printList()
+            end
+        end
+        task.wait(SCAN_EVERY)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO LOOP
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoAll then
+            fireAll()
+        end
+        task.wait(0.2)
+    end
+end)
+
+--------------------------------------------------------------------
+_G[NAME] = { stop = stop, version = VERSION }
+
+print("[Clean Everything] v" .. VERSION .. " loaded - crossmap pickup, no teleport")
+pcall(function()
+    notify("Clean Everything", "v" .. VERSION .. " loaded - pick items from the menu", 4)
+end)
