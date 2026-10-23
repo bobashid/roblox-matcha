@@ -1,7 +1,13 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.6  -  auto place eggs
+--  v10.7  -  Vector3 constructor fixed, auto place eggs loads
+--
+--  THE CRASH
+--    v10.6 died on load with "attempt to call a table value". The
+--    offsets table was built with Vector3(gx * 3, 0, gz * 3), but in
+--    this VM Vector3 is a table and only Vector3.new is callable.
+--    Both places now use Vector3.new.
 --
 --  AUTO PLACE EGGS
 --    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor, the
@@ -73,7 +79,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.6"
+local VERSION = "v10.7"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -436,7 +442,7 @@ local PLACE_OFFSETS = {}
 
 for gx = -2, 2 do
     for gz = -2, 2 do
-        PLACE_OFFSETS[#PLACE_OFFSETS + 1] = Vector3(gx * 3, 0, gz * 3)
+        PLACE_OFFSETS[#PLACE_OFFSETS + 1] = Vector3.new(gx * 3, 0, gz * 3)
     end
 end
 
@@ -1233,7 +1239,7 @@ task.spawn(function()
                     idx = idx + 1
                     if idx > #PLACE_OFFSETS then idx = 1 end
 
-                    local target = pos + Vector3(off.X, topY, off.Z)
+                    local target = pos + Vector3.new(off.X, topY, off.Z)
 
                     pcall(function() remote:FireServer(eggs[1], target) end)
 
@@ -1688,5 +1694,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - auto place eggs added", 5)
+notifyUser("Loaded - auto place eggs fixed", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
