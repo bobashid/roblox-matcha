@@ -1,28 +1,36 @@
 -- Anti Afk - Matcha LuauVM
--- Virtual key keepalive. Nothing replicates: no movement, no jump, no mouse.
--- Input is only injected while the Roblox window is focused, so it never
--- types into your browser or another app.
+-- Keeps the client active without moving, jumping or touching your mouse.
+-- Keys are injected into Roblox only, never into another window.
+-- Roblox's own 20 minute timer is client input based: whether an unfocused
+-- client still counts injected input varies by build, so this script reports
+-- what it sees instead of assuming.
 
 local NAME    = 'AntiAfk'
-local VERSION = 'v1.0'
+local VERSION = 'v2.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 print('[' .. NAME .. '] ' .. VERSION)
 
+local UIS     = game:GetService('UserInputService')
 local running = true
 local built   = false
 local fires   = 0
+local seen    = 0
+local skipped = 0
 local nextAt  = 0
+local works   = nil
 
 local cfg = {
-    enabled  = true,
-    interval = 60,
-    jitter   = 20,
+    enabled   = true,
+    interval  = 55,
+    jitter    = 15,
+    unfocused = true,
 }
 
-local VK = 0x13 -- Pause key, unbound in normal games
+local VK = 0x13
+local remotes = {}
 
 local function log(...)
     print('[' .. NAME .. ']', ...)
@@ -38,33 +46,72 @@ local function schedule()
     nextAt = tick() + w
 end
 
-local function inject()
-    if not cfg.enabled then return false end
-    if type(keypress) ~= 'function' then return false end
-    if type(isrbxactive) == 'function' then
-        if not isrbxactive() then return false end
+local connIn = UIS.InputBegan:Connect(function(input)
+    seen = seen + 1
+end)
+
+local function pingRemotes()
+    local n = 0
+    for i = 1, #remotes do
+        local r = remotes[i]
+        local ok = pcall(function()
+            r.obj:FireServer(table.unpack(r.args))
+        end)
+        if ok then n = n + 1 end
     end
-    local ok = pcall(function()
-        keypress(VK)
-        task.wait(0.06)
-        keyrelease(VK)
-    end)
-    if ok then
-        fires = fires + 1
-        return true
-    end
-    return false
+    return n
 end
 
-if type(setrobloxinput) == 'function' then
-    pcall(setrobloxinput, true)
+local function inject()
+    if not cfg.enabled then return false end
+    local active = true
+    if type(isrbxactive) == 'function' then
+        active = isrbxactive()
+    end
+    if not active and not cfg.unfocused then
+        skipped = skipped + 1
+        return false
+    end
+    local before = seen
+    if type(setrobloxinput) == 'function' then
+        pcall(setrobloxinput, true)
+    end
+    if type(keypress) == 'function' then
+        pcall(keypress, VK)
+        task.wait(0.05)
+        pcall(keyrelease, VK)
+    end
+    if type(setrobloxinput) == 'function' then
+        pcall(setrobloxinput, true, VK)
+        task.wait(0.02)
+        pcall(setrobloxinput, false, VK)
+    end
+    task.wait(0.12)
+    fires = fires + 1
+    if seen > before then
+        works = true
+    elseif works == nil then
+        works = false
+    end
+    return true
+end
+
+local function addRemote(remote, args)
+    if remote == nil then return false end
+    remotes[#remotes + 1] = { obj = remote, args = args or {} }
+    log('remote added, total ' .. #remotes)
+    return true
 end
 
 task.spawn(function()
     schedule()
     while running do
         if tick() >= nextAt then
-            if inject() then
+            local sent = inject()
+            local r = pingRemotes()
+            if sent and r > 0 then
+                log('key sent and ' .. r .. ' remote pinged')
+            elseif sent then
                 log('key sent, total ' .. fires)
             end
             schedule()
@@ -146,6 +193,18 @@ local function mkButton(sec, label, cb)
     return false
 end
 
+local function statusLine()
+    local a = false
+    if type(isrbxactive) == 'function' then a = isrbxactive() end
+    local w = 'unknown'
+    if works == true then w = 'client sees it'
+    elseif works == false then w = 'client does not see it'
+    end
+    return 'enabled=' .. tostring(cfg.enabled) .. ' fires=' .. fires ..
+        ' seen=' .. seen .. ' skipped=' .. skipped ..
+        ' window=' .. tostring(a) .. ' input=' .. w .. ' remotes=' .. #remotes
+end
+
 local function buildTab(tab)
     if built then return end
     built = true
@@ -156,24 +215,36 @@ local function buildTab(tab)
             cfg.enabled = v
             log('enabled = ' .. tostring(v))
         end)
-        mkSlider(sec, 'Interval (s)', 'aa_interval', 20, 300, 60, function(v)
+        mkToggle(sec, 'Try While Unfocused', 'aa_unfocused', true, function(v)
+            cfg.unfocused = v
+            log('unfocused attempts = ' .. tostring(v))
+        end)
+        mkSlider(sec, 'Interval (s)', 'aa_interval', 20, 300, 55, function(v)
             cfg.interval = v
             schedule()
         end)
-        mkSlider(sec, 'Jitter (s)', 'aa_jitter', 0, 60, 20, function(v)
+        mkSlider(sec, 'Jitter (s)', 'aa_jitter', 0, 60, 15, function(v)
             cfg.jitter = v
         end)
         mkButton(sec, 'Send now', function()
             local sent = inject()
-            log('manual send: ' .. tostring(sent) .. ', total ' .. fires)
+            log('manual send ' .. tostring(sent) .. ', total ' .. fires)
             if type(notify) == 'function' then
-                notify('Anti Afk', sent and 'key sent' or 'skipped (window not focused)', 2)
+                notify('Anti Afk', sent and 'key sent' or 'skipped', 2)
+            end
+        end)
+        mkButton(sec, 'Ping remotes', function()
+            local n = pingRemotes()
+            log('pinged ' .. n .. ' remotes')
+            if type(notify) == 'function' then
+                notify('Anti Afk', 'pinged ' .. n .. ' remotes', 2)
             end
         end)
         mkButton(sec, 'Status', function()
-            local a = false
-            if type(isrbxactive) == 'function' then a = isrbxactive() end
-            log('status: enabled=' .. tostring(cfg.enabled) .. ' fires=' .. fires .. ' active=' .. tostring(a))
+            log(statusLine())
+            if type(notify) == 'function' then
+                notify('Anti Afk', statusLine(), 4)
+            end
         end)
     end)
     if not ok then
@@ -197,6 +268,7 @@ end
 
 local function stop()
     running = false
+    pcall(function() connIn:Disconnect() end)
     if type(UI) == 'table' and type(UI.RemoveTab) == 'function' then
         pcall(function() UI.RemoveTab('Anti Afk') end)
     end
@@ -204,5 +276,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, version = VERSION }
+_G[NAME] = { stop = stop, version = VERSION, addRemote = addRemote }
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI))
