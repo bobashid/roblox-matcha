@@ -1,35 +1,45 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.1  -  Farm section, full toggle names
+--  v10.2  -  Farm Kill re-equips your weapon itself
+--
+--  AUTO WEAPON  (inside Farm Kill, no separate toggle)
+--    Picking up an egg puts the egg Tool in your Character and drops
+--    the mosquito Tool back into the Backpack, which is why the hits
+--    stopped mid-farm. Every pass of the farm loop now checks for a
+--    held mosquito Tool and, if there is none, re-parents one from the
+--    Backpack into the Character.
+--
+--    That is what an equip is - no hotkey, no input, no EquipTool call
+--    (Humanoid.EquipTool reads nil in this VM). It replicates on its
+--    own, so it keeps working while the game window is not focused.
+--
+--    It never steals a mosquito Tool that is still initialising (a
+--    held one without an ActorId is left alone), and it does nothing
+--    while the toggle is off.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
 --      Farm       Farm Kill, Auto Hatch, Auto Equip Best
 --      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
---    No abbreviated labels and no abbreviated widget ids.
 --
 --  FARM KILL
 --    AttackPart is the only thing written on the tool: shrink to 2
 --    studs to end every contact, grow back to map size for a new one,
 --    then PlaySound("SwingSound") + Attack on the LIVE tool actor from
---    the tool's ActorId value. No mouse input, nothing reparented.
+--    the tool's ActorId value.
 --
 --  AUTO HATCH
 --    For every Runtime.Actors child named Egg_<uuid>:
 --        .Events.Hatch:FireServer()
---    on a HATCH_RATE loop. The egg actors are rebuilt every pass, so a
---    newly placed egg is picked up on the next tick. Enemy_* actors
---    have no Hatch remote and are skipped.
---
---    Readiness cannot be read from here: HatchReady is a RemoteEvent,
---    not a value, and hooking is not available. So every Hatch is fired
---    on each pass and the server ignores the ones that are not ready.
+--    on a HATCH_RATE loop. Readiness cannot be read from here
+--    (HatchReady is a RemoteEvent, not a value), so the server ignores
+--    the passes that are not ready yet.
 --
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
 --    EQUIP_RATE loop. The path is built from LocalPlayer.UserId, so it
---    works on any account, not just the one it was tested on.
+--    works on any account.
 --
 --  AUTO PICKUP / TP PICKUP
 --    near range  - plain fireproximityprompt, instant
@@ -52,7 +62,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.1"
+local VERSION = "v10.2"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -416,6 +426,85 @@ local function equippedTool()
         end
     end
 
+    return nil
+end
+
+--------------------------------------------------------------------
+-- AUTO WEAPON  (used by Farm Kill only)
+--------------------------------------------------------------------
+local function isMosquitoTool(t)
+    if not t or t.ClassName ~= "Tool" then return false end
+
+    local it = t:FindFirstChild("ItemType")
+    if it then
+        local ok, v = pcall(function() return it.Value end)
+        if ok and type(v) == "string" then return v == "Mosquito" end
+    end
+
+    return t:FindFirstChild("ActorId") ~= nil
+end
+
+local function heldMosquito()
+    local c = LP.Character
+    if not c then return nil end
+
+    local ok, kids = pcall(function() return c:GetChildren() end)
+    if not ok or not kids then return nil end
+
+    for i = 1, #kids do
+        local t = kids[i]
+        if isMosquitoTool(t) then return t end
+    end
+
+    return nil
+end
+
+local function backpackMosquito()
+    local bp = LP:FindFirstChild("Backpack")
+    if not bp then return nil end
+
+    local ok, kids = pcall(function() return bp:GetChildren() end)
+    if not ok or not kids then return nil end
+
+    local best = nil
+
+    for i = 1, #kids do
+        local t = kids[i]
+
+        if isMosquitoTool(t) then
+            if best == nil then
+                best = t
+            elseif best:FindFirstChild("ActorId") == nil
+                and t:FindFirstChild("ActorId") ~= nil then
+                best = t
+            end
+        end
+    end
+
+    return best
+end
+
+-- the whole "equip" is this re-parent; it replicates on its own and
+-- needs no keypress, so it also works while the window is not focused
+local function equipWeapon()
+    local char = LP.Character
+    if not char then return nil end
+
+    local held = heldMosquito()
+
+    if held then
+        -- a held mosquito that has no ActorId yet is still loading;
+        -- swapping now would just thrash the tool back and forth
+        if held:FindFirstChild("ActorId") then return held end
+        return nil
+    end
+
+    local tool = backpackMosquito()
+    if not tool then return nil end
+
+    pcall(function() tool.Parent = char end)
+
+    if tool.Parent == char then return tool end
     return nil
 end
 
@@ -1297,7 +1386,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL
+-- FARM KILL  (re-equips the weapon itself)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -1312,15 +1401,27 @@ task.spawn(function()
     local stale    = 0
     local cachedId = nil
     local cachedAtk, cachedPs = nil, nil
+    local equippedName = nil
 
     while running do
         if Config.Farm and alive() then
             local tool = equippedTool()
 
             if not tool then
+                -- the egg you just picked up replaced the mosquito, so
+                -- put a mosquito back in the Character ourselves
+                tool = equipWeapon()
+
+                if tool and tool.Name ~= equippedName then
+                    equippedName = tool.Name
+                    print("[" .. NAME .. "] farm kill: equipped " .. tostring(tool.Name))
+                end
+            end
+
+            if not tool then
                 if not warnedTool then
                     warnedTool = true
-                    print("[" .. NAME .. "] farm kill: equip a weapon")
+                    print("[" .. NAME .. "] farm kill: no mosquito tool in Backpack")
                 end
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
                 task.wait(0.25)
@@ -1446,12 +1547,13 @@ task.spawn(function()
                 print("[" .. NAME .. "] farm kill off")
             end
 
-            warnedTool = false
-            warnedAct  = false
-            stale      = 0
-            staleWarn  = false
-            noBossWarn = false
-            lastSum    = nil
+            warnedTool   = false
+            warnedAct    = false
+            stale        = 0
+            staleWarn    = false
+            noBossWarn   = false
+            lastSum      = nil
+            equippedName = nil
             cachedId, cachedAtk, cachedPs = nil, nil, nil
 
             if reachOn then
@@ -1523,5 +1625,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - Farm section added", 5)
+notifyUser("Loaded - farm kill re-equips your weapon", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
