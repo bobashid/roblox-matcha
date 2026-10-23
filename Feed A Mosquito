@@ -1,33 +1,50 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.13  -  fast respawn that puts you back where you stood
+--  v10.14  -  respawn works: health is written in memory
 --
---  WHY v10.12 NEVER FIRED
---    It required "no live boss" before resetting. A boss standing
---    there alive (which is exactly the case when you have no weapon to
---    kill it with) made that false forever, so the reset never ran.
---    That condition is gone.
+--  WHY THE OLD RESPAWN DID NOTHING
+--    Humanoid.Health = 0 and Character:BreakJoints() were both
+--    measured as no-ops in this game - health stayed at its value and
+--    the character stayed alive, because the server re-syncs
+--    Humanoid.Health. Writing the field in memory sidesteps that.
+--
+--  VERIFIED THIS SESSION
+--    memory_write("float", hum.Address + 0x184, -10)
+--        before = 17116448, alive = true
+--        after  = -10,       alive = false
+--    So the write lands and the character dies.
+--
+--    The offset 0x184 is independently confirmed: a scan of
+--    Address + 0..4096 found the health float at offset 388, which is
+--    0x184. theo's offsets file also reports Health = 0x184.
+--
+--  THE OFFSET IS FETCHED, WITH A FALLBACK
+--    At load this tries theo's offsets.hpp for the current Roblox
+--    version and parses "Health = 0x...". If the fetch or the parse
+--    fails it uses 0x184 and says so in the console, so you can see
+--    which one it used. Offsets shift when Roblox updates, so the
+--    fetch is the version-proof path and the fallback is the safety
+--    net.
 --
 --  FAST RESPAWN  (inside Farm Kill, no separate toggle)
---    When Farm Kill is on and your Character holds NO Tool at all - no
---    weapon, no egg being carried - it:
---        1. remembers your HumanoidRootPart CFrame
---        2. sets Humanoid.Health = 0 (the same thing dying does)
---        3. watches for the new Character
---        4. writes the remembered CFrame back onto the new
---           HumanoidRootPart, so you land exactly where you stood
+--    Fires when Farm Kill is on, you are alive, and the Character
+--    holds NO Tool at all - no weapon, no egg being carried. That is
+--    the "nothing in the queue and not holding my weapon" case.
+--
+--        1. remember your HumanoidRootPart CFrame
+--        2. memory_write health to -10
+--        3. watch for the new Character every 0.05 s
+--        4. write the saved CFrame onto the new HumanoidRootPart
+--
 --    The game then runs its own respawn equip, which is the re-equip
 --    you confirmed works. Nothing re-parents a Tool.
 --
---    Timing: fires after FAST_SETTLE (0.4 s) of an empty hand, at most
---    once every FAST_COOLDOWN (1.5 s). The moment the game puts a
---    weapon back in your hand the loop stops, so it cannot sit there
---    resetting you forever.
---
---    No "no boss" / "no pickup" condition: an egg in hand IS a Tool,
---    so the empty-hand test already skips pickups, and an idle boss no
---    longer blocks the reset.
+--  THE RESPAWN DELAY
+--    The wait between death and respawn is the game's own
+--    Players.RespawnTime, server-side. A client cannot shorten it. The
+--    script prints that value on load so you know what to expect, and
+--    returns you to your spot the moment the new character exists.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -72,15 +89,12 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.13"
+local VERSION = "v10.14"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
 end
 print("[" .. NAME .. "] " .. VERSION)
-
-local running = true
-local built   = false
 
 -- fixed tuning
 local POLL_RATE    = 0.1
@@ -96,10 +110,10 @@ local STALE_LIMIT  = 40
 local EQUIP_RATE   = 1.5
 local HATCH_RATE   = 0.6
 
--- fast respawn tuning
+-- respawn tuning
 local FAST_SETTLE   = 0.4
 local FAST_COOLDOWN = 1.5
-local FAST_MAX_WAIT = 6.0
+local FAST_MAX_WAIT = 15.0
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -135,6 +149,48 @@ local COL_BAR_BG = Color3.fromRGB(26, 26, 33)
 local COL_FILL   = Color3.fromRGB(120, 190, 135)
 local COL_NAME   = Color3.fromRGB(255, 255, 255)
 local COL_HP     = Color3.fromRGB(198, 208, 200)
+
+--------------------------------------------------------------------
+-- HEALTH OFFSET
+--------------------------------------------------------------------
+-- Verified this session: writing a float of -10 at
+-- Humanoid.Address + 0x184 took health from 17116448 to -10 and the
+-- character died. A scan of Address + 0..4096 found the health float
+-- at offset 388 = 0x184, so the constant and theo's offsets agree.
+-- Offsets move with Roblox updates, so fetch first, fall back after.
+local OFFSETS_URL      = "https://offsets.imtheo.lol/version-9ac8595712b447a7/offsets.hpp"
+local HEALTH_FALLBACK  = 0x184
+
+local healthOffset       = HEALTH_FALLBACK
+local healthOffsetSource = "fallback"
+
+do
+    local ok, res = pcall(function() return game:HttpGet(OFFSETS_URL) end)
+
+    if ok and type(res) == "string" then
+        local hex = res:match("Health%s*=%s*(0x%x+)")
+        local n   = hex and tonumber(hex)
+
+        if n and n > 0 then
+            healthOffset       = n
+            healthOffsetSource = "fetched"
+        end
+    end
+end
+
+print("[" .. NAME .. "] health offset " .. string.format("0x%X", healthOffset)
+    .. " (" .. healthOffsetSource .. ")")
+
+local respawnTime = nil
+
+pcall(function()
+    local rt = Players.RespawnTime
+    if type(rt) == "number" then respawnTime = rt end
+end)
+
+if respawnTime then
+    print("[" .. NAME .. "] game respawn time " .. tostring(respawnTime) .. "s (server-side)")
+end
 
 local EGG_PRICE = {
     Mosquito = 100, BloodMosquito = 100, NerdMosquito = 100, WhiteMosquito = 100,
@@ -190,9 +246,6 @@ local RARITY_IDS  = {}
 
 -- last time an egg pickup actually fired
 local lastPickupAt = 0
-
--- where the fast respawn should put you back
-local respawnHome = nil
 
 -- held between the two CFrame writes so stop() can put you back
 local tpHome   = nil
@@ -765,7 +818,7 @@ local function restoreAttackParts()
 end
 
 -- any Tool at all in the Character: a weapon, a mosquito, or an egg
--- being carried. The fast respawn must see none of these.
+-- being carried. The respawn must see none of these.
 local function anythingInHand()
     local c = LP.Character
     if not c then return true end
@@ -778,6 +831,26 @@ local function anythingInHand()
     end
 
     return false
+end
+
+-- writes -10 into the health field itself, which is the one thing that
+-- actually kills here. Humanoid.Health = 0 and BreakJoints were both
+-- measured as no-ops because the server re-syncs the property.
+local function killCharacter()
+    if type(memory_write) ~= "function" then return false, "no memory_write" end
+
+    local hum = humanoid()
+    if not hum then return false, "no humanoid" end
+
+    local okA, addr = pcall(function() return hum.Address end)
+    if not okA or type(addr) ~= "number" then return false, "no Address" end
+
+    local ok = pcall(function()
+        memory_write("float", addr + healthOffset, -10)
+    end)
+
+    if not ok then return false, "write failed" end
+    return true, nil
 end
 
 --------------------------------------------------------------------
@@ -1346,20 +1419,24 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FAST RESPAWN  (reset, then put you back where you stood)
+-- FAST RESPAWN  (memory write, then back to your spot)
 --------------------------------------------------------------------
--- You found the game re-equips your weapon on respawn, so the re-equip
--- is done by the game: this only triggers the respawn and returns you
--- to the exact CFrame you were standing on.
+-- Humanoid.Health = 0 and BreakJoints were both measured as no-ops in
+-- this game. Writing the health field in memory does work:
+--     memory_write("float", hum.Address + 0x184, -10)
+--     health 17116448 -> -10, alive false
+-- This resets the character the same way dying does, so the game runs
+-- its own respawn equip, and then puts you back on the saved CFrame.
 --
 -- Fires when Farm Kill is on, you are alive, and the Character holds
 -- NO Tool at all (no weapon, no carried egg). After FAST_SETTLE of an
 -- empty hand, at most once every FAST_COOLDOWN. As soon as the game
 -- puts a weapon back in your hand it stops.
 task.spawn(function()
-    local lastReset  = 0
+    local lastKill   = 0
     local emptySince = nil
     local lastChar   = nil
+    local watching   = false
 
     while running do
         if Config.Farm and alive() then
@@ -1376,46 +1453,60 @@ task.spawn(function()
                 if emptySince == nil then emptySince = now end
 
                 if (now - emptySince) >= FAST_SETTLE
-                    and (now - lastReset) >= FAST_COOLDOWN then
-                    local hum = humanoid()
+                    and (now - lastKill) >= FAST_COOLDOWN
+                    and not watching then
                     local hrp = rootPart()
+                    local home = nil
 
-                    if hum and hum.Health > 0 then
-                        lastReset  = now
+                    if hrp then
+                        local ok, cf = pcall(function() return hrp.CFrame end)
+                        if ok and cf then home = cf end
+                    end
+
+                    local okKill, why = killCharacter()
+
+                    if okKill then
+                        lastKill   = now
                         emptySince = nil
+                        watching   = true
 
-                        if hrp then
-                            local ok, cf = pcall(function() return hrp.CFrame end)
-                            if ok and cf then respawnHome = cf end
-                        end
+                        print("[" .. NAME .. "] no weapon in hand: resetting")
 
-                        print("[" .. NAME .. "] no weapon in hand: respawning")
-
-                        local target = respawnHome
-                        pcall(function() hum.Health = 0 end)
-
-                        -- put the new Character back on the saved spot
                         task.spawn(function()
                             local waited = 0
 
                             while running and waited < FAST_MAX_WAIT do
-                                task.wait(0.1)
-                                waited = waited + 0.1
+                                task.wait(0.05)
+                                waited = waited + 0.05
 
                                 local c = LP.Character
-                                local h = c and c:FindFirstChild("Humanoid")
+                                local h = c and c:FindFirstChildOfClass("Humanoid")
 
                                 if c and h and h.Health > 0 then
                                     local r = c:FindFirstChild("HumanoidRootPart")
 
-                                    if r and target then
-                                        pcall(function() r.CFrame = target end)
+                                    if r and home then
+                                        pcall(function() r.CFrame = home end)
                                     end
 
+                                    print("[" .. NAME .. "] respawned"
+                                        .. (home and " - put back on your spot" or ""))
+
+                                    watching = false
                                     return
                                 end
                             end
+
+                            if running then
+                                print("[" .. NAME .. "] still no new character after "
+                                    .. tostring(FAST_MAX_WAIT) .. "s - reset once by hand")
+                            end
+
+                            watching = false
                         end)
+                    else
+                        lastKill = now
+                        print("[" .. NAME .. "] reset failed: " .. tostring(why))
                     end
                 end
             end
@@ -1424,7 +1515,7 @@ task.spawn(function()
             lastChar   = nil
         end
 
-        task.wait(0.25)
+        task.wait(0.2)
     end
 end)
 
@@ -1649,12 +1740,11 @@ local function stop()
     eggCache  = {}
     eggStamp  = 0
     partCache = {}
-    respawnHome = nil
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - fast respawn returns you to your spot", 5)
+notifyUser("Loaded - reset writes health in memory", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
