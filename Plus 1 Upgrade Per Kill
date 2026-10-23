@@ -1,0 +1,240 @@
+-- Plus 1 Upgrade Per Kill - reach: hit everyone in the arena - Matcha LuauVM
+-- Fires the game's Remotes.Attack at every combatant with the swing origin
+-- spoofed onto the target, so the hit lands from anywhere on the map.
+-- No Instance.new, no hooks, no input simulation.
+
+local NAME    = 'HitEveryone'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players = game:GetService('Players')
+local RS      = game:GetService('ReplicatedStorage')
+local lp      = Players.LocalPlayer
+
+local remotes = RS:FindFirstChild('Remotes')
+local Attack  = remotes and remotes:FindFirstChild('Attack')
+if not Attack then
+    warn('[' .. NAME .. '] Remotes.Attack not found - script idle')
+end
+
+local running = true
+local built   = false
+
+local cfg = {
+    enabled   = true,
+    arenaOnly = true,
+    aps       = 20,
+}
+
+local function setBool(key, v)
+    if cfg[key] ~= v then
+        cfg[key] = v
+        print('[' .. NAME .. '] ' .. key .. ' = ' .. tostring(v))
+    end
+end
+
+local function setNum(key, v)
+    if cfg[key] ~= v then
+        cfg[key] = v
+        print('[' .. NAME .. '] ' .. key .. ' = ' .. tostring(v))
+    end
+end
+
+local function getChar(plr)
+    local c = plr.Character
+    if not c then return nil end
+    local hrp = c:FindFirstChild('HumanoidRootPart')
+    if not hrp then return nil end
+    return c, hrp
+end
+
+local function isTarget(plr)
+    if plr == lp then return false end
+    local c, hrp = getChar(plr)
+    if not c then return false end
+    local cid = c:GetAttribute('CombatantId')
+    if type(cid) ~= 'number' then return false end
+    local hp = c:GetAttribute('Health')
+    if type(hp) == 'number' and hp <= 0 then return false end
+    local zone = c:GetAttribute('Zone')
+    if zone == 'Dead' then return false end
+    if cfg.arenaOnly and zone ~= 'Arena' then return false end
+    return true, c, hrp
+end
+
+local function fireAt(char, hrp)
+    local eye = hrp.Position + Vector3.new(0, 1.5, 0)
+    local payload = {
+        sprint = false,
+        crit   = false,
+        eye    = eye,
+        dir    = Vector3.new(0, -1, 0),
+        block  = false,
+        charge = 1,
+        t      = os.clock(),
+        vt     = nil,
+    }
+    pcall(function()
+        Attack:FireServer(char, payload)
+    end)
+end
+
+-- menu ---------------------------------------------------------------
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok2, sec2 = pcall(function() return tab:Section(name) end)
+    if ok2 and sec2 ~= nil then return sec2 end
+    warn('[' .. NAME .. '] section ' .. name .. ' failed')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'Reach')
+        if not sec then return end
+        mkToggle(sec, 'Enabled',    'he_enabled', true,  function(v) setBool('enabled', v) end)
+        mkToggle(sec, 'Arena Only', 'he_arena',   true,  function(v) setBool('arenaOnly', v) end)
+        mkSlider(sec, 'Hits / Sec', 'he_aps',     1, 30, 20, function(v) setNum('aps', v) end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] build error: ' .. tostring(err))
+    end
+    print('[' .. NAME .. '] tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Reach All', function(tab)
+            if built then return end
+            print('[' .. NAME .. '] tab opened - building widgets')
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn('[' .. NAME .. '] no UI table - menu unavailable')
+end
+
+-- poll the menu ------------------------------------------------------
+
+task.spawn(function()
+    while running do
+        if HAS_UI and type(UI.GetValue) == 'function' then
+            pcall(function()
+                local v = UI.GetValue('he_enabled')
+                if type(v) ~= 'boolean' then v = UI.GetValue('Enabled') end
+                if type(v) == 'boolean' then cfg.enabled = v end
+
+                local a = UI.GetValue('he_arena')
+                if type(a) ~= 'boolean' then a = UI.GetValue('Arena Only') end
+                if type(a) == 'boolean' then cfg.arenaOnly = a end
+
+                local s = UI.GetValue('he_aps')
+                if type(s) ~= 'number' then s = UI.GetValue('Hits / Sec') end
+                if type(s) == 'number' then cfg.aps = math.clamp(s, 1, 30) end
+            end)
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- attack loop --------------------------------------------------------
+
+task.spawn(function()
+    while running do
+        if cfg.enabled and Attack then
+            local interval = 1 / math.max(1, cfg.aps)
+            local list = Players:GetPlayers()
+            for i = 1, #list do
+                if not running or not cfg.enabled then break end
+                local ok, c, hrp = isTarget(list[i])
+                if ok then
+                    fireAt(c, hrp)
+                    task.wait(interval)
+                end
+            end
+        end
+        task.wait(0.05)
+    end
+end)
+
+-- stop ---------------------------------------------------------------
+
+local function stop()
+    running = false
+    cfg.enabled = false
+    if HAS_UI then
+        pcall(function() UI.RemoveTab('Reach All') end)
+    end
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - open the Reach All tab')
