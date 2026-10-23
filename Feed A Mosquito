@@ -1,1 +1,1787 @@
-PLACEHOLDER
+--==================================================================
+--  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
+--
+--  v10.9  -  auto place eggs targets YOUR plot, not the biggest plate
+--
+--  WHAT v10.8 GOT WRONG
+--    It picked the base part with the largest X*Z. On the live map the
+--    plate nearest the plot is 60x90 at Y~1.1 while your own 40x40 sits
+--    at Y~6, so every attempt was aimed at a plate the server will not
+--    accept and a full lap came back refused.
+--
+--  WHAT CHANGED
+--    - myBasePart() now scores by DISTANCE to your character, not area,
+--      and keeps the closest part that passes the game's own check
+--    - the part that last produced a real placement is remembered and
+--      reused first, so it does not wander between plots
+--    - the offsets are 4 studs apart inside a 40x40 plot, which is what
+--      actually fits on your own base
+--    - placement is still counted only when the Backpack egg count drops
+--
+--  AUTO PLACE EGGS
+--    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor, the
+--    game itself only does this when you activate the egg Tool:
+--
+--        local hit = raycast onto a BasePart in your own base
+--        PlayerActorIface:FireServer("PlaceEgg", itemUid, hit.Position)
+--
+--    and its isValidBasePart check is: part.Name == "BasePart", the
+--    parent Model name contains "Base", and that Model's "Player"
+--    ObjectValue equals you. So the whole call reduces to the egg Tool's
+--    ItemUid plus a point on your BasePart - no mouse, no raycast, no
+--    keypress. Verified live: one call took the Backpack egg count
+--    10 -> 9.
+--
+--    An occupied spot refuses an egg, so the grid steps outward from the
+--    centre and every point is clamped inside the part.
+--
+--  MENU
+--      Main       Auto Health, Auto Collect
+--      Farm       Farm Kill, Auto Hatch, Auto Equip Best, Auto Place Eggs
+--      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
+--
+--  FARM KILL
+--    AttackPart is the only thing written on the tool: shrink to 2
+--    studs to end every contact, grow back to map size for a new one,
+--    then PlaySound("SwingSound") + Attack on the LIVE tool actor from
+--    the tool's ActorId value. No mouse input, nothing reparented.
+--
+--  AUTO HATCH
+--    For every Runtime.Actors child named Egg_<uuid>:
+--        .Events.Hatch:FireServer()
+--    on a HATCH_RATE loop. Readiness cannot be read from here
+--    (HatchReady is a RemoteEvent, not a value), so the server ignores
+--    the passes that are not ready yet.
+--
+--  AUTO EQUIP BEST
+--    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
+--    EQUIP_RATE loop. The path is built from LocalPlayer.UserId, so it
+--    works on any account, not just the one it was tested on.
+--
+--  AUTO PICKUP / TP PICKUP
+--    near range  - plain fireproximityprompt, instant
+--    far range   - hop under the egg. Writing a CFrame below the floor
+--      alone does not hold (the Humanoid collides with the baseplate
+--      and physics resolves it back up), so CanCollide is turned off on
+--      YOUR OWN character parts for the hop only, and restored on
+--      return - plus again in stop() if it is called mid-hop.
+--
+--  PANEL
+--      left  PANEL_X = 300   boss name, HP bar, hp / max
+--
+--  Stop with _G.FeedAMosquito.stop().
+--==================================================================
+local Players    = game:GetService("Players")
+local RS         = game:GetService("ReplicatedStorage")
+local WS         = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+
+local LP = Players.LocalPlayer
+
+local NAME    = "Feed A Mosquito"
+local VERSION = "v10.9"
+
+if _G.FeedAMosquito and _G.FeedAMosquito.stop then
+    pcall(_G.FeedAMosquito.stop)
+end
+print("[" .. NAME .. "] " .. VERSION)
+
+local running = true
+local built   = false
+
+-- fixed tuning
+local POLL_RATE    = 0.1
+local HEAL_RATE    = 0.25
+local HEAL_REFIRE  = 1.0
+local COLLECT_RATE = 1.5
+local HIT_RATE     = 0.12
+local TOUCH_PARTS  = 4
+local ATK_BURST    = 2
+local STALE_LIMIT  = 40
+
+-- equip / hatch / place tuning
+local EQUIP_RATE    = 1.5
+local HATCH_RATE    = 0.6
+local PLACE_RATE    = 0.5
+local PLACE_SPACING = 4
+local PLACE_RINGS   = 3
+
+-- size cycle tuning
+local AP_SMALL     = 2
+local AP_HOLD      = 0.03
+local REACH_PAD    = 30
+local REACH_MIN    = 60
+local REACH_MAX    = 4000
+local BOSS_TTL     = 0.6
+local PART_TTL     = 2.0
+local EGG_TTL      = 1.0
+
+-- pickup tuning
+local PICK_RATE     = 0.35
+local PICK_COOLDOWN = 1.0
+local TP_DEPTH      = 10
+local TP_SETTLE     = 0.15
+local TP_HOLD       = 0.20
+
+-- panel tuning
+local PANEL_ROWS   = 6
+local ROW_H        = 34
+local PANEL_BAR_W  = 160
+local PANEL_BAR_H  = 7
+local PANEL_W      = 310
+local PANEL_X      = 300
+local PANEL_LIFT   = 150
+local PAD_X        = 10
+local PAD_TOP      = 12
+local PAD_BOTTOM   = 12
+
+local COL_BACK   = Color3.fromRGB(40, 40, 50)
+local COL_BAR_BG = Color3.fromRGB(26, 26, 33)
+local COL_FILL   = Color3.fromRGB(120, 190, 135)
+local COL_NAME   = Color3.fromRGB(255, 255, 255)
+local COL_HP     = Color3.fromRGB(198, 208, 200)
+
+local EGG_PRICE = {
+    Mosquito = 100, BloodMosquito = 100, NerdMosquito = 100, WhiteMosquito = 100,
+    VenomousMosquito = 200, GlowingMosquito = 200, BlueMosquito = 200, PunkMosquito = 200,
+    ClownMosquito = 2000, ChickenMosquito = 2000, IceMosquito = 2000,
+    PirateMosquito = 2000, DrillMosquito = 2000,
+    FireMosquito = 30000, PandaMosquito = 30000, RocketMosquito = 30000,
+    GhostMosquito = 30000, BalloonMosquito = 30000, SniperMosquito = 30000,
+    ShockMosquito = 300000, MammothMosquito = 300000,
+    RainbowMosquito = 300000, SkullMosquito = 300000,
+}
+
+local RARITY_COLOR = {
+    Common    = Color3.fromRGB(235, 235, 235),
+    Uncommon  = Color3.fromRGB(140, 230, 150),
+    Rare      = Color3.fromRGB(130, 190, 250),
+    Epic      = Color3.fromRGB(190, 150, 250),
+    Legendary = Color3.fromRGB(255, 190, 110),
+    Mythical  = Color3.fromRGB(255, 140, 210),
+    Divine    = Color3.fromRGB(255, 235, 120),
+    Secret    = Color3.fromRGB(255, 120, 120),
+}
+
+local RARITIES = {
+    "Common", "Uncommon", "Rare", "Epic",
+    "Legendary", "Mythical", "Divine", "Secret",
+}
+
+local SKIP_PART = {
+    Area      = true,
+    ChaseArea = true,
+}
+
+local Config = {
+    Heal        = false,
+    AutoCollect = false,
+    Farm        = false,
+    Pickup      = false,
+    TPPickup    = false,
+    BestEquip   = false,
+    AutoHatch   = false,
+    AutoPlace   = false,
+}
+
+local PickCfg = {}
+
+for i = 1, #RARITIES do
+    PickCfg[RARITIES[i]] = false
+end
+
+local TOGGLES     = {}
+local getterWorks = {}
+local RARITY_IDS  = {}
+
+-- held between the two CFrame writes so stop() can put you back
+local tpHome   = nil
+local tpAway   = false
+local tpSaved  = {}   -- character part address -> { part, collide }
+
+local function restoreHome()
+    if tpAway and tpHome then
+        local c = LP.Character
+        local hrp = c and c:FindFirstChild("HumanoidRootPart")
+
+        if hrp then
+            pcall(function() hrp.CFrame = tpHome end)
+        end
+    end
+
+    tpAway = false
+    tpHome = nil
+end
+
+-- character-only collision switch, restored right after the hop
+local function noClipOn()
+    tpSaved = {}
+
+    local c = LP.Character
+    if not c then return end
+
+    local ok, desc = pcall(function() return c:GetDescendants() end)
+    if not ok or not desc then return end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "Part" or d.ClassName == "MeshPart" then
+            local k = keyOf(d)
+            local okC, col = pcall(function() return d.CanCollide end)
+
+            if k ~= nil and okC and col == true then
+                tpSaved[#tpSaved + 1] = { part = d, collide = col }
+                pcall(function() d.CanCollide = false end)
+            end
+        end
+    end
+end
+
+local function noClipOff()
+    for i = 1, #tpSaved do
+        local e = tpSaved[i]
+
+        if e.part then
+            pcall(function() e.part.CanCollide = e.collide end)
+        end
+    end
+
+    tpSaved = {}
+end
+
+_G.FeedAMosquito = { stop = function() running = false end }
+
+--------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------
+local function humanoid()
+    local c = LP.Character
+    if not c then return nil end
+    local h = c:FindFirstChild("Humanoid")
+    if h and h.ClassName == "Humanoid" then return h end
+    return nil
+end
+
+local function rootPart()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function alive()
+    local hum = humanoid()
+    return hum ~= nil and hum.Health > 0
+end
+
+local function notifyUser(msg, dur)
+    pcall(function() notify(NAME, msg, dur or 3) end)
+end
+
+local function child(a, b, c)
+    if not a or not b then return nil end
+    local n1 = a:FindFirstChild(b)
+    if not n1 or not c then return n1 end
+    return n1:FindFirstChild(c)
+end
+
+local function isBasePart(p)
+    local cn = p.ClassName
+    return cn == "Part" or cn == "MeshPart" or cn == "UnionOperation"
+        or cn == "WedgePart" or cn == "CornerWedgePart" or cn == "TrussPart"
+        or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
+end
+
+function keyOf(inst)
+    if inst == nil then return nil end
+    local ok, a = pcall(function() return inst.Address end)
+    if ok and a ~= nil then return a end
+    return inst
+end
+
+local function areaRarity(areaName)
+    if type(areaName) ~= "string" then return "Common" end
+    if string.sub(areaName, -4) == "Area" then
+        return string.sub(areaName, 1, #areaName - 4)
+    end
+    return areaName
+end
+
+local function billboardRarity(model)
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "TextLabel" and d.Name == "Rarity" then
+            local okT, t = pcall(function() return d.Text end)
+
+            if okT and type(t) == "string" and #t > 0 then
+                return t
+            end
+        end
+    end
+
+    return nil
+end
+
+local function mosquitoId(eggName)
+    if type(eggName) ~= "string" then return nil end
+    if string.sub(eggName, -3) == "Egg" then
+        return string.sub(eggName, 1, #eggName - 3)
+    end
+    return eggName
+end
+
+local function eggPrompt(model)
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    local first = nil
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "ProximityPrompt" then
+            if d.Name == "CarryPrompt" then return d end
+            if first == nil then first = d end
+        end
+    end
+
+    return first
+end
+
+local function eggPosition(model)
+    if not model then return nil end
+
+    local r = model:FindFirstChild("HumanoidRootPart")
+    if not r then return nil end
+
+    local ok, p = pcall(function() return r.Position end)
+    if ok and p then return p end
+    return nil
+end
+
+--------------------------------------------------------------------
+-- Player actor remotes
+--------------------------------------------------------------------
+local pEvents = nil
+local pFor    = nil
+
+local function playerEvents()
+    if pFor == LP.UserId and pEvents then return pEvents end
+
+    local actors = child(RS, "Runtime", "Actors")
+    if not actors then return nil end
+
+    local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
+    if not actor then return nil end
+
+    pEvents = actor:FindFirstChild("Events")
+    pFor    = LP.UserId
+    return pEvents
+end
+
+local function fireEvent(name)
+    local events = playerEvents()
+    local r = events and events:FindFirstChild(name)
+    if not r then return false end
+    return (pcall(function() r:FireServer() end))
+end
+
+--------------------------------------------------------------------
+-- BEST MOSQUITO  (the game's own PlaceBest remote)
+--------------------------------------------------------------------
+local function placeBest()
+    local events = playerEvents()
+    local r = events and events:FindFirstChild("PlaceBest")
+    if not r then return false end
+    return (pcall(function() r:FireServer() end))
+end
+
+--------------------------------------------------------------------
+-- AUTO HATCH  (every Egg_<uuid> actor's Hatch remote)
+--------------------------------------------------------------------
+local function hatchAll()
+    local actors = child(RS, "Runtime", "Actors")
+    if not actors then return 0 end
+
+    local ok, kids = pcall(function() return actors:GetChildren() end)
+    if not ok or not kids then return 0 end
+
+    local fired = 0
+
+    for i = 1, #kids do
+        local a = kids[i]
+        local nm = a.Name
+
+        if type(nm) == "string"
+            and string.sub(nm, 1, 4) == "Egg_"
+            and string.find(nm, "-", 1, true) then
+            local ev = a:FindFirstChild("Events")
+            local h  = ev and ev:FindFirstChild("Hatch")
+
+            if h then
+                if pcall(function() h:FireServer() end) then
+                    fired = fired + 1
+                end
+            end
+        end
+    end
+
+    return fired
+end
+
+--------------------------------------------------------------------
+-- AUTO PLACE EGGS  (the game's own PlaceEgg remote)
+--------------------------------------------------------------------
+-- EggToolActor.OnToolActivated ends with exactly:
+--     PlayerActorIface:FireServer("PlaceEgg", itemUid, hitPosition)
+-- and its isValidBasePart check is: part.Name == "BasePart", parent
+-- Model name contains "Base", and that Model's "Player" ObjectValue is
+-- you. Verified live - one call took the Backpack egg count 10 -> 9.
+--
+-- v10.8 chose the biggest part and aimed at a 60x90 plate that is not
+-- yours to place on. Now it chooses the part nearest your character.
+local PLACE_OFFSETS = { { x = 0, z = 0 } }
+
+for r = 1, PLACE_RINGS do
+    for gx = -r, r do
+        for gz = -r, r do
+            local mx = gx
+            if mx < 0 then mx = -mx end
+
+            local mz = gz
+            if mz < 0 then mz = -mz end
+
+            if mx == r or mz == r then
+                PLACE_OFFSETS[#PLACE_OFFSETS + 1] = { x = gx, z = gz }
+            end
+        end
+    end
+end
+
+local lastGoodBase = nil
+
+-- mirrors the game's isValidBasePart, then keeps the part closest to you
+local function myBasePart()
+    if lastGoodBase then
+        local okP = pcall(function() return lastGoodBase.Parent end)
+        if okP and lastGoodBase.Parent ~= nil then return lastGoodBase end
+        lastGoodBase = nil
+    end
+
+    local ok, desc = pcall(function() return WS:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    local hrp = rootPart()
+    local myPos = nil
+
+    if hrp then
+        local okM, p = pcall(function() return hrp.Position end)
+        if okM and p then myPos = p end
+    end
+
+    local best     = nil
+    local bestDist = 1e12
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.Name == "BasePart" then
+            local cur    = d
+            local mine   = false
+            local isBase = false
+
+            for lvl = 1, 3 do
+                cur = cur.Parent
+                if not cur then break end
+
+                if string.find(cur.Name, "Base", 1, true) then isBase = true end
+
+                local pl = cur:FindFirstChild("Player")
+                if pl then
+                    local okV, v = pcall(function() return pl.Value end)
+                    if okV and v == LP then mine = true end
+                    break
+                end
+            end
+
+            if mine and isBase then
+                local dist = 0
+
+                if myPos then
+                    local okP2, p2 = pcall(function() return d.Position end)
+                    if okP2 and p2 then
+                        local okD, dd = pcall(function() return (p2 - myPos).Magnitude end)
+                        if okD and type(dd) == "number" then dist = dd end
+                    end
+                end
+
+                if dist < bestDist then
+                    bestDist = dist
+                    best     = d
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function backpackEggs()
+    local bp = LP:FindFirstChild("Backpack")
+    local out = {}
+
+    if not bp then return out end
+
+    local ok, kids = pcall(function() return bp:GetChildren() end)
+    if not ok or not kids then return out end
+
+    for i = 1, #kids do
+        local t = kids[i]
+
+        if t.ClassName == "Tool" then
+            local it = t:FindFirstChild("ItemType")
+            local okT, v = pcall(function() return it and it.Value end)
+
+            if okT and v == "Egg" then
+                local uidv = t:FindFirstChild("ItemUid")
+                local okU, uid = pcall(function() return uidv and uidv.Value end)
+
+                if okU and type(uid) == "string" and #uid > 0 then
+                    out[#out + 1] = uid
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+--------------------------------------------------------------------
+-- LIVE TOOL ACTOR
+--------------------------------------------------------------------
+local function equippedTool()
+    local c = LP.Character
+    if not c then return nil end
+
+    local kids = c:GetChildren()
+    for i = 1, #kids do
+        local t = kids[i]
+        if t.ClassName == "Tool" then
+            if t:FindFirstChild("ActorId") then return t end
+        end
+    end
+
+    return nil
+end
+
+local function actorIdOf(tool)
+    if not tool then return nil end
+
+    local idv = tool:FindFirstChild("ActorId")
+    if not idv then return nil end
+
+    local ok, id = pcall(function() return idv.Value end)
+    if ok and type(id) == "string" then return id end
+    return nil
+end
+
+local function remotesOfActor(name)
+    if not name then return nil, nil end
+
+    local actors = child(RS, "Runtime", "Actors")
+    if not actors then return nil, nil end
+
+    local a = actors:FindFirstChild(name)
+    if not a then return nil, nil end
+
+    local ev = a:FindFirstChild("Events")
+    if not ev then return nil, nil end
+
+    return ev:FindFirstChild("Attack"), ev:FindFirstChild("PlaySound")
+end
+
+--------------------------------------------------------------------
+-- Boss lookup (READ ONLY, strict, cached)
+--------------------------------------------------------------------
+local bossCache = {}
+local bossStamp = 0
+local partCache = {}
+
+local function isBossModel(m)
+    if not m then return false end
+    if m.ClassName ~= "Model" then return false end
+
+    local nm = m.Name
+    if type(nm) ~= "string" then return false end
+    if string.sub(nm, -4) ~= "Mama" then return false end
+
+    return m:FindFirstChild("Humanoid") ~= nil
+end
+
+local function collectBosses()
+    local out = {}
+
+    local areas = WS:FindFirstChild("SpawnAreas")
+    if not areas then return out end
+
+    local okA, areaKids = pcall(function() return areas:GetChildren() end)
+    if not okA or not areaKids then return out end
+
+    for i = 1, #areaKids do
+        local ok, kids = pcall(function() return areaKids[i]:GetChildren() end)
+
+        if ok and kids then
+            for j = 1, #kids do
+                local m = kids[j]
+                if isBossModel(m) then out[#out + 1] = m end
+            end
+        end
+    end
+
+    return out
+end
+
+local function bossList()
+    local now = tick()
+    if (now - bossStamp) < BOSS_TTL then return bossCache end
+
+    bossCache = collectBosses()
+    bossStamp = now
+    return bossCache
+end
+
+--------------------------------------------------------------------
+-- Egg lookup
+--------------------------------------------------------------------
+local eggCache = {}
+local eggStamp = 0
+
+local function collectEggs()
+    local out = {}
+
+    local areas = WS:FindFirstChild("SpawnAreas")
+    if not areas then return out end
+
+    local okA, areaKids = pcall(function() return areas:GetChildren() end)
+    if not okA or not areaKids then return out end
+
+    for i = 1, #areaKids do
+        local area = areaKids[i]
+        local ok, kids = pcall(function() return area:GetChildren() end)
+
+        if ok and kids then
+            for j = 1, #kids do
+                local m = kids[j]
+
+                if m.ClassName == "Model" and string.find(string.lower(m.Name), "egg", 1, true) then
+                    local rarity = billboardRarity(m) or areaRarity(area.Name)
+                    local id     = mosquitoId(m.Name)
+                    local price  = nil
+
+                    if id then price = EGG_PRICE[id] end
+
+                    out[#out + 1] = {
+                        model  = m,
+                        name   = m.Name,
+                        rarity = rarity,
+                        price  = price,
+                    }
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+local function eggList()
+    local now = tick()
+    if (now - eggStamp) < EGG_TTL then return eggCache end
+
+    eggCache = collectEggs()
+    eggStamp = now
+    return eggCache
+end
+
+local function bossPosition(boss)
+    if not boss then return nil end
+
+    local okP, parent = pcall(function() return boss.Parent end)
+    if not okP or parent == nil then return nil end
+
+    local r = boss:FindFirstChild("HumanoidRootPart")
+    if not r then return nil end
+
+    local ok, p = pcall(function() return r.Position end)
+    if ok and p then return p end
+    return nil
+end
+
+local function bossHealth(boss)
+    if not boss then return nil end
+
+    local okP, parent = pcall(function() return boss.Parent end)
+    if not okP or parent == nil then return nil end
+
+    local h = boss:FindFirstChild("Humanoid")
+    if not h then return nil end
+
+    local okH, hp = pcall(function() return h.Health end)
+    if okH and type(hp) == "number" then return hp end
+    return nil
+end
+
+local function bossMaxHealth(boss)
+    if not boss then return 1 end
+
+    local h = boss:FindFirstChild("Humanoid")
+    if not h then return 1 end
+
+    local okM, mv = pcall(function() return h.MaxHealth end)
+    if okM and type(mv) == "number" and mv > 0 then return mv end
+    return 1
+end
+
+local function bossParts(boss)
+    local k   = keyOf(boss)
+    local now = tick()
+
+    local rec = k and partCache[k]
+    if rec and (now - rec.stamp) < PART_TTL then return rec.parts end
+
+    local parts = {}
+    local r = boss:FindFirstChild("HumanoidRootPart")
+
+    if r and isBasePart(r) then parts[#parts + 1] = r end
+
+    local ok, desc = pcall(function() return boss:GetDescendants() end)
+
+    if ok and desc then
+        for j = 1, #desc do
+            if #parts >= TOUCH_PARTS then break end
+
+            local d = desc[j]
+            if isBasePart(d) and not SKIP_PART[d.Name] and d ~= r then
+                parts[#parts + 1] = d
+            end
+        end
+    end
+
+    if k then partCache[k] = { stamp = now, parts = parts } end
+    return parts
+end
+
+local function pruneParts()
+    local dead = nil
+
+    for k, rec in pairs(partCache) do
+        local anyAlive = false
+
+        for j = 1, #rec.parts do
+            local p = rec.parts[j]
+            local ok, parent = pcall(function() return p and p.Parent end)
+            if ok and parent ~= nil then
+                anyAlive = true
+                break
+            end
+        end
+
+        if not anyAlive then
+            dead = dead or {}
+            dead[#dead + 1] = k
+        end
+    end
+
+    if dead then
+        for i = 1, #dead do partCache[dead[i]] = nil end
+    end
+end
+
+local function farthestBoss(myPos)
+    local list = bossList()
+    local far  = 0
+    local seen = 0
+
+    for i = 1, #list do
+        local bp = bossPosition(list[i])
+        if bp then
+            local ok, d = pcall(function() return (bp - myPos).Magnitude end)
+            if ok and type(d) == "number" then
+                seen = seen + 1
+                if d > far then far = d end
+            end
+        end
+    end
+
+    return far, seen
+end
+
+--------------------------------------------------------------------
+-- ATTACKPART  (the only thing ever written on the tool)
+--------------------------------------------------------------------
+local apSaved = {}
+local reachOn = false
+
+local function attackPartOf(tool)
+    if not tool then return nil end
+
+    local ap = tool:FindFirstChild("AttackPart")
+    if ap and isBasePart(ap) then return ap end
+
+    local ok, desc = pcall(function() return tool:GetDescendants() end)
+
+    if ok and desc then
+        for j = 1, #desc do
+            local d = desc[j]
+            if isBasePart(d) and d.Name == "AttackPart" then return d end
+        end
+    end
+
+    return nil
+end
+
+local function mapSize()
+    local hrp = rootPart()
+    if not hrp then return nil, 0 end
+
+    local okM, myPos = pcall(function() return hrp.Position end)
+    if not okM or not myPos then return nil, 0 end
+
+    local far, seen = farthestBoss(myPos)
+
+    local side = (far + REACH_PAD) * 2
+    if side < REACH_MIN then side = REACH_MIN end
+    if side > REACH_MAX then side = REACH_MAX end
+
+    return Vector3.new(side, side, side), seen
+end
+
+local function rememberPart(ap)
+    local k = keyOf(ap)
+    if k == nil then return end
+
+    if apSaved[k] == nil then
+        local okS, s = pcall(function() return ap.Size end)
+        if okS and s then
+            apSaved[k] = { part = ap, size = s }
+        end
+    end
+end
+
+local function restoreAttackParts()
+    local n = 0
+
+    for k, e in pairs(apSaved) do
+        local p = e.part
+        if p then
+            pcall(function() p.Size = e.size end)
+            n = n + 1
+        end
+    end
+
+    apSaved = {}
+
+    if reachOn then
+        print("[" .. NAME .. "] AttackPart restored on " .. tostring(n))
+    end
+    reachOn = false
+    return n
+end
+
+--------------------------------------------------------------------
+-- HUD  (boss panel only)
+--------------------------------------------------------------------
+local hudPool   = {}
+local panelBack = nil
+local hudConn   = nil
+
+local function buildHud()
+    if #hudPool > 0 then return end
+
+    panelBack = Drawing.new("Square")
+    panelBack.Filled       = true
+    panelBack.Thickness    = 0
+    panelBack.Color        = COL_BACK
+    panelBack.Transparency = 0.1
+    panelBack.Visible      = false
+
+    for i = 1, PANEL_ROWS do
+        local nameTag = Drawing.new("Text")
+        nameTag.Text     = ""
+        nameTag.Size     = 14
+        nameTag.Font     = 2
+        nameTag.Center   = false
+        nameTag.Outline  = true
+        nameTag.Color    = COL_NAME
+        nameTag.Visible  = false
+
+        local hpTag = Drawing.new("Text")
+        hpTag.Text       = ""
+        hpTag.Size       = 13
+        hpTag.Font       = 2
+        hpTag.Center     = false
+        hpTag.Outline    = true
+        hpTag.Color      = COL_HP
+        hpTag.Visible    = false
+
+        local back = Drawing.new("Square")
+        back.Filled      = true
+        back.Thickness   = 0
+        back.Color       = COL_BAR_BG
+        back.Visible     = false
+
+        local fill = Drawing.new("Square")
+        fill.Filled      = true
+        fill.Thickness   = 0
+        fill.Color       = COL_FILL
+        fill.Visible     = false
+
+        hudPool[i] = {
+            nameTag = nameTag,
+            hpTag   = hpTag,
+            back    = back,
+            fill    = fill,
+        }
+    end
+end
+
+local function hideSlot(slot)
+    slot.nameTag.Visible = false
+    slot.hpTag.Visible   = false
+    slot.back.Visible    = false
+    slot.fill.Visible    = false
+end
+
+local function viewportHeight()
+    local cam = WS:FindFirstChild("Camera")
+    if cam then
+        local okV, vp = pcall(function() return cam.ViewportSize end)
+        if okV and vp and type(vp.Y) == "number" and vp.Y > 0 then
+            return vp.Y
+        end
+    end
+
+    return 1080
+end
+
+local function startHud()
+    if hudConn then return end
+
+    buildHud()
+
+    hudConn = RunService.RenderStepped:Connect(function()
+        local baseY = viewportHeight() - PANEL_LIFT
+
+        local list = bossList()
+        local n    = 0
+
+        for i = 1, #list do
+            if n >= PANEL_ROWS then break end
+
+            local boss = list[i]
+            local hp   = bossHealth(boss)
+
+            if hp and hp > 0 then
+                local maxHp = bossMaxHealth(boss)
+                local frac  = hp / maxHp
+
+                if frac < 0 then frac = 0 end
+                if frac > 1 then frac = 1 end
+
+                n = n + 1
+
+                local slot = hudPool[n]
+                local rowY = baseY - (n - 1) * ROW_H
+
+                slot.nameTag.Text     = boss.Name
+                slot.nameTag.Position = Vector2.new(PANEL_X, rowY)
+                slot.nameTag.Visible  = true
+
+                slot.back.Position = Vector2.new(PANEL_X, rowY + 19)
+                slot.back.Size     = Vector2.new(PANEL_BAR_W, PANEL_BAR_H)
+                slot.back.Visible  = true
+
+                slot.fill.Position = Vector2.new(PANEL_X, rowY + 19)
+                slot.fill.Size     = Vector2.new(PANEL_BAR_W * frac, PANEL_BAR_H)
+                slot.fill.Visible  = true
+
+                slot.hpTag.Text     = tostring(math.floor(hp))
+                    .. " / " .. tostring(math.floor(maxHp))
+                slot.hpTag.Position = Vector2.new(
+                    PANEL_X + PANEL_BAR_W + 10,
+                    rowY + 2
+                )
+                slot.hpTag.Visible  = true
+            end
+        end
+
+        for i = n + 1, PANEL_ROWS do
+            local slot = hudPool[i]
+            if slot then hideSlot(slot) end
+        end
+
+        if panelBack then
+            if n > 0 then
+                local topY   = baseY - (n - 1) * ROW_H - PAD_TOP
+                local height = (n - 1) * ROW_H + ROW_H + PAD_TOP + PAD_BOTTOM
+
+                panelBack.Position = Vector2.new(PANEL_X - PAD_X, topY)
+                panelBack.Size     = Vector2.new(PANEL_W, height)
+                panelBack.Visible  = true
+            else
+                panelBack.Visible = false
+            end
+        end
+    end)
+end
+
+local function stopHud()
+    if hudConn then
+        pcall(function() hudConn:Disconnect() end)
+        hudConn = nil
+    end
+
+    for i = 1, #hudPool do
+        local slot = hudPool[i]
+
+        pcall(function() slot.nameTag:Remove() end)
+        pcall(function() slot.hpTag:Remove() end)
+        pcall(function() slot.back:Remove() end)
+        pcall(function() slot.fill:Remove() end)
+    end
+
+    if panelBack then
+        pcall(function() panelBack:Remove() end)
+        panelBack = nil
+    end
+
+    hudPool = {}
+end
+
+startHud()
+
+--------------------------------------------------------------------
+-- Toggle plumbing
+--------------------------------------------------------------------
+local function applyBool(key)
+    return function(a, b, c)
+        if getterWorks[key] then return end
+        if type(a) == "boolean" then Config[key] = a return end
+        if type(b) == "boolean" then Config[key] = b return end
+        if type(c) == "boolean" then Config[key] = c return end
+    end
+end
+
+local function registerToggle(key, id, name)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name }
+end
+
+local function safeToggle(sec, name, id, default, cb)
+    local tries = {
+        function() sec:Toggle(name, id, default, cb) end,
+        function() sec:Toggle(id, name, default, cb) end,
+        function() sec:Toggle(name, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn("[" .. NAME .. "] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function makeSection(tab, name, side)
+    local ok, sec = pcall(function() return tab:Section(name, side) end)
+    if ok and type(sec) == "table" then return sec end
+    ok, sec = pcall(function() tab:Section(name) end)
+    if ok and type(sec) == "table" then return sec end
+    return nil
+end
+
+local function addToggle(sec, label, id, key, default)
+    if safeToggle(sec, label, id, default, applyBool(key)) then
+        registerToggle(key, id, label)
+    end
+end
+
+local function addRarity(sec, rarity)
+    local id = "rarity_" .. string.lower(rarity)
+
+    local cb = function(a, b, c)
+        if getterWorks[rarity] then return end
+        if type(a) == "boolean" then PickCfg[rarity] = a return end
+        if type(b) == "boolean" then PickCfg[rarity] = b return end
+        if type(c) == "boolean" then PickCfg[rarity] = c return end
+    end
+
+    if safeToggle(sec, rarity, id, false, cb) then
+        RARITY_IDS[#RARITY_IDS + 1] = { rarity = rarity, id = id, name = rarity }
+    end
+end
+
+--------------------------------------------------------------------
+-- Menu
+--------------------------------------------------------------------
+local function buildTab(tab)
+    if built then return end
+    if type(tab) ~= "table" then return end
+    built = true
+
+    local ok, err = pcall(function()
+        local main = makeSection(tab, "Main", "Left")
+        if main then
+            addToggle(main, "Auto Health", "auto_health", "Heal", false)
+            addToggle(main, "Auto Collect", "auto_collect", "AutoCollect", false)
+        end
+
+        local farm = makeSection(tab, "Farm", "Left")
+        if farm then
+            addToggle(farm, "Farm Kill", "farm_kill", "Farm", false)
+            addToggle(farm, "Auto Hatch", "auto_hatch", "AutoHatch", false)
+            addToggle(farm, "Auto Equip Best", "auto_equip_best", "BestEquip", false)
+            addToggle(farm, "Auto Place Eggs", "auto_place_eggs", "AutoPlace", false)
+        end
+
+        local pick = makeSection(tab, "Egg Pickup", "Left")
+        if pick then
+            addToggle(pick, "Auto Pickup", "auto_pickup", "Pickup", false)
+            addToggle(pick, "TP Pickup (under egg)", "tp_pickup", "TPPickup", false)
+
+            for i = 1, #RARITIES do
+                addRarity(pick, RARITIES[i])
+            end
+        end
+    end)
+
+    if not ok then
+        warn("[" .. NAME .. "] build error: " .. tostring(err))
+    end
+    print("[" .. NAME .. "] tab widgets built")
+end
+
+local HAS_UI = type(UI) == "table" and type(UI.AddTab) == "function"
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab(NAME, function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn("[" .. NAME .. "] UI.AddTab failed: " .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn("[" .. NAME .. "] no UI table - menu unavailable")
+end
+
+--------------------------------------------------------------------
+-- POLLERS
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t = TOGGLES[i]
+            local val = nil
+
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == "boolean" then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                if ok2 and type(v2) == "boolean" then val = v2 end
+            end
+
+            if val ~= nil then
+                getterWorks[t.key] = true
+                if Config[t.key] ~= val then
+                    Config[t.key] = val
+                    print("[" .. NAME .. "] " .. t.name .. " = " .. tostring(val))
+                end
+            end
+        end
+
+        for i = 1, #RARITY_IDS do
+            local r = RARITY_IDS[i]
+            local val = nil
+
+            local ok1, v1 = pcall(function() return UI.GetValue(r.id) end)
+            if ok1 and type(v1) == "boolean" then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(r.name) end)
+                if ok2 and type(v2) == "boolean" then val = v2 end
+            end
+
+            if val ~= nil then
+                getterWorks[r.rarity] = true
+                if PickCfg[r.rarity] ~= val then
+                    PickCfg[r.rarity] = val
+                    print("[" .. NAME .. "] rarity " .. r.name .. " = " .. tostring(val))
+                end
+            end
+        end
+
+        task.wait(POLL_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO HATCH  (all Egg_<uuid> actors)
+--------------------------------------------------------------------
+task.spawn(function()
+    local wasOn   = false
+    local lastSay = false
+
+    while running do
+        if Config.AutoHatch then
+            local fired = hatchAll()
+
+            if fired > 0 then
+                if not wasOn then
+                    wasOn = true
+                    print("[" .. NAME .. "] auto hatch on (" .. tostring(fired) .. " eggs)")
+                end
+                lastSay = false
+            elseif not lastSay then
+                lastSay = true
+                print("[" .. NAME .. "] auto hatch: no Egg_ actor with a Hatch remote")
+            end
+
+            task.wait(HATCH_RATE)
+        else
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] auto hatch off")
+            end
+
+            lastSay = false
+            task.wait(0.2)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO PLACE EGGS  (PlaceEgg remote, one egg per pass)
+--------------------------------------------------------------------
+task.spawn(function()
+    local wasOn     = false
+    local lastSay   = false
+    local idx       = 1
+    local placed    = 0
+    local lastCount = nil
+    local misses    = 0
+
+    while running do
+        if Config.AutoPlace then
+            local part = myBasePart()
+            local eggs = backpackEggs()
+
+            if part and #eggs > 0 then
+                local count = #eggs
+
+                if not wasOn then
+                    wasOn = true
+                    print("[" .. NAME .. "] auto place eggs on ("
+                        .. tostring(count) .. " egg Tools in Backpack)")
+                end
+
+                if lastCount and count < lastCount then
+                    placed = placed + (lastCount - count)
+                    misses = 0
+                    lastGoodBase = part
+                elseif lastCount then
+                    misses = misses + 1
+
+                    if misses >= #PLACE_OFFSETS then
+                        misses = 0
+                        print("[" .. NAME .. "] auto place eggs: a full lap of "
+                            .. tostring(#PLACE_OFFSETS) .. " spots was refused")
+                    end
+                end
+
+                lastCount = count
+                lastSay   = false
+
+                local okP, pos = pcall(function() return part.Position end)
+                local okS, sz  = pcall(function() return part.Size end)
+
+                local topY  = 1
+                local halfX = 12
+                local halfZ = 12
+
+                if okS and sz and type(sz.Y) == "number" then
+                    topY  = sz.Y / 2
+                    halfX = sz.X / 2 - 2
+                    halfZ = sz.Z / 2 - 2
+
+                    if halfX < 0 then halfX = 0 end
+                    if halfZ < 0 then halfZ = 0 end
+                end
+
+                local events = playerEvents()
+                local remote = events and events:FindFirstChild("PlaceEgg")
+
+                if okP and pos and remote then
+                    local off = PLACE_OFFSETS[idx]
+                    idx = idx + 1
+                    if idx > #PLACE_OFFSETS then idx = 1 end
+
+                    local ox = off.x * PLACE_SPACING
+                    local oz = off.z * PLACE_SPACING
+
+                    if ox > halfX then ox = halfX elseif ox < -halfX then ox = -halfX end
+                    if oz > halfZ then oz = halfZ elseif oz < -halfZ then oz = -halfZ end
+
+                    local target = pos + Vector3.new(ox, topY, oz)
+
+                    pcall(function() remote:FireServer(eggs[1], target) end)
+                elseif not lastSay then
+                    lastSay = true
+                    print("[" .. NAME .. "] auto place eggs: no BasePart of yours or no PlaceEgg remote")
+                end
+            elseif not lastSay then
+                lastSay = true
+                print("[" .. NAME .. "] auto place eggs: no egg Tools in Backpack")
+            end
+
+            task.wait(PLACE_RATE)
+        else
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] auto place eggs off (" .. tostring(placed) .. " placed)")
+            end
+
+            lastSay   = false
+            idx       = 1
+            placed    = 0
+            lastCount = nil
+            misses    = 0
+            task.wait(0.2)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO EQUIP BEST  (PlaceBest remote)
+--------------------------------------------------------------------
+task.spawn(function()
+    local wasOn    = false
+    local warned   = false
+    local lastFire = 0
+
+    while running do
+        if Config.BestEquip and alive() then
+            local now = tick()
+
+            if not wasOn or (now - lastFire) >= EQUIP_RATE then
+                lastFire = now
+
+                if placeBest() then
+                    if not wasOn then
+                        print("[" .. NAME .. "] auto equip best on (PlaceBest)")
+                    end
+                    wasOn  = true
+                    warned = false
+                elseif not warned then
+                    warned = true
+                    print("[" .. NAME .. "] auto equip best: PlaceBest remote not found")
+                end
+            end
+
+            task.wait(0.3)
+        else
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] auto equip best off")
+            end
+
+            warned   = false
+            lastFire = 0
+            task.wait(0.2)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- EGG PICKUP  (character collision off during the hop only)
+--------------------------------------------------------------------
+task.spawn(function()
+    local hasPrompt = (type(fireproximityprompt) == "function")
+
+    local warned = false
+    local wasOn  = false
+    local taken  = 0
+    local lastAt = {}
+    local diag   = false
+
+    if not hasPrompt then
+        print("[" .. NAME .. "] fireproximityprompt missing - re-run the Matcha loader")
+    end
+
+    while running do
+        if Config.Pickup and hasPrompt and alive() then
+            local eggs = eggList()
+            local now  = tick()
+            local done = false
+
+            for i = 1, #eggs do
+                if done then break end
+
+                local egg = eggs[i]
+
+                if PickCfg[egg.rarity] == true then
+                    local okP, parent = pcall(function() return egg.model.Parent end)
+
+                    if okP and parent ~= nil then
+                        local k = keyOf(egg.model)
+                        local ready = true
+
+                        if k ~= nil and lastAt[k] ~= nil then
+                            if (now - lastAt[k]) < PICK_COOLDOWN then
+                                ready = false
+                            end
+                        end
+
+                        if ready then
+                            local prompt = eggPrompt(egg.model)
+
+                            if prompt then
+                                if Config.TPPickup then
+                                    local epos = eggPosition(egg.model)
+                                    local hrp  = rootPart()
+
+                                    if epos and hrp then
+                                        local okH, home = pcall(function() return hrp.CFrame end)
+
+                                        if okH and home then
+                                            tpHome = home
+                                            tpAway = true
+
+                                            -- the floor was resolving the
+                                            -- character back up; with the
+                                            -- character's own collision off
+                                            -- the write actually holds
+                                            noClipOn()
+
+                                            pcall(function()
+                                                hrp.CFrame = CFrame.new(
+                                                    epos.X,
+                                                    epos.Y - TP_DEPTH,
+                                                    epos.Z
+                                                )
+                                            end)
+
+                                            task.wait(TP_SETTLE)
+
+                                            if running and Config.Pickup then
+                                                pcall(function()
+                                                    fireproximityprompt(prompt)
+                                                end)
+                                            end
+
+                                            task.wait(TP_HOLD)
+
+                                            local okR, hrp2 = pcall(function() return rootPart() end)
+                                            local back = (okR and hrp2) or hrp
+
+                                            pcall(function() back.CFrame = home end)
+
+                                            noClipOff()
+
+                                            tpAway = false
+                                            tpHome = nil
+
+                                            done = true
+                                            taken = taken + 1
+
+                                            if k ~= nil then lastAt[k] = tick() end
+
+                                            if not diag then
+                                                diag = true
+
+                                                local dist = 0
+                                                local okD, d = pcall(function()
+                                                    return (home.Position - epos).Magnitude
+                                                end)
+                                                if okD and type(d) == "number" then dist = d end
+
+                                                print("[" .. NAME .. "] tp pickup on "
+                                                    .. tostring(egg.name)
+                                                    .. "  was " .. tostring(math.floor(dist))
+                                                    .. " away")
+                                            end
+                                        end
+                                    end
+                                else
+                                    pcall(function() fireproximityprompt(prompt) end)
+                                    done = true
+                                    taken = taken + 1
+
+                                    if k ~= nil then lastAt[k] = tick() end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+
+            if done then
+                warned = false
+
+                if not wasOn then
+                    wasOn = true
+                    print("[" .. NAME .. "] auto pickup on ("
+                        .. (Config.TPPickup and "tp under egg" or "prompt")
+                        .. ")")
+                end
+            elseif not warned then
+                warned = true
+                print("[" .. NAME .. "] auto pickup: no egg matched an enabled rarity")
+            end
+
+            task.wait(PICK_RATE)
+        else
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] auto pickup off (" .. tostring(taken) .. " eggs)")
+            end
+
+            pcall(restoreHome)
+            pcall(noClipOff)
+            task.wait(0.2)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- FARM KILL
+--------------------------------------------------------------------
+task.spawn(function()
+    local hasTouch = (type(firetouchinterest) == "function")
+
+    local wasOn      = false
+    local warnedTool = false
+    local warnedAct  = false
+    local staleWarn  = false
+    local noBossWarn = false
+
+    local lastSum  = nil
+    local stale    = 0
+    local cachedId = nil
+    local cachedAtk, cachedPs = nil, nil
+
+    while running do
+        if Config.Farm and alive() then
+            local tool = equippedTool()
+
+            if not tool then
+                if not warnedTool then
+                    warnedTool = true
+                    print("[" .. NAME .. "] farm kill: equip a weapon")
+                end
+                cachedId, cachedAtk, cachedPs = nil, nil, nil
+                task.wait(0.25)
+            else
+                warnedTool = false
+
+                local id = actorIdOf(tool)
+
+                if id ~= cachedId then
+                    cachedId = id
+                    cachedAtk, cachedPs = remotesOfActor(id)
+
+                    if cachedAtk then
+                        print("[" .. NAME .. "] live actor " .. tostring(id))
+                    end
+                end
+
+                local ap = attackPartOf(tool)
+
+                if not ap then
+                    if not warnedAct then
+                        warnedAct = true
+                        print("[" .. NAME .. "] farm kill: no AttackPart on this tool")
+                    end
+                    cachedId = nil
+                    task.wait(0.25)
+                else
+                    warnedAct = false
+
+                    if not wasOn then
+                        wasOn = true
+                        print("[" .. NAME .. "] farm kill on (size cycle per pass)")
+                    end
+
+                    rememberPart(ap)
+
+                    local big, seen = mapSize()
+
+                    pcall(function()
+                        ap.Size = Vector3.new(AP_SMALL, AP_SMALL, AP_SMALL)
+                    end)
+
+                    task.wait(AP_HOLD)
+
+                    if big then
+                        pcall(function() ap.Size = big end)
+                        reachOn = true
+                    end
+
+                    local list = bossList()
+
+                    if seen > 0 then
+                        noBossWarn = false
+
+                        if hasTouch then
+                            pruneParts()
+
+                            for i = 1, #list do
+                                local boss = list[i]
+                                local hp   = bossHealth(boss)
+
+                                if hp and hp > 0 then
+                                    local parts = bossParts(boss)
+
+                                    for j = 1, #parts do
+                                        local part = parts[j]
+                                        pcall(function()
+                                            firetouchinterest(ap, part, 0)
+                                        end)
+                                    end
+                                end
+                            end
+                        end
+                    elseif not noBossWarn then
+                        noBossWarn = true
+                        print("[" .. NAME .. "] no boss spawned - box kept at minimum")
+                    end
+
+                    if cachedAtk then
+                        for b = 1, ATK_BURST do
+                            if cachedPs then
+                                pcall(function() cachedPs:FireServer("SwingSound") end)
+                            end
+                            pcall(function() cachedAtk:FireServer() end)
+                        end
+                    end
+
+                    local sum  = 0
+                    local live = 0
+
+                    for i = 1, #list do
+                        local hp = bossHealth(list[i])
+                        if hp and hp > 0 then
+                            sum  = sum + hp
+                            live = live + 1
+                        end
+                    end
+
+                    if live == 0 then
+                        stale = 0
+                        staleWarn = false
+                        lastSum = nil
+                    elseif lastSum and sum >= lastSum then
+                        stale = stale + 1
+
+                        if stale >= STALE_LIMIT and not staleWarn then
+                            staleWarn = true
+                            print("[" .. NAME .. "] boss HP not dropping - hits not landing")
+                        end
+                    else
+                        stale = 0
+                        staleWarn = false
+                    end
+
+                    if live > 0 then lastSum = sum end
+
+                    task.wait(HIT_RATE)
+                end
+            end
+        else
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] farm kill off")
+            end
+
+            warnedTool = false
+            warnedAct  = false
+            stale      = 0
+            staleWarn  = false
+            noBossWarn = false
+            lastSum    = nil
+            cachedId, cachedAtk, cachedPs = nil, nil, nil
+
+            if reachOn then
+                restoreAttackParts()
+            end
+
+            task.wait(0.1)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO HEALTH
+--------------------------------------------------------------------
+task.spawn(function()
+    local transfusing = false
+    local lastFire    = 0
+
+    while running do
+        if Config.Heal then
+            local hum = humanoid()
+            if hum then
+                local now = tick()
+                if not transfusing or (now - lastFire) >= HEAL_REFIRE then
+                    if fireEvent("TransfuseBlood") then
+                        transfusing = true
+                        lastFire    = now
+                    end
+                end
+            end
+        elseif transfusing then
+            fireEvent("StopTransfuseBlood")
+            transfusing = false
+        end
+
+        task.wait(HEAL_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO COLLECT
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.AutoCollect then
+            fireEvent("CollectIncome")
+            fireEvent("ClaimOfflineIncome")
+        end
+        task.wait(COLLECT_RATE)
+    end
+end)
+
+--------------------------------------------------------------------
+local function stop()
+    running = false
+    pcall(restoreHome)
+    pcall(noClipOff)
+    pcall(stopHud)
+    pcall(restoreAttackParts)
+    pcall(function() fireEvent("StopTransfuseBlood") end)
+    bossCache = {}
+    bossStamp = 0
+    eggCache  = {}
+    eggStamp  = 0
+    partCache = {}
+    _G.FeedAMosquito = nil
+    print("[" .. NAME .. "] stopped")
+end
+
+_G.FeedAMosquito = { stop = stop, version = VERSION }
+
+notifyUser("Loaded - place eggs on your own base", 5)
+print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
