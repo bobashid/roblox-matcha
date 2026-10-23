@@ -1,11 +1,12 @@
 -- Plus 1 Upgrade Per Kill - kill aura + health bars - Matcha LuauVM
 -- One Kill Aura toggle: sweeps every combatant (players and NPCs/bots) in
--- reach, one pass every 0.01s. Custom health bars (health only, no names)
--- over every enemy, redrawn every frame from live values so they do not lag.
+-- reach, one pass every 0.01s. Custom health bars (health only, no names).
+-- Positions and health are re-read from the live character every frame inside
+-- RenderStepped, so the bars track the head with no collector delay.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v2.1'
+local VERSION = 'v2.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -23,17 +24,14 @@ if not Attack then
     warn('[' .. NAME .. '] Remotes.Attack not found - script idle')
 end
 
--- maxed reach
 local RANGE = 30
 local POOL  = 40
 
--- names the aura and the bars must ignore, lowercase
 local EXCLUDE = {
     ['o_csf']        = true,
     ['fakeaimboton'] = true,
 }
 
--- only these folders are scanned for NPC models (keeps the scan cheap)
 local NPC_FOLDERS = { 'Bots', 'NPCs', 'Npcs', 'Enemies', 'Dummies', 'AI' }
 
 local running = true
@@ -89,7 +87,7 @@ for i = 1, POOL do
     label.Color   = Color3.fromRGB(255, 255, 255)
     label.Visible = false
 
-    pool[i] = { bg = bg, fill = fill, label = label }
+    pool[i] = { bg = bg, fill = fill, label = label, lastText = '' }
 end
 
 -- targeting ----------------------------------------------------------
@@ -99,14 +97,12 @@ local function excluded(name)
     return EXCLUDE[string.lower(name)] == true
 end
 
--- cheap live read, used every frame by the renderer
-local function liveHp(model)
+local function hpOf(model)
     local h = model:GetAttribute('Health')
     if type(h) ~= 'number' then
         local hum = model:FindFirstChild('Humanoid')
         if hum then h = hum.Health end
     end
-    if type(h) ~= 'number' then return nil end
     return h
 end
 
@@ -120,24 +116,28 @@ local function maxHpOf(model)
     return mh
 end
 
-local function validModel(model, requireArena)
-    if not model then return nil end
-    if model:GetAttribute('CombatantId') == nil then return nil end
-    if model:GetAttribute('Zone') == 'Dead' then return nil end
-    if requireArena and model:GetAttribute('Zone') ~= 'Arena' then return nil end
-    local h = liveHp(model)
-    if not h or h <= 0 then return nil end
-    local hrp = model:FindFirstChild('HumanoidRootPart')
-    if not hrp then return nil end
-    return { model = model, root = hrp, maxhp = maxHpOf(model) }
-end
-
+-- membership only; positions and health are read live in the renderer
 local function playerTarget(plr)
     if plr == lp then return nil end
     if excluded(plr.Name) then return nil end
     local c = plr.Character
     if not c then return nil end
-    return validModel(c, true)
+    if c:GetAttribute('CombatantId') == nil then return nil end
+    local zone = c:GetAttribute('Zone')
+    if zone ~= 'Arena' then return nil end
+    local hp = hpOf(c)
+    if type(hp) ~= 'number' or hp <= 0 then return nil end
+    return { plr = plr, model = c, maxhp = maxHpOf(c) }
+end
+
+local function npcTarget(model)
+    if excluded(model.Name) then return nil end
+    if model:GetAttribute('CombatantId') == nil then return nil end
+    if model:GetAttribute('Zone') == 'Dead' then return nil end
+    local hp = hpOf(model)
+    if type(hp) ~= 'number' or hp <= 0 then return nil end
+    if not model:FindFirstChild('HumanoidRootPart') then return nil end
+    return { model = model, maxhp = maxHpOf(model) }
 end
 
 local function scanNPCs(out)
@@ -145,10 +145,8 @@ local function scanNPCs(out)
     for i = 1, #kids do
         local inst = kids[i]
         if inst.ClassName == 'Model' then
-            local t = validModel(inst, false)
-            if t and not excluded(inst.Name) then
-                out[#out + 1] = t
-            end
+            local t = npcTarget(inst)
+            if t then out[#out + 1] = t end
         elseif inst.ClassName == 'Folder' then
             local wanted = false
             for k = 1, #NPC_FOLDERS do
@@ -159,10 +157,8 @@ local function scanNPCs(out)
                 for j = 1, #sub do
                     local m = sub[j]
                     if m.ClassName == 'Model' then
-                        local t = validModel(m, false)
-                        if t and not excluded(m.Name) then
-                            out[#out + 1] = t
-                        end
+                        local t = npcTarget(m)
+                        if t then out[#out + 1] = t end
                     end
                 end
             end
@@ -285,7 +281,7 @@ task.spawn(function()
     end
 end)
 
--- collector: players + NPCs/bots, 6 times a second -------------------
+-- collector: membership only, 6 times a second -----------------------
 
 task.spawn(function()
     while running do
@@ -315,7 +311,13 @@ task.spawn(function()
                 for i = 1, #list do
                     if not running or not cfg.aura then break end
                     local t = list[i]
-                    local root = t.root
+                    local root
+                    if t.plr then
+                        local ch = t.plr.Character
+                        root = ch and ch:FindFirstChild('HumanoidRootPart')
+                    else
+                        root = t.model:FindFirstChild('HumanoidRootPart')
+                    end
                     if root and root.Parent then
                         local pos = root.Position
                         if (pos - myPos).Magnitude <= RANGE then
@@ -331,7 +333,7 @@ task.spawn(function()
     end
 end)
 
--- health bars: live read + live position every frame ----------------
+-- health bars: live position + live health every frame ---------------
 
 trackConn(RunService.RenderStepped:Connect(function()
     if not cfg.bars then
@@ -349,10 +351,20 @@ trackConn(RunService.RenderStepped:Connect(function()
     for i = 1, #list do
         if n >= POOL then break end
         local t = list[i]
-        local root = t.root
-        if root and root.Parent then
-            local hp = liveHp(t.model)
-            if hp and hp > 0 then
+
+        -- fresh resolve every frame: no stale wrapper, no collector delay
+        local model, root
+        if t.plr then
+            model = t.plr.Character
+            root  = model and model:FindFirstChild('HumanoidRootPart')
+        else
+            model = t.model
+            root  = model and model:FindFirstChild('HumanoidRootPart')
+        end
+
+        if model and root and root.Parent then
+            local hp = hpOf(model)
+            if type(hp) == 'number' and hp > 0 then
                 local pos = root.Position
                 local top, v1 = WorldToScreen(pos + Vector3.new(0, 2.6, 0))
                 local bot, v2 = WorldToScreen(pos - Vector3.new(0, 2.4, 0))
@@ -372,18 +384,23 @@ trackConn(RunService.RenderStepped:Connect(function()
 
                         local barH = 4
                         local barY = top.Y - 10
+                        local leftX = top.X - w * 0.5
 
-                        e.bg.Position = Vector2.new(top.X - w * 0.5, barY)
+                        e.bg.Position = Vector2.new(leftX, barY)
                         e.bg.Size     = Vector2.new(w, barH)
                         e.bg.Visible  = true
 
                         local fillW = w * frac
-                        e.fill.Position = Vector2.new(top.X - w * 0.5, barY)
+                        e.fill.Position = Vector2.new(leftX, barY)
                         e.fill.Size     = Vector2.new(fillW, barH)
                         e.fill.Color    = Color3.fromRGB(math.floor(255 * (1 - frac)) + 20, math.floor(200 * frac) + 30, 60)
                         e.fill.Visible  = fillW > 0.5
 
-                        e.label.Text     = math.floor(hp) .. '/' .. math.floor(maxhp)
+                        local txt = math.floor(hp) .. '/' .. math.floor(maxhp)
+                        if e.lastText ~= txt then
+                            e.label.Text = txt
+                            e.lastText   = txt
+                        end
                         e.label.Position = Vector2.new(top.X, barY - 16)
                         e.label.Visible  = true
                     end
