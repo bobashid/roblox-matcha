@@ -1,20 +1,21 @@
--- Plus 1 Upgrade Per Kill - kill aura - Matcha LuauVM
--- One toggle. Every pass it hits every alive player inside RANGE, then waits
--- 0.01s. Uses the game's Remotes.Attack with the swing aimed at the target,
--- so the server's own distance check still passes.
+-- Plus 1 Upgrade Per Kill - kill aura + health bars - Matcha LuauVM
+-- One Kill Aura toggle: sweeps every combatant (players and NPCs/bots) inside
+-- reach, one pass every 0.01s. Custom health bars over every enemy because the
+-- built-in ESP does not work in this game.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v1.2'
+local VERSION = 'v2.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 print('[' .. NAME .. '] ' .. VERSION)
 
-local Players = game:GetService('Players')
-local RS      = game:GetService('ReplicatedStorage')
-local lp      = Players.LocalPlayer
+local Players    = game:GetService('Players')
+local RS         = game:GetService('ReplicatedStorage')
+local RunService = game:GetService('RunService')
+local lp         = Players.LocalPlayer
 
 local remotes = RS:FindFirstChild('Remotes')
 local Attack  = remotes and remotes:FindFirstChild('Attack')
@@ -22,16 +23,40 @@ if not Attack then
     warn('[' .. NAME .. '] Remotes.Attack not found - script idle')
 end
 
--- kill aura radius in studs
 local RANGE = 12
+local POOL  = 32
+
+-- names the aura and the bars must ignore, lowercase
+local EXCLUDE = {
+    ['o_csf']        = true,
+    ['fakeaimboton'] = true,
+}
+
+-- only these folders are scanned for NPC models (keeps the scan cheap)
+local NPC_FOLDERS = { 'Bots', 'NPCs', 'Npcs', 'Enemies', 'Dummies', 'AI' }
 
 local running = true
 local built   = false
 local targets = {}
 
 local cfg = {
-    aura = true,
+    aura  = true,
+    bars  = true,
+    range = 12,
 }
+
+local conns    = {}
+local drawings = {}
+
+local function trackConn(c)
+    conns[#conns + 1] = c
+    return c
+end
+
+local function trackDraw(d)
+    drawings[#drawings + 1] = d
+    return d
+end
 
 local function setBool(key, v)
     if cfg[key] ~= v then
@@ -40,21 +65,124 @@ local function setBool(key, v)
     end
 end
 
-local function aliveTarget(plr)
-    if plr == lp then return nil end
-    local c = plr.Character
-    if not c then return nil end
-    local hrp = c:FindFirstChild('HumanoidRootPart')
-    if not hrp then return nil end
-    local cid = c:GetAttribute('CombatantId')
-    if type(cid) ~= 'number' then return nil end
-    local hp = c:GetAttribute('Health')
-    if type(hp) == 'number' and hp <= 0 then return nil end
-    if c:GetAttribute('Zone') ~= 'Arena' then return nil end
-    return { char = c, root = hrp }
+local function setNum(key, v)
+    if cfg[key] ~= v then
+        cfg[key] = v
+        print('[' .. NAME .. '] ' .. key .. ' = ' .. tostring(v))
+    end
 end
 
-local function fireAt(char, eye, targetPos)
+-- health bar pool ----------------------------------------------------
+
+local pool = {}
+for i = 1, POOL do
+    local bg = trackDraw(Drawing.new('Square'))
+    bg.Filled       = true
+    bg.Thickness    = 1
+    bg.Color        = Color3.fromRGB(15, 15, 15)
+    bg.Transparency = 0.35
+    bg.Visible      = false
+
+    local fill = trackDraw(Drawing.new('Square'))
+    fill.Filled    = true
+    fill.Thickness = 1
+    fill.Color     = Color3.fromRGB(90, 220, 120)
+    fill.Visible   = false
+
+    local label = trackDraw(Drawing.new('Text'))
+    label.Size    = 13
+    label.Center  = true
+    label.Outline = true
+    label.Color   = Color3.fromRGB(255, 255, 255)
+    label.Visible = false
+
+    pool[i] = { bg = bg, fill = fill, label = label }
+end
+
+-- targeting ----------------------------------------------------------
+
+local function excluded(name)
+    if type(name) ~= 'string' then return false end
+    return EXCLUDE[string.lower(name)] == true
+end
+
+local function healthOf(model)
+    local h  = model:GetAttribute('Health')
+    local mh = model:GetAttribute('MaxHealth')
+    if type(h) ~= 'number' then
+        local hum = model:FindFirstChild('Humanoid')
+        if hum then
+            h  = hum.Health
+            mh = hum.MaxHealth
+        end
+    end
+    if type(h) ~= 'number' then return nil end
+    if h <= 0 then return nil end
+    if type(mh) ~= 'number' or mh <= 0 then mh = 20 end
+    return h, mh
+end
+
+local function validModel(model, requireArena)
+    if not model then return nil end
+    if model:GetAttribute('CombatantId') == nil then return nil end
+    if model:GetAttribute('Zone') == 'Dead' then return nil end
+    if requireArena and model:GetAttribute('Zone') ~= 'Arena' then return nil end
+    local h, mh = healthOf(model)
+    if not h then return nil end
+    local hrp = model:FindFirstChild('HumanoidRootPart')
+    if not hrp then return nil end
+    return { model = model, root = hrp, hp = h, maxhp = mh }
+end
+
+local function playerTarget(plr)
+    if plr == lp then return nil end
+    if excluded(plr.Name) then return nil end
+    local c = plr.Character
+    if not c then return nil end
+    local t = validModel(c, true)
+    if not t then return nil end
+    t.name     = plr.Name
+    t.isPlayer = true
+    return t
+end
+
+local function scanNPCs(out)
+    local kids = workspace:GetChildren()
+    for i = 1, #kids do
+        local inst = kids[i]
+        if inst.ClassName == 'Model' then
+            local t = validModel(inst, false)
+            if t and not excluded(inst.Name) then
+                t.name     = inst.Name
+                t.isPlayer = false
+                out[#out + 1] = t
+            end
+        elseif inst.ClassName == 'Folder' then
+            local wanted = false
+            for k = 1, #NPC_FOLDERS do
+                if inst.Name == NPC_FOLDERS[k] then wanted = true break end
+            end
+            if wanted then
+                local sub = inst:GetChildren()
+                for j = 1, #sub do
+                    local m = sub[j]
+                    if m.ClassName == 'Model' then
+                        local t = validModel(m, false)
+                        if t and not excluded(m.Name) then
+                            t.name     = m.Name
+                            t.isPlayer = false
+                            out[#out + 1] = t
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- swinging -----------------------------------------------------------
+
+local function fireAt(model, eye, targetPos)
     local dir = targetPos - eye
     if dir.Magnitude < 0.001 then
         dir = Vector3.new(0, -1, 0)
@@ -72,7 +200,7 @@ local function fireAt(char, eye, targetPos)
         vt     = nil,
     }
     pcall(function()
-        Attack:FireServer(char, payload)
+        Attack:FireServer(model, payload)
     end)
 end
 
@@ -84,6 +212,14 @@ local function firstBool(...)
     for i = 1, select('#', ...) do
         local v = select(i, ...)
         if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
     end
     return nil
 end
@@ -117,13 +253,32 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
 local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Kill Aura', 'he_aura', true, function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Kill Aura',    'he_aura',  true, function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Health Bars',  'he_bars',  true, function(v) setBool('bars', v) end)
+        mkSlider(sec, 'Reach',        'he_range', 3, 30, 12, function(v) setNum('range', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -156,28 +311,37 @@ task.spawn(function()
                 local v = UI.GetValue('he_aura')
                 if type(v) ~= 'boolean' then v = UI.GetValue('Kill Aura') end
                 if type(v) == 'boolean' then cfg.aura = v end
+
+                local b = UI.GetValue('he_bars')
+                if type(b) ~= 'boolean' then b = UI.GetValue('Health Bars') end
+                if type(b) == 'boolean' then cfg.bars = b end
+
+                local r = UI.GetValue('he_range')
+                if type(r) ~= 'number' then r = UI.GetValue('Reach') end
+                if type(r) == 'number' then cfg.range = math.clamp(r, 3, 30) end
             end)
         end
         task.wait(0.2)
     end
 end)
 
--- collector: resolves characters a few times a second -----------------
+-- collector: players + NPCs/bots, 4 times a second --------------------
 
 task.spawn(function()
     while running do
         local out = {}
-        local list = Players:GetPlayers()
-        for i = 1, #list do
-            local t = aliveTarget(list[i])
+        local plist = Players:GetPlayers()
+        for i = 1, #plist do
+            local t = playerTarget(plist[i])
             if t then out[#out + 1] = t end
         end
+        pcall(scanNPCs, out)
         targets = out
-        task.wait(0.2)
+        task.wait(0.25)
     end
 end)
 
--- kill aura loop: one sweep every 0.01s -------------------------------
+-- kill aura: one pass over every target, then 0.01s -------------------
 
 task.spawn(function()
     while running do
@@ -191,9 +355,12 @@ task.spawn(function()
                 for i = 1, #list do
                     if not running or not cfg.aura then break end
                     local t = list[i]
-                    local pos = t.root.Position
-                    if (pos - myPos).Magnitude <= RANGE then
-                        fireAt(t.char, eye, pos)
+                    local root = t.root
+                    if root and root.Parent then
+                        local pos = root.Position
+                        if (pos - myPos).Magnitude <= cfg.range then
+                            fireAt(t.model, eye, pos)
+                        end
                     end
                 end
             end
@@ -204,11 +371,88 @@ task.spawn(function()
     end
 end)
 
+-- health bars --------------------------------------------------------
+
+trackConn(RunService.RenderStepped:Connect(function()
+    if not cfg.bars then
+        for i = 1, POOL do
+            pool[i].bg.Visible    = false
+            pool[i].fill.Visible  = false
+            pool[i].label.Visible = false
+        end
+        return
+    end
+
+    local list = targets
+    local myChar = lp.Character
+    local myRoot = myChar and myChar:FindFirstChild('HumanoidRootPart')
+    local myPos = myRoot and myRoot.Position or nil
+
+    local n = 0
+    for i = 1, #list do
+        if n >= POOL then break end
+        local t = list[i]
+        local root = t.root
+        if root and root.Parent then
+            local pos = root.Position
+            if (not myPos) or (pos - myPos).Magnitude <= 250 then
+                local top, v1 = WorldToScreen(pos + Vector3.new(0, 2.6, 0))
+                local bot, v2 = WorldToScreen(pos - Vector3.new(0, 2.4, 0))
+                if v1 and v2 then
+                    local h = bot.Y - top.Y
+                    if h > 8 then
+                        n = n + 1
+                        local e = pool[n]
+                        local w = h * 0.55
+                        if w < 16 then w = 16 end
+
+                        local barH = 4
+                        local barY = top.Y - 10
+                        local maxhp = t.maxhp > 0 and t.maxhp or 20
+                        local frac = t.hp / maxhp
+                        if frac < 0 then frac = 0 end
+                        if frac > 1 then frac = 1 end
+
+                        e.bg.Position = Vector2.new(top.X - w * 0.5, barY)
+                        e.bg.Size     = Vector2.new(w, barH)
+                        e.bg.Visible  = true
+
+                        e.fill.Position = Vector2.new(top.X - w * 0.5, barY)
+                        e.fill.Size     = Vector2.new(w * frac, barH)
+                        e.fill.Color    = Color3.fromRGB(math.floor(255 * (1 - frac)) + 20, math.floor(200 * frac) + 30, 60)
+                        e.fill.Visible  = true
+
+                        e.label.Text     = t.name .. '  ' .. math.floor(t.hp) .. '/' .. math.floor(maxhp)
+                        e.label.Position = Vector2.new(top.X, barY - 16)
+                        e.label.Visible  = true
+                    end
+                end
+            end
+        end
+    end
+
+    for i = n + 1, POOL do
+        pool[i].bg.Visible    = false
+        pool[i].fill.Visible  = false
+        pool[i].label.Visible = false
+    end
+end))
+
 -- stop ---------------------------------------------------------------
 
 local function stop()
     running = false
     cfg.aura = false
+    cfg.bars = false
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    conns = {}
+    for i = 1, #drawings do
+        pcall(function() drawings[i]:Remove() end)
+    end
+    drawings = {}
+    pool = {}
     if HAS_UI then
         pcall(function() UI.RemoveTab('Kill Aura') end)
     end
