@@ -1,68 +1,64 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.14  -  respawn works: health is written in memory
+--  v10.15  -  auto reset unblocked, farm kill gets a real weapon
 --
---  WHY THE OLD RESPAWN DID NOTHING
---    Humanoid.Health = 0 and Character:BreakJoints() were both
---    measured as no-ops in this game - health stayed at its value and
---    the character stayed alive, because the server re-syncs
---    Humanoid.Health. Writing the field in memory sidesteps that.
+--  TWO GATES WERE CLOSED, NOT THE HIT CODE
+--    The hit block below is byte-for-byte the v10.5 one. Nothing in
+--    it changed. What was wrong was what fed it.
 --
---  VERIFIED THIS SESSION
---    memory_write("float", hum.Address + 0x184, -10)
---        before = 17116448, alive = true
---        after  = -10,       alive = false
---    So the write lands and the character dies.
+--  1) AUTO RESET NEVER FIRED
+--     It required NO Tool at all in your hand. You were holding a
+--     mosquito (ActorId present, AttackPart absent) - still a Tool -
+--     so the condition was permanently false.
 --
---    The offset 0x184 is independently confirmed: a scan of
---    Address + 0..4096 found the health float at offset 388, which is
---    0x184. theo's offsets file also reports Health = 0x184.
+--     It now resets when there is no WEAPON and no carried EGG:
+--         no Tool with an AttackPart
+--         no Tool whose ItemType is "Egg"
+--     A mosquito in hand no longer blocks it, because a mosquito has
+--     no AttackPart and farm kill cannot swing one anyway.
 --
---  THE OFFSET IS FETCHED, WITH A FALLBACK
---    At load this tries theo's offsets.hpp for the current Roblox
---    version and parses "Health = 0x...". If the fetch or the parse
---    fails it uses 0x184 and says so in the console, so you can see
---    which one it used. Offsets shift when Roblox updates, so the
---    fetch is the version-proof path and the fallback is the safety
---    net.
+--     It also refuses to reset unless your Backpack actually contains
+--     a weapon, so it can never put you in an endless death loop with
+--     nothing to re-equip.
 --
---  FAST RESPAWN  (inside Farm Kill, no separate toggle)
---    Fires when Farm Kill is on, you are alive, and the Character
---    holds NO Tool at all - no weapon, no egg being carried. That is
---    the "nothing in the queue and not holding my weapon" case.
+--  2) FARM KILL WENT QUIET
+--     equippedTool() returned the first Tool carrying an ActorId, and
+--     mosquitoes carry one. The farm loop was handed the mosquito,
+--     attackPartOf found no AttackPart, and it bailed before any hit.
 --
---        1. remember your HumanoidRootPart CFrame
---        2. memory_write health to -10
---        3. watch for the new Character every 0.05 s
---        4. write the saved CFrame onto the new HumanoidRootPart
+--     equippedTool() now prefers the held Tool that HAS an AttackPart,
+--     falling back to the old ActorId pick only when no weapon is held.
+--     The hit sequence itself - shrink AttackPart to 2, grow it back to
+--     map size, firetouchinterest every boss part, then the Attack and
+--     PlaySound burst on the live actor - is unchanged from v10.5.
 --
---    The game then runs its own respawn equip, which is the re-equip
---    you confirmed works. Nothing re-parents a Tool.
+--  RESET MECHANISM  (verified this session)
+--    Humanoid.Health = 0 and BreakJoints were both measured as no-ops:
+--    the server re-syncs the property. Writing the field in memory
+--    does work:
+--        memory_write("float", hum.Address + 0x184, -10)
+--        health 17116448 -> -10, alive false
+--    The offset is fetched from theo's offsets file at load and falls
+--    back to 0x184, which an independent scan of Address + 0..4096
+--    confirmed (health float sits at offset 388 = 0x184).
 --
---  THE RESPAWN DELAY
---    The wait between death and respawn is the game's own
---    Players.RespawnTime, server-side. A client cannot shorten it. The
---    script prints that value on load so you know what to expect, and
---    returns you to your spot the moment the new character exists.
+--    After the write the script watches for the new Character every
+--    0.05 s and writes your saved CFrame onto it, so you land back on
+--    the exact spot you were standing on. The gap between death and
+--    respawn is the game's own Players.RespawnTime and cannot be
+--    shortened from the client; that value is printed on load.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
 --      Farm       Farm Kill, Auto Hatch, Auto Equip Best
 --      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
 --
---  FARM KILL
---    AttackPart is the only thing written on the tool: shrink to 2
---    studs to end every contact, grow back to map size for a new one,
---    then PlaySound("SwingSound") + Attack on the LIVE tool actor from
---    the tool's ActorId value. No mouse input, nothing reparented.
---
 --  AUTO HATCH
 --    For every Runtime.Actors child named Egg_<uuid>:
 --        .Events.Hatch:FireServer()
---    on a HATCH_RATE loop. Readiness cannot be read from here
---    (HatchReady is a RemoteEvent, not a value), so the server ignores
---    the passes that are not ready yet.
+--    Readiness cannot be read from here (HatchReady is a RemoteEvent,
+--    not a value), so the server ignores passes that are not ready.
 --
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
@@ -89,12 +85,15 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.14"
+local VERSION = "v10.15"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
 end
 print("[" .. NAME .. "] " .. VERSION)
+
+local running = true
+local built   = false
 
 -- fixed tuning
 local POLL_RATE    = 0.1
@@ -158,8 +157,8 @@ local COL_HP     = Color3.fromRGB(198, 208, 200)
 -- character died. A scan of Address + 0..4096 found the health float
 -- at offset 388 = 0x184, so the constant and theo's offsets agree.
 -- Offsets move with Roblox updates, so fetch first, fall back after.
-local OFFSETS_URL      = "https://offsets.imtheo.lol/version-9ac8595712b447a7/offsets.hpp"
-local HEALTH_FALLBACK  = 0x184
+local OFFSETS_URL     = "https://offsets.imtheo.lol/version-9ac8595712b447a7/offsets.hpp"
+local HEALTH_FALLBACK = 0x184
 
 local healthOffset       = HEALTH_FALLBACK
 local healthOffsetSource = "fallback"
@@ -181,16 +180,12 @@ end
 print("[" .. NAME .. "] health offset " .. string.format("0x%X", healthOffset)
     .. " (" .. healthOffsetSource .. ")")
 
-local respawnTime = nil
-
 pcall(function()
     local rt = Players.RespawnTime
-    if type(rt) == "number" then respawnTime = rt end
+    if type(rt) == "number" then
+        print("[" .. NAME .. "] game respawn time " .. tostring(rt) .. "s (server-side)")
+    end
 end)
-
-if respawnTime then
-    print("[" .. NAME .. "] game respawn time " .. tostring(respawnTime) .. "s (server-side)")
-end
 
 local EGG_PRICE = {
     Mosquito = 100, BloodMosquito = 100, NerdMosquito = 100, WhiteMosquito = 100,
@@ -488,19 +483,52 @@ end
 --------------------------------------------------------------------
 -- LIVE TOOL ACTOR
 --------------------------------------------------------------------
+-- a weapon is any Tool that carries an AttackPart. A mosquito Tool has
+-- an ActorId but no AttackPart, which is what made the old pick hand
+-- the farm loop a mosquito and stop every hit.
+local function hasAttackPart(tool)
+    if not tool then return false end
+    if tool:FindFirstChild("AttackPart") then return true end
+
+    local ok, desc = pcall(function() return tool:GetDescendants() end)
+    if ok and desc then
+        for i = 1, #desc do
+            if desc[i].Name == "AttackPart" then return true end
+        end
+    end
+
+    return false
+end
+
+local function itemTypeOf(tool)
+    if not tool then return nil end
+
+    local it = tool:FindFirstChild("ItemType")
+    if not it then return nil end
+
+    local ok, v = pcall(function() return it.Value end)
+    if ok and type(v) == "string" then return v end
+    return nil
+end
+
+-- the weapon first, an ActorId-only Tool only as a fallback
 local function equippedTool()
     local c = LP.Character
     if not c then return nil end
 
     local kids = c:GetChildren()
+    local fallback = nil
+
     for i = 1, #kids do
         local t = kids[i]
-        if t.ClassName == "Tool" then
-            if t:FindFirstChild("ActorId") then return t end
+
+        if t.ClassName == "Tool" and t:FindFirstChild("ActorId") then
+            if hasAttackPart(t) then return t end
+            if fallback == nil then fallback = t end
         end
     end
 
-    return nil
+    return fallback
 end
 
 local function actorIdOf(tool)
@@ -817,25 +845,48 @@ local function restoreAttackParts()
     return n
 end
 
--- any Tool at all in the Character: a weapon, a mosquito, or an egg
--- being carried. The respawn must see none of these.
-local function anythingInHand()
+-- true when the Character holds no weapon and is not carrying an egg.
+-- A mosquito Tool in hand does NOT block the reset: it has no
+-- AttackPart, so farm kill cannot swing it anyway.
+local function needsWeapon()
     local c = LP.Character
-    if not c then return true end
+    if not c then return false end
 
     local ok, kids = pcall(function() return c:GetChildren() end)
-    if not ok or not kids then return true end
+    if not ok or not kids then return false end
 
     for i = 1, #kids do
-        if kids[i].ClassName == "Tool" then return true end
+        local t = kids[i]
+
+        if t.ClassName == "Tool" then
+            if hasAttackPart(t) then return false end
+            if itemTypeOf(t) == "Egg" then return false end
+        end
+    end
+
+    return true
+end
+
+-- only reset when the game actually has a weapon to give back, so this
+-- can never become an endless death loop
+local function backpackHasWeapon()
+    local bp = LP:FindFirstChild("Backpack")
+    if not bp then return false end
+
+    local ok, kids = pcall(function() return bp:GetChildren() end)
+    if not ok or not kids then return false end
+
+    for i = 1, #kids do
+        local t = kids[i]
+        if t.ClassName == "Tool" and hasAttackPart(t) then return true end
     end
 
     return false
 end
 
--- writes -10 into the health field itself, which is the one thing that
--- actually kills here. Humanoid.Health = 0 and BreakJoints were both
--- measured as no-ops because the server re-syncs the property.
+-- writes -10 into the health field itself, the one thing measured to
+-- actually kill here. Humanoid.Health = 0 and BreakJoints were both
+-- no-ops because the server re-syncs the property.
 local function killCharacter()
     if type(memory_write) ~= "function" then return false, "no memory_write" end
 
@@ -1419,19 +1470,11 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FAST RESPAWN  (memory write, then back to your spot)
+-- AUTO RESET  (no weapon in hand, back to the same spot)
 --------------------------------------------------------------------
--- Humanoid.Health = 0 and BreakJoints were both measured as no-ops in
--- this game. Writing the health field in memory does work:
---     memory_write("float", hum.Address + 0x184, -10)
---     health 17116448 -> -10, alive false
--- This resets the character the same way dying does, so the game runs
--- its own respawn equip, and then puts you back on the saved CFrame.
---
--- Fires when Farm Kill is on, you are alive, and the Character holds
--- NO Tool at all (no weapon, no carried egg). After FAST_SETTLE of an
--- empty hand, at most once every FAST_COOLDOWN. As soon as the game
--- puts a weapon back in your hand it stops.
+-- v10.14 required NO Tool at all in hand, so a mosquito in hand kept
+-- this permanently closed. It now needs only: no weapon, no carried
+-- egg, and a weapon in the Backpack for the game to hand back.
 task.spawn(function()
     local lastKill   = 0
     local emptySince = nil
@@ -1439,7 +1482,7 @@ task.spawn(function()
     local watching   = false
 
     while running do
-        if Config.Farm and alive() then
+        if Config.Farm and alive() and not watching then
             if LP.Character ~= lastChar then
                 lastChar   = LP.Character
                 emptySince = nil
@@ -1447,15 +1490,12 @@ task.spawn(function()
 
             local now = tick()
 
-            if anythingInHand() then
-                emptySince = nil
-            else
+            if needsWeapon() and backpackHasWeapon() then
                 if emptySince == nil then emptySince = now end
 
                 if (now - emptySince) >= FAST_SETTLE
-                    and (now - lastKill) >= FAST_COOLDOWN
-                    and not watching then
-                    local hrp = rootPart()
+                    and (now - lastKill) >= FAST_COOLDOWN then
+                    local hrp  = rootPart()
                     local home = nil
 
                     if hrp then
@@ -1509,6 +1549,8 @@ task.spawn(function()
                         print("[" .. NAME .. "] reset failed: " .. tostring(why))
                     end
                 end
+            else
+                emptySince = nil
             end
         else
             emptySince = nil
@@ -1520,7 +1562,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL
+-- FARM KILL  (hit block unchanged from v10.5)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -1746,5 +1788,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - reset writes health in memory", 5)
+notifyUser("Loaded - reset on no weapon, farm kill gets the weapon", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
