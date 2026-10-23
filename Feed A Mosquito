@@ -1,33 +1,33 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.12  -  idle respawn instead of re-parenting the weapon
+--  v10.13  -  fast respawn that puts you back where you stood
 --
---  WHY THIS INSTEAD OF RE-PARENTING
---    You found that after a reset or death the game puts the weapon
---    back in your hand by itself. That is the game's own equip code,
---    and it works. v10.11 (and v10.2-v10.4 before it) tried to move
---    the Tool by hand instead, which is what broke pulling the weapon
---    out manually. That re-parent code is gone.
+--  WHY v10.12 NEVER FIRED
+--    It required "no live boss" before resetting. A boss standing
+--    there alive (which is exactly the case when you have no weapon to
+--    kill it with) made that false forever, so the reset never ran.
+--    That condition is gone.
 --
---  WHAT IT DOES NOW  (inside Farm Kill, no separate toggle)
---    When Farm Kill is on and the farm has nothing to do, it resets
---    your character so the game re-equips for you.
+--  FAST RESPAWN  (inside Farm Kill, no separate toggle)
+--    When Farm Kill is on and your Character holds NO Tool at all - no
+--    weapon, no egg being carried - it:
+--        1. remembers your HumanoidRootPart CFrame
+--        2. sets Humanoid.Health = 0 (the same thing dying does)
+--        3. watches for the new Character
+--        4. writes the remembered CFrame back onto the new
+--           HumanoidRootPart, so you land exactly where you stood
+--    The game then runs its own respawn equip, which is the re-equip
+--    you confirmed works. Nothing re-parents a Tool.
 --
---    "Nothing to do" means ALL of these at once:
---        - no live boss (every boss Health <= 0 or none spawned)
---        - no egg pickup in the last RESET_PICK_HOLD (3 s)
---        - no Tool at all in your Character - not a weapon, not an egg
---          being carried, nothing mid-equip
---    and it has been true for RESET_SETTLE (2 s).
+--    Timing: fires after FAST_SETTLE (0.4 s) of an empty hand, at most
+--    once every FAST_COOLDOWN (1.5 s). The moment the game puts a
+--    weapon back in your hand the loop stops, so it cannot sit there
+--    resetting you forever.
 --
---    A reset is Humanoid.Health = 0 - the same thing dying does, so
---    the game runs its normal respawn and hand-equip. Resets are at
---    least RESET_COOLDOWN (10 s) apart, and the timer restarts every
---    time a boss appears or you pick something up, so it never fires
---    while there is work in the queue.
---
---    Toggling Farm Kill off stops it immediately.
+--    No "no boss" / "no pickup" condition: an egg in hand IS a Tool,
+--    so the empty-hand test already skips pickups, and an idle boss no
+--    longer blocks the reset.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -72,7 +72,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.12"
+local VERSION = "v10.13"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -96,10 +96,10 @@ local STALE_LIMIT  = 40
 local EQUIP_RATE   = 1.5
 local HATCH_RATE   = 0.6
 
--- idle respawn tuning
-local RESET_SETTLE    = 2.0
-local RESET_COOLDOWN  = 10.0
-local RESET_PICK_HOLD = 3.0
+-- fast respawn tuning
+local FAST_SETTLE   = 0.4
+local FAST_COOLDOWN = 1.5
+local FAST_MAX_WAIT = 6.0
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -188,9 +188,11 @@ local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
 
--- last time an egg pickup actually fired, so the idle reset can tell
--- "nothing to do" apart from "in the middle of a pickup"
+-- last time an egg pickup actually fired
 local lastPickupAt = 0
+
+-- where the fast respawn should put you back
+local respawnHome = nil
 
 -- held between the two CFrame writes so stop() can put you back
 local tpHome   = nil
@@ -763,7 +765,7 @@ local function restoreAttackParts()
 end
 
 -- any Tool at all in the Character: a weapon, a mosquito, or an egg
--- being carried. The idle reset must see none of these.
+-- being carried. The fast respawn must see none of these.
 local function anythingInHand()
     local c = LP.Character
     if not c then return true end
@@ -773,17 +775,6 @@ local function anythingInHand()
 
     for i = 1, #kids do
         if kids[i].ClassName == "Tool" then return true end
-    end
-
-    return false
-end
-
-local function hasLiveBoss()
-    local list = bossList()
-
-    for i = 1, #list do
-        local hp = bossHealth(list[i])
-        if hp and hp > 0 then return true end
     end
 
     return false
@@ -1355,24 +1346,20 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- IDLE RESPAWN  (lets the game re-equip your weapon)
+-- FAST RESPAWN  (reset, then put you back where you stood)
 --------------------------------------------------------------------
--- You found that after a reset or death the game itself puts the
--- weapon back in your hand. So when the farm has nothing to do and
--- your hand is empty, this resets the character and lets that happen
--- instead of moving Tools around, which is what broke manual equipping.
+-- You found the game re-equips your weapon on respawn, so the re-equip
+-- is done by the game: this only triggers the respawn and returns you
+-- to the exact CFrame you were standing on.
 --
--- Fires only when ALL of these hold:
---    Farm Kill on, character alive
---    no live boss
---    no egg pickup in the last RESET_PICK_HOLD
---    no Tool at all in the Character
--- and it has been true for RESET_SETTLE. At least RESET_COOLDOWN apart.
+-- Fires when Farm Kill is on, you are alive, and the Character holds
+-- NO Tool at all (no weapon, no carried egg). After FAST_SETTLE of an
+-- empty hand, at most once every FAST_COOLDOWN. As soon as the game
+-- puts a weapon back in your hand it stops.
 task.spawn(function()
     local lastReset  = 0
     local emptySince = nil
     local lastChar   = nil
-    local said       = false
 
     while running do
         if Config.Farm and alive() then
@@ -1381,42 +1368,63 @@ task.spawn(function()
                 emptySince = nil
             end
 
-            local now     = tick()
-            local picking = (now - lastPickupAt) < RESET_PICK_HOLD
-            local idle    = not hasLiveBoss()
-                            and not picking
-                            and not anythingInHand()
+            local now = tick()
 
-            if not idle then
+            if anythingInHand() then
                 emptySince = nil
-                said       = false
             else
                 if emptySince == nil then emptySince = now end
 
-                if (now - emptySince) >= RESET_SETTLE
-                    and (now - lastReset) >= RESET_COOLDOWN then
+                if (now - emptySince) >= FAST_SETTLE
+                    and (now - lastReset) >= FAST_COOLDOWN then
                     local hum = humanoid()
+                    local hrp = rootPart()
 
                     if hum and hum.Health > 0 then
                         lastReset  = now
                         emptySince = nil
 
-                        if not said then
-                            said = true
-                            print("[" .. NAME .. "] farm idle + empty hand: resetting so the game re-equips")
+                        if hrp then
+                            local ok, cf = pcall(function() return hrp.CFrame end)
+                            if ok and cf then respawnHome = cf end
                         end
 
+                        print("[" .. NAME .. "] no weapon in hand: respawning")
+
+                        local target = respawnHome
                         pcall(function() hum.Health = 0 end)
+
+                        -- put the new Character back on the saved spot
+                        task.spawn(function()
+                            local waited = 0
+
+                            while running and waited < FAST_MAX_WAIT do
+                                task.wait(0.1)
+                                waited = waited + 0.1
+
+                                local c = LP.Character
+                                local h = c and c:FindFirstChild("Humanoid")
+
+                                if c and h and h.Health > 0 then
+                                    local r = c:FindFirstChild("HumanoidRootPart")
+
+                                    if r and target then
+                                        pcall(function() r.CFrame = target end)
+                                    end
+
+                                    return
+                                end
+                            end
+                        end)
                     end
                 end
             end
         else
             emptySince = nil
             lastChar   = nil
-            said       = false
         end
 
-        task.wait(0.5)
+        task.wait(0.25)
     end
 end)
 
@@ -1641,11 +1649,12 @@ local function stop()
     eggCache  = {}
     eggStamp  = 0
     partCache = {}
+    respawnHome = nil
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - idle reset re-equips your weapon", 5)
+notifyUser("Loaded - fast respawn returns you to your spot", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
