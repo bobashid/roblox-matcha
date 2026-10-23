@@ -7,10 +7,10 @@
 --    ClickDetector   -> fireclickdetector(cd, 0, "MouseClick")
 --
 --  NAMING
---    Matcha reads ObjectText / ActionText as nil, so a real item
---    like "Big Coffee Cup" is named from the model it sits in,
---    not from the prompt text. Model names win over part names,
---    generic names (Part, Model, Pickup...) are skipped.
+--    ObjectText / ActionText read as nil in Matcha, so the name
+--    comes from the label floating over the item (BillboardGui
+--    TextLabel, e.g. "Big Coffee Cup"), then from the model name.
+--    Generic names (Part, Model, Handle, Prompt...) are skipped.
 --
 --  MENU: Auto Pickup All toggle, Pick Up Everything, Rescan World,
 --        and one button per discovered item.
@@ -20,7 +20,7 @@ local Workspace = game:GetService("Workspace")
 
 local LP = Players.LocalPlayer
 
-local VERSION       = "1.1.0"
+local VERSION       = "1.1.1"
 local NAME          = "CleanEverything"
 local MAX_BUTTONS   = 30
 local SCAN_EVERY    = 2
@@ -110,6 +110,7 @@ local GENERIC = {
     Pickups = true, Collect = true, Collectable = true, Collectible = true,
     Spawn = true, Spawner = true, Decoration = true, Decor = true,
     Handle = true, Main = true, Root = true, Base = true,
+    BillboardGui = true, SurfaceGui = true, TextLabel = true,
 }
 
 local function readProp(inst, prop)
@@ -131,29 +132,43 @@ local function meaningful(v)
     if not s then return nil end
     if GENERIC[s] then return nil end
     if s:match("^%d+$") then return nil end
-    if s:match("^%d+%s*") and #s < 4 then return nil end
     return s
 end
 
--- Matcha returns nil for ObjectText / ActionText, so the real item
--- name comes from the instance chain. A Model name wins, then the
--- nearest ancestor that is not a generic placeholder.
+-- The floating label over a ground item is a BillboardGui TextLabel
+-- ("Big Coffee Cup" in the example). That is the real item name.
+local function labelName(node)
+    local ok, kids = pcall(function() return node:GetDescendants() end)
+    if not ok or type(kids) ~= "table" then return nil end
+    local n = #kids
+    if n > 60 then n = 60 end
+    for i = 1, n do
+        local d = kids[i]
+        if d.ClassName == "TextLabel" then
+            local t = meaningful(readProp(d, "Text"))
+            if t then return t end
+        end
+    end
+    return nil
+end
+
 local function nameFor(inst)
     local obj = meaningful(readProp(inst, "ObjectText"))
     if obj then return obj end
     local act = meaningful(readProp(inst, "ActionText"))
     if act then return act end
 
-    local node     = inst.Parent
-    local depth    = 0
-    local nearest  = nil
-    local own      = meaningful(readProp(inst, "Name"))
+    local node    = inst.Parent
+    local depth   = 0
+    local nearest = nil
 
     while node and node ~= Workspace and depth < 6 do
+        local lbl = labelName(node)
+        if lbl then return lbl end
+
         local n = meaningful(readProp(node, "Name"))
         if n then
-            local cn = node.ClassName
-            if cn == "Model" then return n end
+            if node.ClassName == "Model" then return n end
             if nearest == nil then nearest = n end
         end
         node  = node.Parent
@@ -161,6 +176,7 @@ local function nameFor(inst)
     end
 
     if nearest then return nearest end
+    local own = meaningful(readProp(inst, "Name"))
     if own then return own end
     return "Item"
 end
