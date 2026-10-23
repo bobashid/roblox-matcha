@@ -1,22 +1,23 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.9  -  auto place eggs targets YOUR plot, not the biggest plate
+--  v11.0  -  place eggs picks a BUILDABLE part, not a prop
 --
---  WHAT v10.8 GOT WRONG
---    It picked the base part with the largest X*Z. On the live map the
---    plate nearest the plot is 60x90 at Y~1.1 while your own 40x40 sits
---    at Y~6, so every attempt was aimed at a plate the server will not
---    accept and a full lap came back refused.
+--  WHAT THE PROBES SHOWED
+--    v10.8 chose the biggest BasePart -> the 60x90 plate at Y~1.1 and
+--    the server refused every attempt ("a full lap of 49 spots was
+--    refused").
+--    v10.9 chose the nearest BasePart -> a 0.2x0.2x0.2 decoration 67
+--    studs away, and a direct PlaceEgg at it placed 0 eggs.
+--    The only part that ever accepted an egg is the 40x40 at Y~6 - the
+--    build plate on your own plot.
 --
---  WHAT CHANGED
---    - myBasePart() now scores by DISTANCE to your character, not area,
---      and keeps the closest part that passes the game's own check
---    - the part that last produced a real placement is remembered and
---      reused first, so it does not wander between plots
---    - the offsets are 4 studs apart inside a 40x40 plot, which is what
---      actually fits on your own base
---    - placement is still counted only when the Backpack egg count drops
+--  THE RULE NOW
+--    A part only counts if its X*Z area is at least MIN_BASE_AREA
+--    (100), which throws out every tiny prop, and among those the one
+--    CLOSEST to your character wins. Stand on your plot and that is the
+--    40x40. The first time the toggle runs it prints the part it chose
+--    (size and position) so the log says exactly what was targeted.
 --
 --  AUTO PLACE EGGS
 --    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor, the
@@ -27,13 +28,9 @@
 --
 --    and its isValidBasePart check is: part.Name == "BasePart", the
 --    parent Model name contains "Base", and that Model's "Player"
---    ObjectValue equals you. So the whole call reduces to the egg Tool's
---    ItemUid plus a point on your BasePart - no mouse, no raycast, no
---    keypress. Verified live: one call took the Backpack egg count
---    10 -> 9.
---
---    An occupied spot refuses an egg, so the grid steps outward from the
---    centre and every point is clamped inside the part.
+--    ObjectValue equals you. One egg per PLACE_RATE pass, grid stepping
+--    outward from the centre, every point clamped inside the part.
+--    A placement is counted only when the Backpack egg count drops.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -49,9 +46,9 @@
 --  AUTO HATCH
 --    For every Runtime.Actors child named Egg_<uuid>:
 --        .Events.Hatch:FireServer()
---    on a HATCH_RATE loop. Readiness cannot be read from here
---    (HatchReady is a RemoteEvent, not a value), so the server ignores
---    the passes that are not ready yet.
+--    on a HATCH_RATE loop. The calls go out (log says 17 eggs) but
+--    whether the server acts on them is NOT confirmed - the game only
+--    enables that prompt after its own HatchReady fires for you.
 --
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
@@ -79,7 +76,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.9"
+local VERSION = "v11.0"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -100,11 +97,12 @@ local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
 -- equip / hatch / place tuning
-local EQUIP_RATE    = 1.5
-local HATCH_RATE    = 0.6
-local PLACE_RATE    = 0.5
-local PLACE_SPACING = 4
-local PLACE_RINGS   = 3
+local EQUIP_RATE     = 1.5
+local HATCH_RATE     = 0.6
+local PLACE_RATE     = 0.5
+local PLACE_SPACING  = 4
+local PLACE_RINGS    = 3
+local MIN_BASE_AREA  = 100
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -441,8 +439,11 @@ end
 -- Model name contains "Base", and that Model's "Player" ObjectValue is
 -- you. Verified live - one call took the Backpack egg count 10 -> 9.
 --
--- v10.8 chose the biggest part and aimed at a 60x90 plate that is not
--- yours to place on. Now it chooses the part nearest your character.
+-- Two failed heuristics before this one:
+--   biggest  -> 60x90 plate at Y~1.1, server refused every position
+--   nearest  -> a 0.2 stud prop 67 studs away, placed 0
+-- So: ignore anything with an X*Z area under MIN_BASE_AREA, then take
+-- the closest of what is left. On your plot that is the 40x40 plate.
 local PLACE_OFFSETS = { { x = 0, z = 0 } }
 
 for r = 1, PLACE_RINGS do
@@ -463,7 +464,6 @@ end
 
 local lastGoodBase = nil
 
--- mirrors the game's isValidBasePart, then keeps the part closest to you
 local function myBasePart()
     if lastGoodBase then
         local okP = pcall(function() return lastGoodBase.Parent end)
@@ -508,19 +508,28 @@ local function myBasePart()
             end
 
             if mine and isBase then
-                local dist = 0
+                local okS, sz = pcall(function() return d.Size end)
+                local area = 0
 
-                if myPos then
-                    local okP2, p2 = pcall(function() return d.Position end)
-                    if okP2 and p2 then
-                        local okD, dd = pcall(function() return (p2 - myPos).Magnitude end)
-                        if okD and type(dd) == "number" then dist = dd end
-                    end
+                if okS and sz and type(sz.X) == "number" and type(sz.Z) == "number" then
+                    area = sz.X * sz.Z
                 end
 
-                if dist < bestDist then
-                    bestDist = dist
-                    best     = d
+                if area >= MIN_BASE_AREA then
+                    local dist = 0
+
+                    if myPos then
+                        local okP2, p2 = pcall(function() return d.Position end)
+                        if okP2 and p2 then
+                            local okD, dd = pcall(function() return (p2 - myPos).Magnitude end)
+                            if okD and type(dd) == "number" then dist = dd end
+                        end
+                    end
+
+                    if dist < bestDist then
+                        bestDist = dist
+                        best     = d
+                    end
                 end
             end
         end
@@ -1273,6 +1282,7 @@ task.spawn(function()
     local placed    = 0
     local lastCount = nil
     local misses    = 0
+    local saidPart  = false
 
     while running do
         if Config.AutoPlace then
@@ -1286,6 +1296,16 @@ task.spawn(function()
                     wasOn = true
                     print("[" .. NAME .. "] auto place eggs on ("
                         .. tostring(count) .. " egg Tools in Backpack)")
+                end
+
+                if not saidPart then
+                    saidPart = true
+
+                    local okS, sz = pcall(function() return part.Size end)
+                    local okP, ps = pcall(function() return part.Position end)
+
+                    print("[" .. NAME .. "] placing on "
+                        .. tostring(okS and sz) .. " at " .. tostring(okP and ps))
                 end
 
                 if lastCount and count < lastCount then
@@ -1340,7 +1360,7 @@ task.spawn(function()
                     pcall(function() remote:FireServer(eggs[1], target) end)
                 elseif not lastSay then
                     lastSay = true
-                    print("[" .. NAME .. "] auto place eggs: no BasePart of yours or no PlaceEgg remote")
+                    print("[" .. NAME .. "] auto place eggs: no buildable BasePart of yours or no PlaceEgg remote")
                 end
             elseif not lastSay then
                 lastSay = true
@@ -1359,6 +1379,7 @@ task.spawn(function()
             placed    = 0
             lastCount = nil
             misses    = 0
+            saidPart  = false
             task.wait(0.2)
         end
     end
@@ -1783,5 +1804,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - place eggs on your own base", 5)
+notifyUser("Loaded - place eggs on your build plate", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
