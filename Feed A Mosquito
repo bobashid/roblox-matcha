@@ -1,64 +1,52 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.15  -  auto reset unblocked, farm kill gets a real weapon
+--  v10.16  -  reset waits properly, hatch stops flooding the server
 --
---  TWO GATES WERE CLOSED, NOT THE HIT CODE
---    The hit block below is byte-for-byte the v10.5 one. Nothing in
---    it changed. What was wrong was what fed it.
+--  WHY THE RESET FIRED CONSTANTLY
+--    v10.15 used a 0.4 s settle and a 1.5 s cooldown. While the game
+--    is moving Tools between your Backpack and your hand - which it
+--    does on its own - "no weapon in hand" flickers true over and over,
+--    so the timer kept completing and it kept killing you.
 --
---  1) AUTO RESET NEVER FIRED
---     It required NO Tool at all in your hand. You were holding a
---     mosquito (ActorId present, AttackPart absent) - still a Tool -
---     so the condition was permanently false.
+--    Now:
+--        any change in what is in your hand restarts the timer
+--        FAST_SETTLE   = 3.0 s of a steady, weaponless hand
+--        FAST_COOLDOWN = 30.0 s between resets
+--    Inventory churn therefore resets the clock instead of triggering
+--    a kill, and you get at most two resets a minute.
 --
---     It now resets when there is no WEAPON and no carried EGG:
---         no Tool with an AttackPart
---         no Tool whose ItemType is "Egg"
---     A mosquito in hand no longer blocks it, because a mosquito has
---     no AttackPart and farm kill cannot swing one anyway.
+--  WHY HATCH ONLY WORKED AT THE START
+--    It fired Hatch on every Egg_<uuid> actor every 0.6 s - roughly
+--    127 remote calls a second with ~76 eggs. The server honours the
+--    first pass and then drops them.
 --
---     It also refuses to reset unless your Backpack actually contains
---     a weapon, so it can never put you in an endless death loop with
---     nothing to re-equip.
+--    Now it fires ONE egg per pass, once per egg per HATCH_COOLDOWN
+--    (5 s), on a HATCH_RATE (1 s) loop. Same remote, same call, just
+--    paced so the server keeps accepting it.
 --
---  2) FARM KILL WENT QUIET
---     equippedTool() returned the first Tool carrying an ActorId, and
---     mosquitoes carry one. The farm loop was handed the mosquito,
---     attackPartOf found no AttackPart, and it bailed before any hit.
+--  FARM KILL  (hit block unchanged from v10.5)
+--    equippedTool() prefers the held Tool with an AttackPart, so the
+--    farm loop gets a weapon instead of a mosquito. The hit sequence is
+--    untouched: shrink AttackPart to 2 studs, grow it back to map size,
+--    firetouchinterest every boss part, then the Attack + PlaySound
+--    burst on the live tool actor.
 --
---     equippedTool() now prefers the held Tool that HAS an AttackPart,
---     falling back to the old ActorId pick only when no weapon is held.
---     The hit sequence itself - shrink AttackPart to 2, grow it back to
---     map size, firetouchinterest every boss part, then the Attack and
---     PlaySound burst on the live actor - is unchanged from v10.5.
+--  AUTO RESET  (verified mechanism)
+--    memory_write("float", hum.Address + 0x184, -10) took health
+--    17116448 -> -10 and the character died; Health = 0 and BreakJoints
+--    were both measured as no-ops here. The offset is fetched from
+--    theo's file at load, falling back to 0x184, and the console says
+--    which one it used. After the write the saved CFrame is written
+--    onto the new character within 0.05 s of it existing.
 --
---  RESET MECHANISM  (verified this session)
---    Humanoid.Health = 0 and BreakJoints were both measured as no-ops:
---    the server re-syncs the property. Writing the field in memory
---    does work:
---        memory_write("float", hum.Address + 0x184, -10)
---        health 17116448 -> -10, alive false
---    The offset is fetched from theo's offsets file at load and falls
---    back to 0x184, which an independent scan of Address + 0..4096
---    confirmed (health float sits at offset 388 = 0x184).
---
---    After the write the script watches for the new Character every
---    0.05 s and writes your saved CFrame onto it, so you land back on
---    the exact spot you were standing on. The gap between death and
---    respawn is the game's own Players.RespawnTime and cannot be
---    shortened from the client; that value is printed on load.
+--    It only fires when the Backpack actually holds a weapon, so it
+--    can never become an endless death loop.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
 --      Farm       Farm Kill, Auto Hatch, Auto Equip Best
 --      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
---
---  AUTO HATCH
---    For every Runtime.Actors child named Egg_<uuid>:
---        .Events.Hatch:FireServer()
---    Readiness cannot be read from here (HatchReady is a RemoteEvent,
---    not a value), so the server ignores passes that are not ready.
 --
 --  AUTO EQUIP BEST
 --    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
@@ -85,7 +73,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.15"
+local VERSION = "v10.16"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -106,12 +94,13 @@ local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
 -- equip / hatch tuning
-local EQUIP_RATE   = 1.5
-local HATCH_RATE   = 0.6
+local EQUIP_RATE     = 1.5
+local HATCH_RATE     = 1.0
+local HATCH_COOLDOWN = 5.0
 
 -- respawn tuning
-local FAST_SETTLE   = 0.4
-local FAST_COOLDOWN = 1.5
+local FAST_SETTLE   = 3.0
+local FAST_COOLDOWN = 30.0
 local FAST_MAX_WAIT = 15.0
 
 -- size cycle tuning
@@ -241,6 +230,9 @@ local RARITY_IDS  = {}
 
 -- last time an egg pickup actually fired
 local lastPickupAt = 0
+
+-- per-egg hatch timestamps, so one egg is not fired twice in a row
+local hatchFired = {}
 
 -- held between the two CFrame writes so stop() can put you back
 local tpHome   = nil
@@ -448,36 +440,50 @@ local function placeBest()
 end
 
 --------------------------------------------------------------------
--- AUTO HATCH  (every Egg_<uuid> actor's Hatch remote)
+-- AUTO HATCH  (one egg per pass, each egg at most once per 5 s)
 --------------------------------------------------------------------
-local function hatchAll()
+-- v10.15 fired Hatch on every Egg_<uuid> actor every 0.6 s. With ~76
+-- eggs that is ~127 remote calls a second, and the server only honours
+-- the first pass. Pacing it keeps the call accepted.
+local function hatchNext()
     local actors = child(RS, "Runtime", "Actors")
-    if not actors then return 0 end
+    if not actors then return 0, 0 end
 
     local ok, kids = pcall(function() return actors:GetChildren() end)
-    if not ok or not kids then return 0 end
+    if not ok or not kids then return 0, 0 end
 
+    local now   = tick()
+    local found = 0
     local fired = 0
 
     for i = 1, #kids do
-        local a = kids[i]
+        local a  = kids[i]
         local nm = a.Name
 
         if type(nm) == "string"
             and string.sub(nm, 1, 4) == "Egg_"
             and string.find(nm, "-", 1, true) then
-            local ev = a:FindFirstChild("Events")
-            local h  = ev and ev:FindFirstChild("Hatch")
+            found = found + 1
 
-            if h then
-                if pcall(function() h:FireServer() end) then
-                    fired = fired + 1
+            if fired < 1 then
+                local last = hatchFired[nm]
+
+                if last == nil or (now - last) >= HATCH_COOLDOWN then
+                    local ev = a:FindFirstChild("Events")
+                    local h  = ev and ev:FindFirstChild("Hatch")
+
+                    if h then
+                        if pcall(function() h:FireServer() end) then
+                            fired = fired + 1
+                            hatchFired[nm] = now
+                        end
+                    end
                 end
             end
         end
     end
 
-    return fired
+    return fired, found
 end
 
 --------------------------------------------------------------------
@@ -884,6 +890,27 @@ local function backpackHasWeapon()
     return false
 end
 
+-- a cheap fingerprint of what is in your hands. The game moves Tools
+-- between Backpack and Character on its own, so any change here means
+-- "the inventory is still settling" and the reset timer restarts.
+local function handSignature()
+    local c = LP.Character
+    if not c then return "" end
+
+    local ok, kids = pcall(function() return c:GetChildren() end)
+    if not ok or not kids then return "" end
+
+    local s = ""
+
+    for i = 1, #kids do
+        if kids[i].ClassName == "Tool" then
+            s = s .. kids[i].Name .. "|"
+        end
+    end
+
+    return s
+end
+
 -- writes -10 into the health field itself, the one thing measured to
 -- actually kill here. Humanoid.Health = 0 and BreakJoints were both
 -- no-ops because the server re-syncs the property.
@@ -1241,7 +1268,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO HATCH  (all Egg_<uuid> actors)
+-- AUTO HATCH  (one egg per pass)
 --------------------------------------------------------------------
 task.spawn(function()
     local wasOn   = false
@@ -1249,15 +1276,16 @@ task.spawn(function()
 
     while running do
         if Config.AutoHatch then
-            local fired = hatchAll()
+            local fired, found = hatchNext()
 
             if fired > 0 then
                 if not wasOn then
                     wasOn = true
-                    print("[" .. NAME .. "] auto hatch on (" .. tostring(fired) .. " eggs)")
+                    print("[" .. NAME .. "] auto hatch on ("
+                        .. tostring(found) .. " eggs, one per pass)")
                 end
                 lastSay = false
-            elseif not lastSay then
+            elseif found == 0 and not lastSay then
                 lastSay = true
                 print("[" .. NAME .. "] auto hatch: no Egg_ actor with a Hatch remote")
             end
@@ -1269,7 +1297,8 @@ task.spawn(function()
                 print("[" .. NAME .. "] auto hatch off")
             end
 
-            lastSay = false
+            hatchFired = {}
+            lastSay    = false
             task.wait(0.2)
         end
     end
@@ -1470,15 +1499,17 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO RESET  (no weapon in hand, back to the same spot)
+-- AUTO RESET  (steady empty hand only, then back to the same spot)
 --------------------------------------------------------------------
--- v10.14 required NO Tool at all in hand, so a mosquito in hand kept
--- this permanently closed. It now needs only: no weapon, no carried
--- egg, and a weapon in the Backpack for the game to hand back.
+-- v10.15 used a 0.4 s settle and 1.5 s cooldown, so the game's own
+-- Tool shuffling kept re-triggering it. Now any change in the hand
+-- restarts the timer, and a reset needs 3 s of a steady weaponless
+-- hand plus 30 s since the last one.
 task.spawn(function()
     local lastKill   = 0
     local emptySince = nil
     local lastChar   = nil
+    local lastSig    = nil
     local watching   = false
 
     while running do
@@ -1486,9 +1517,17 @@ task.spawn(function()
             if LP.Character ~= lastChar then
                 lastChar   = LP.Character
                 emptySince = nil
+                lastSig    = nil
             end
 
             local now = tick()
+            local sig = handSignature()
+
+            -- anything moving in or out of the hand restarts the clock
+            if sig ~= lastSig then
+                lastSig    = sig
+                emptySince = nil
+            end
 
             if needsWeapon() and backpackHasWeapon() then
                 if emptySince == nil then emptySince = now end
@@ -1555,6 +1594,7 @@ task.spawn(function()
         else
             emptySince = nil
             lastChar   = nil
+            lastSig    = nil
         end
 
         task.wait(0.2)
@@ -1777,16 +1817,17 @@ local function stop()
     pcall(stopHud)
     pcall(restoreAttackParts)
     pcall(function() fireEvent("StopTransfuseBlood") end)
-    bossCache = {}
-    bossStamp = 0
-    eggCache  = {}
-    eggStamp  = 0
-    partCache = {}
+    bossCache   = {}
+    bossStamp   = 0
+    eggCache    = {}
+    eggStamp    = 0
+    partCache   = {}
+    hatchFired  = {}
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - reset on no weapon, farm kill gets the weapon", 5)
+notifyUser("Loaded - paced reset and hatch", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
