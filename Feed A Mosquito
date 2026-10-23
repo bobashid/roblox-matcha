@@ -1,47 +1,49 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.19  -  hatch waits for HatchReady, farm kill restored to v10.5
+--  v10.20  -  hatch gated by the egg's own prompt, hide under farm
 --
---  WHY HATCH ONLY WORKED AT LAUNCH
---    Decompiled EggActor does this:
---        ListenRemoteEvent("HatchReady", onHatchReady)
---    and onHatchReady is what sets the prompt up and enables it. So an
---    egg is only hatchable AFTER the server sends HatchReady for it.
+--  AUTO HATCH  (only eggs the server has announced)
+--    Decompiled EggActor: the Hatch ProximityPrompt is created inside
+--    getOrCreatePrompt(), and that is only called from onHatchReady -
+--    i.e. when the server sends HatchReady for that egg.
 --
---    Firing Hatch on every Egg_<uuid> actor meant almost every call was
---    for an egg that had not announced ready - the server ignored them,
---    and the ones it accepted were the handful ready at launch. That is
---    exactly the behaviour you described.
+--    So the prompt's EXISTENCE is the readiness test:
+--        prompt not there  -> not ready, do not touch it
+--        prompt there      -> ready, fire it
 --
---    Now each Egg_<uuid> actor's Events.HatchReady is listened to with
---    OnClientEvent. Only the eggs that fired HatchReady get Hatch sent,
---    once, and the flag is cleared until the next HatchReady. No
---    guessing, no flooding.
+--    The old code fired Hatch at every Egg_<uuid> actor regardless, so
+--    almost everything it sent was for an unready egg and the server
+--    ignored it (and the few it accepted were the ones ready at
+--    launch). It now walks the workspace egg models, finds a
+--    ProximityPrompt inside one that is NOT the CarryPrompt and NOT the
+--    Skip prompt, and fires only that. Nothing is sent for an egg with
+--    no prompt, so unready eggs are never touched.
 --
---    If no HatchReady remote can be found on any egg actor at all, it
---    says so once in the console and falls back to one egg per pass so
---    the feature is not silently dead.
+--  AUTO EQUIP BEST  (fixed after every reset)
+--    playerEvents() cached the Player_<id> actor folder by UserId and
+--    never re-checked it. A reset rebuilds that folder, so the cached
+--    one was orphaned, FindFirstChild("PlaceBest") returned nil, and
+--    the toggle silently did nothing from then on. The cache is now
+--    used only while it is still parented, otherwise it re-resolves.
 --
---  FARM KILL RESTORED
---    equippedTool() prefers a Tool with an AttackPart and falls back to
---    the first Tool carrying an ActorId - the v10.5 behaviour. The hit
---    block and the cache rule are v10.5's as well:
---        if id ~= cachedId then
---            cachedId = id
---            cachedAtk, cachedPs = remotesOfActor(id)
---        end
---    Nothing else in the hit path was touched.
+--  HIDE UNDER FARM  (new toggle, Farm section)
+--    While on, you are held HIDE_DEPTH studs below your own BasePart,
+--    under the map. A keeper re-writes the CFrame if you drift, and
+--    every TP egg pickup returns you to the hide spot instead of the
+--    surface, so a pickup never reveals you.
 --
---  ALSO IN
---    Reset: memory_write at the fetched health offset (0x184 fallback,
---    verified in game), 3 s of a steady weaponless hand, 30 s apart,
---    saved CFrame restored within 0.05 s of the new character.
---    TP pickup depth 3. PlaceBest only when your mosquito list changes.
+--  EGG PICKUP  (faster, and silent from under the map)
+--    PICK_RATE 0.35 -> 0.15, PICK_COOLDOWN 1.0 -> 0.4, and the prompt
+--    is fired twice 0.05 s apart so a prompt that was mid-refresh is
+--    still caught. With Hide Under Farm on, the hop starts and ends
+--    under the map.
+--
+--  FARM KILL  unchanged from v10.19 (v10.5 pick, cache and hit block).
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
---      Farm       Farm Kill, Auto Hatch, Auto Equip Best
+--      Farm       Farm Kill, Auto Hatch, Auto Equip Best, Hide Under Farm
 --      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
 --
 --  Stop with _G.FeedAMosquito.stop().
@@ -54,7 +56,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.19"
+local VERSION = "v10.20"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -75,14 +77,19 @@ local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
 -- equip / hatch tuning
-local EQUIP_RATE   = 1.5
-local HATCH_RATE   = 0.4
-local HATCH_GAP    = 0.03
+local EQUIP_RATE     = 1.5
+local HATCH_RATE     = 0.5
+local HATCH_GAP      = 0.03
+local HATCH_COOLDOWN = 1.5
 
 -- respawn tuning
 local FAST_SETTLE   = 3.0
 local FAST_COOLDOWN = 30.0
 local FAST_MAX_WAIT = 15.0
+
+-- hide tuning
+local HIDE_DEPTH = 25
+local HIDE_KEEP  = 0.5
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -95,11 +102,11 @@ local PART_TTL     = 2.0
 local EGG_TTL      = 1.0
 
 -- pickup tuning
-local PICK_RATE     = 0.35
-local PICK_COOLDOWN = 1.0
+local PICK_RATE     = 0.15
+local PICK_COOLDOWN = 0.4
 local TP_DEPTH      = 3
-local TP_SETTLE     = 0.15
-local TP_HOLD       = 0.20
+local TP_SETTLE     = 0.12
+local TP_HOLD       = 0.18
 
 -- panel tuning
 local PANEL_ROWS   = 6
@@ -185,6 +192,7 @@ local Config = {
     TPPickup    = false,
     BestEquip   = false,
     AutoHatch   = false,
+    HideUnder   = false,
 }
 
 local PickCfg = {}
@@ -198,12 +206,11 @@ local getterWorks = {}
 local RARITY_IDS  = {}
 
 local lastPickupAt = 0
+local hatchFired   = {}
+local pickingNow   = false
 
--- hatch state
-local hatchReady   = {}   -- actor name -> true, set by HatchReady
-local hatchWatched = {}   -- actor name -> true, OnClientEvent connected
-local hatchFired   = {}   -- actor name -> tick of last fire
-local hatchSweep   = {}   -- fallback rotation marker
+local hideSpot = nil
+local hideSaid = false
 
 local tpHome   = nil
 local tpAway   = false
@@ -401,13 +408,18 @@ local function eggPosition(model)
 end
 
 --------------------------------------------------------------------
--- Player actor remotes
+-- Player actor remotes  (cache only while the folder is still alive)
 --------------------------------------------------------------------
 local pEvents = nil
 local pFor    = nil
 
 local function playerEvents()
-    if pFor == LP.UserId and pEvents then return pEvents end
+    if pFor == LP.UserId and pEvents and pEvents.Parent ~= nil then
+        return pEvents
+    end
+
+    pEvents = nil
+    pFor    = nil
 
     local actors = child(RS, "Runtime", "Actors")
     if not actors then return nil end
@@ -415,7 +427,10 @@ local function playerEvents()
     local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
     if not actor then return nil end
 
-    pEvents = actor:FindFirstChild("Events")
+    local ev = actor:FindFirstChild("Events")
+    if not ev then return nil end
+
+    pEvents = ev
     pFor    = LP.UserId
     return pEvents
 end
@@ -435,10 +450,8 @@ local function placeBest()
 end
 
 --------------------------------------------------------------------
--- LIVE TOOL ACTOR  (v10.5 pick and cache)
+-- LIVE TOOL ACTOR
 --------------------------------------------------------------------
--- weapon first, then the first Tool carrying an ActorId - the v10.5
--- behaviour, so the hit path is what you said worked
 local function equippedTool()
     local c = LP.Character
     if not c then return nil end
@@ -755,7 +768,7 @@ local function restoreAttackParts()
 end
 
 --------------------------------------------------------------------
--- Reset helpers
+-- Reset / base / hide helpers
 --------------------------------------------------------------------
 local function needsWeapon()
     local c = LP.Character
@@ -826,122 +839,137 @@ local function killCharacter()
     return true, nil
 end
 
---------------------------------------------------------------------
--- AUTO HATCH  (only eggs that sent HatchReady)
---------------------------------------------------------------------
--- EggActor listens for HatchReady and only then sets its prompt up and
--- enables it. So the only safe time to fire Hatch is after that event.
-local hatchNoEvent = false
+-- the game's own isValidBasePart: part named BasePart, an ancestor whose
+-- name contains "Base", and that ancestor's Player ObjectValue is you
+local function myBasePart()
+    local ok, desc = pcall(function() return WS:GetDescendants() end)
+    if not ok or not desc then return nil end
 
-local function eggActors()
-    local actors = child(RS, "Runtime", "Actors")
-    if not actors then return nil end
+    local best     = nil
+    local bestArea = -1
 
-    local ok, kids = pcall(function() return actors:GetChildren() end)
-    if not ok or not kids then return nil end
+    for i = 1, #desc do
+        local d = desc[i]
 
-    return kids
-end
+        if d.Name == "BasePart" then
+            local cur    = d
+            local mine   = false
+            local isBase = false
 
--- connect HatchReady for any egg actor we have not seen yet
-local function watchEggs()
-    local kids = eggActors()
-    if not kids then return end
+            for lvl = 1, 3 do
+                cur = cur.Parent
+                if not cur then break end
 
-    for i = 1, #kids do
-        local a  = kids[i]
-        local nm = a.Name
+                if string.find(cur.Name, "Base", 1, true) then isBase = true end
 
-        if type(nm) == "string"
-            and string.sub(nm, 1, 4) == "Egg_"
-            and string.find(nm, "-", 1, true)
-            and not hatchWatched[nm] then
-            local ev = a:FindFirstChild("Events")
-            local hr = ev and ev:FindFirstChild("HatchReady")
+                local pl = cur:FindFirstChild("Player")
+                if pl then
+                    local okV, v = pcall(function() return pl.Value end)
+                    if okV and v == LP then mine = true end
+                    break
+                end
+            end
 
-            if hr then
-                local ok = pcall(function()
-                    hr.OnClientEvent:Connect(function()
-                        hatchReady[nm] = true
-                    end)
-                end)
+            if mine and isBase then
+                local okS, sz = pcall(function() return d.Size end)
+                local area = 0
 
-                if ok then
-                    hatchWatched[nm] = true
+                if okS and sz and type(sz.X) == "number" and type(sz.Z) == "number" then
+                    area = sz.X * sz.Z
+                end
+
+                if area > bestArea then
+                    bestArea = area
+                    best     = d
                 end
             end
         end
     end
+
+    return best
 end
 
--- fire the eggs that have announced ready. Returns fired, readyCount
-local function hatchReadyOnes()
-    local kids = eggActors()
-    if not kids then return 0, 0 end
+local function computeHideSpot()
+    local part = myBasePart()
+    if not part then return nil end
 
+    local okP, pos = pcall(function() return part.Position end)
+    if not okP or not pos then return nil end
+
+    return CFrame.new(pos.X, pos.Y - HIDE_DEPTH, pos.Z)
+end
+
+local function goHide()
+    if not hideSpot then hideSpot = computeHideSpot() end
+    if not hideSpot then return false end
+
+    local hrp = rootPart()
+    if not hrp then return false end
+
+    pcall(function() hrp.CFrame = hideSpot end)
+    return true
+end
+
+--------------------------------------------------------------------
+-- AUTO HATCH  (only eggs whose own Hatch prompt exists)
+--------------------------------------------------------------------
+-- The Hatch prompt is created by EggActor.getOrCreatePrompt(), which is
+-- only reached from onHatchReady. No prompt means the server has not
+-- announced that egg yet, so it is left completely alone.
+local function readyPrompt(model)
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.ClassName == "ProximityPrompt" and d.Name ~= "CarryPrompt" then
+            local okA, act = pcall(function() return d.ActionText end)
+
+            if okA and act == "Skip" then
+                -- the skip-hatch prompt, not the hatch one
+            else
+                local okE, en = pcall(function() return d.Enabled end)
+
+                if not okE or en ~= false then return d end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function hatchReadyEggs()
+    local eggs = eggList()
+    local now  = tick()
     local fired = 0
-    local readyCount = 0
+    local total = 0
 
-    for i = 1, #kids do
-        local a  = kids[i]
-        local nm = a.Name
+    for i = 1, #eggs do
+        local m = eggs[i].model
+        local k = keyOf(m)
 
-        if type(nm) == "string" and hatchReady[nm] then
-            readyCount = readyCount + 1
+        if k ~= nil then
+            local last = hatchFired[k]
 
-            local ev = a:FindFirstChild("Events")
-            local h  = ev and ev:FindFirstChild("Hatch")
+            if last == nil or (now - last) >= HATCH_COOLDOWN then
+                local prompt = readyPrompt(m)
 
-            if h then
-                if pcall(function() h:FireServer() end) then
-                    fired = fired + 1
-                end
-            end
+                if prompt then
+                    total = total + 1
 
-            hatchReady[nm] = nil
-            hatchFired[nm] = tick()
+                    if pcall(function() fireproximityprompt(prompt) end) then
+                        hatchFired[k] = now
+                        fired = fired + 1
 
-            if HATCH_GAP > 0 then task.wait(HATCH_GAP) end
-        end
-    end
-
-    return fired, readyCount
-end
-
--- fallback used only when no egg actor exposes a HatchReady remote at
--- all: one egg per pass, paced, so the feature is not silently dead
-local function hatchOnePaced()
-    local kids = eggActors()
-    if not kids then return 0, 0 end
-
-    local now   = tick()
-    local found = 0
-
-    for i = 1, #kids do
-        local a  = kids[i]
-        local nm = a.Name
-
-        if type(nm) == "string"
-            and string.sub(nm, 1, 4) == "Egg_"
-            and string.find(nm, "-", 1, true) then
-            found = found + 1
-
-            if not hatchSweep[nm] and (hatchFired[nm] == nil or (now - hatchFired[nm]) >= 3) then
-                local ev = a:FindFirstChild("Events")
-                local h  = ev and ev:FindFirstChild("Hatch")
-
-                if h then
-                    if pcall(function() h:FireServer() end) then
-                        hatchFired[nm] = now
-                        hatchSweep[nm] = true
-                        return 1, found
+                        if HATCH_GAP > 0 then task.wait(HATCH_GAP) end
                     end
                 end
             end
         end
     end
 
-    return 0, found
+    return fired, total
 end
 
 task.spawn(function()
@@ -950,29 +978,18 @@ task.spawn(function()
 
     while running do
         if Config.AutoHatch then
-            watchEggs()
-
-            local fired, ready = hatchReadyOnes()
-            local found        = 0
-
-            if fired == 0 and not next(hatchWatched) then
-                hatchNoEvent = true
-                local f, n = hatchOnePaced()
-                fired = f
-                found = n
-            end
+            local fired, ready = hatchReadyEggs()
 
             if fired > 0 then
                 if not wasOn then
                     wasOn = true
                     print("[" .. NAME .. "] auto hatch on ("
-                        .. (hatchNoEvent and "paced fallback" or "only eggs that sent HatchReady")
-                        .. ")")
+                        .. tostring(ready) .. " eggs ready)")
                 end
                 lastSay = false
-            elseif ready == 0 and not lastSay and not hatchNoEvent then
+            elseif not lastSay then
                 lastSay = true
-                print("[" .. NAME .. "] auto hatch armed: waiting for HatchReady")
+                print("[" .. NAME .. "] auto hatch: waiting for eggs to show a Hatch prompt")
             end
 
             task.wait(HATCH_RATE)
@@ -982,9 +999,7 @@ task.spawn(function()
                 print("[" .. NAME .. "] auto hatch off")
             end
 
-            hatchReady = {}
             hatchFired = {}
-            hatchSweep = {}
             lastSay    = false
             task.wait(0.2)
         end
@@ -1241,6 +1256,7 @@ local function buildTab(tab)
             addToggle(farm, "Farm Kill", "farm_kill", "Farm", false)
             addToggle(farm, "Auto Hatch", "auto_hatch", "AutoHatch", false)
             addToggle(farm, "Auto Equip Best", "auto_equip_best", "BestEquip", false)
+            addToggle(farm, "Hide Under Farm", "hide_under_farm", "HideUnder", false)
         end
 
         local pick = makeSection(tab, "Egg Pickup", "Left")
@@ -1328,6 +1344,56 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
+-- HIDE UNDER FARM
+--------------------------------------------------------------------
+local function handHasTool()
+    local c = LP.Character
+    if not c then return false end
+
+    local ok, kids = pcall(function() return c:GetChildren() end)
+    if not ok or not kids then return false end
+
+    for i = 1, #kids do
+        if kids[i].ClassName == "Tool" then return true end
+    end
+
+    return false
+end
+
+task.spawn(function()
+    while running do
+        if Config.HideUnder and alive() then
+            if not hideSpot then
+                hideSpot = computeHideSpot()
+
+                if hideSpot and not hideSaid then
+                    hideSaid = true
+                    print("[" .. NAME .. "] hide under farm on (" .. HIDE_DEPTH .. " studs below your BasePart)")
+                elseif not hideSpot and not hideSaid then
+                    hideSaid = true
+                    print("[" .. NAME .. "] hide under farm: no BasePart of yours found yet")
+                end
+            end
+
+            if hideSpot and not pickingNow then
+                local hrp = rootPart()
+                if hrp then pcall(function() hrp.CFrame = hideSpot end) end
+            end
+
+            task.wait(HIDE_KEEP)
+        else
+            if hideSpot and not Config.HideUnder then
+                hideSpot = nil
+                hideSaid = false
+                print("[" .. NAME .. "] hide under farm off")
+            end
+
+            task.wait(0.3)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
 -- AUTO EQUIP BEST  (only when your mosquito list changes)
 --------------------------------------------------------------------
 local function mosquitoSignature()
@@ -1363,7 +1429,7 @@ task.spawn(function()
 
             local should = (lastSig == nil)
                 or (sig ~= lastSig)
-                or ((now - lastFire) >= 60)
+                or ((now - lastFire) >= 30)
 
             if should then
                 lastSig = sig
@@ -1447,9 +1513,18 @@ task.spawn(function()
                                     local hrp  = rootPart()
 
                                     if epos and hrp then
-                                        local okH, home = pcall(function() return hrp.CFrame end)
+                                        -- return to the hide spot when hiding
+                                        local home = nil
 
-                                        if okH and home then
+                                        if Config.HideUnder and hideSpot then
+                                            home = hideSpot
+                                        else
+                                            local okH, cf = pcall(function() return hrp.CFrame end)
+                                            if okH and cf then home = cf end
+                                        end
+
+                                        if home then
+                                            pickingNow = true
                                             tpHome = home
                                             tpAway = true
 
@@ -1469,6 +1544,12 @@ task.spawn(function()
                                                 pcall(function()
                                                     fireproximityprompt(prompt)
                                                 end)
+
+                                                task.wait(0.05)
+
+                                                pcall(function()
+                                                    fireproximityprompt(prompt)
+                                                end)
                                             end
 
                                             task.wait(TP_HOLD)
@@ -1482,6 +1563,7 @@ task.spawn(function()
 
                                             tpAway = false
                                             tpHome = nil
+                                            pickingNow = false
 
                                             done = true
                                             taken = taken + 1
@@ -1542,6 +1624,7 @@ task.spawn(function()
 
             pcall(restoreHome)
             pcall(noClipOff)
+            pickingNow = false
             task.wait(0.2)
         end
     end
@@ -1581,7 +1664,9 @@ task.spawn(function()
                     local hrp  = rootPart()
                     local home = nil
 
-                    if hrp then
+                    if Config.HideUnder and hideSpot then
+                        home = hideSpot
+                    elseif hrp then
                         local ok, cf = pcall(function() return hrp.CFrame end)
                         if ok and cf then home = cf end
                     end
@@ -1646,7 +1731,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL  (v10.5 pick, cache and hit block)
+-- FARM KILL
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -1866,15 +1951,14 @@ local function stop()
     eggCache    = {}
     eggStamp    = 0
     partCache   = {}
-    hatchReady  = {}
-    hatchWatched = {}
     hatchFired  = {}
-    hatchSweep  = {}
+    hideSpot    = nil
+    pickingNow  = false
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - hatch waits for HatchReady", 5)
+notifyUser("Loaded - hatch gated by prompt, hide under farm", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
