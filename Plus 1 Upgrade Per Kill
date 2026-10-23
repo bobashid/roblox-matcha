@@ -213,8 +213,8 @@ task.spawn(function()
             local list = Players:GetPlayers()
             for i = 1, #list do
                 if not running or not cfg.enabled then break end
-                local ok, c, hrp = isTarget(list[i])
-                if ok then
+                local hit, c, hrp = isTarget(list[i])
+                if hit then
                     fireAt(c, hrp)
                     task.wait(interval)
                 end
