@@ -1,45 +1,44 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.20  -  hatch gated by the egg's own prompt, hide under farm
+--  v10.21  -  Hide Under Farm is an anchored float, not a fall
 --
---  AUTO HATCH  (only eggs the server has announced)
---    Decompiled EggActor: the Hatch ProximityPrompt is created inside
---    getOrCreatePrompt(), and that is only called from onHatchReady -
---    i.e. when the server sends HatchReady for that egg.
+--  WHY v10.20 CRASHED YOU
+--    It only wrote the CFrame once every HIDE_KEEP (0.5 s). Between
+--    writes gravity kept pulling, the character accelerated downward
+--    under the baseplate, and you fell to your death. Writing a
+--    position is not hovering.
 --
---    So the prompt's EXISTENCE is the readiness test:
---        prompt not there  -> not ready, do not touch it
---        prompt there      -> ready, fire it
+--  WHAT IT DOES NOW
+--    1. Anchors your HumanoidRootPart (Anchored = true), so nothing
+--       can pull it down - you genuinely float.
+--    2. Holds the spot on RenderStepped (every frame), not on a timer.
+--    3. Zeroes linear and angular velocity on the way in.
+--    4. Remembers the original Anchored value and restores it when you
+--       turn the toggle off, in stop(), and if the hide is bailed out.
+--    5. Turning the toggle off puts you back on the SURFACE above your
+--       BasePart first, then unanchors, so you never drop through the
+--       map on the way out.
+--    6. Safety: if your health falls below half of what it was when
+--       the hide started, it unanchors, says so, and stops holding you
+--       there (the spot is damaging). Toggle off/on to retry.
 --
---    The old code fired Hatch at every Egg_<uuid> actor regardless, so
---    almost everything it sent was for an unready egg and the server
---    ignored it (and the few it accepted were the ones ready at
---    launch). It now walks the workspace egg models, finds a
---    ProximityPrompt inside one that is NOT the CarryPrompt and NOT the
---    Skip prompt, and fires only that. Nothing is sent for an egg with
---    no prompt, so unready eggs are never touched.
+--  PICKUP WHILE HIDING
+--    The per-frame hold is skipped while a TP pickup is in flight, or
+--    it would yank you back mid-hop. Because the root stays anchored
+--    the whole time, the hop is a plain CFrame write and you cannot
+--    fall; when the hop ends you are written back to the hide spot.
 --
---  AUTO EQUIP BEST  (fixed after every reset)
---    playerEvents() cached the Player_<id> actor folder by UserId and
---    never re-checked it. A reset rebuilds that folder, so the cached
---    one was orphaned, FindFirstChild("PlaceBest") returned nil, and
---    the toggle silently did nothing from then on. The cache is now
---    used only while it is still parented, otherwise it re-resolves.
+--  AUTO HATCH  (unchanged from v10.20)
+--    Only an egg that already has its own Hatch ProximityPrompt is
+--    fired. That prompt is created by the game's onHatchReady, so its
+--    presence is the readiness test - unready eggs get nothing.
 --
---  HIDE UNDER FARM  (new toggle, Farm section)
---    While on, you are held HIDE_DEPTH studs below your own BasePart,
---    under the map. A keeper re-writes the CFrame if you drift, and
---    every TP egg pickup returns you to the hide spot instead of the
---    surface, so a pickup never reveals you.
+--  AUTO EQUIP BEST  (unchanged from v10.20)
+--    playerEvents() drops its cache when the Player_<id> folder is gone,
+--    so a reset no longer leaves PlaceBest unfindable.
 --
---  EGG PICKUP  (faster, and silent from under the map)
---    PICK_RATE 0.35 -> 0.15, PICK_COOLDOWN 1.0 -> 0.4, and the prompt
---    is fired twice 0.05 s apart so a prompt that was mid-refresh is
---    still caught. With Hide Under Farm on, the hop starts and ends
---    under the map.
---
---  FARM KILL  unchanged from v10.19 (v10.5 pick, cache and hit block).
+--  FARM KILL  unchanged (v10.5 pick, cache and hit block).
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
@@ -56,7 +55,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.20"
+local VERSION = "v10.21"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -89,7 +88,7 @@ local FAST_MAX_WAIT = 15.0
 
 -- hide tuning
 local HIDE_DEPTH = 25
-local HIDE_KEEP  = 0.5
+local HIDE_LIFT  = 6
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -209,8 +208,14 @@ local lastPickupAt = 0
 local hatchFired   = {}
 local pickingNow   = false
 
-local hideSpot = nil
-local hideSaid = false
+-- hide state
+local hideSpot    = nil
+local hideSurface = nil
+local hideSaid    = false
+local hideBail    = false
+local hideHP      = nil
+local hideConn    = nil
+local hideAnchor  = nil   -- { part = hrp, was = original Anchored }
 
 local tpHome   = nil
 local tpAway   = false
@@ -768,7 +773,7 @@ local function restoreAttackParts()
 end
 
 --------------------------------------------------------------------
--- Reset / base / hide helpers
+-- Reset / base helpers
 --------------------------------------------------------------------
 local function needsWeapon()
     local c = LP.Character
@@ -839,8 +844,6 @@ local function killCharacter()
     return true, nil
 end
 
--- the game's own isValidBasePart: part named BasePart, an ancestor whose
--- name contains "Base", and that ancestor's Player ObjectValue is you
 local function myBasePart()
     local ok, desc = pcall(function() return WS:GetDescendants() end)
     if not ok or not desc then return nil end
@@ -889,33 +892,132 @@ local function myBasePart()
     return best
 end
 
-local function computeHideSpot()
+--------------------------------------------------------------------
+-- HIDE UNDER FARM  (anchored float, held every frame)
+--------------------------------------------------------------------
+local function computeSpots()
     local part = myBasePart()
-    if not part then return nil end
+    if not part then return nil, nil end
 
     local okP, pos = pcall(function() return part.Position end)
-    if not okP or not pos then return nil end
+    if not okP or not pos then return nil, nil end
 
-    return CFrame.new(pos.X, pos.Y - HIDE_DEPTH, pos.Z)
+    local hide = CFrame.new(pos.X, pos.Y - HIDE_DEPTH, pos.Z)
+    local surf = CFrame.new(pos.X, pos.Y + HIDE_LIFT, pos.Z)
+
+    return hide, surf
 end
 
-local function goHide()
-    if not hideSpot then hideSpot = computeHideSpot() end
-    if not hideSpot then return false end
+local function unanchorHide()
+    if hideAnchor and hideAnchor.part then
+        local part = hideAnchor.part
+        local was  = hideAnchor.was
 
+        pcall(function() part.Anchored = was end)
+    end
+
+    hideAnchor = nil
+end
+
+-- floats you at the spot: anchored root, velocity zeroed, CFrame written
+local function anchorAt(spot)
     local hrp = rootPart()
-    if not hrp then return false end
+    if not hrp or not spot then return false end
 
-    pcall(function() hrp.CFrame = hideSpot end)
+    if hideAnchor == nil or hideAnchor.part ~= hrp then
+        unanchorHide()
+
+        local ok, was = pcall(function() return hrp.Anchored end)
+        hideAnchor = { part = hrp, was = (ok and was) or false }
+    end
+
+    pcall(function() hrp.Anchored = true end)
+    pcall(function() hrp.CFrame = spot end)
+    pcall(function()
+        hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
+        hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    end)
+
     return true
+end
+
+local function surfaceNow()
+    local hrp = rootPart()
+    if not hrp then return end
+
+    if hideSurface then
+        pcall(function() hrp.CFrame = hideSurface end)
+    end
+end
+
+local function startHideLoop()
+    if hideConn then return end
+
+    hideConn = RunService.RenderStepped:Connect(function()
+        if not running or not Config.HideUnder then return end
+        if hideBail then return end
+        if pickingNow then return end
+        if not alive() then return end
+
+        if not hideSpot then
+            hideSpot, hideSurface = computeSpots()
+
+            if hideSpot and not hideSaid then
+                hideSaid = true
+                print("[" .. NAME .. "] hide under farm on ("
+                    .. tostring(HIDE_DEPTH) .. " studs below your BasePart, anchored)")
+            end
+        end
+
+        if not hideSpot then return end
+
+        -- a damaging spot: leave rather than die in a loop
+        local hum = humanoid()
+
+        if hum then
+            if hideHP == nil then hideHP = hum.Health end
+
+            if hideHP and hum.Health < hideHP * 0.5 then
+                hideBail = true
+
+                unanchorHide()
+                surfaceNow()
+
+                print("[" .. NAME .. "] hide under farm: taking damage down there, stopped. Toggle it off and on to retry.")
+                return
+            end
+        end
+
+        anchorAt(hideSpot)
+    end)
+end
+
+local function stopHideLoop()
+    if hideConn then
+        pcall(function() hideConn:Disconnect() end)
+        hideConn = nil
+    end
+end
+
+local function leaveHide()
+    stopHideLoop()
+
+    if hideAnchor then
+        surfaceNow()
+        unanchorHide()
+        print("[" .. NAME .. "] hide under farm off (put back on the surface)")
+    end
+
+    hideSpot    = nil
+    hideSurface = nil
+    hideSaid    = false
+    hideHP      = nil
+    hideBail    = false
 end
 
 --------------------------------------------------------------------
 -- AUTO HATCH  (only eggs whose own Hatch prompt exists)
 --------------------------------------------------------------------
--- The Hatch prompt is created by EggActor.getOrCreatePrompt(), which is
--- only reached from onHatchReady. No prompt means the server has not
--- announced that egg yet, so it is left completely alone.
 local function readyPrompt(model)
     local ok, desc = pcall(function() return model:GetDescendants() end)
     if not ok or not desc then return nil end
@@ -940,8 +1042,8 @@ local function readyPrompt(model)
 end
 
 local function hatchReadyEggs()
-    local eggs = eggList()
-    local now  = tick()
+    local eggs  = eggList()
+    local now   = tick()
     local fired = 0
     local total = 0
 
@@ -1296,6 +1398,8 @@ end
 -- POLLERS
 --------------------------------------------------------------------
 task.spawn(function()
+    local hideWas = false
+
     while running do
         for i = 1, #TOGGLES do
             local t = TOGGLES[i]
@@ -1315,6 +1419,22 @@ task.spawn(function()
                     Config[t.key] = val
                     print("[" .. NAME .. "] " .. t.name .. " = " .. tostring(val))
                 end
+            end
+        end
+
+        -- hide on/off edges
+        if Config.HideUnder ~= hideWas then
+            hideWas = Config.HideUnder
+
+            if Config.HideUnder then
+                hideSpot, hideSurface = computeSpots()
+                hideSaid = false
+                hideBail = false
+                hideHP   = nil
+
+                startHideLoop()
+            else
+                leaveHide()
             end
         end
 
@@ -1344,57 +1464,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HIDE UNDER FARM
---------------------------------------------------------------------
-local function handHasTool()
-    local c = LP.Character
-    if not c then return false end
-
-    local ok, kids = pcall(function() return c:GetChildren() end)
-    if not ok or not kids then return false end
-
-    for i = 1, #kids do
-        if kids[i].ClassName == "Tool" then return true end
-    end
-
-    return false
-end
-
-task.spawn(function()
-    while running do
-        if Config.HideUnder and alive() then
-            if not hideSpot then
-                hideSpot = computeHideSpot()
-
-                if hideSpot and not hideSaid then
-                    hideSaid = true
-                    print("[" .. NAME .. "] hide under farm on (" .. HIDE_DEPTH .. " studs below your BasePart)")
-                elseif not hideSpot and not hideSaid then
-                    hideSaid = true
-                    print("[" .. NAME .. "] hide under farm: no BasePart of yours found yet")
-                end
-            end
-
-            if hideSpot and not pickingNow then
-                local hrp = rootPart()
-                if hrp then pcall(function() hrp.CFrame = hideSpot end) end
-            end
-
-            task.wait(HIDE_KEEP)
-        else
-            if hideSpot and not Config.HideUnder then
-                hideSpot = nil
-                hideSaid = false
-                print("[" .. NAME .. "] hide under farm off")
-            end
-
-            task.wait(0.3)
-        end
-    end
-end)
-
---------------------------------------------------------------------
--- AUTO EQUIP BEST  (only when your mosquito list changes)
+-- AUTO EQUIP BEST
 --------------------------------------------------------------------
 local function mosquitoSignature()
     local bp = LP:FindFirstChild("Backpack")
@@ -1513,7 +1583,6 @@ task.spawn(function()
                                     local hrp  = rootPart()
 
                                     if epos and hrp then
-                                        -- return to the hide spot when hiding
                                         local home = nil
 
                                         if Config.HideUnder and hideSpot then
@@ -1943,6 +2012,8 @@ local function stop()
     running = false
     pcall(restoreHome)
     pcall(noClipOff)
+    pcall(stopHideLoop)
+    pcall(unanchorHide)
     pcall(stopHud)
     pcall(restoreAttackParts)
     pcall(function() fireEvent("StopTransfuseBlood") end)
@@ -1953,6 +2024,7 @@ local function stop()
     partCache   = {}
     hatchFired  = {}
     hideSpot    = nil
+    hideSurface = nil
     pickingNow  = false
     _G.FeedAMosquito = nil
     print("[" .. NAME .. "] stopped")
@@ -1960,5 +2032,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - hatch gated by prompt, hide under farm", 5)
+notifyUser("Loaded - hide is an anchored float now", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
