@@ -1,23 +1,33 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.5  -  weapon auto-equip removed, back to the v10.1 behaviour
+--  v10.6  -  auto place eggs
 --
---  REVERTED
---    v10.2 / v10.3 / v10.4 all tried to put a weapon back in your
---    hands for you. The last one backed off when your hands were not
---    empty and gave up after five tries, and it still broke pulling
---    the weapon out by hand and auto hatch with it. All of that is
---    gone: this file is the v10.1 script again (commit 39abbf5a),
---    with only the version stamp changed.
+--  AUTO PLACE EGGS
+--    Decompiled from RS.Scripts.Mosquito.ToolActors.EggToolActor, the
+--    game itself only does this when you activate the egg Tool:
 --
---    Farm Kill is back to using whatever weapon you are holding. If
---    an egg pickup takes it away, equip it yourself and the hits
---    resume - nothing in here touches your Tools.
+--        local hit = raycast onto a BasePart in your own base
+--        PlayerActorIface:FireServer("PlaceEgg", itemUid, hit.Position)
+--
+--    and its isValidBasePart check is: part.Name == "BasePart", the
+--    parent Model name contains "Base", and that Model's "Player"
+--    ObjectValue equals you. So the whole call reduces to the egg
+--    Tool's ItemUid plus a point on your BasePart - no mouse, no
+--    raycast, no keypress.
+--
+--    Verified live: firing PlaceEgg once took the Backpack egg count
+--    from 10 to 9.
+--
+--    One egg per PLACE_RATE pass, using the first Egg Tool found in the
+--    Backpack. Positions walk a 5x5 grid over your BasePart so the eggs
+--    do not all stack on one point; the index advances every pass, so a
+--    position the server refuses costs nothing - the next pass simply
+--    tries a different one and the same egg.
 --
 --  MENU
 --      Main       Auto Health, Auto Collect
---      Farm       Farm Kill, Auto Hatch, Auto Equip Best
+--      Farm       Farm Kill, Auto Hatch, Auto Equip Best, Auto Place Eggs
 --      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
 --
 --  FARM KILL
@@ -63,7 +73,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.5"
+local VERSION = "v10.6"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -83,9 +93,10 @@ local TOUCH_PARTS  = 4
 local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
--- equip / hatch tuning
+-- equip / hatch / place tuning
 local EQUIP_RATE   = 1.5
 local HATCH_RATE   = 0.6
+local PLACE_RATE   = 0.5
 
 -- size cycle tuning
 local AP_SMALL     = 2
@@ -162,6 +173,7 @@ local Config = {
     TPPickup    = false,
     BestEquip   = false,
     AutoHatch   = false,
+    AutoPlace   = false,
 }
 
 local PickCfg = {}
@@ -410,6 +422,82 @@ local function hatchAll()
     end
 
     return fired
+end
+
+--------------------------------------------------------------------
+-- AUTO PLACE EGGS  (the game's own PlaceEgg remote)
+--------------------------------------------------------------------
+-- EggToolActor.OnToolActivated ends with exactly:
+--     PlayerActorIface:FireServer("PlaceEgg", itemUid, hitPosition)
+-- and its isValidBasePart check is: part.Name == "BasePart", parent
+-- Model name contains "Base", and that Model's "Player" ObjectValue is
+-- you. Verified live - one call took the Backpack egg count 10 -> 9.
+local PLACE_OFFSETS = {}
+
+for gx = -2, 2 do
+    for gz = -2, 2 do
+        PLACE_OFFSETS[#PLACE_OFFSETS + 1] = Vector3(gx * 3, 0, gz * 3)
+    end
+end
+
+local function myBasePart()
+    local ok, desc = pcall(function() return WS:GetDescendants() end)
+    if not ok or not desc then return nil end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if d.Name == "BasePart" then
+            local cur = d
+            local mine = false
+
+            for lvl = 1, 3 do
+                cur = cur.Parent
+                if not cur then break end
+
+                local pl = cur:FindFirstChild("Player")
+                if pl then
+                    local okV, v = pcall(function() return pl.Value end)
+                    if okV and v == LP then mine = true end
+                    break
+                end
+            end
+
+            if mine then return d end
+        end
+    end
+
+    return nil
+end
+
+local function backpackEggs()
+    local bp = LP:FindFirstChild("Backpack")
+    local out = {}
+
+    if not bp then return out end
+
+    local ok, kids = pcall(function() return bp:GetChildren() end)
+    if not ok or not kids then return out end
+
+    for i = 1, #kids do
+        local t = kids[i]
+
+        if t.ClassName == "Tool" then
+            local it = t:FindFirstChild("ItemType")
+            local okT, v = pcall(function() return it and it.Value end)
+
+            if okT and v == "Egg" then
+                local uidv = t:FindFirstChild("ItemUid")
+                local okU, uid = pcall(function() return uidv and uidv.Value end)
+
+                if okU and type(uid) == "string" and #uid > 0 then
+                    out[#out + 1] = uid
+                end
+            end
+        end
+    end
+
+    return out
 end
 
 --------------------------------------------------------------------
@@ -994,6 +1082,7 @@ local function buildTab(tab)
             addToggle(farm, "Farm Kill", "farm_kill", "Farm", false)
             addToggle(farm, "Auto Hatch", "auto_hatch", "AutoHatch", false)
             addToggle(farm, "Auto Equip Best", "auto_equip_best", "BestEquip", false)
+            addToggle(farm, "Auto Place Eggs", "auto_place_eggs", "AutoPlace", false)
         end
 
         local pick = makeSection(tab, "Egg Pickup", "Left")
@@ -1110,6 +1199,71 @@ task.spawn(function()
             end
 
             lastSay = false
+            task.wait(0.2)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- AUTO PLACE EGGS  (PlaceEgg remote, one egg per pass)
+--------------------------------------------------------------------
+task.spawn(function()
+    local wasOn   = false
+    local lastSay = false
+    local idx     = 1
+    local placed  = 0
+
+    while running do
+        if Config.AutoPlace then
+            local part = myBasePart()
+            local eggs = backpackEggs()
+
+            if part and #eggs > 0 then
+                local okP, pos = pcall(function() return part.Position end)
+                local okS, sz  = pcall(function() return part.Size end)
+
+                local topY = 1
+                if okS and sz and type(sz.Y) == "number" then topY = sz.Y / 2 end
+
+                local events = playerEvents()
+                local remote = events and events:FindFirstChild("PlaceEgg")
+
+                if okP and pos and remote then
+                    local off = PLACE_OFFSETS[idx]
+                    idx = idx + 1
+                    if idx > #PLACE_OFFSETS then idx = 1 end
+
+                    local target = pos + Vector3(off.X, topY, off.Z)
+
+                    pcall(function() remote:FireServer(eggs[1], target) end)
+
+                    placed = placed + 1
+                    lastSay = false
+
+                    if not wasOn then
+                        wasOn = true
+                        print("[" .. NAME .. "] auto place eggs on ("
+                            .. tostring(#eggs) .. " in Backpack)")
+                    end
+                elseif not lastSay then
+                    lastSay = true
+                    print("[" .. NAME .. "] auto place eggs: no BasePart of yours or no PlaceEgg remote")
+                end
+            elseif not lastSay then
+                lastSay = true
+                print("[" .. NAME .. "] auto place eggs: no egg Tools in Backpack")
+            end
+
+            task.wait(PLACE_RATE)
+        else
+            if wasOn then
+                wasOn = false
+                print("[" .. NAME .. "] auto place eggs off (" .. tostring(placed) .. " placed)")
+            end
+
+            lastSay = false
+            idx     = 1
+            placed  = 0
             task.wait(0.2)
         end
     end
@@ -1534,5 +1688,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - weapon auto-equip removed", 5)
+notifyUser("Loaded - auto place eggs added", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
