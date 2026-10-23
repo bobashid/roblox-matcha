@@ -1,49 +1,46 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.0  -  auto hatch for every egg actor
+--  v10.1  -  Farm section, full toggle names
+--
+--  MENU
+--      Main       Auto Health, Auto Collect
+--      Farm       Farm Kill, Auto Hatch, Auto Equip Best
+--      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
+--    No abbreviated labels and no abbreviated widget ids.
+--
+--  FARM KILL
+--    AttackPart is the only thing written on the tool: shrink to 2
+--    studs to end every contact, grow back to map size for a new one,
+--    then PlaySound("SwingSound") + Attack on the LIVE tool actor from
+--    the tool's ActorId value. No mouse input, nothing reparented.
 --
 --  AUTO HATCH
---    Same remote you fired by hand, for every egg instead of one:
---        for each Runtime.Actors child named Egg_<uuid>:
---            .Events.Hatch:FireServer()
---    Fires on a HATCH_RATE loop while the toggle is on. The egg actors
---    are rebuilt every pass (they come and go with the world), so a
---    newly placed egg is picked up on the next tick.
---
---    The workspace Model is not named after the actor (probe: no
---    Workspace child with that name), so the actors folder is the only
---    place to look. Only actors whose name carries a uuid are touched -
---    the Enemy_* actors have no Hatch remote and are skipped.
+--    For every Runtime.Actors child named Egg_<uuid>:
+--        .Events.Hatch:FireServer()
+--    on a HATCH_RATE loop. The egg actors are rebuilt every pass, so a
+--    newly placed egg is picked up on the next tick. Enemy_* actors
+--    have no Hatch remote and are skipped.
 --
 --    Readiness cannot be read from here: HatchReady is a RemoteEvent,
 --    not a value, and hooking is not available. So every Hatch is fired
 --    on each pass and the server ignores the ones that are not ready.
 --
 --  AUTO EQUIP BEST
---    No ranking. The toggle fires
---        Runtime.Actors.Player_<UserId>.Events.PlaceBest:FireServer()
---    on an EQUIP_RATE loop. Path is built from LocalPlayer.UserId, so it
+--    Fires Runtime.Actors.Player_<UserId>.Events.PlaceBest on an
+--    EQUIP_RATE loop. The path is built from LocalPlayer.UserId, so it
 --    works on any account, not just the one it was tested on.
 --
---  v9.5 note (still true): writing a CFrame below the floor does not
---    put you under it - the Humanoid collides with the baseplate and
---    the physics step resolves you straight back up. The TP pickup
---    turns CanCollide off on YOUR OWN character parts for the hop
---    only, restores them on return, and stop() restores them too.
---
---  PICKUP
---      near range  - plain fireproximityprompt, instant
---      far range   - the hop above, one egg per pass
+--  AUTO PICKUP / TP PICKUP
+--    near range  - plain fireproximityprompt, instant
+--    far range   - hop under the egg. Writing a CFrame below the floor
+--      alone does not hold (the Humanoid collides with the baseplate
+--      and physics resolves it back up), so CanCollide is turned off on
+--      YOUR OWN character parts for the hop only, and restored on
+--      return - plus again in stop() if it is called mid-hop.
 --
 --  PANEL
 --      left  PANEL_X = 300   boss name, HP bar, hp / max
---
---  Hit logic unchanged from v8.2:
---    - AttackPart is the only thing written on the tool: shrink to 2
---      studs to end every contact, grow back to map size for a new one
---    - PlaySound("SwingSound") + Attack on the LIVE tool actor from
---      the tool's ActorId value
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -55,7 +52,7 @@ local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
 local NAME    = "Feed A Mosquito"
-local VERSION = "v10.0"
+local VERSION = "v10.1"
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -952,7 +949,7 @@ local function addToggle(sec, label, id, key, default)
 end
 
 local function addRarity(sec, rarity)
-    local id = "pick_" .. string.lower(rarity)
+    local id = "rarity_" .. string.lower(rarity)
 
     local cb = function(a, b, c)
         if getterWorks[rarity] then return end
@@ -977,21 +974,21 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local main = makeSection(tab, "Main", "Left")
         if main then
-            addToggle(main, "Auto Health", "heal", "Heal", false)
-            addToggle(main, "Auto Collect", "collect", "AutoCollect", false)
+            addToggle(main, "Auto Health", "auto_health", "Heal", false)
+            addToggle(main, "Auto Collect", "auto_collect", "AutoCollect", false)
         end
 
-        local combat = makeSection(tab, "Combat", "Left")
-        if combat then
-            addToggle(combat, "Kill Farm (repeat hits)", "farm", "Farm", false)
-            addToggle(combat, "Auto Equip Best Mosquito", "besteq", "BestEquip", false)
+        local farm = makeSection(tab, "Farm", "Left")
+        if farm then
+            addToggle(farm, "Farm Kill", "farm_kill", "Farm", false)
+            addToggle(farm, "Auto Hatch", "auto_hatch", "AutoHatch", false)
+            addToggle(farm, "Auto Equip Best", "auto_equip_best", "BestEquip", false)
         end
 
         local pick = makeSection(tab, "Egg Pickup", "Left")
         if pick then
-            addToggle(pick, "Auto Pickup", "pickup", "Pickup", false)
-            addToggle(pick, "TP Pickup (under egg)", "tppickup", "TPPickup", false)
-            addToggle(pick, "Auto Hatch (all eggs)", "autoh", "AutoHatch", false)
+            addToggle(pick, "Auto Pickup", "auto_pickup", "Pickup", false)
+            addToggle(pick, "TP Pickup (under egg)", "tp_pickup", "TPPickup", false)
 
             for i = 1, #RARITIES do
                 addRarity(pick, RARITIES[i])
@@ -1042,7 +1039,7 @@ task.spawn(function()
                 getterWorks[t.key] = true
                 if Config[t.key] ~= val then
                     Config[t.key] = val
-                    print("[" .. NAME .. "] " .. t.key .. " = " .. tostring(val))
+                    print("[" .. NAME .. "] " .. t.name .. " = " .. tostring(val))
                 end
             end
         end
@@ -1063,7 +1060,7 @@ task.spawn(function()
                 getterWorks[r.rarity] = true
                 if PickCfg[r.rarity] ~= val then
                     PickCfg[r.rarity] = val
-                    print("[" .. NAME .. "] pick " .. r.rarity .. " = " .. tostring(val))
+                    print("[" .. NAME .. "] rarity " .. r.name .. " = " .. tostring(val))
                 end
             end
         end
@@ -1124,13 +1121,13 @@ task.spawn(function()
 
                 if placeBest() then
                     if not wasOn then
-                        print("[" .. NAME .. "] auto equip on (PlaceBest)")
+                        print("[" .. NAME .. "] auto equip best on (PlaceBest)")
                     end
                     wasOn  = true
                     warned = false
                 elseif not warned then
                     warned = true
-                    print("[" .. NAME .. "] auto equip: PlaceBest remote not found")
+                    print("[" .. NAME .. "] auto equip best: PlaceBest remote not found")
                 end
             end
 
@@ -1138,7 +1135,7 @@ task.spawn(function()
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto equip off")
+                print("[" .. NAME .. "] auto equip best off")
             end
 
             warned   = false
@@ -1282,7 +1279,7 @@ task.spawn(function()
                 end
             elseif not warned then
                 warned = true
-                print("[" .. NAME .. "] pickup: no egg matched an enabled rarity")
+                print("[" .. NAME .. "] auto pickup: no egg matched an enabled rarity")
             end
 
             task.wait(PICK_RATE)
@@ -1300,7 +1297,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- KILL FARM
+-- FARM KILL
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == "function")
@@ -1323,7 +1320,7 @@ task.spawn(function()
             if not tool then
                 if not warnedTool then
                     warnedTool = true
-                    print("[" .. NAME .. "] kill farm: equip a weapon")
+                    print("[" .. NAME .. "] farm kill: equip a weapon")
                 end
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
                 task.wait(0.25)
@@ -1346,7 +1343,7 @@ task.spawn(function()
                 if not ap then
                     if not warnedAct then
                         warnedAct = true
-                        print("[" .. NAME .. "] kill farm: no AttackPart on this tool")
+                        print("[" .. NAME .. "] farm kill: no AttackPart on this tool")
                     end
                     cachedId = nil
                     task.wait(0.25)
@@ -1355,7 +1352,7 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] kill farm on (size cycle per pass)")
+                        print("[" .. NAME .. "] farm kill on (size cycle per pass)")
                     end
 
                     rememberPart(ap)
@@ -1446,7 +1443,7 @@ task.spawn(function()
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] kill farm off")
+                print("[" .. NAME .. "] farm kill off")
             end
 
             warnedTool = false
@@ -1526,5 +1523,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - auto hatch + auto equip best", 5)
+notifyUser("Loaded - Farm section added", 5)
 print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
