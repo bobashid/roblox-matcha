@@ -1,71 +1,59 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v10.21  -  Hide Under Farm is an anchored float, not a fall
+--  v11.0
 --
---  WHY v10.20 CRASHED YOU
---    It only wrote the CFrame once every HIDE_KEEP (0.5 s). Between
---    writes gravity kept pulling, the character accelerated downward
---    under the baseplate, and you fell to your death. Writing a
---    position is not hovering.
+--  WHY v10.20/21 STILL DROPPED YOU
+--    Writing the CFrame on a timer, or even every frame, does not
+--    cancel gravity - it only resets the position after physics has
+--    already moved you. If the Anchored write does not stick, the
+--    velocity keeps building and you accelerate down under the map.
 --
 --  WHAT IT DOES NOW
---    1. Anchors your HumanoidRootPart (Anchored = true), so nothing
---       can pull it down - you genuinely float.
---    2. Holds the spot on RenderStepped (every frame), not on a timer.
---    3. Zeroes linear and angular velocity on the way in.
---    4. Remembers the original Anchored value and restores it when you
---       turn the toggle off, in stop(), and if the hide is bailed out.
---    5. Turning the toggle off puts you back on the SURFACE above your
---       BasePart first, then unanchors, so you never drop through the
---       map on the way out.
---    6. Safety: if your health falls below half of what it was when
---       the hide started, it unanchors, says so, and stops holding you
---       there (the spot is damaging). Toggle off/on to retry.
+--    1. Anchors the HumanoidRootPart and re-writes it every frame,
+--       zeroing linear and angular velocity on every write.
+--    2. Watchdog: it reads your Y back each frame. If you drift more
+--       than HIDE_TOL below the spot, or the Anchored write is not
+--       holding, it puts you back on the SURFACE and switches the
+--       toggle off instead of letting you fall to your death.
+--    3. Damage watchdog: if your health drops below 70% of what it
+--       was when the hide started, same bail-out.
+--    4. Death watchdog: if you die while hiding, the new character is
+--       put on the surface (never back under the map). Two deaths and
+--       the hide switches itself off.
+--    5. The no-weapon auto reset does NOT run while hiding, so it can
+--       no longer respawn you straight back under the farm in a loop.
+--    6. A stale pickup flag can no longer freeze the hold: after
+--       TP_MAX seconds the flag clears and the float resumes.
 --
 --  PICKUP WHILE HIDING
---    The per-frame hold is skipped while a TP pickup is in flight, or
---    it would yank you back mid-hop. Because the root stays anchored
---    the whole time, the hop is a plain CFrame write and you cannot
---    fall; when the hop ends you are written back to the hide spot.
+--    The hold is skipped for the length of a TP pickup only. The root
+--    stays anchored, so the hop is a plain CFrame write and cannot
+--    drop you; it is written back to the hide spot afterwards.
 --
---  AUTO HATCH  (unchanged from v10.20)
---    Only an egg that already has its own Hatch ProximityPrompt is
---    fired. That prompt is created by the game's onHatchReady, so its
---    presence is the readiness test - unready eggs get nothing.
---
---  AUTO EQUIP BEST  (unchanged from v10.20)
---    playerEvents() drops its cache when the Player_<id> folder is gone,
---    so a reset no longer leaves PlaceBest unfindable.
---
---  FARM KILL  unchanged (v10.5 pick, cache and hit block).
---
---  MENU
---      Main       Auto Health, Auto Collect
---      Farm       Farm Kill, Auto Hatch, Auto Equip Best, Hide Under Farm
---      Egg Pickup Auto Pickup, TP Pickup (under egg), rarity filters
+--  When it bails it says why and leaves the toggle off. Flip it off
+--  and on again to retry from your current base.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
-local Players    = game:GetService("Players")
-local RS         = game:GetService("ReplicatedStorage")
-local WS         = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
+local Players    = game:GetService('Players')
+local RS         = game:GetService('ReplicatedStorage')
+local WS         = game:GetService('Workspace')
+local RunService = game:GetService('RunService')
 
-local LP = Players.LocalPlayer
-
-local NAME    = "Feed A Mosquito"
-local VERSION = "v10.21"
+local LP      = Players.LocalPlayer
+local NAME    = 'Feed A Mosquito'
+local VERSION = 'v11.0'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
 end
-print("[" .. NAME .. "] " .. VERSION)
+print('[' .. NAME .. '] ' .. VERSION)
 
 local running = true
 local built   = false
 
--- fixed tuning
+-- tuning
 local POLL_RATE    = 0.1
 local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
@@ -75,49 +63,47 @@ local TOUCH_PARTS  = 4
 local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
--- equip / hatch tuning
-local EQUIP_RATE     = 1.5
 local HATCH_RATE     = 0.5
 local HATCH_GAP      = 0.03
 local HATCH_COOLDOWN = 1.5
 
--- respawn tuning
 local FAST_SETTLE   = 3.0
 local FAST_COOLDOWN = 30.0
 local FAST_MAX_WAIT = 15.0
 
--- hide tuning
-local HIDE_DEPTH = 25
-local HIDE_LIFT  = 6
+local HIDE_DEPTH   = 25
+local HIDE_LIFT    = 6
+local HIDE_TOL     = 8
+local HIDE_FALLMAX = 60
+local HIDE_FALLFR  = 45
+local HIDE_BAIL_HP = 0.7
 
--- size cycle tuning
-local AP_SMALL     = 2
-local AP_HOLD      = 0.03
-local REACH_PAD    = 30
-local REACH_MIN    = 60
-local REACH_MAX    = 4000
-local BOSS_TTL     = 0.6
-local PART_TTL     = 2.0
-local EGG_TTL      = 1.0
+local AP_SMALL  = 2
+local AP_HOLD   = 0.03
+local REACH_PAD = 30
+local REACH_MIN = 60
+local REACH_MAX = 4000
+local BOSS_TTL  = 0.6
+local PART_TTL  = 2.0
+local EGG_TTL   = 1.0
 
--- pickup tuning
-local PICK_RATE     = 0.15
-local PICK_COOLDOWN = 0.4
+local PICK_RATE     = 0.1
+local PICK_COOLDOWN = 0.15
 local TP_DEPTH      = 3
-local TP_SETTLE     = 0.12
-local TP_HOLD       = 0.18
+local TP_SETTLE     = 0.1
+local TP_HOLD       = 0.12
+local TP_MAX        = 3.0
 
--- panel tuning
-local PANEL_ROWS   = 6
-local ROW_H        = 34
-local PANEL_BAR_W  = 160
-local PANEL_BAR_H  = 7
-local PANEL_W      = 310
-local PANEL_X      = 300
-local PANEL_LIFT   = 150
-local PAD_X        = 10
-local PAD_TOP      = 12
-local PAD_BOTTOM   = 12
+local PANEL_ROWS  = 6
+local ROW_H       = 34
+local PANEL_BAR_W = 160
+local PANEL_BAR_H = 7
+local PANEL_W     = 310
+local PANEL_X     = 300
+local PANEL_LIFT  = 150
+local PAD_X       = 10
+local PAD_TOP     = 12
+local PAD_BOTTOM  = 12
 
 local COL_BACK   = Color3.fromRGB(40, 40, 50)
 local COL_BAR_BG = Color3.fromRGB(26, 26, 33)
@@ -128,29 +114,32 @@ local COL_HP     = Color3.fromRGB(198, 208, 200)
 --------------------------------------------------------------------
 -- HEALTH OFFSET
 --------------------------------------------------------------------
-local OFFSETS_URL     = "https://offsets.imtheo.lol/version-9ac8595712b447a7/offsets.hpp"
+local OFFSETS_URL     = 'https://offsets.imtheo.lol/version-9ac8595712b447a7/offsets.hpp'
 local HEALTH_FALLBACK = 0x184
 
 local healthOffset       = HEALTH_FALLBACK
-local healthOffsetSource = "fallback"
+local healthOffsetSource = 'fallback'
 
 do
     local ok, res = pcall(function() return game:HttpGet(OFFSETS_URL) end)
 
-    if ok and type(res) == "string" then
-        local hex = res:match("Health%s*=%s*(0x%x+)")
+    if ok and type(res) == 'string' then
+        local hex = res:match('Health%s*=%s*(0x%x+)')
         local n   = hex and tonumber(hex)
 
         if n and n > 0 then
             healthOffset       = n
-            healthOffsetSource = "fetched"
+            healthOffsetSource = 'fetched'
         end
     end
 end
 
-print("[" .. NAME .. "] health offset " .. string.format("0x%X", healthOffset)
-    .. " (" .. healthOffsetSource .. ")")
+print('[' .. NAME .. '] health offset ' .. string.format('0x%X', healthOffset)
+    .. ' (' .. healthOffsetSource .. ')')
 
+--------------------------------------------------------------------
+-- DATA
+--------------------------------------------------------------------
 local EGG_PRICE = {
     Mosquito = 100, BloodMosquito = 100, NerdMosquito = 100, WhiteMosquito = 100,
     VenomousMosquito = 200, GlowingMosquito = 200, BlueMosquito = 200, PunkMosquito = 200,
@@ -162,20 +151,9 @@ local EGG_PRICE = {
     RainbowMosquito = 300000, SkullMosquito = 300000,
 }
 
-local RARITY_COLOR = {
-    Common    = Color3.fromRGB(235, 235, 235),
-    Uncommon  = Color3.fromRGB(140, 230, 150),
-    Rare      = Color3.fromRGB(130, 190, 250),
-    Epic      = Color3.fromRGB(190, 150, 250),
-    Legendary = Color3.fromRGB(255, 190, 110),
-    Mythical  = Color3.fromRGB(255, 140, 210),
-    Divine    = Color3.fromRGB(255, 235, 120),
-    Secret    = Color3.fromRGB(255, 120, 120),
-}
-
 local RARITIES = {
-    "Common", "Uncommon", "Rare", "Epic",
-    "Legendary", "Mythical", "Divine", "Secret",
+    'Common', 'Uncommon', 'Rare', 'Epic',
+    'Legendary', 'Mythical', 'Divine', 'Secret',
 }
 
 local SKIP_PART = {
@@ -204,74 +182,20 @@ local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
 
-local lastPickupAt = 0
-local hatchFired   = {}
-local pickingNow   = false
+local lastPickupAt  = 0
+local hatchFired    = {}
+local pickingNow    = false
+local pickStartedAt = 0
 
--- hide state
-local hideSpot    = nil
-local hideSurface = nil
-local hideSaid    = false
-local hideBail    = false
-local hideHP      = nil
-local hideConn    = nil
-local hideAnchor  = nil   -- { part = hrp, was = original Anchored }
+local hideSpot, hideSurface = nil, nil
+local hideChar, hideAnchor  = nil, nil
+local hideDeaths, hideHP0   = 0, nil
+local hideFallFrames        = 0
+local hideLocked            = false
+local hideConn              = nil
 
-local tpHome   = nil
-local tpAway   = false
-local tpSaved  = {}
-
-local function restoreHome()
-    if tpAway and tpHome then
-        local c = LP.Character
-        local hrp = c and c:FindFirstChild("HumanoidRootPart")
-
-        if hrp then
-            pcall(function() hrp.CFrame = tpHome end)
-        end
-    end
-
-    tpAway = false
-    tpHome = nil
-end
-
-local function noClipOn()
-    tpSaved = {}
-
-    local c = LP.Character
-    if not c then return end
-
-    local ok, desc = pcall(function() return c:GetDescendants() end)
-    if not ok or not desc then return end
-
-    for i = 1, #desc do
-        local d = desc[i]
-
-        if d.ClassName == "Part" or d.ClassName == "MeshPart" then
-            local k = keyOf(d)
-            local okC, col = pcall(function() return d.CanCollide end)
-
-            if k ~= nil and okC and col == true then
-                tpSaved[#tpSaved + 1] = { part = d, collide = col }
-                pcall(function() d.CanCollide = false end)
-            end
-        end
-    end
-end
-
-local function noClipOff()
-    for i = 1, #tpSaved do
-        local e = tpSaved[i]
-
-        if e.part then
-            pcall(function() e.part.CanCollide = e.collide end)
-        end
-    end
-
-    tpSaved = {}
-end
-
-_G.FeedAMosquito = { stop = function() running = false end }
+local tpHome, tpAway = nil, false
+local tpSaved        = {}
 
 --------------------------------------------------------------------
 -- Helpers
@@ -279,14 +203,14 @@ _G.FeedAMosquito = { stop = function() running = false end }
 local function humanoid()
     local c = LP.Character
     if not c then return nil end
-    local h = c:FindFirstChild("Humanoid")
-    if h and h.ClassName == "Humanoid" then return h end
+    local h = c:FindFirstChild('Humanoid')
+    if h and h.ClassName == 'Humanoid' then return h end
     return nil
 end
 
 local function rootPart()
     local c = LP.Character
-    return c and c:FindFirstChild("HumanoidRootPart") or nil
+    return c and c:FindFirstChild('HumanoidRootPart') or nil
 end
 
 local function alive()
@@ -307,10 +231,12 @@ end
 
 local function isBasePart(p)
     local cn = p.ClassName
-    return cn == "Part" or cn == "MeshPart" or cn == "UnionOperation"
-        or cn == "WedgePart" or cn == "CornerWedgePart" or cn == "TrussPart"
-        or cn == "SpawnLocation" or cn == "Seat" or cn == "VehicleSeat"
+    return cn == 'Part' or cn == 'MeshPart' or cn == 'UnionOperation'
+        or cn == 'WedgePart' or cn == 'CornerWedgePart' or cn == 'TrussPart'
+        or cn == 'SpawnLocation' or cn == 'Seat' or cn == 'VehicleSeat'
 end
+
+local keyOf
 
 function keyOf(inst)
     if inst == nil then return nil end
@@ -321,27 +247,24 @@ end
 
 local function itemTypeOf(tool)
     if not tool then return nil end
-
-    local it = tool:FindFirstChild("ItemType")
+    local it = tool:FindFirstChild('ItemType')
     if not it then return nil end
-
     local ok, v = pcall(function() return it.Value end)
-    if ok and type(v) == "string" then return v end
+    if ok and type(v) == 'string' then return v end
     return nil
 end
 
 local function attackPartOf(tool)
     if not tool then return nil end
 
-    local ap = tool:FindFirstChild("AttackPart")
+    local ap = tool:FindFirstChild('AttackPart')
     if ap and isBasePart(ap) then return ap end
 
     local ok, desc = pcall(function() return tool:GetDescendants() end)
-
     if ok and desc then
         for j = 1, #desc do
             local d = desc[j]
-            if isBasePart(d) and d.Name == "AttackPart" then return d end
+            if isBasePart(d) and d.Name == 'AttackPart' then return d end
         end
     end
 
@@ -349,8 +272,8 @@ local function attackPartOf(tool)
 end
 
 local function areaRarity(areaName)
-    if type(areaName) ~= "string" then return "Common" end
-    if string.sub(areaName, -4) == "Area" then
+    if type(areaName) ~= 'string' then return 'Common' end
+    if string.sub(areaName, -4) == 'Area' then
         return string.sub(areaName, 1, #areaName - 4)
     end
     return areaName
@@ -362,13 +285,9 @@ local function billboardRarity(model)
 
     for i = 1, #desc do
         local d = desc[i]
-
-        if d.ClassName == "TextLabel" and d.Name == "Rarity" then
+        if d.ClassName == 'TextLabel' and d.Name == 'Rarity' then
             local okT, t = pcall(function() return d.Text end)
-
-            if okT and type(t) == "string" and #t > 0 then
-                return t
-            end
+            if okT and type(t) == 'string' and #t > 0 then return t end
         end
     end
 
@@ -376,8 +295,8 @@ local function billboardRarity(model)
 end
 
 local function mosquitoId(eggName)
-    if type(eggName) ~= "string" then return nil end
-    if string.sub(eggName, -3) == "Egg" then
+    if type(eggName) ~= 'string' then return nil end
+    if string.sub(eggName, -3) == 'Egg' then
         return string.sub(eggName, 1, #eggName - 3)
     end
     return eggName
@@ -391,9 +310,8 @@ local function eggPrompt(model)
 
     for i = 1, #desc do
         local d = desc[i]
-
-        if d.ClassName == "ProximityPrompt" then
-            if d.Name == "CarryPrompt" then return d end
+        if d.ClassName == 'ProximityPrompt' then
+            if d.Name == 'CarryPrompt' then return d end
             if first == nil then first = d end
         end
     end
@@ -403,17 +321,15 @@ end
 
 local function eggPosition(model)
     if not model then return nil end
-
-    local r = model:FindFirstChild("HumanoidRootPart")
+    local r = model:FindFirstChild('HumanoidRootPart')
     if not r then return nil end
-
     local ok, p = pcall(function() return r.Position end)
     if ok and p then return p end
     return nil
 end
 
 --------------------------------------------------------------------
--- Player actor remotes  (cache only while the folder is still alive)
+-- Player remotes
 --------------------------------------------------------------------
 local pEvents = nil
 local pFor    = nil
@@ -426,13 +342,13 @@ local function playerEvents()
     pEvents = nil
     pFor    = nil
 
-    local actors = child(RS, "Runtime", "Actors")
+    local actors = child(RS, 'Runtime', 'Actors')
     if not actors then return nil end
 
-    local actor = actors:FindFirstChild("Player_" .. tostring(LP.UserId))
+    local actor = actors:FindFirstChild('Player_' .. tostring(LP.UserId))
     if not actor then return nil end
 
-    local ev = actor:FindFirstChild("Events")
+    local ev = actor:FindFirstChild('Events')
     if not ev then return nil end
 
     pEvents = ev
@@ -449,13 +365,13 @@ end
 
 local function placeBest()
     local events = playerEvents()
-    local r = events and events:FindFirstChild("PlaceBest")
+    local r = events and events:FindFirstChild('PlaceBest')
     if not r then return false end
     return (pcall(function() r:FireServer() end))
 end
 
 --------------------------------------------------------------------
--- LIVE TOOL ACTOR
+-- Tool / actor
 --------------------------------------------------------------------
 local function equippedTool()
     local c = LP.Character
@@ -466,8 +382,7 @@ local function equippedTool()
 
     for i = 1, #kids do
         local t = kids[i]
-
-        if t.ClassName == "Tool" and t:FindFirstChild("ActorId") then
+        if t.ClassName == 'Tool' and t:FindFirstChild('ActorId') then
             if attackPartOf(t) then return t end
             if fallback == nil then fallback = t end
         end
@@ -478,28 +393,26 @@ end
 
 local function actorIdOf(tool)
     if not tool then return nil end
-
-    local idv = tool:FindFirstChild("ActorId")
+    local idv = tool:FindFirstChild('ActorId')
     if not idv then return nil end
-
     local ok, id = pcall(function() return idv.Value end)
-    if ok and type(id) == "string" then return id end
+    if ok and type(id) == 'string' then return id end
     return nil
 end
 
 local function remotesOfActor(name)
     if not name then return nil, nil end
 
-    local actors = child(RS, "Runtime", "Actors")
+    local actors = child(RS, 'Runtime', 'Actors')
     if not actors then return nil, nil end
 
     local a = actors:FindFirstChild(name)
     if not a then return nil, nil end
 
-    local ev = a:FindFirstChild("Events")
+    local ev = a:FindFirstChild('Events')
     if not ev then return nil, nil end
 
-    return ev:FindFirstChild("Attack"), ev:FindFirstChild("PlaySound")
+    return ev:FindFirstChild('Attack'), ev:FindFirstChild('PlaySound')
 end
 
 --------------------------------------------------------------------
@@ -511,19 +424,18 @@ local partCache = {}
 
 local function isBossModel(m)
     if not m then return false end
-    if m.ClassName ~= "Model" then return false end
+    if m.ClassName ~= 'Model' then return false end
 
     local nm = m.Name
-    if type(nm) ~= "string" then return false end
-    if string.sub(nm, -4) ~= "Mama" then return false end
+    if type(nm) ~= 'string' then return false end
+    if string.sub(nm, -4) ~= 'Mama' then return false end
 
-    return m:FindFirstChild("Humanoid") ~= nil
+    return m:FindFirstChild('Humanoid') ~= nil
 end
 
 local function collectBosses()
     local out = {}
-
-    local areas = WS:FindFirstChild("SpawnAreas")
+    local areas = WS:FindFirstChild('SpawnAreas')
     if not areas then return out end
 
     local okA, areaKids = pcall(function() return areas:GetChildren() end)
@@ -531,7 +443,6 @@ local function collectBosses()
 
     for i = 1, #areaKids do
         local ok, kids = pcall(function() return areaKids[i]:GetChildren() end)
-
         if ok and kids then
             for j = 1, #kids do
                 local m = kids[j]
@@ -546,72 +457,17 @@ end
 local function bossList()
     local now = tick()
     if (now - bossStamp) < BOSS_TTL then return bossCache end
-
     bossCache = collectBosses()
     bossStamp = now
     return bossCache
 end
 
---------------------------------------------------------------------
--- Egg lookup
---------------------------------------------------------------------
-local eggCache = {}
-local eggStamp = 0
-
-local function collectEggs()
-    local out = {}
-
-    local areas = WS:FindFirstChild("SpawnAreas")
-    if not areas then return out end
-
-    local okA, areaKids = pcall(function() return areas:GetChildren() end)
-    if not okA or not areaKids then return out end
-
-    for i = 1, #areaKids do
-        local area = areaKids[i]
-        local ok, kids = pcall(function() return area:GetChildren() end)
-
-        if ok and kids then
-            for j = 1, #kids do
-                local m = kids[j]
-
-                if m.ClassName == "Model" and string.find(string.lower(m.Name), "egg", 1, true) then
-                    local rarity = billboardRarity(m) or areaRarity(area.Name)
-                    local id     = mosquitoId(m.Name)
-                    local price  = nil
-
-                    if id then price = EGG_PRICE[id] end
-
-                    out[#out + 1] = {
-                        model  = m,
-                        name   = m.Name,
-                        rarity = rarity,
-                        price  = price,
-                    }
-                end
-            end
-        end
-    end
-
-    return out
-end
-
-local function eggList()
-    local now = tick()
-    if (now - eggStamp) < EGG_TTL then return eggCache end
-
-    eggCache = collectEggs()
-    eggStamp = now
-    return eggCache
-end
-
 local function bossPosition(boss)
     if not boss then return nil end
-
     local okP, parent = pcall(function() return boss.Parent end)
     if not okP or parent == nil then return nil end
 
-    local r = boss:FindFirstChild("HumanoidRootPart")
+    local r = boss:FindFirstChild('HumanoidRootPart')
     if not r then return nil end
 
     local ok, p = pcall(function() return r.Position end)
@@ -621,26 +477,23 @@ end
 
 local function bossHealth(boss)
     if not boss then return nil end
-
     local okP, parent = pcall(function() return boss.Parent end)
     if not okP or parent == nil then return nil end
 
-    local h = boss:FindFirstChild("Humanoid")
+    local h = boss:FindFirstChild('Humanoid')
     if not h then return nil end
 
     local okH, hp = pcall(function() return h.Health end)
-    if okH and type(hp) == "number" then return hp end
+    if okH and type(hp) == 'number' then return hp end
     return nil
 end
 
 local function bossMaxHealth(boss)
     if not boss then return 1 end
-
-    local h = boss:FindFirstChild("Humanoid")
+    local h = boss:FindFirstChild('Humanoid')
     if not h then return 1 end
-
     local okM, mv = pcall(function() return h.MaxHealth end)
-    if okM and type(mv) == "number" and mv > 0 then return mv end
+    if okM and type(mv) == 'number' and mv > 0 then return mv end
     return 1
 end
 
@@ -652,8 +505,7 @@ local function bossParts(boss)
     if rec and (now - rec.stamp) < PART_TTL then return rec.parts end
 
     local parts = {}
-    local r = boss:FindFirstChild("HumanoidRootPart")
-
+    local r = boss:FindFirstChild('HumanoidRootPart')
     if r and isBasePart(r) then parts[#parts + 1] = r end
 
     local ok, desc = pcall(function() return boss:GetDescendants() end)
@@ -661,7 +513,6 @@ local function bossParts(boss)
     if ok and desc then
         for j = 1, #desc do
             if #parts >= TOUCH_PARTS then break end
-
             local d = desc[j]
             if isBasePart(d) and not SKIP_PART[d.Name] and d ~= r then
                 parts[#parts + 1] = d
@@ -708,7 +559,7 @@ local function farthestBoss(myPos)
         local bp = bossPosition(list[i])
         if bp then
             local ok, d = pcall(function() return (bp - myPos).Magnitude end)
-            if ok and type(d) == "number" then
+            if ok and type(d) == 'number' then
                 seen = seen + 1
                 if d > far then far = d end
             end
@@ -719,7 +570,58 @@ local function farthestBoss(myPos)
 end
 
 --------------------------------------------------------------------
--- ATTACKPART size cycle
+-- Egg lookup
+--------------------------------------------------------------------
+local eggCache = {}
+local eggStamp = 0
+
+local function collectEggs()
+    local out = {}
+    local areas = WS:FindFirstChild('SpawnAreas')
+    if not areas then return out end
+
+    local okA, areaKids = pcall(function() return areas:GetChildren() end)
+    if not okA or not areaKids then return out end
+
+    for i = 1, #areaKids do
+        local area = areaKids[i]
+        local ok, kids = pcall(function() return area:GetChildren() end)
+
+        if ok and kids then
+            for j = 1, #kids do
+                local m = kids[j]
+
+                if m.ClassName == 'Model' and string.find(string.lower(m.Name), 'egg', 1, true) then
+                    local rarity = billboardRarity(m) or areaRarity(area.Name)
+                    local id     = mosquitoId(m.Name)
+                    local price  = nil
+
+                    if id then price = EGG_PRICE[id] end
+
+                    out[#out + 1] = {
+                        model  = m,
+                        name   = m.Name,
+                        rarity = rarity,
+                        price  = price,
+                    }
+                end
+            end
+        end
+    end
+
+    return out
+end
+
+local function eggList()
+    local now = tick()
+    if (now - eggStamp) < EGG_TTL then return eggCache end
+    eggCache = collectEggs()
+    eggStamp = now
+    return eggCache
+end
+
+--------------------------------------------------------------------
+-- AttackPart size cycle
 --------------------------------------------------------------------
 local apSaved = {}
 local reachOn = false
@@ -746,9 +648,7 @@ local function rememberPart(ap)
 
     if apSaved[k] == nil then
         local okS, s = pcall(function() return ap.Size end)
-        if okS and s then
-            apSaved[k] = { part = ap, size = s }
-        end
+        if okS and s then apSaved[k] = { part = ap, size = s } end
     end
 end
 
@@ -766,14 +666,15 @@ local function restoreAttackParts()
     apSaved = {}
 
     if reachOn then
-        print("[" .. NAME .. "] AttackPart restored on " .. tostring(n))
+        print('[' .. NAME .. '] AttackPart restored on ' .. tostring(n))
     end
+
     reachOn = false
     return n
 end
 
 --------------------------------------------------------------------
--- Reset / base helpers
+-- Reset helpers
 --------------------------------------------------------------------
 local function needsWeapon()
     local c = LP.Character
@@ -784,10 +685,9 @@ local function needsWeapon()
 
     for i = 1, #kids do
         local t = kids[i]
-
-        if t.ClassName == "Tool" then
+        if t.ClassName == 'Tool' then
             if attackPartOf(t) then return false end
-            if itemTypeOf(t) == "Egg" then return false end
+            if itemTypeOf(t) == 'Egg' then return false end
         end
     end
 
@@ -795,7 +695,7 @@ local function needsWeapon()
 end
 
 local function backpackHasWeapon()
-    local bp = LP:FindFirstChild("Backpack")
+    local bp = LP:FindFirstChild('Backpack')
     if not bp then return false end
 
     local ok, kids = pcall(function() return bp:GetChildren() end)
@@ -803,7 +703,7 @@ local function backpackHasWeapon()
 
     for i = 1, #kids do
         local t = kids[i]
-        if t.ClassName == "Tool" and attackPartOf(t) then return true end
+        if t.ClassName == 'Tool' and attackPartOf(t) then return true end
     end
 
     return false
@@ -811,16 +711,16 @@ end
 
 local function handSignature()
     local c = LP.Character
-    if not c then return "" end
+    if not c then return '' end
 
     local ok, kids = pcall(function() return c:GetChildren() end)
-    if not ok or not kids then return "" end
+    if not ok or not kids then return '' end
 
-    local s = ""
+    local s = ''
 
     for i = 1, #kids do
-        if kids[i].ClassName == "Tool" then
-            s = s .. kids[i].Name .. "|"
+        if kids[i].ClassName == 'Tool' then
+            s = s .. kids[i].Name .. '|'
         end
     end
 
@@ -828,19 +728,19 @@ local function handSignature()
 end
 
 local function killCharacter()
-    if type(memory_write) ~= "function" then return false, "no memory_write" end
+    if type(memory_write) ~= 'function' then return false, 'no memory_write' end
 
     local hum = humanoid()
-    if not hum then return false, "no humanoid" end
+    if not hum then return false, 'no humanoid' end
 
     local okA, addr = pcall(function() return hum.Address end)
-    if not okA or type(addr) ~= "number" then return false, "no Address" end
+    if not okA or type(addr) ~= 'number' then return false, 'no Address' end
 
     local ok = pcall(function()
-        memory_write("float", addr + healthOffset, -10)
+        memory_write('float', addr + healthOffset, -10)
     end)
 
-    if not ok then return false, "write failed" end
+    if not ok then return false, 'write failed' end
     return true, nil
 end
 
@@ -854,7 +754,7 @@ local function myBasePart()
     for i = 1, #desc do
         local d = desc[i]
 
-        if d.Name == "BasePart" then
+        if d.Name == 'BasePart' then
             local cur    = d
             local mine   = false
             local isBase = false
@@ -863,9 +763,9 @@ local function myBasePart()
                 cur = cur.Parent
                 if not cur then break end
 
-                if string.find(cur.Name, "Base", 1, true) then isBase = true end
+                if string.find(cur.Name, 'Base', 1, true) then isBase = true end
 
-                local pl = cur:FindFirstChild("Player")
+                local pl = cur:FindFirstChild('Player')
                 if pl then
                     local okV, v = pcall(function() return pl.Value end)
                     if okV and v == LP then mine = true end
@@ -877,7 +777,7 @@ local function myBasePart()
                 local okS, sz = pcall(function() return d.Size end)
                 local area = 0
 
-                if okS and sz and type(sz.X) == "number" and type(sz.Z) == "number" then
+                if okS and sz and type(sz.X) == 'number' and type(sz.Z) == 'number' then
                     area = sz.X * sz.Z
                 end
 
@@ -893,7 +793,7 @@ local function myBasePart()
 end
 
 --------------------------------------------------------------------
--- HIDE UNDER FARM  (anchored float, held every frame)
+-- HIDE UNDER FARM  (anchored float + watchdogs)
 --------------------------------------------------------------------
 local function computeSpots()
     local part = myBasePart()
@@ -908,27 +808,54 @@ local function computeSpots()
     return hide, surf
 end
 
+local function stopHideLoop()
+    if hideConn then
+        pcall(function() hideConn:Disconnect() end)
+        hideConn = nil
+    end
+end
+
 local function unanchorHide()
     if hideAnchor and hideAnchor.part then
-        local part = hideAnchor.part
-        local was  = hideAnchor.was
-
-        pcall(function() part.Anchored = was end)
+        local p, was = hideAnchor.part, hideAnchor.was
+        pcall(function() p.Anchored = was end)
     end
-
     hideAnchor = nil
 end
 
--- floats you at the spot: anchored root, velocity zeroed, CFrame written
-local function anchorAt(spot)
+local function surfaceNow()
+    local hrp = rootPart()
+    if not hrp or not hideSurface then return end
+
+    pcall(function() hrp.CFrame = hideSurface end)
+    pcall(function()
+        hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
+        hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    end)
+end
+
+local function bailHide(why)
+    stopHideLoop()
+    surfaceNow()
+    unanchorHide()
+
+    hideLocked     = true
+    hideDeaths     = 0
+    hideHP0        = nil
+    hideFallFrames = 0
+
+    print('[' .. NAME .. '] hide under farm off: ' .. why)
+    notifyUser('Hide stopped - flip the toggle off and on to retry', 6)
+end
+
+local function holdAt(spot)
     local hrp = rootPart()
     if not hrp or not spot then return false end
 
     if hideAnchor == nil or hideAnchor.part ~= hrp then
         unanchorHide()
-
         local ok, was = pcall(function() return hrp.Anchored end)
-        hideAnchor = { part = hrp, was = (ok and was) or false }
+        hideAnchor = { part = hrp, was = (ok and was == true) }
     end
 
     pcall(function() hrp.Anchored = true end)
@@ -941,12 +868,67 @@ local function anchorAt(spot)
     return true
 end
 
-local function surfaceNow()
+local function hideFrame()
+    if not running or not Config.HideUnder or hideLocked then return end
+
+    if pickingNow then
+        if (tick() - pickStartedAt) > TP_MAX then
+            pickingNow = false
+        else
+            return
+        end
+    end
+
+    if not alive() then return end
+
     local hrp = rootPart()
     if not hrp then return end
 
-    if hideSurface then
-        pcall(function() hrp.CFrame = hideSurface end)
+    if LP.Character ~= hideChar then
+        hideChar   = LP.Character
+        hideDeaths = hideDeaths + 1
+        hideHP0    = nil
+
+        if hideDeaths >= 2 then
+            bailHide('you died down there twice, that spot is not safe')
+            return
+        end
+
+        if hideSurface then
+            pcall(function() hrp.CFrame = hideSurface end)
+        end
+    end
+
+    if not hideSpot then hideSpot, hideSurface = computeSpots() end
+    if not hideSpot then return end
+
+    local hum = humanoid()
+
+    if hum then
+        if hideHP0 == nil then hideHP0 = hum.Health end
+
+        if hideHP0 and hideHP0 > 0 and hum.Health < hideHP0 * HIDE_BAIL_HP then
+            bailHide('something down there is damaging you')
+            return
+        end
+    end
+
+    holdAt(hideSpot)
+
+    local okP, pos = pcall(function() return hrp.Position end)
+
+    if okP and pos then
+        local drift = hideSpot.Position.Y - pos.Y
+
+        if drift > HIDE_TOL then
+            hideFallFrames = hideFallFrames + 1
+        else
+            hideFallFrames = 0
+        end
+
+        if drift > HIDE_FALLMAX or hideFallFrames > HIDE_FALLFR then
+            bailHide('the game keeps pulling you down, Anchored is not sticking here')
+        end
     end
 end
 
@@ -954,69 +936,27 @@ local function startHideLoop()
     if hideConn then return end
 
     hideConn = RunService.RenderStepped:Connect(function()
-        if not running or not Config.HideUnder then return end
-        if hideBail then return end
-        if pickingNow then return end
-        if not alive() then return end
-
-        if not hideSpot then
-            hideSpot, hideSurface = computeSpots()
-
-            if hideSpot and not hideSaid then
-                hideSaid = true
-                print("[" .. NAME .. "] hide under farm on ("
-                    .. tostring(HIDE_DEPTH) .. " studs below your BasePart, anchored)")
-            end
-        end
-
-        if not hideSpot then return end
-
-        -- a damaging spot: leave rather than die in a loop
-        local hum = humanoid()
-
-        if hum then
-            if hideHP == nil then hideHP = hum.Health end
-
-            if hideHP and hum.Health < hideHP * 0.5 then
-                hideBail = true
-
-                unanchorHide()
-                surfaceNow()
-
-                print("[" .. NAME .. "] hide under farm: taking damage down there, stopped. Toggle it off and on to retry.")
-                return
-            end
-        end
-
-        anchorAt(hideSpot)
+        pcall(hideFrame)
     end)
-end
-
-local function stopHideLoop()
-    if hideConn then
-        pcall(function() hideConn:Disconnect() end)
-        hideConn = nil
-    end
 end
 
 local function leaveHide()
     stopHideLoop()
+    surfaceNow()
+    unanchorHide()
 
-    if hideAnchor then
-        surfaceNow()
-        unanchorHide()
-        print("[" .. NAME .. "] hide under farm off (put back on the surface)")
-    end
+    hideSpot       = nil
+    hideSurface    = nil
+    hideChar       = nil
+    hideDeaths     = 0
+    hideHP0        = nil
+    hideFallFrames = 0
 
-    hideSpot    = nil
-    hideSurface = nil
-    hideSaid    = false
-    hideHP      = nil
-    hideBail    = false
+    print('[' .. NAME .. '] hide under farm off (put back on the surface)')
 end
 
 --------------------------------------------------------------------
--- AUTO HATCH  (only eggs whose own Hatch prompt exists)
+-- AUTO HATCH
 --------------------------------------------------------------------
 local function readyPrompt(model)
     local ok, desc = pcall(function() return model:GetDescendants() end)
@@ -1025,14 +965,11 @@ local function readyPrompt(model)
     for i = 1, #desc do
         local d = desc[i]
 
-        if d.ClassName == "ProximityPrompt" and d.Name ~= "CarryPrompt" then
+        if d.ClassName == 'ProximityPrompt' and d.Name ~= 'CarryPrompt' then
             local okA, act = pcall(function() return d.ActionText end)
 
-            if okA and act == "Skip" then
-                -- the skip-hatch prompt, not the hatch one
-            else
+            if not (okA and act == 'Skip') then
                 local okE, en = pcall(function() return d.Enabled end)
-
                 if not okE or en ~= false then return d end
             end
         end
@@ -1085,20 +1022,19 @@ task.spawn(function()
             if fired > 0 then
                 if not wasOn then
                     wasOn = true
-                    print("[" .. NAME .. "] auto hatch on ("
-                        .. tostring(ready) .. " eggs ready)")
+                    print('[' .. NAME .. '] auto hatch on (' .. tostring(ready) .. ' eggs ready)')
                 end
                 lastSay = false
             elseif not lastSay then
                 lastSay = true
-                print("[" .. NAME .. "] auto hatch: waiting for eggs to show a Hatch prompt")
+                print('[' .. NAME .. '] auto hatch: waiting for eggs to show a Hatch prompt')
             end
 
             task.wait(HATCH_RATE)
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto hatch off")
+                print('[' .. NAME .. '] auto hatch off')
             end
 
             hatchFired = {}
@@ -1109,7 +1045,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- HUD  (boss panel only)
+-- HUD
 --------------------------------------------------------------------
 local hudPool   = {}
 local panelBack = nil
@@ -1118,7 +1054,7 @@ local hudConn   = nil
 local function buildHud()
     if #hudPool > 0 then return end
 
-    panelBack = Drawing.new("Square")
+    panelBack = Drawing.new('Square')
     panelBack.Filled       = true
     panelBack.Thickness    = 0
     panelBack.Color        = COL_BACK
@@ -1126,8 +1062,8 @@ local function buildHud()
     panelBack.Visible      = false
 
     for i = 1, PANEL_ROWS do
-        local nameTag = Drawing.new("Text")
-        nameTag.Text     = ""
+        local nameTag = Drawing.new('Text')
+        nameTag.Text     = ''
         nameTag.Size     = 14
         nameTag.Font     = 2
         nameTag.Center   = false
@@ -1135,8 +1071,8 @@ local function buildHud()
         nameTag.Color    = COL_NAME
         nameTag.Visible  = false
 
-        local hpTag = Drawing.new("Text")
-        hpTag.Text       = ""
+        local hpTag = Drawing.new('Text')
+        hpTag.Text       = ''
         hpTag.Size       = 13
         hpTag.Font       = 2
         hpTag.Center     = false
@@ -1144,24 +1080,19 @@ local function buildHud()
         hpTag.Color      = COL_HP
         hpTag.Visible    = false
 
-        local back = Drawing.new("Square")
+        local back = Drawing.new('Square')
         back.Filled      = true
         back.Thickness   = 0
         back.Color       = COL_BAR_BG
         back.Visible     = false
 
-        local fill = Drawing.new("Square")
+        local fill = Drawing.new('Square')
         fill.Filled      = true
         fill.Thickness   = 0
         fill.Color       = COL_FILL
         fill.Visible     = false
 
-        hudPool[i] = {
-            nameTag = nameTag,
-            hpTag   = hpTag,
-            back    = back,
-            fill    = fill,
-        }
+        hudPool[i] = { nameTag = nameTag, hpTag = hpTag, back = back, fill = fill }
     end
 end
 
@@ -1173,14 +1104,11 @@ local function hideSlot(slot)
 end
 
 local function viewportHeight()
-    local cam = WS:FindFirstChild("Camera")
+    local cam = WS:FindFirstChild('Camera')
     if cam then
         local okV, vp = pcall(function() return cam.ViewportSize end)
-        if okV and vp and type(vp.Y) == "number" and vp.Y > 0 then
-            return vp.Y
-        end
+        if okV and vp and type(vp.Y) == 'number' and vp.Y > 0 then return vp.Y end
     end
-
     return 1080
 end
 
@@ -1191,9 +1119,8 @@ local function startHud()
 
     hudConn = RunService.RenderStepped:Connect(function()
         local baseY = viewportHeight() - PANEL_LIFT
-
-        local list = bossList()
-        local n    = 0
+        local list  = bossList()
+        local n     = 0
 
         for i = 1, #list do
             if n >= PANEL_ROWS then break end
@@ -1226,11 +1153,8 @@ local function startHud()
                 slot.fill.Visible  = true
 
                 slot.hpTag.Text     = tostring(math.floor(hp))
-                    .. " / " .. tostring(math.floor(maxHp))
-                slot.hpTag.Position = Vector2.new(
-                    PANEL_X + PANEL_BAR_W + 10,
-                    rowY + 2
-                )
+                    .. ' / ' .. tostring(math.floor(maxHp))
+                slot.hpTag.Position = Vector2.new(PANEL_X + PANEL_BAR_W + 10, rowY + 2)
                 slot.hpTag.Visible  = true
             end
         end
@@ -1263,7 +1187,6 @@ local function stopHud()
 
     for i = 1, #hudPool do
         local slot = hudPool[i]
-
         pcall(function() slot.nameTag:Remove() end)
         pcall(function() slot.hpTag:Remove() end)
         pcall(function() slot.back:Remove() end)
@@ -1281,14 +1204,14 @@ end
 startHud()
 
 --------------------------------------------------------------------
--- Toggle plumbing
+-- Menu
 --------------------------------------------------------------------
 local function applyBool(key)
     return function(a, b, c)
         if getterWorks[key] then return end
-        if type(a) == "boolean" then Config[key] = a return end
-        if type(b) == "boolean" then Config[key] = b return end
-        if type(c) == "boolean" then Config[key] = c return end
+        if type(a) == 'boolean' then Config[key] = a return end
+        if type(b) == 'boolean' then Config[key] = b return end
+        if type(c) == 'boolean' then Config[key] = c return end
     end
 end
 
@@ -1302,18 +1225,22 @@ local function safeToggle(sec, name, id, default, cb)
         function() sec:Toggle(id, name, default, cb) end,
         function() sec:Toggle(name, default, cb) end,
     }
+
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
     end
-    warn("[" .. NAME .. "] Toggle failed: " .. tostring(name))
+
+    warn('[' .. NAME .. '] Toggle failed: ' .. tostring(name))
     return false
 end
 
 local function makeSection(tab, name, side)
     local ok, sec = pcall(function() return tab:Section(name, side) end)
-    if ok and type(sec) == "table" then return sec end
+    if ok and type(sec) == 'table' then return sec end
+
     ok, sec = pcall(function() tab:Section(name) end)
-    if ok and type(sec) == "table" then return sec end
+    if ok and type(sec) == 'table' then return sec end
+
     return nil
 end
 
@@ -1324,13 +1251,13 @@ local function addToggle(sec, label, id, key, default)
 end
 
 local function addRarity(sec, rarity)
-    local id = "rarity_" .. string.lower(rarity)
+    local id = 'rarity_' .. string.lower(rarity)
 
     local cb = function(a, b, c)
         if getterWorks[rarity] then return end
-        if type(a) == "boolean" then PickCfg[rarity] = a return end
-        if type(b) == "boolean" then PickCfg[rarity] = b return end
-        if type(c) == "boolean" then PickCfg[rarity] = c return end
+        if type(a) == 'boolean' then PickCfg[rarity] = a return end
+        if type(b) == 'boolean' then PickCfg[rarity] = b return end
+        if type(c) == 'boolean' then PickCfg[rarity] = c return end
     end
 
     if safeToggle(sec, rarity, id, false, cb) then
@@ -1338,33 +1265,30 @@ local function addRarity(sec, rarity)
     end
 end
 
---------------------------------------------------------------------
--- Menu
---------------------------------------------------------------------
 local function buildTab(tab)
     if built then return end
-    if type(tab) ~= "table" then return end
+    if type(tab) ~= 'table' then return end
     built = true
 
     local ok, err = pcall(function()
-        local main = makeSection(tab, "Main", "Left")
+        local main = makeSection(tab, 'Main', 'Left')
         if main then
-            addToggle(main, "Auto Health", "auto_health", "Heal", false)
-            addToggle(main, "Auto Collect", "auto_collect", "AutoCollect", false)
+            addToggle(main, 'Auto Health', 'auto_health', 'Heal', false)
+            addToggle(main, 'Auto Collect', 'auto_collect', 'AutoCollect', false)
         end
 
-        local farm = makeSection(tab, "Farm", "Left")
+        local farm = makeSection(tab, 'Farm', 'Left')
         if farm then
-            addToggle(farm, "Farm Kill", "farm_kill", "Farm", false)
-            addToggle(farm, "Auto Hatch", "auto_hatch", "AutoHatch", false)
-            addToggle(farm, "Auto Equip Best", "auto_equip_best", "BestEquip", false)
-            addToggle(farm, "Hide Under Farm", "hide_under_farm", "HideUnder", false)
+            addToggle(farm, 'Farm Kill', 'farm_kill', 'Farm', false)
+            addToggle(farm, 'Auto Hatch', 'auto_hatch', 'AutoHatch', false)
+            addToggle(farm, 'Auto Equip Best', 'auto_equip_best', 'BestEquip', false)
+            addToggle(farm, 'Hide Under Farm', 'hide_under_farm', 'HideUnder', false)
         end
 
-        local pick = makeSection(tab, "Egg Pickup", "Left")
+        local pick = makeSection(tab, 'Egg Pickup', 'Left')
         if pick then
-            addToggle(pick, "Auto Pickup", "auto_pickup", "Pickup", false)
-            addToggle(pick, "TP Pickup (under egg)", "tp_pickup", "TPPickup", false)
+            addToggle(pick, 'Auto Pickup', 'auto_pickup', 'Pickup', false)
+            addToggle(pick, 'TP Pickup (under egg)', 'tp_pickup', 'TPPickup', false)
 
             for i = 1, #RARITIES do
                 addRarity(pick, RARITIES[i])
@@ -1373,12 +1297,13 @@ local function buildTab(tab)
     end)
 
     if not ok then
-        warn("[" .. NAME .. "] build error: " .. tostring(err))
+        warn('[' .. NAME .. '] build error: ' .. tostring(err))
     end
-    print("[" .. NAME .. "] tab widgets built")
+
+    print('[' .. NAME .. '] tab widgets built')
 end
 
-local HAS_UI = type(UI) == "table" and type(UI.AddTab) == "function"
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
 if HAS_UI then
     local ok, err = pcall(function()
@@ -1386,75 +1311,89 @@ if HAS_UI then
             pcall(buildTab, tab)
         end)
     end)
+
     if not ok then
-        warn("[" .. NAME .. "] UI.AddTab failed: " .. tostring(err))
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
         HAS_UI = false
     end
 else
-    warn("[" .. NAME .. "] no UI table - menu unavailable")
+    warn('[' .. NAME .. '] no UI table - menu unavailable')
 end
 
 --------------------------------------------------------------------
--- POLLERS
+-- POLLER
 --------------------------------------------------------------------
 task.spawn(function()
     local hideWas = false
 
     while running do
         for i = 1, #TOGGLES do
-            local t = TOGGLES[i]
+            local t   = TOGGLES[i]
             local val = nil
 
             local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
-            if ok1 and type(v1) == "boolean" then
+            if ok1 and type(v1) == 'boolean' then
                 val = v1
             else
                 local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
-                if ok2 and type(v2) == "boolean" then val = v2 end
+                if ok2 and type(v2) == 'boolean' then val = v2 end
             end
 
             if val ~= nil then
                 getterWorks[t.key] = true
+
+                if t.key == 'HideUnder' and hideLocked then
+                    if val == false then hideLocked = false end
+                    val = false
+                end
+
                 if Config[t.key] ~= val then
                     Config[t.key] = val
-                    print("[" .. NAME .. "] " .. t.name .. " = " .. tostring(val))
+                    print('[' .. NAME .. '] ' .. t.name .. ' = ' .. tostring(val))
                 end
             end
         end
 
-        -- hide on/off edges
         if Config.HideUnder ~= hideWas then
             hideWas = Config.HideUnder
 
             if Config.HideUnder then
+                stopHideLoop()
+                unanchorHide()
+
                 hideSpot, hideSurface = computeSpots()
-                hideSaid = false
-                hideBail = false
-                hideHP   = nil
+                hideChar       = LP.Character
+                hideDeaths     = 0
+                hideHP0        = nil
+                hideFallFrames = 0
 
                 startHideLoop()
+            elseif hideLocked then
+                stopHideLoop()
+                unanchorHide()
             else
                 leaveHide()
             end
         end
 
         for i = 1, #RARITY_IDS do
-            local r = RARITY_IDS[i]
+            local r   = RARITY_IDS[i]
             local val = nil
 
             local ok1, v1 = pcall(function() return UI.GetValue(r.id) end)
-            if ok1 and type(v1) == "boolean" then
+            if ok1 and type(v1) == 'boolean' then
                 val = v1
             else
                 local ok2, v2 = pcall(function() return UI.GetValue(r.name) end)
-                if ok2 and type(v2) == "boolean" then val = v2 end
+                if ok2 and type(v2) == 'boolean' then val = v2 end
             end
 
             if val ~= nil then
                 getterWorks[r.rarity] = true
+
                 if PickCfg[r.rarity] ~= val then
                     PickCfg[r.rarity] = val
-                    print("[" .. NAME .. "] rarity " .. r.name .. " = " .. tostring(val))
+                    print('[' .. NAME .. '] rarity ' .. r.name .. ' = ' .. tostring(val))
                 end
             end
         end
@@ -1467,19 +1406,18 @@ end)
 -- AUTO EQUIP BEST
 --------------------------------------------------------------------
 local function mosquitoSignature()
-    local bp = LP:FindFirstChild("Backpack")
-    if not bp then return "" end
+    local bp = LP:FindFirstChild('Backpack')
+    if not bp then return '' end
 
     local ok, kids = pcall(function() return bp:GetChildren() end)
-    if not ok or not kids then return "" end
+    if not ok or not kids then return '' end
 
-    local s = ""
+    local s = ''
 
     for i = 1, #kids do
         local t = kids[i]
-
-        if t.ClassName == "Tool" and itemTypeOf(t) == "Mosquito" then
-            s = s .. t.Name .. "|"
+        if t.ClassName == 'Tool' and itemTypeOf(t) == 'Mosquito' then
+            s = s .. t.Name .. '|'
         end
     end
 
@@ -1508,14 +1446,14 @@ task.spawn(function()
                     lastFire = now
 
                     if not wasOn then
-                        print("[" .. NAME .. "] auto equip best on (fires when your mosquito list changes)")
+                        print('[' .. NAME .. '] auto equip best on (fires when your mosquito list changes)')
                     end
 
                     wasOn  = true
                     warned = false
                 elseif not warned then
                     warned = true
-                    print("[" .. NAME .. "] auto equip best: PlaceBest remote not found")
+                    print('[' .. NAME .. '] auto equip best: PlaceBest remote not found')
                 end
             end
 
@@ -1523,7 +1461,7 @@ task.spawn(function()
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto equip best off")
+                print('[' .. NAME .. '] auto equip best off')
             end
 
             warned   = false
@@ -1537,8 +1475,52 @@ end)
 --------------------------------------------------------------------
 -- EGG PICKUP
 --------------------------------------------------------------------
+local function noClipOn()
+    tpSaved = {}
+
+    local c = LP.Character
+    if not c then return end
+
+    local ok, desc = pcall(function() return c:GetDescendants() end)
+    if not ok or not desc then return end
+
+    for i = 1, #desc do
+        local d  = desc[i]
+        local cn = d.ClassName
+
+        if cn == 'Part' or cn == 'MeshPart' then
+            local okC, col = pcall(function() return d.CanCollide end)
+
+            if okC and col == true then
+                tpSaved[#tpSaved + 1] = { part = d, collide = col }
+                pcall(function() d.CanCollide = false end)
+            end
+        end
+    end
+end
+
+local function noClipOff()
+    for i = 1, #tpSaved do
+        local e = tpSaved[i]
+        if e.part then pcall(function() e.part.CanCollide = e.collide end) end
+    end
+
+    tpSaved = {}
+end
+
+local function restoreHome()
+    if tpAway and tpHome then
+        local hrp = rootPart()
+        if hrp then pcall(function() hrp.CFrame = tpHome end) end
+    end
+
+    tpAway = false
+    tpHome = nil
+    pickingNow = false
+end
+
 task.spawn(function()
-    local hasPrompt = (type(fireproximityprompt) == "function")
+    local hasPrompt = (type(fireproximityprompt) == 'function')
 
     local warned = false
     local wasOn  = false
@@ -1547,7 +1529,7 @@ task.spawn(function()
     local diag   = false
 
     if not hasPrompt then
-        print("[" .. NAME .. "] fireproximityprompt missing - re-run the Matcha loader")
+        print('[' .. NAME .. '] fireproximityprompt missing - re-run the Matcha loader')
     end
 
     while running do
@@ -1565,13 +1547,11 @@ task.spawn(function()
                     local okP, parent = pcall(function() return egg.model.Parent end)
 
                     if okP and parent ~= nil then
-                        local k = keyOf(egg.model)
+                        local k     = keyOf(egg.model)
                         local ready = true
 
                         if k ~= nil and lastAt[k] ~= nil then
-                            if (now - lastAt[k]) < PICK_COOLDOWN then
-                                ready = false
-                            end
+                            if (now - lastAt[k]) < PICK_COOLDOWN then ready = false end
                         end
 
                         if ready then
@@ -1593,49 +1573,38 @@ task.spawn(function()
                                         end
 
                                         if home then
-                                            pickingNow = true
-                                            tpHome = home
-                                            tpAway = true
+                                            pickingNow    = true
+                                            pickStartedAt = tick()
+                                            tpHome        = home
+                                            tpAway        = true
 
                                             noClipOn()
 
                                             pcall(function()
-                                                hrp.CFrame = CFrame.new(
-                                                    epos.X,
-                                                    epos.Y - TP_DEPTH,
-                                                    epos.Z
-                                                )
+                                                hrp.CFrame = CFrame.new(epos.X, epos.Y - TP_DEPTH, epos.Z)
                                             end)
 
                                             task.wait(TP_SETTLE)
 
                                             if running and Config.Pickup then
-                                                pcall(function()
-                                                    fireproximityprompt(prompt)
-                                                end)
-
+                                                pcall(function() fireproximityprompt(prompt) end)
                                                 task.wait(0.05)
-
-                                                pcall(function()
-                                                    fireproximityprompt(prompt)
-                                                end)
+                                                pcall(function() fireproximityprompt(prompt) end)
                                             end
 
                                             task.wait(TP_HOLD)
 
-                                            local okR, hrp2 = pcall(function() return rootPart() end)
-                                            local back = (okR and hrp2) or hrp
-
-                                            pcall(function() back.CFrame = home end)
+                                            local hrp2 = rootPart()
+                                            pcall(function() (hrp2 or hrp).CFrame = home end)
 
                                             noClipOff()
 
-                                            tpAway = false
-                                            tpHome = nil
+                                            tpAway     = false
+                                            tpHome     = nil
                                             pickingNow = false
 
-                                            done = true
-                                            taken = taken + 1
+                                            done         = true
+                                            taken        = taken + 1
                                             lastPickupAt = tick()
 
                                             if k ~= nil then lastAt[k] = tick() end
@@ -1647,19 +1616,18 @@ task.spawn(function()
                                                 local okD, d = pcall(function()
                                                     return (home.Position - epos).Magnitude
                                                 end)
-                                                if okD and type(d) == "number" then dist = d end
+                                                if okD and type(d) == 'number' then dist = d end
 
-                                                print("[" .. NAME .. "] tp pickup on "
-                                                    .. tostring(egg.name)
-                                                    .. "  was " .. tostring(math.floor(dist))
-                                                    .. " away")
+                                                print('[' .. NAME .. '] tp pickup on ' .. tostring(egg.name)
+                                                    .. '  was ' .. tostring(math.floor(dist)) .. ' away')
                                             end
                                         end
                                     end
                                 else
                                     pcall(function() fireproximityprompt(prompt) end)
-                                    done = true
-                                    taken = taken + 1
+
+                                    done         = true
+                                    taken        = taken + 1
                                     lastPickupAt = tick()
 
                                     if k ~= nil then lastAt[k] = tick() end
@@ -1675,20 +1643,19 @@ task.spawn(function()
 
                 if not wasOn then
                     wasOn = true
-                    print("[" .. NAME .. "] auto pickup on ("
-                        .. (Config.TPPickup and "tp under egg" or "prompt")
-                        .. ")")
+                    print('[' .. NAME .. '] auto pickup on ('
+                        .. (Config.TPPickup and 'tp under egg' or 'prompt') .. ')')
                 end
             elseif not warned then
                 warned = true
-                print("[" .. NAME .. "] auto pickup: no egg matched an enabled rarity")
+                print('[' .. NAME .. '] auto pickup: no egg matched an enabled rarity')
             end
 
             task.wait(PICK_RATE)
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] auto pickup off (" .. tostring(taken) .. " eggs)")
+                print('[' .. NAME .. '] auto pickup off (' .. tostring(taken) .. ' eggs)')
             end
 
             pcall(restoreHome)
@@ -1700,7 +1667,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO RESET
+-- AUTO RESET  (never while hiding)
 --------------------------------------------------------------------
 task.spawn(function()
     local lastKill   = 0
@@ -1710,7 +1677,7 @@ task.spawn(function()
     local watching   = false
 
     while running do
-        if Config.Farm and alive() and not watching then
+        if Config.Farm and not Config.HideUnder and alive() and not watching then
             if LP.Character ~= lastChar then
                 lastChar   = LP.Character
                 emptySince = nil
@@ -1730,16 +1697,6 @@ task.spawn(function()
 
                 if (now - emptySince) >= FAST_SETTLE
                     and (now - lastKill) >= FAST_COOLDOWN then
-                    local hrp  = rootPart()
-                    local home = nil
-
-                    if Config.HideUnder and hideSpot then
-                        home = hideSpot
-                    elseif hrp then
-                        local ok, cf = pcall(function() return hrp.CFrame end)
-                        if ok and cf then home = cf end
-                    end
-
                     local okKill, why = killCharacter()
 
                     if okKill then
@@ -1747,7 +1704,7 @@ task.spawn(function()
                         emptySince = nil
                         watching   = true
 
-                        print("[" .. NAME .. "] no weapon in hand: resetting")
+                        print('[' .. NAME .. '] no weapon in hand: resetting')
 
                         task.spawn(function()
                             local waited = 0
@@ -1757,33 +1714,25 @@ task.spawn(function()
                                 waited = waited + 0.05
 
                                 local c = LP.Character
-                                local h = c and c:FindFirstChildOfClass("Humanoid")
+                                local h = c and c:FindFirstChildOfClass('Humanoid')
 
                                 if c and h and h.Health > 0 then
-                                    local r = c:FindFirstChild("HumanoidRootPart")
-
-                                    if r and home then
-                                        pcall(function() r.CFrame = home end)
-                                    end
-
-                                    print("[" .. NAME .. "] respawned"
-                                        .. (home and " - put back on your spot" or ""))
-
+                                    print('[' .. NAME .. '] respawned')
                                     watching = false
                                     return
                                 end
                             end
 
                             if running then
-                                print("[" .. NAME .. "] still no new character after "
-                                    .. tostring(FAST_MAX_WAIT) .. "s - reset once by hand")
+                                print('[' .. NAME .. '] still no new character after '
+                                    .. tostring(FAST_MAX_WAIT) .. 's - reset once by hand')
                             end
 
                             watching = false
                         end)
                     else
                         lastKill = now
-                        print("[" .. NAME .. "] reset failed: " .. tostring(why))
+                        print('[' .. NAME .. '] reset failed: ' .. tostring(why))
                     end
                 end
             else
@@ -1803,7 +1752,7 @@ end)
 -- FARM KILL
 --------------------------------------------------------------------
 task.spawn(function()
-    local hasTouch = (type(firetouchinterest) == "function")
+    local hasTouch = (type(firetouchinterest) == 'function')
 
     local wasOn      = false
     local warnedTool = false
@@ -1823,7 +1772,7 @@ task.spawn(function()
             if not tool then
                 if not warnedTool then
                     warnedTool = true
-                    print("[" .. NAME .. "] farm kill: equip a weapon")
+                    print('[' .. NAME .. '] farm kill: equip a weapon')
                 end
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
                 task.wait(0.25)
@@ -1837,7 +1786,7 @@ task.spawn(function()
                     cachedAtk, cachedPs = remotesOfActor(id)
 
                     if cachedAtk then
-                        print("[" .. NAME .. "] live actor " .. tostring(id))
+                        print('[' .. NAME .. '] live actor ' .. tostring(id))
                     end
                 end
 
@@ -1846,7 +1795,7 @@ task.spawn(function()
                 if not ap then
                     if not warnedAct then
                         warnedAct = true
-                        print("[" .. NAME .. "] farm kill: no AttackPart on this tool")
+                        print('[' .. NAME .. '] farm kill: no AttackPart on this tool')
                     end
                     cachedId = nil
                     task.wait(0.25)
@@ -1855,17 +1804,14 @@ task.spawn(function()
 
                     if not wasOn then
                         wasOn = true
-                        print("[" .. NAME .. "] farm kill on (size cycle per pass)")
+                        print('[' .. NAME .. '] farm kill on (size cycle per pass)')
                     end
 
                     rememberPart(ap)
 
                     local big, seen = mapSize()
 
-                    pcall(function()
-                        ap.Size = Vector3.new(AP_SMALL, AP_SMALL, AP_SMALL)
-                    end)
-
+                    pcall(function() ap.Size = Vector3.new(AP_SMALL, AP_SMALL, AP_SMALL) end)
                     task.wait(AP_HOLD)
 
                     if big then
@@ -1890,22 +1836,20 @@ task.spawn(function()
 
                                     for j = 1, #parts do
                                         local part = parts[j]
-                                        pcall(function()
-                                            firetouchinterest(ap, part, 0)
-                                        end)
+                                        pcall(function() firetouchinterest(ap, part, 0) end)
                                     end
                                 end
                             end
                         end
                     elseif not noBossWarn then
                         noBossWarn = true
-                        print("[" .. NAME .. "] no boss spawned - box kept at minimum")
+                        print('[' .. NAME .. '] no boss spawned - box kept at minimum')
                     end
 
                     if cachedAtk then
                         for b = 1, ATK_BURST do
                             if cachedPs then
-                                pcall(function() cachedPs:FireServer("SwingSound") end)
+                                pcall(function() cachedPs:FireServer('SwingSound') end)
                             end
                             pcall(function() cachedAtk:FireServer() end)
                         end
@@ -1923,18 +1867,18 @@ task.spawn(function()
                     end
 
                     if live == 0 then
-                        stale = 0
+                        stale     = 0
                         staleWarn = false
-                        lastSum = nil
+                        lastSum   = nil
                     elseif lastSum and sum >= lastSum then
                         stale = stale + 1
 
                         if stale >= STALE_LIMIT and not staleWarn then
                             staleWarn = true
-                            print("[" .. NAME .. "] boss HP not dropping - hits not landing")
+                            print('[' .. NAME .. '] boss HP not dropping - hits not landing')
                         end
                     else
-                        stale = 0
+                        stale     = 0
                         staleWarn = false
                     end
 
@@ -1946,7 +1890,7 @@ task.spawn(function()
         else
             if wasOn then
                 wasOn = false
-                print("[" .. NAME .. "] farm kill off")
+                print('[' .. NAME .. '] farm kill off')
             end
 
             warnedTool = false
@@ -1957,9 +1901,7 @@ task.spawn(function()
             lastSum    = nil
             cachedId, cachedAtk, cachedPs = nil, nil, nil
 
-            if reachOn then
-                restoreAttackParts()
-            end
+            if reachOn then restoreAttackParts() end
 
             task.wait(0.1)
         end
@@ -1976,17 +1918,19 @@ task.spawn(function()
     while running do
         if Config.Heal then
             local hum = humanoid()
+
             if hum then
                 local now = tick()
+
                 if not transfusing or (now - lastFire) >= HEAL_REFIRE then
-                    if fireEvent("TransfuseBlood") then
+                    if fireEvent('TransfuseBlood') then
                         transfusing = true
                         lastFire    = now
                     end
                 end
             end
         elseif transfusing then
-            fireEvent("StopTransfuseBlood")
+            fireEvent('StopTransfuseBlood')
             transfusing = false
         end
 
@@ -2000,37 +1944,45 @@ end)
 task.spawn(function()
     while running do
         if Config.AutoCollect then
-            fireEvent("CollectIncome")
-            fireEvent("ClaimOfflineIncome")
+            fireEvent('CollectIncome')
+            fireEvent('ClaimOfflineIncome')
         end
         task.wait(COLLECT_RATE)
     end
 end)
 
 --------------------------------------------------------------------
+-- STOP
+--------------------------------------------------------------------
 local function stop()
     running = false
-    pcall(restoreHome)
-    pcall(noClipOff)
+
     pcall(stopHideLoop)
     pcall(unanchorHide)
+    pcall(noClipOff)
     pcall(stopHud)
     pcall(restoreAttackParts)
-    pcall(function() fireEvent("StopTransfuseBlood") end)
-    bossCache   = {}
-    bossStamp   = 0
-    eggCache    = {}
-    eggStamp    = 0
-    partCache   = {}
-    hatchFired  = {}
-    hideSpot    = nil
-    hideSurface = nil
-    pickingNow  = false
+    pcall(function() fireEvent('StopTransfuseBlood') end)
+
+    bossCache      = {}
+    bossStamp      = 0
+    eggCache       = {}
+    eggStamp       = 0
+    partCache      = {}
+    hatchFired     = {}
+    hideSpot       = nil
+    hideSurface    = nil
+    hideLocked     = false
+    pickingNow     = false
+    tpAway         = false
+    tpHome         = nil
+
     _G.FeedAMosquito = nil
-    print("[" .. NAME .. "] stopped")
+
+    print('[' .. NAME .. '] stopped')
 end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser("Loaded - hide is an anchored float now", 5)
-print("[" .. NAME .. "] " .. VERSION .. " loaded | menu=" .. tostring(HAS_UI))
+notifyUser('Loaded - hide is an anchored float with a fall watchdog', 5)
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
