@@ -6,18 +6,12 @@
 --    ProximityPrompt -> fireproximityprompt(prompt)
 --    ClickDetector   -> fireclickdetector(cd, 0, "MouseClick")
 --
---  NAMING
---    ObjectText / ActionText read as nil in Matcha, and when the
---    game does expose them they hold the action word ("STORE"),
---    not the item. So the name comes from the floating label over
---    the item: the longest TextLabel that is not a prompt line
---    ("Press [E] to pick up", "STORE" are skipped).
---
---  GROUPING
---    Names are reduced to their base: "Chocolate Bar (Minty Moon)"
---    and "Chocolate Bar (Original)" both become "Chocolate Bar",
---    so ONE button fires every bar on the map. NPCs and bots that
---    carry a prompt are grouped the same way, under the model name.
+--  NAMING (grouping reverted)
+--    ObjectText / ActionText read as nil in Matcha, so the name
+--    comes from the label floating over the item (BillboardGui
+--    TextLabel, e.g. "Big Coffee Cup"), then from the model name.
+--    Every prompt is its own entry again - no base-name merging,
+--    so each discovered item gets its own button.
 --
 --  HEALTH BARS
 --    Matcha's built-in ESP does not render in this game, so the
@@ -34,7 +28,7 @@ local Workspace  = game:GetService("Workspace")
 
 local LP = Players.LocalPlayer
 
-local VERSION       = "1.3.0"
+local VERSION       = "1.3.1"
 local NAME          = "CleanEverything"
 local MAX_BUTTONS   = 30
 local SCAN_EVERY    = 2
@@ -146,81 +140,57 @@ local function cleanName(v)
     return v
 end
 
-local function isPromptText(s)
-    local low = s:lower()
-    if low == "store" or low == "shop" or low == "buy" then return true end
-    if low:find("press", 1, true) then return true end
-    if low:find("pick up", 1, true) then return true end
-    if low:find("pickup", 1, true) then return true end
-    if low:find("to open", 1, true) then return true end
-    if low:find("to use", 1, true) then return true end
-    if low:find("to equip", 1, true) then return true end
-    if low:find("to talk", 1, true) then return true end
-    if low:find("to interact", 1, true) then return true end
-    return false
-end
-
 local function meaningful(v)
     local s = cleanName(v)
     if not s then return nil end
     if GENERIC[s] then return nil end
     if s:match("^%d+$") then return nil end
-    if isPromptText(s) then return nil end
     return s
 end
 
--- "Chocolate Bar (Minty Moon)" -> "Chocolate Bar"
-local function baseName(s)
-    if type(s) ~= "string" then return s end
-    local b = s:gsub("%b()", "")
-    b = b:gsub("%b[]", "")
-    b = b:gsub("%s*[%-:|].*$", "")
-    b = b:gsub("%s+", " ")
-    b = b:gsub("^%s+", "")
-    b = b:gsub("%s+$", "")
-    if b == "" then return s end
-    return b
-end
-
+-- The floating label over a ground item is a BillboardGui TextLabel
+-- ("Big Coffee Cup" in the example). That is the real item name.
 local function labelName(node)
     local ok, kids = pcall(function() return node:GetDescendants() end)
     if not ok or type(kids) ~= "table" then return nil end
     local n = #kids
-    if n > 80 then n = 80 end
-    local best = nil
+    if n > 60 then n = 60 end
     for i = 1, n do
         local d = kids[i]
         if d.ClassName == "TextLabel" then
             local t = meaningful(readProp(d, "Text"))
-            if t and (best == nil or #t > #best) then best = t end
+            if t then return t end
         end
     end
-    return best
+    return nil
 end
 
 local function nameFor(inst)
+    local obj = meaningful(readProp(inst, "ObjectText"))
+    if obj then return obj end
+    local act = meaningful(readProp(inst, "ActionText"))
+    if act then return act end
+
     local node    = inst.Parent
     local depth   = 0
     local nearest = nil
 
     while node and node ~= Workspace and depth < 6 do
         local lbl = labelName(node)
-        if lbl then return baseName(lbl) end
+        if lbl then return lbl end
 
         local n = meaningful(readProp(node, "Name"))
         if n then
-            if node.ClassName == "Model" then return baseName(n) end
+            if node.ClassName == "Model" then return n end
             if nearest == nil then nearest = n end
         end
         node  = node.Parent
         depth = depth + 1
     end
 
-    local obj = meaningful(readProp(inst, "ObjectText"))
-    if obj then return baseName(obj) end
-    if nearest then return baseName(nearest) end
+    if nearest then return nearest end
     local own = meaningful(readProp(inst, "Name"))
-    if own then return baseName(own) end
+    if own then return own end
     return "Item"
 end
 
@@ -579,7 +549,7 @@ end)
 --------------------------------------------------------------------
 _G[NAME] = { stop = stop, version = VERSION }
 
-print("[Clean Everything] v" .. VERSION .. " loaded - crossmap pickup, NPC support, health bars")
+print("[Clean Everything] v" .. VERSION .. " loaded - crossmap pickup, no teleport")
 pcall(function()
     notify("Clean Everything", "v" .. VERSION .. " loaded - pickup + health bars", 4)
 end)
