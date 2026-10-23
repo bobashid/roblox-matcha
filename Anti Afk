@@ -1,0 +1,208 @@
+-- Anti Afk - Matcha LuauVM
+-- Virtual key keepalive. Nothing replicates: no movement, no jump, no mouse.
+-- Input is only injected while the Roblox window is focused, so it never
+-- types into your browser or another app.
+
+local NAME    = 'AntiAfk'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local running = true
+local built   = false
+local fires   = 0
+local nextAt  = 0
+
+local cfg = {
+    enabled  = true,
+    interval = 60,
+    jitter   = 20,
+}
+
+local VK = 0x13 -- Pause key, unbound in normal games
+
+local function log(...)
+    print('[' .. NAME .. ']', ...)
+end
+
+local function schedule()
+    local j = 0
+    if cfg.jitter > 0 then
+        j = math.random(-cfg.jitter, cfg.jitter)
+    end
+    local w = cfg.interval + j
+    if w < 10 then w = 10 end
+    nextAt = tick() + w
+end
+
+local function inject()
+    if not cfg.enabled then return false end
+    if type(keypress) ~= 'function' then return false end
+    if type(isrbxactive) == 'function' then
+        if not isrbxactive() then return false end
+    end
+    local ok = pcall(function()
+        keypress(VK)
+        task.wait(0.06)
+        keyrelease(VK)
+    end)
+    if ok then
+        fires = fires + 1
+        return true
+    end
+    return false
+end
+
+if type(setrobloxinput) == 'function' then
+    pcall(setrobloxinput, true)
+end
+
+task.spawn(function()
+    schedule()
+    while running do
+        if tick() >= nextAt then
+            if inject() then
+                log('key sent, total ' .. fires)
+            end
+            schedule()
+        end
+        task.wait(1)
+    end
+end)
+
+-- menu ---------------------------------------------------------------
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    warn('[' .. NAME .. '] section failed: ' .. name)
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. label)
+    return false
+end
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'Keepalive')
+        if not sec then return end
+        mkToggle(sec, 'Enabled', 'aa_enabled', true, function(v)
+            cfg.enabled = v
+            log('enabled = ' .. tostring(v))
+        end)
+        mkSlider(sec, 'Interval (s)', 'aa_interval', 20, 300, 60, function(v)
+            cfg.interval = v
+            schedule()
+        end)
+        mkSlider(sec, 'Jitter (s)', 'aa_jitter', 0, 60, 20, function(v)
+            cfg.jitter = v
+        end)
+        mkButton(sec, 'Send now', function()
+            local sent = inject()
+            log('manual send: ' .. tostring(sent) .. ', total ' .. fires)
+            if type(notify) == 'function' then
+                notify('Anti Afk', sent and 'key sent' or 'skipped (window not focused)', 2)
+            end
+        end)
+        mkButton(sec, 'Status', function()
+            local a = false
+            if type(isrbxactive) == 'function' then a = isrbxactive() end
+            log('status: enabled=' .. tostring(cfg.enabled) .. ' fires=' .. fires .. ' active=' .. tostring(a))
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] build error: ' .. tostring(err))
+    end
+    log('tab built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Anti Afk', function(tab)
+            if built then return end
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+end
+
+local function stop()
+    running = false
+    if type(UI) == 'table' and type(UI.RemoveTab) == 'function' then
+        pcall(function() UI.RemoveTab('Anti Afk') end)
+    end
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI))
