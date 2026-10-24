@@ -1,16 +1,20 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- Payload now matches a real swing captured in game:
---   { crit, sprint, charge, vt, dir, eye, t }  (no `block`, `vt` is a time)
--- The previous build sent vt = nil plus a block key the server does not get,
--- which is why hits stopped registering.
--- Kill aura: crit = true on every swing, paced to MaxAttacksPerSecond (0.04s)
--- and skipping targets still inside HurtResistantTicks (1.0s).
--- Health bars: collector at 3 Hz, health at 10 Hz, per-frame renderer only
--- reads Position and writes pooled Drawings, with a distance cull.
+-- Two aura modes behind one toggle:
+--   Crit Only ON  (default): every swing carries crit = true, and a swing only
+--                   counts once the target's health actually drops. Swings that
+--                   register no damage are not counted, so the target is
+--                   retried immediately instead of being locked out for a
+--                   second. This is what makes crits "go through".
+--   Crit Only OFF (Spam):    swings at whatever can still take damage, paced to
+--                   MaxAttacksPerSecond, no per-target pending gate.
+-- Both modes skip targets still inside HurtResistantTicks (1.0s) and both
+-- send the real payload { crit, sprint, charge, vt, dir, eye, t }.
+-- Health bars: collector 3 Hz, health 10 Hz, per-frame renderer only reads
+-- Position and writes pooled Drawings, with a distance cull.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.8'
+local VERSION = 'v3.9'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -37,9 +41,9 @@ local HEALTH_EVERY  = 0.1     -- refresh cached health (10 Hz)
 local FORGET_AFTER  = 3.0     -- drop a cached target not seen for this long
 local SWING_WAIT    = 0.04    -- 25 swings/s = Config.Combat.MaxAttacksPerSecond
 local HURT_WINDOW   = 1.0     -- HurtResistantTicks 20 at 20 tps
+local VERIFY_AFTER  = 0.12    -- wait this long before judging a swing
 local MAX_BAR_DIST  = 220     -- do not draw bars past this many studs
 
--- hoisted constants: no table allocation in the render loop
 local HEAD_OFFSET = Vector3.new(0, 2.6, 0)
 local FEET_OFFSET = Vector3.new(0, 2.4, 0)
 local EYE_OFFSET  = Vector3.new(0, 1.5, 0)
@@ -55,10 +59,12 @@ local running = true
 local built   = false
 local targets = {}
 local lastHit = {}
+local pending = {}
 
 local cfg = {
-    aura = true,
-    bars = true,
+    aura     = true,
+    bars     = true,
+    critMode = true,
 }
 
 local conns    = {}
@@ -235,8 +241,6 @@ end
 
 -- Mirrors the real client payload exactly:
 --   Attack:FireServer(characterModel, { crit, sprint, charge, vt, dir, eye, t })
--- vt is a time value; the old build sent nil and also included a `block` key
--- that the server never receives, which is why hits stopped counting.
 local function fireAt(model, eye, targetPos)
     local delta = targetPos - eye
     local dir
@@ -306,8 +310,9 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Kill Aura',   'aura', true, function(v) setBool('aura', v) end)
-        mkToggle(sec, 'Health Bars', 'bars', true, function(v) setBool('bars', v) end)
+        mkToggle(sec, 'Kill Aura',      'aura',      true, function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Crit Only',      'crit_mode', true, function(v) setBool('critMode', v) end)
+        mkToggle(sec, 'Health Bars',    'bars',      true, function(v) setBool('bars', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -344,6 +349,10 @@ task.spawn(function()
                 local b = UI.GetValue('bars')
                 if type(b) ~= 'boolean' then b = UI.GetValue('Health Bars') end
                 if type(b) == 'boolean' then cfg.bars = b end
+
+                local c = UI.GetValue('crit_mode')
+                if type(c) ~= 'boolean' then c = UI.GetValue('Crit Only') end
+                if type(c) == 'boolean' then cfg.critMode = c end
             end)
         end
         task.wait(0.1)
@@ -372,11 +381,13 @@ task.spawn(function()
     end
 end)
 
--- HEALTH: refreshes the cached hp fields at 10 Hz, no tree lookups ----
+-- HEALTH + VERIFY: 10 Hz. Refreshes hp, and confirms which swings landed --
 
 task.spawn(function()
     while running do
+        local now  = os.clock()
         local list = targets
+
         for i = 1, #list do
             local t = list[i]
             local m = t.model
@@ -385,11 +396,32 @@ task.spawn(function()
                 if type(h) == 'number' then t.hp = h end
             end
         end
+
+        -- a swing only becomes a real hit (and starts the hurt window) when
+        -- the target's health actually dropped
+        for key, p in pairs(pending) do
+            if (now - p.t) >= VERIFY_AFTER then
+                pending[key] = nil
+                local e = entryKey[key]
+                local cur = nil
+                if e and e.target then cur = e.target.hp end
+                if cur == nil then
+                    -- fall back to the live target list
+                    for i = 1, #list do
+                        if list[i].key == key then cur = list[i].hp break end
+                    end
+                end
+                if cur ~= nil and cur < p.hp - 0.01 then
+                    lastHit[key] = p.t
+                end
+            end
+        end
+
         task.wait(HEALTH_EVERY)
     end
 end)
 
--- kill aura: one swing per tick, skipping targets still hurt-immune --
+-- kill aura: crit-only verifies each swing, spam ignores the pending gate --
 
 task.spawn(function()
     local idx = 0
@@ -411,15 +443,20 @@ task.spawn(function()
                         checked = checked + 1
 
                         local t  = list[idx]
+                        local ok = true
                         local lh = lastHit[t.key]
 
-                        if lh == nil or (now - lh) >= HURT_WINDOW then
+                        if lh and (now - lh) < HURT_WINDOW then ok = false end
+                        if ok and cfg.critMode and pending[t.key] ~= nil then ok = false end
+
+                        if ok then
                             local tr = t.root
                             if tr and tr.Parent then
                                 local pos = tr.Position
                                 if (pos - myPos).Magnitude <= RANGE then
+                                    local hpBefore = t.hp
                                     fireAt(t.model, eye, pos)
-                                    lastHit[t.key] = now
+                                    pending[t.key] = { t = now, hp = hpBefore }
                                     fired = true
                                     break
                                 end
@@ -486,6 +523,7 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
                     if hgt > 8 then
                         local e = acquire(t.key, now)
                         if e then
+                            e.target = t
                             local w = hgt * 0.55
                             if w < 16 then w = 16 end
 
@@ -550,6 +588,7 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
             e.bg.Visible    = false
             e.fill.Visible  = false
             e.label.Visible = false
+            e.target = nil
             if e.key and (now - e.lastSeen) > FORGET_AFTER then
                 if entryKey[e.key] == e then entryKey[e.key] = nil end
                 e.key = nil
@@ -577,6 +616,7 @@ local function stop()
     pool     = {}
     entryKey = {}
     lastHit  = {}
+    pending  = {}
     if HAS_UI then
         pcall(function() UI.RemoveTab('Kill Aura') end)
     end
