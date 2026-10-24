@@ -1,17 +1,16 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- Kill aura: every swing carries crit = true, paced to MaxAttacksPerSecond
--- (0.04s) and skipping targets still inside HurtResistantTicks (1.0s), which
--- is why enemies used to take exactly one hit.
--- Health bars are optimised for framerate:
---   * characters/roots are resolved in a COLLECTOR at 3 Hz and cached, so the
---     per-frame RENDERER does no FindFirstChild and no attribute reads
---   * health is refreshed 10 Hz into the cache, not read per frame
---   * distance cull before projecting, and constant Vector3 offsets hoisted
---   * pooled Drawings, hidden tail, no allocation inside the loop
+-- Payload now matches a real swing captured in game:
+--   { crit, sprint, charge, vt, dir, eye, t }  (no `block`, `vt` is a time)
+-- The previous build sent vt = nil plus a block key the server does not get,
+-- which is why hits stopped registering.
+-- Kill aura: crit = true on every swing, paced to MaxAttacksPerSecond (0.04s)
+-- and skipping targets still inside HurtResistantTicks (1.0s).
+-- Health bars: collector at 3 Hz, health at 10 Hz, per-frame renderer only
+-- reads Position and writes pooled Drawings, with a distance cull.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.7'
+local VERSION = 'v3.8'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -186,7 +185,6 @@ local function maxHpOf(model)
     return mh
 end
 
--- resolves one model into a cached target record, or nil
 local function buildTarget(model, key, plr)
     if not model then return nil end
     if excluded(model.Name) then return nil end
@@ -235,22 +233,26 @@ end
 
 -- swinging ------------------------------------------------------------
 
+-- Mirrors the real client payload exactly:
+--   Attack:FireServer(characterModel, { crit, sprint, charge, vt, dir, eye, t })
+-- vt is a time value; the old build sent nil and also included a `block` key
+-- that the server never receives, which is why hits stopped counting.
 local function fireAt(model, eye, targetPos)
-    local dir = targetPos - eye
-    if dir.Magnitude < 0.001 then
+    local delta = targetPos - eye
+    local dir
+    if delta.Magnitude < 0.001 then
         dir = Vector3.new(0, -1, 0)
     else
-        dir = dir.Unit
+        dir = delta.Unit
     end
     local payload = {
-        sprint = false,
         crit   = true,
-        eye    = eye,
-        dir    = dir,
-        block  = false,
+        sprint = false,
         charge = 1,
+        vt     = os.time(),
+        dir    = dir,
+        eye    = eye,
         t      = os.clock(),
-        vt     = nil,
     }
     pcall(function()
         Attack:FireServer(model, payload)
