@@ -10,8 +10,12 @@
 --  The server range-checks the grab, so each pass:
 --    1. fires the remote from where you stand (works up close)
 --    2. if the egg is still not carried, blinks the character onto
---       the egg for ~0.4s, fires again, and blinks straight back.
+--       the egg, fires again, and blinks straight back.
 --  One egg per pass, 0.55s cooldown, failed ids blacklisted 30s.
+--
+--  NestEggs.Cycle changes every nest reset; when it does the
+--  position and ban caches are dropped, otherwise the tp would
+--  aim at last cycle's coordinates.
 --
 --  MENU: Auto Grab, Teleport Fallback, Grab Now, one toggle per
 --  rarity that actually exists in the current nest cycle.
@@ -19,7 +23,7 @@
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local VERSION = "v1.0"
+local VERSION = "v1.1"
 local NAME = "HikeForEggs"
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -43,11 +47,10 @@ local BAN_TIME = 30
 
 local posCache = {}
 local banUntil = {}
+local cacheCycle = nil
 
-local EggGrab = game:GetService("ReplicatedStorage")
-    :WaitForChild("SwimAdventure")
-    :WaitForChild("Remotes")
-    :WaitForChild("EggGrab")
+local SwimAdventure = game:GetService("ReplicatedStorage"):WaitForChild("SwimAdventure")
+local EggGrab = SwimAdventure:WaitForChild("Remotes"):WaitForChild("EggGrab")
 
 --------------------------------------------------------------------
 -- HELPERS
@@ -66,6 +69,18 @@ end
 local function eggFolder()
     local ln = workspace:FindFirstChild("LocalNests")
     return ln and ln:FindFirstChild("Eggs") or nil
+end
+
+local function refreshCycle()
+    local cfg = SwimAdventure:FindFirstChild("NestEggs")
+    if not cfg then return end
+    local c = cfg:GetAttribute("Cycle")
+    if c ~= cacheCycle then
+        cacheCycle = c
+        posCache = {}
+        banUntil = {}
+        print("[Hike For Eggs] nest cycle changed - caches cleared")
+    end
 end
 
 local function eggPos(m)
@@ -105,6 +120,7 @@ local function grabOne(force)
     if not force and carrying() then return false end
     local now = os.clock()
     if now - lastGrab < GRAB_GAP then return false end
+    refreshCycle()
     local eggs = eggFolder()
     local hrp = playerHRP()
     if not eggs or not hrp then return false end
@@ -131,13 +147,14 @@ local function grabOne(force)
 
     lastGrab = now
     local id = best.Name
+    local rarity = tostring(best:GetAttribute("Rarity"))
 
     -- 1: remote from where we stand
     tryInvoke(id)
     task.wait(0.16)
     if carrying() then
         grabbed = grabbed + 1
-        print("[Hike For Eggs] grabbed " .. id .. " (" .. tostring(best:GetAttribute("Rarity")) .. ") remote")
+        print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ") remote")
         return true
     end
 
@@ -159,7 +176,7 @@ local function grabOne(force)
 
     if carrying() then
         grabbed = grabbed + 1
-        print("[Hike For Eggs] grabbed " .. id .. " (" .. tostring(best:GetAttribute("Rarity")) .. ") tp")
+        print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ") tp")
         return true
     end
 
@@ -334,6 +351,7 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
+        refreshCycle()
         if Config.Auto and not carrying() then
             pcall(grabOne, false)
         end
