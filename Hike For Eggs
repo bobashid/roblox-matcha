@@ -2,25 +2,24 @@
 --  Hike For Eggs  |  Egg Grab + Rarity Toggles
 --  Matcha LuaVM  -  built-in tab (UI.AddTab)
 --
---  v1.3
---    * Every rarity now gets its own toggle, built up front from
---      RarityConfig's order, not only the ones in the current nest.
---    * Travel is a tween, not an instant CFrame snap. The server
---      rejects cross-map jumps, so the character is moved in 24
---      small steps over a distance-scaled duration, grabs, then
---      tweens back the same way.
---    * Teleport stays opt-in (off by default); remote-only grabs
---      still happen first from wherever you stand.
---    * Single flight guard, buttons run in task.spawn.
+--  v1.4 - crash bisect step
+--    Removed EVERYTHING that writes to the character. No CFrame, no
+--    tween, no teleport, no travel. The only thing this does is
+--    call EggGrab:InvokeServer(eggId) at most once every 1.2s from
+--    wherever you are standing.
 --
---  Eggs = workspace.LocalNests.Eggs (Models, attribute Rarity)
---  Grab = ReplicatedStorage.SwimAdventure.Remotes.EggGrab
---              :InvokeServer(eggId)
+--    If this still crashes, the movement was never the cause and
+--    the next thing to look at is the invoke rate / the remote
+--    itself. If it does not crash, movement can come back one
+--    piece at a time.
+--
+--    Also added: 5 consecutive failures pauses the loop for 15s,
+--    so a bad id cannot be hammered.
 --==================================================================
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local VERSION = "v1.3"
+local VERSION = "v1.4"
 local NAME = "HikeForEggs"
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -31,7 +30,7 @@ local RARITY_ORDER = {
     "Transcendent", "Cosmic", "Ascendant", "Primordial",
 }
 
-local Config = { Auto = true, TP = false }
+local Config = { Auto = true }
 local RarityOn = {}
 for i = 1, #RARITY_ORDER do RarityOn[RARITY_ORDER[i]] = true end
 
@@ -39,19 +38,16 @@ local running = true
 local busy = false
 local grabbed = 0
 local lastGrab = 0
-local GRAB_GAP = 0.55
-local TP_HOVER = 3
+local GRAB_GAP = 1.2
 local BAN_TIME = 45
-
--- tween tuning
-local TWEEN_STEPS = 24
-local SPEED = 150          -- studs per second the tween aims for
-local MIN_DUR = 0.25
-local MAX_DUR = 1.10
+local MAX_FAILS = 5
+local PAUSE_TIME = 15
 
 local posCache = {}
 local banUntil = {}
 local cacheCycle = nil
+local failCount = 0
+local pausedUntil = 0
 
 local SwimAdventure = game:GetService("ReplicatedStorage"):WaitForChild("SwimAdventure")
 local EggGrab = SwimAdventure:WaitForChild("Remotes"):WaitForChild("EggGrab")
@@ -65,9 +61,10 @@ local function carrying()
     return c
 end
 
-local function playerHRP()
+local function playerPos()
     local char = LP.Character
-    return char and char:FindFirstChild("HumanoidRootPart") or nil
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    return hrp and hrp.Position or nil
 end
 
 local function eggFolder()
@@ -83,10 +80,11 @@ local function refreshCycle()
         cacheCycle = c
         posCache = {}
         banUntil = {}
+        failCount = 0
+        pausedUntil = 0
     end
 end
 
--- PrimaryPart, else the first direct BasePart child. No deep scan.
 local function eggPos(m)
     local cached = posCache[m.Name]
     if cached then return cached end
@@ -114,43 +112,20 @@ local function isBanned(id)
     return t ~= nil and os.clock() < t
 end
 
-local function tryInvoke(id)
-    local ok, ret = pcall(function() return EggGrab:InvokeServer(id) end)
-    return ok, ret
-end
-
--- step the character instead of snapping it, so the server sees a
--- plausible move
-local function tweenTo(hrp, targetCF, dist)
-    local dur = dist / SPEED
-    if dur < MIN_DUR then dur = MIN_DUR end
-    if dur > MAX_DUR then dur = MAX_DUR end
-    local startCF = hrp.CFrame
-    local stepTime = dur / TWEEN_STEPS
-    for i = 1, TWEEN_STEPS do
-        if not running then return false end
-        local cf = startCF:Lerp(targetCF, i / TWEEN_STEPS)
-        local ok = pcall(function() hrp.CFrame = cf end)
-        if not ok then return false end
-        task.wait(stepTime)
-    end
-    return true
-end
-
 --------------------------------------------------------------------
--- GRAB CORE
+-- GRAB CORE - remote only, no movement
 --------------------------------------------------------------------
 local function grabInner(force)
     if not force and carrying() then return false end
     local now = os.clock()
+    if now < pausedUntil then return false end
     if now - lastGrab < GRAB_GAP then return false end
 
     refreshCycle()
     local eggs = eggFolder()
-    local hrp = playerHRP()
-    if not eggs or not hrp then return false end
+    local myPos = playerPos()
+    if not eggs or not myPos then return false end
 
-    local myPos = hrp.Position
     local best, bestD = nil, nil
     local kids = eggs:GetChildren()
     for i = 1, #kids do
@@ -174,43 +149,28 @@ local function grabInner(force)
     local id = best.Name
     local rarity = tostring(best:GetAttribute("Rarity"))
 
-    -- 1: remote only, from where we stand
-    tryInvoke(id)
+    local ok = pcall(function() EggGrab:InvokeServer(id) end)
     task.wait(0.16)
-    if carrying() then
+
+    if ok and carrying() then
         grabbed = grabbed + 1
+        failCount = 0
         print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ")")
         return true
     end
 
-    -- 2: tween over, grab, tween back
-    if not Config.TP then
-        banUntil[id] = os.clock() + BAN_TIME
-        return false
-    end
-    local pos = eggPos(best)
-    if not pos then return false end
-    local back = hrp.CFrame
-    local okGo = tweenTo(hrp, CFrame.new(pos.X, pos.Y + TP_HOVER, pos.Z), bestD or 0)
-    if okGo then
-        task.wait(0.14)
-        tryInvoke(id)
-        task.wait(0.20)
-        tweenTo(hrp, back, bestD or 0)
-    end
-
-    if carrying() then
-        grabbed = grabbed + 1
-        print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ") travel")
-        return true
-    end
-
     banUntil[id] = os.clock() + BAN_TIME
-    print("[Hike For Eggs] failed " .. id .. " - ban " .. BAN_TIME .. "s")
+    failCount = failCount + 1
+    print("[Hike For Eggs] miss " .. id .. " fail " .. tostring(failCount))
+
+    if failCount >= MAX_FAILS then
+        failCount = 0
+        pausedUntil = os.clock() + PAUSE_TIME
+        print("[Hike For Eggs] too many misses - pausing " .. PAUSE_TIME .. "s")
+    end
     return false
 end
 
--- single flight, always clears busy
 local function grabOne(force)
     if busy then return false end
     busy = true
@@ -292,9 +252,6 @@ local function buildTab(tab)
             if safeToggle(sec, "Auto Grab Eggs", "hike_autograb", true, applyBool("cfg", "Auto")) then
                 TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "Auto", id = "hike_autograb", name = "Auto Grab Eggs" }
             end
-            if safeToggle(sec, "Travel To Egg", "hike_tpfall", false, applyBool("cfg", "TP")) then
-                TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "TP", id = "hike_tpfall", name = "Travel To Egg" }
-            end
             safeButton(sec, "Grab Nearest Now", "hike_grabnow", function()
                 task.spawn(function()
                     local ok = grabOne(true)
@@ -367,7 +324,7 @@ task.spawn(function()
         if Config.Auto and not busy and not carrying() then
             grabOne(false)
         end
-        task.wait(0.25)
+        task.wait(0.35)
     end
 end)
 
@@ -379,5 +336,5 @@ end
 
 _G[NAME] = { stop = stop, version = VERSION }
 
-notify("Hike For Eggs", "Loaded " .. VERSION .. " - egg grab", 4)
+notify("Hike For Eggs", "Loaded " .. VERSION .. " - no movement", 4)
 print("[Hike For Eggs] " .. VERSION .. " loaded")
