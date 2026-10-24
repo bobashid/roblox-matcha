@@ -1,29 +1,25 @@
 --==================================================================
---  Hike For Eggs  |  Cross-Map Egg Grab + Rarity Toggles
+--  Hike For Eggs  |  Egg Grab + Rarity Toggles
 --  Matcha LuaVM  -  built-in tab (UI.AddTab)
 --
---  Nest eggs are client clones in workspace.LocalNests.Eggs:
---  one Model per egg, Name = egg id, attribute "Rarity".
+--  v1.2 - crash fix
+--    Most likely cause: the teleport blink. It wrote CFrame every
+--    pass with no re-entry guard, and Grab Now ran it inline on the
+--    UI callback. Now:
+--      * remote-only by default, teleport is an opt-in toggle
+--      * busy flag, so only one grab can ever be in flight
+--      * buttons run inside task.spawn, never on the UI callback
+--      * egg position read from PrimaryPart / direct children only
+--        (no GetDescendants over every model)
+--
+--  Eggs = workspace.LocalNests.Eggs (Models, attribute Rarity)
 --  Grab = ReplicatedStorage.SwimAdventure.Remotes.EggGrab
 --              :InvokeServer(eggId)
---
---  The server range-checks the grab, so each pass:
---    1. fires the remote from where you stand (works up close)
---    2. if the egg is still not carried, blinks the character onto
---       the egg, fires again, and blinks straight back.
---  One egg per pass, 0.55s cooldown, failed ids blacklisted 30s.
---
---  NestEggs.Cycle changes every nest reset; when it does the
---  position and ban caches are dropped, otherwise the tp would
---  aim at last cycle's coordinates.
---
---  MENU: Auto Grab, Teleport Fallback, Grab Now, one toggle per
---  rarity that actually exists in the current nest cycle.
 --==================================================================
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local VERSION = "v1.1"
+local VERSION = "v1.2"
 local NAME = "HikeForEggs"
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -34,16 +30,17 @@ local RARITY_ORDER = {
     "Transcendent", "Cosmic", "Ascendant", "Primordial",
 }
 
-local Config = { Auto = true, TP = true }
+local Config = { Auto = true, TP = false }
 local RarityOn = {}
 for i = 1, #RARITY_ORDER do RarityOn[RARITY_ORDER[i]] = true end
 
 local running = true
+local busy = false
 local grabbed = 0
 local lastGrab = 0
 local GRAB_GAP = 0.55
 local TP_HOVER = 3
-local BAN_TIME = 30
+local BAN_TIME = 45
 
 local posCache = {}
 local banUntil = {}
@@ -79,23 +76,25 @@ local function refreshCycle()
         cacheCycle = c
         posCache = {}
         banUntil = {}
-        print("[Hike For Eggs] nest cycle changed - caches cleared")
     end
 end
 
+-- PrimaryPart, else the first direct BasePart child. No deep scan.
 local function eggPos(m)
     local cached = posCache[m.Name]
     if cached then return cached end
+    local pos = nil
     local pp = m.PrimaryPart
-    local pos = pp and pp.Position or nil
-    if not pos then
-        local kids = m:GetDescendants()
+    if pp then
+        pos = pp.Position
+    else
+        local kids = m:GetChildren()
         for i = 1, #kids do
             local d = kids[i]
             local cn = d.ClassName
-            if (cn == "Part" or cn == "MeshPart") and d.Position then
-                pos = d.Position
-                break
+            if cn == "Part" or cn == "MeshPart" then
+                local p = d.Position
+                if p then pos = p break end
             end
         end
     end
@@ -108,18 +107,19 @@ local function isBanned(id)
     return t ~= nil and os.clock() < t
 end
 
---------------------------------------------------------------------
--- GRAB
---------------------------------------------------------------------
 local function tryInvoke(id)
     local ok, ret = pcall(function() return EggGrab:InvokeServer(id) end)
     return ok, ret
 end
 
-local function grabOne(force)
+--------------------------------------------------------------------
+-- GRAB CORE
+--------------------------------------------------------------------
+local function grabInner(force)
     if not force and carrying() then return false end
     local now = os.clock()
     if now - lastGrab < GRAB_GAP then return false end
+
     refreshCycle()
     local eggs = eggFolder()
     local hrp = playerHRP()
@@ -149,16 +149,16 @@ local function grabOne(force)
     local id = best.Name
     local rarity = tostring(best:GetAttribute("Rarity"))
 
-    -- 1: remote from where we stand
+    -- 1: remote only, from where we stand
     tryInvoke(id)
     task.wait(0.16)
     if carrying() then
         grabbed = grabbed + 1
-        print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ") remote")
+        print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ")")
         return true
     end
 
-    -- 2: blink to the egg, grab, blink back
+    -- 2: optional blink, off by default
     if not Config.TP then
         banUntil[id] = os.clock() + BAN_TIME
         return false
@@ -167,11 +167,9 @@ local function grabOne(force)
     if not pos then return false end
     local back = hrp.CFrame
     pcall(function() hrp.CFrame = CFrame.new(pos.X, pos.Y + TP_HOVER, pos.Z) end)
+    task.wait(0.22)
+    tryInvoke(id)
     task.wait(0.18)
-    tryInvoke(id)
-    task.wait(0.16)
-    tryInvoke(id)
-    task.wait(0.14)
     pcall(function() hrp.CFrame = back end)
 
     if carrying() then
@@ -181,8 +179,21 @@ local function grabOne(force)
     end
 
     banUntil[id] = os.clock() + BAN_TIME
-    print("[Hike For Eggs] failed " .. id .. " - ban 30s")
+    print("[Hike For Eggs] failed " .. id .. " - ban " .. BAN_TIME .. "s")
     return false
+end
+
+-- single flight, always clears busy
+local function grabOne(force)
+    if busy then return false end
+    busy = true
+    local ok, res = pcall(grabInner, force)
+    busy = false
+    if not ok then
+        print("[Hike For Eggs] grab error: " .. tostring(res))
+        return false
+    end
+    return res
 end
 
 --------------------------------------------------------------------
@@ -252,12 +263,15 @@ local function buildMain(tab)
     if safeToggle(sec, "Auto Grab Eggs", "hike_autograb", true, applyBool("cfg", "Auto")) then
         TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "Auto", id = "hike_autograb", name = "Auto Grab Eggs" }
     end
-    if safeToggle(sec, "Teleport Fallback", "hike_tpfall", true, applyBool("cfg", "TP")) then
+    if safeToggle(sec, "Teleport Fallback", "hike_tpfall", false, applyBool("cfg", "TP")) then
         TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "TP", id = "hike_tpfall", name = "Teleport Fallback" }
     end
+
     safeButton(sec, "Grab Nearest Now", "hike_grabnow", function()
-        local ok = grabOne(true)
-        print("[Hike For Eggs] manual grab " .. (ok and "ok" or "nothing"))
+        task.spawn(function()
+            local ok = grabOne(true)
+            print("[Hike For Eggs] manual grab " .. (ok and "ok" or "nothing"))
+        end)
     end)
 end
 
@@ -351,11 +365,11 @@ end)
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        refreshCycle()
-        if Config.Auto and not carrying() then
-            pcall(grabOne, false)
+        pcall(refreshCycle)
+        if Config.Auto and not busy and not carrying() then
+            grabOne(false)
         end
-        task.wait(0.2)
+        task.wait(0.25)
     end
 end)
 
