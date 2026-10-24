@@ -1,12 +1,13 @@
--- +1 Upgrade Per Kill - kill aura + health bars - Matcha LuauVM
--- One Kill Aura toggle: hits every combatant (players and NPCs/bots) inside
--- reach with crit swings, one pass every 0.01s. Custom health bars, health
--- only, no names, redrawn every frame and smoothed so they sit steady on the
--- head instead of jittering.
+-- +1 Upgrade Per Kill - kill aura (crit) + smooth health bars - Matcha LuauVM
+-- One Kill Aura toggle: every 0.01s it swings at every combatant in reach,
+-- players and NPCs/bots, with crit = true on every swing.
+-- Health bars (health only, no names) are driven from RenderStepped, keyed
+-- per combatant so a bar never jumps between enemies, and exponentially
+-- smoothed so they glide with the head instead of jittering.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.0'
+local VERSION = 'v3.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -24,9 +25,11 @@ if not Attack then
     warn('[' .. NAME .. '] Remotes.Attack not found - script idle')
 end
 
-local RANGE = 30
-local POOL  = 40
-local ALPHA = 0.5
+local RANGE         = 30      -- maxed reach, studs
+local POOL          = 40      -- max simultaneous health bars
+local SMOOTH_RATE   = 28      -- higher = snappier, lower = smoother
+local COLLECT_EVERY = 0.1     -- target list refresh, seconds
+local FORGET_AFTER  = 2.0     -- drop a bar key not seen for this long
 
 local EXCLUDE = {
     ['o_csf']        = true,
@@ -66,8 +69,12 @@ end
 
 -- health bar pool ----------------------------------------------------
 
-local pool = {}
-for i = 1, POOL do
+local pool     = {}
+local entryKey = {}
+
+local function newEntry(key)
+    if #pool >= POOL then return nil end
+
     local bg = trackDraw(Drawing.new('Square'))
     bg.Filled       = true
     bg.Thickness    = 1
@@ -88,7 +95,48 @@ for i = 1, POOL do
     label.Color   = Color3.fromRGB(255, 255, 255)
     label.Visible = false
 
-    pool[i] = { bg = bg, fill = fill, label = label, lastText = '', px = nil, py = nil, pw = nil }
+    local e = {
+        bg = bg, fill = fill, label = label,
+        key = key, lastText = '',
+        x = nil, y = nil, w = nil, h = nil,
+        lastSeen = 0, used = false,
+    }
+    pool[#pool + 1] = e
+    entryKey[key] = e
+    return e
+end
+
+local function acquire(key, now)
+    local e = entryKey[key]
+    if e then
+        e.lastSeen = now
+        return e
+    end
+
+    e = newEntry(key)
+    if e then
+        e.lastSeen = now
+        return e
+    end
+
+    local oldest, oldestT = nil, math.huge
+    for i = 1, #pool do
+        local p = pool[i]
+        if not p.used and p.lastSeen < oldestT then
+            oldest, oldestT = p, p.lastSeen
+        end
+    end
+    if not oldest then return nil end
+
+    if oldest.key and entryKey[oldest.key] == oldest then
+        entryKey[oldest.key] = nil
+    end
+    oldest.key      = key
+    oldest.lastText = ''
+    oldest.x, oldest.y, oldest.w, oldest.h = nil, nil, nil, nil
+    oldest.lastSeen = now
+    entryKey[key]   = oldest
+    return oldest
 end
 
 -- targeting ----------------------------------------------------------
@@ -117,7 +165,6 @@ local function maxHpOf(model)
     return mh
 end
 
--- membership only; positions and health are read live in the renderer
 local function playerTarget(plr)
     if plr == lp then return nil end
     if excluded(plr.Name) then return nil end
@@ -127,7 +174,7 @@ local function playerTarget(plr)
     if c:GetAttribute('Zone') ~= 'Arena' then return nil end
     local hp = hpOf(c)
     if type(hp) ~= 'number' or hp <= 0 then return nil end
-    return { plr = plr, model = c, maxhp = maxHpOf(c) }
+    return { plr = plr, model = c, key = 'p' .. tostring(plr.UserId), maxhp = maxHpOf(c) }
 end
 
 local function npcTarget(model)
@@ -137,7 +184,7 @@ local function npcTarget(model)
     local hp = hpOf(model)
     if type(hp) ~= 'number' or hp <= 0 then return nil end
     if not model:FindFirstChild('HumanoidRootPart') then return nil end
-    return { model = model, maxhp = maxHpOf(model) }
+    return { model = model, key = 'n' .. tostring(model.Address), maxhp = maxHpOf(model) }
 end
 
 local function scanNPCs(out)
@@ -277,11 +324,11 @@ task.spawn(function()
                 if type(b) == 'boolean' then cfg.bars = b end
             end)
         end
-        task.wait(0.2)
+        task.wait(0.1)
     end
 end)
 
--- collector: membership only, 6 times a second -----------------------
+-- collector: membership only, 10 times a second ----------------------
 
 task.spawn(function()
     while running do
@@ -293,7 +340,7 @@ task.spawn(function()
         end
         pcall(scanNPCs, out)
         targets = out
-        task.wait(0.15)
+        task.wait(COLLECT_EVERY)
     end
 end)
 
@@ -333,25 +380,29 @@ task.spawn(function()
     end
 end)
 
--- health bars: every frame, live position and health, smoothed ------
+-- health bars: live position + live health every frame, smoothed -----
 
-trackConn(RunService.RenderStepped:Connect(function()
+trackConn(RunService.RenderStepped:Connect(function(dt)
+    local now = os.clock()
+
     if not cfg.bars then
-        for i = 1, POOL do
+        for i = 1, #pool do
             local e = pool[i]
+            e.used = false
             e.bg.Visible    = false
             e.fill.Visible  = false
             e.label.Visible = false
-            e.px, e.py, e.pw = nil, nil, nil
         end
         return
     end
 
+    local alpha = 1 - math.exp(-SMOOTH_RATE * (dt or 0.016))
+    if alpha > 1 then alpha = 1 end
+    if alpha < 0.2 then alpha = 0.2 end
+
     local list = targets
-    local n = 0
 
     for i = 1, #list do
-        if n >= POOL then break end
         local t = list[i]
 
         local model, root
@@ -369,61 +420,76 @@ trackConn(RunService.RenderStepped:Connect(function()
                 local pos = root.Position
                 local top, v1 = WorldToScreen(pos + Vector3.new(0, 2.6, 0))
                 local bot, v2 = WorldToScreen(pos - Vector3.new(0, 2.4, 0))
+
                 if v1 and v2 then
                     local hgt = bot.Y - top.Y
                     if hgt > 8 then
-                        n = n + 1
-                        local e = pool[n]
-                        local w = hgt * 0.55
-                        if w < 16 then w = 16 end
+                        local e = acquire(t.key, now)
+                        if e then
+                            local w = hgt * 0.55
+                            if w < 16 then w = 16 end
 
-                        local barH = 4
-                        local tx = top.X - w * 0.5
-                        local ty = top.Y - 10
+                            local tx = top.X
+                            local ty = top.Y
 
-                        if e.px == nil then
-                            e.px, e.py, e.pw = tx, ty, w
-                        else
-                            e.px = e.px + (tx - e.px) * ALPHA
-                            e.py = e.py + (ty - e.py) * ALPHA
-                            e.pw = e.pw + (w  - e.pw) * ALPHA
+                            if e.x == nil then
+                                e.x, e.y, e.w, e.h = tx, ty, w, hgt
+                            else
+                                e.x = e.x + (tx  - e.x) * alpha
+                                e.y = e.y + (ty  - e.y) * alpha
+                                e.w = e.w + (w   - e.w) * alpha
+                                e.h = e.h + (hgt - e.h) * alpha
+                            end
+
+                            local maxhp = t.maxhp
+                            if type(maxhp) ~= 'number' or maxhp <= 0 then maxhp = 20 end
+                            local frac = hp / maxhp
+                            if frac < 0 then frac = 0 end
+                            if frac > 1 then frac = 1 end
+
+                            local barH  = 4
+                            local barY  = e.y - 10
+                            local leftX = e.x - e.w * 0.5
+
+                            e.bg.Position = Vector2.new(leftX, barY)
+                            e.bg.Size     = Vector2.new(e.w, barH)
+                            e.bg.Visible  = true
+
+                            local fillW = e.w * frac
+                            e.fill.Position = Vector2.new(leftX, barY)
+                            e.fill.Size     = Vector2.new(fillW, barH)
+                            e.fill.Color    = Color3.fromRGB(math.floor(255 * (1 - frac)) + 20, math.floor(200 * frac) + 30, 60)
+                            e.fill.Visible  = fillW > 0.5
+
+                            local txt = math.floor(hp) .. '/' .. math.floor(maxhp)
+                            if e.lastText ~= txt then
+                                e.label.Text = txt
+                                e.lastText   = txt
+                            end
+                            e.label.Position = Vector2.new(e.x, barY - 16)
+                            e.label.Visible  = true
+
+                            e.used = true
                         end
-
-                        local maxhp = t.maxhp
-                        if type(maxhp) ~= 'number' or maxhp <= 0 then maxhp = 20 end
-                        local frac = hp / maxhp
-                        if frac < 0 then frac = 0 end
-                        if frac > 1 then frac = 1 end
-
-                        e.bg.Position = Vector2.new(e.px, e.py)
-                        e.bg.Size     = Vector2.new(e.pw, barH)
-                        e.bg.Visible  = true
-
-                        local fillW = e.pw * frac
-                        e.fill.Position = Vector2.new(e.px, e.py)
-                        e.fill.Size     = Vector2.new(fillW, barH)
-                        e.fill.Color    = Color3.fromRGB(math.floor(255 * (1 - frac)) + 20, math.floor(200 * frac) + 30, 60)
-                        e.fill.Visible  = fillW > 0.5
-
-                        local txt = math.floor(hp) .. '/' .. math.floor(maxhp)
-                        if e.lastText ~= txt then
-                            e.label.Text = txt
-                            e.lastText   = txt
-                        end
-                        e.label.Position = Vector2.new(e.px + e.pw * 0.5, e.py - 14)
-                        e.label.Visible  = true
                     end
                 end
             end
         end
     end
 
-    for i = n + 1, POOL do
+    for i = 1, #pool do
         local e = pool[i]
-        e.bg.Visible    = false
-        e.fill.Visible  = false
-        e.label.Visible = false
-        e.px, e.py, e.pw = nil, nil, nil
+        if not e.used then
+            e.bg.Visible    = false
+            e.fill.Visible  = false
+            e.label.Visible = false
+            if e.key and (now - e.lastSeen) > FORGET_AFTER then
+                if entryKey[e.key] == e then entryKey[e.key] = nil end
+                e.key = nil
+                e.x, e.y, e.w, e.h = nil, nil, nil, nil
+            end
+        end
+        e.used = false
     end
 end))
 
@@ -441,7 +507,8 @@ local function stop()
         pcall(function() drawings[i]:Remove() end)
     end
     drawings = {}
-    pool = {}
+    pool     = {}
+    entryKey = {}
     if HAS_UI then
         pcall(function() UI.RemoveTab('Kill Aura') end)
     end
