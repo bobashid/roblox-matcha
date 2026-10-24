@@ -1,14 +1,18 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- Crit is unconditional: every swing is sent with crit = true and there is no
--- falling gate and no crit cooldown of any kind. The swing loop has no real
--- delay either - it rotates one target per tick and yields with the smallest
--- wait the VM honours, so the rate is limited by the scheduler, not by us.
+-- Why it stopped registering hits: Config.Combat sets HurtResistantTicks = 20
+-- and this game runs at 20 ticks/s (MoveSpeed 0.1, Gravity 0.08, JumpVelocity
+-- 0.42 are the 20 tps constants), so a target is immune for 1.0s after taking
+-- a hit. The previous build sprayed 1000 swings/s at whoever came up next in
+-- the rotation, so nearly every swing landed on an immune target and each
+-- enemy took exactly one hit. Now each target is skipped until its hurt
+-- window expires, and swings are paced at MaxAttacksPerSecond = 25 (0.04s),
+-- which is the server's own cap. Every swing still carries crit = true.
 -- Health bars: health only, no names, keyed per combatant, snapped on big
 -- movement so they never trail.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.5'
+local VERSION = 'v3.6'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -32,7 +36,8 @@ local SMOOTH_RATE   = 90      -- higher = snappier tracking
 local SNAP_PX       = 10      -- snap onto the target past this jump, px
 local COLLECT_EVERY = 0.1     -- target list refresh, seconds
 local FORGET_AFTER  = 2.0     -- drop a bar key not seen for this long
-local SWING_WAIT    = 0.001   -- smallest yield; no attack throttle
+local SWING_WAIT    = 0.04    -- 25 swings/s = Config.Combat.MaxAttacksPerSecond
+local HURT_WINDOW   = 1.0     -- HurtResistantTicks 20 at 20 tps
 
 local EXCLUDE = {
     ['o_csf']        = true,
@@ -44,6 +49,7 @@ local NPC_FOLDERS = { 'Bots', 'NPCs', 'Npcs', 'Enemies', 'Dummies', 'AI' }
 local running = true
 local built   = false
 local targets = {}
+local lastHit = {}
 
 local cfg = {
     aura = true,
@@ -233,7 +239,7 @@ local function fireAt(model, eye, targetPos)
     end
     local payload = {
         sprint = false,
-        crit   = true,          -- unconditional crit
+        crit   = true,
         eye    = eye,
         dir    = dir,
         block  = false,
@@ -353,37 +359,58 @@ task.spawn(function()
     end
 end)
 
--- kill aura: no throttle, rotates one target per tick ----------------
+-- kill aura: one swing per tick, skipping targets still hurt-immune --
 
 task.spawn(function()
     local idx = 0
     while running do
         if cfg.aura and Attack then
             local root = myRoot()
+            local fired = false
             if root then
+                local now   = os.clock()
                 local myPos = root.Position
-                local eye = myPos + Vector3.new(0, 1.5, 0)
-                local list = targets
+                local eye   = myPos + Vector3.new(0, 1.5, 0)
+                local list  = targets
                 local total = #list
+
                 if total > 0 then
-                    idx = idx % total + 1
-                    local t = list[idx]
-                    local tr
-                    if t.plr then
-                        local ch = t.plr.Character
-                        tr = ch and ch:FindFirstChild('HumanoidRootPart')
-                    else
-                        tr = t.model:FindFirstChild('HumanoidRootPart')
-                    end
-                    if tr and tr.Parent then
-                        local pos = tr.Position
-                        if (pos - myPos).Magnitude <= RANGE then
-                            fireAt(t.model, eye, pos)
+                    local checked = 0
+                    while checked < total do
+                        idx = idx % total + 1
+                        checked = checked + 1
+
+                        local t  = list[idx]
+                        local lh = lastHit[t.key]
+
+                        if lh == nil or (now - lh) >= HURT_WINDOW then
+                            local tr
+                            if t.plr then
+                                local ch = t.plr.Character
+                                tr = ch and ch:FindFirstChild('HumanoidRootPart')
+                            else
+                                tr = t.model:FindFirstChild('HumanoidRootPart')
+                            end
+
+                            if tr and tr.Parent then
+                                local pos = tr.Position
+                                if (pos - myPos).Magnitude <= RANGE then
+                                    fireAt(t.model, eye, pos)
+                                    lastHit[t.key] = now
+                                    fired = true
+                                    break
+                                end
+                            end
                         end
                     end
                 end
             end
-            task.wait(SWING_WAIT)
+
+            if fired then
+                task.wait(SWING_WAIT)
+            else
+                task.wait(0.02)
+            end
         else
             task.wait(0.05)
         end
@@ -526,6 +553,7 @@ local function stop()
     drawings = {}
     pool     = {}
     entryKey = {}
+    lastHit  = {}
     if HAS_UI then
         pcall(function() UI.RemoveTab('Kill Aura') end)
     end
