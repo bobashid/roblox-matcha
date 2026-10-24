@@ -1,20 +1,20 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- Two aura modes behind one toggle:
---   Crit Only ON  (default): every swing carries crit = true, and a swing only
---                   counts once the target's health actually drops. Swings that
---                   register no damage are not counted, so the target is
---                   retried immediately instead of being locked out for a
---                   second. This is what makes crits "go through".
---   Crit Only OFF (Spam):    swings at whatever can still take damage, paced to
---                   MaxAttacksPerSecond, no per-target pending gate.
--- Both modes skip targets still inside HurtResistantTicks (1.0s) and both
--- send the real payload { crit, sprint, charge, vt, dir, eye, t }.
+-- Confirmed in game: the server only accepts crit = true while the attacker is
+-- actually falling, which is why you had to jump. Crit Only mode now jumps for
+-- you: when no crit window is open it applies ONE upward velocity impulse to
+-- the HumanoidRootPart (throttled), waits until the falling check passes, then
+-- swings. So crits land without you pressing space.
+--   Crit Only ON  (default): self-jump, swing only while falling, verify each
+--                   swing by the target's health dropping, retry instantly if
+--                   the swing was rejected.
+--   Crit Only OFF (Spam):   constant swings, no jump assist, no pending gate.
+-- Auto Jump can be turned off if you would rather jump yourself.
 -- Health bars: collector 3 Hz, health 10 Hz, per-frame renderer only reads
 -- Position and writes pooled Drawings, with a distance cull.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.9'
+local VERSION = 'v4.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -44,6 +44,12 @@ local HURT_WINDOW   = 1.0     -- HurtResistantTicks 20 at 20 tps
 local VERIFY_AFTER  = 0.12    -- wait this long before judging a swing
 local MAX_BAR_DIST  = 220     -- do not draw bars past this many studs
 
+-- jump assist (only used by Crit Only mode). One impulse per JUMP_COOLDOWN;
+-- a velocity write is expensive, so it never happens per frame.
+local JUMP_VEL      = 26      -- upward studs/s; raise if you never leave the ground
+local JUMP_COOLDOWN = 0.45    -- seconds between auto jumps
+local CRIT_VEL_Y    = -1.5    -- falling faster than this counts as airborne
+
 local HEAD_OFFSET = Vector3.new(0, 2.6, 0)
 local FEET_OFFSET = Vector3.new(0, 2.4, 0)
 local EYE_OFFSET  = Vector3.new(0, 1.5, 0)
@@ -55,16 +61,18 @@ local EXCLUDE = {
 
 local NPC_FOLDERS = { 'Bots', 'NPCs', 'Npcs', 'Enemies', 'Dummies', 'AI' }
 
-local running = true
-local built   = false
-local targets = {}
-local lastHit = {}
-local pending = {}
+local running  = true
+local built    = false
+local targets  = {}
+local lastHit  = {}
+local pending  = {}
+local lastJump = 0
 
 local cfg = {
     aura     = true,
     bars     = true,
     critMode = true,
+    autoJump = true,
 }
 
 local conns    = {}
@@ -91,6 +99,26 @@ local function myRoot()
     local c = lp.Character
     if not c then return nil end
     return c:FindFirstChild('HumanoidRootPart')
+end
+
+-- true while actually falling, which is what the server checks for a crit
+local function falling(root)
+    if not root then return false end
+    local v = root.AssemblyLinearVelocity
+    if typeof(v) ~= 'Vector3' then return false end
+    return v.Y < CRIT_VEL_Y
+end
+
+-- one throttled upward impulse so the falling check opens
+local function tryJump(root, now)
+    if now - lastJump < JUMP_COOLDOWN then return end
+    local v = root.AssemblyLinearVelocity
+    if typeof(v) ~= 'Vector3' then return end
+    if v.Y > 5 then return end
+    lastJump = now
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.new(v.X, JUMP_VEL, v.Z)
+    end)
 end
 
 -- health bar pool -----------------------------------------------------
@@ -125,7 +153,7 @@ local function newEntry(key)
         bg = bg, fill = fill, label = label,
         key = key, lastText = '',
         x = nil, y = nil, w = nil, h = nil,
-        lastSeen = 0, used = false,
+        lastSeen = 0, used = false, target = nil,
     }
     pool[#pool + 1] = e
     entryKey[key] = e
@@ -161,6 +189,7 @@ local function acquire(key, now)
     oldest.lastText = ''
     oldest.x, oldest.y, oldest.w, oldest.h = nil, nil, nil, nil
     oldest.lastSeen = now
+    oldest.target   = nil
     entryKey[key]   = oldest
     return oldest
 end
@@ -310,9 +339,10 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Kill Aura',      'aura',      true, function(v) setBool('aura', v) end)
-        mkToggle(sec, 'Crit Only',      'crit_mode', true, function(v) setBool('critMode', v) end)
-        mkToggle(sec, 'Health Bars',    'bars',      true, function(v) setBool('bars', v) end)
+        mkToggle(sec, 'Kill Aura',   'aura',      true, function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Crit Only',   'crit_mode', true, function(v) setBool('critMode', v) end)
+        mkToggle(sec, 'Auto Jump',   'auto_jump', true, function(v) setBool('autoJump', v) end)
+        mkToggle(sec, 'Health Bars', 'bars',      true, function(v) setBool('bars', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -353,6 +383,10 @@ task.spawn(function()
                 local c = UI.GetValue('crit_mode')
                 if type(c) ~= 'boolean' then c = UI.GetValue('Crit Only') end
                 if type(c) == 'boolean' then cfg.critMode = c end
+
+                local j = UI.GetValue('auto_jump')
+                if type(j) ~= 'boolean' then j = UI.GetValue('Auto Jump') end
+                if type(j) == 'boolean' then cfg.autoJump = j end
             end)
         end
         task.wait(0.1)
@@ -381,7 +415,7 @@ task.spawn(function()
     end
 end)
 
--- HEALTH + VERIFY: 10 Hz. Refreshes hp, and confirms which swings landed --
+-- HEALTH + VERIFY: 10 Hz ---------------------------------------------
 
 task.spawn(function()
     while running do
@@ -397,16 +431,15 @@ task.spawn(function()
             end
         end
 
-        -- a swing only becomes a real hit (and starts the hurt window) when
-        -- the target's health actually dropped
+        -- a swing only becomes a confirmed hit (and starts the hurt window)
+        -- when the target's health actually dropped
         for key, p in pairs(pending) do
             if (now - p.t) >= VERIFY_AFTER then
                 pending[key] = nil
-                local e = entryKey[key]
                 local cur = nil
+                local e = entryKey[key]
                 if e and e.target then cur = e.target.hp end
                 if cur == nil then
-                    -- fall back to the live target list
                     for i = 1, #list do
                         if list[i].key == key then cur = list[i].hp break end
                     end
@@ -421,7 +454,7 @@ task.spawn(function()
     end
 end)
 
--- kill aura: crit-only verifies each swing, spam ignores the pending gate --
+-- kill aura: Crit Only self-jumps and swings only while falling ------
 
 task.spawn(function()
     local idx = 0
@@ -429,36 +462,50 @@ task.spawn(function()
         if cfg.aura and Attack then
             local root = myRoot()
             local fired = false
+
             if root then
-                local now   = os.clock()
-                local myPos = root.Position
-                local eye   = myPos + EYE_OFFSET
-                local list  = targets
-                local total = #list
+                local now      = os.clock()
+                local airborne = falling(root)
+                local swingOk  = true
 
-                if total > 0 then
-                    local checked = 0
-                    while checked < total do
-                        idx = idx % total + 1
-                        checked = checked + 1
+                if cfg.critMode then
+                    -- the server only credits a crit while falling
+                    swingOk = airborne
+                    if not airborne and cfg.autoJump then
+                        tryJump(root, now)
+                    end
+                end
 
-                        local t  = list[idx]
-                        local ok = true
-                        local lh = lastHit[t.key]
+                if swingOk then
+                    local myPos = root.Position
+                    local eye   = myPos + EYE_OFFSET
+                    local list  = targets
+                    local total = #list
 
-                        if lh and (now - lh) < HURT_WINDOW then ok = false end
-                        if ok and cfg.critMode and pending[t.key] ~= nil then ok = false end
+                    if total > 0 then
+                        local checked = 0
+                        while checked < total do
+                            idx = idx % total + 1
+                            checked = checked + 1
 
-                        if ok then
-                            local tr = t.root
-                            if tr and tr.Parent then
-                                local pos = tr.Position
-                                if (pos - myPos).Magnitude <= RANGE then
-                                    local hpBefore = t.hp
-                                    fireAt(t.model, eye, pos)
-                                    pending[t.key] = { t = now, hp = hpBefore }
-                                    fired = true
-                                    break
+                            local t  = list[idx]
+                            local ok = true
+                            local lh = lastHit[t.key]
+
+                            if lh and (now - lh) < HURT_WINDOW then ok = false end
+                            if ok and cfg.critMode and pending[t.key] ~= nil then ok = false end
+
+                            if ok then
+                                local tr = t.root
+                                if tr and tr.Parent then
+                                    local pos = tr.Position
+                                    if (pos - myPos).Magnitude <= RANGE then
+                                        local hpBefore = t.hp
+                                        fireAt(t.model, eye, pos)
+                                        pending[t.key] = { t = now, hp = hpBefore }
+                                        fired = true
+                                        break
+                                    end
                                 end
                             end
                         end
