@@ -1,0 +1,453 @@
+-- +1 Upgrade Per Kill - kill aura + health bars - Matcha LuauVM
+-- One Kill Aura toggle: hits every combatant (players and NPCs/bots) inside
+-- reach with crit swings, one pass every 0.01s. Custom health bars, health
+-- only, no names, redrawn every frame and smoothed so they sit steady on the
+-- head instead of jittering.
+-- No Instance.new, no hooks, no input simulation.
+
+local NAME    = 'HitEveryone'
+local VERSION = 'v3.0'
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players    = game:GetService('Players')
+local RS         = game:GetService('ReplicatedStorage')
+local RunService = game:GetService('RunService')
+local lp         = Players.LocalPlayer
+
+local remotes = RS:FindFirstChild('Remotes')
+local Attack  = remotes and remotes:FindFirstChild('Attack')
+if not Attack then
+    warn('[' .. NAME .. '] Remotes.Attack not found - script idle')
+end
+
+local RANGE = 30
+local POOL  = 40
+local ALPHA = 0.5
+
+local EXCLUDE = {
+    ['o_csf']        = true,
+    ['fakeaimboton'] = true,
+}
+
+local NPC_FOLDERS = { 'Bots', 'NPCs', 'Npcs', 'Enemies', 'Dummies', 'AI' }
+
+local running = true
+local built   = false
+local targets = {}
+
+local cfg = {
+    aura = true,
+    bars = true,
+}
+
+local conns    = {}
+local drawings = {}
+
+local function trackConn(c)
+    conns[#conns + 1] = c
+    return c
+end
+
+local function trackDraw(d)
+    drawings[#drawings + 1] = d
+    return d
+end
+
+local function setBool(key, v)
+    if cfg[key] ~= v then
+        cfg[key] = v
+        print('[' .. NAME .. '] ' .. key .. ' = ' .. tostring(v))
+    end
+end
+
+-- health bar pool ----------------------------------------------------
+
+local pool = {}
+for i = 1, POOL do
+    local bg = trackDraw(Drawing.new('Square'))
+    bg.Filled       = true
+    bg.Thickness    = 1
+    bg.Color        = Color3.fromRGB(15, 15, 15)
+    bg.Transparency = 0.3
+    bg.Visible      = false
+
+    local fill = trackDraw(Drawing.new('Square'))
+    fill.Filled    = true
+    fill.Thickness = 1
+    fill.Color     = Color3.fromRGB(90, 220, 120)
+    fill.Visible   = false
+
+    local label = trackDraw(Drawing.new('Text'))
+    label.Size    = 13
+    label.Center  = true
+    label.Outline = true
+    label.Color   = Color3.fromRGB(255, 255, 255)
+    label.Visible = false
+
+    pool[i] = { bg = bg, fill = fill, label = label, lastText = '', px = nil, py = nil, pw = nil }
+end
+
+-- targeting ----------------------------------------------------------
+
+local function excluded(name)
+    if type(name) ~= 'string' then return false end
+    return EXCLUDE[string.lower(name)] == true
+end
+
+local function hpOf(model)
+    local h = model:GetAttribute('Health')
+    if type(h) ~= 'number' then
+        local hum = model:FindFirstChild('Humanoid')
+        if hum then h = hum.Health end
+    end
+    return h
+end
+
+local function maxHpOf(model)
+    local mh = model:GetAttribute('MaxHealth')
+    if type(mh) ~= 'number' or mh <= 0 then
+        local hum = model:FindFirstChild('Humanoid')
+        if hum then mh = hum.MaxHealth end
+    end
+    if type(mh) ~= 'number' or mh <= 0 then mh = 20 end
+    return mh
+end
+
+-- membership only; positions and health are read live in the renderer
+local function playerTarget(plr)
+    if plr == lp then return nil end
+    if excluded(plr.Name) then return nil end
+    local c = plr.Character
+    if not c then return nil end
+    if c:GetAttribute('CombatantId') == nil then return nil end
+    if c:GetAttribute('Zone') ~= 'Arena' then return nil end
+    local hp = hpOf(c)
+    if type(hp) ~= 'number' or hp <= 0 then return nil end
+    return { plr = plr, model = c, maxhp = maxHpOf(c) }
+end
+
+local function npcTarget(model)
+    if excluded(model.Name) then return nil end
+    if model:GetAttribute('CombatantId') == nil then return nil end
+    if model:GetAttribute('Zone') == 'Dead' then return nil end
+    local hp = hpOf(model)
+    if type(hp) ~= 'number' or hp <= 0 then return nil end
+    if not model:FindFirstChild('HumanoidRootPart') then return nil end
+    return { model = model, maxhp = maxHpOf(model) }
+end
+
+local function scanNPCs(out)
+    local kids = workspace:GetChildren()
+    for i = 1, #kids do
+        local inst = kids[i]
+        if inst.ClassName == 'Model' then
+            local t = npcTarget(inst)
+            if t then out[#out + 1] = t end
+        elseif inst.ClassName == 'Folder' then
+            local wanted = false
+            for k = 1, #NPC_FOLDERS do
+                if inst.Name == NPC_FOLDERS[k] then wanted = true break end
+            end
+            if wanted then
+                local sub = inst:GetChildren()
+                for j = 1, #sub do
+                    local m = sub[j]
+                    if m.ClassName == 'Model' then
+                        local t = npcTarget(m)
+                        if t then out[#out + 1] = t end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- swinging -----------------------------------------------------------
+
+local function fireAt(model, eye, targetPos)
+    local dir = targetPos - eye
+    if dir.Magnitude < 0.001 then
+        dir = Vector3.new(0, -1, 0)
+    else
+        dir = dir.Unit
+    end
+    local payload = {
+        sprint = false,
+        crit   = true,
+        eye    = eye,
+        dir    = dir,
+        block  = false,
+        charge = 1,
+        t      = os.clock(),
+        vt     = nil,
+    }
+    pcall(function()
+        Attack:FireServer(model, payload)
+    end)
+end
+
+-- menu ---------------------------------------------------------------
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok2, sec2 = pcall(function() return tab:Section(name) end)
+    if ok2 and sec2 ~= nil then return sec2 end
+    warn('[' .. NAME .. '] section ' .. name .. ' failed')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'Kill Aura')
+        if not sec then return end
+        mkToggle(sec, 'Kill Aura',   'aura', true, function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Health Bars', 'bars', true, function(v) setBool('bars', v) end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] build error: ' .. tostring(err))
+    end
+    print('[' .. NAME .. '] tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Kill Aura', function(tab)
+            if built then return end
+            print('[' .. NAME .. '] tab opened - building widgets')
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn('[' .. NAME .. '] no UI table - menu unavailable')
+end
+
+-- poll the menu ------------------------------------------------------
+
+task.spawn(function()
+    while running do
+        if HAS_UI and type(UI.GetValue) == 'function' then
+            pcall(function()
+                local v = UI.GetValue('aura')
+                if type(v) ~= 'boolean' then v = UI.GetValue('Kill Aura') end
+                if type(v) == 'boolean' then cfg.aura = v end
+
+                local b = UI.GetValue('bars')
+                if type(b) ~= 'boolean' then b = UI.GetValue('Health Bars') end
+                if type(b) == 'boolean' then cfg.bars = b end
+            end)
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- collector: membership only, 6 times a second -----------------------
+
+task.spawn(function()
+    while running do
+        local out = {}
+        local plist = Players:GetPlayers()
+        for i = 1, #plist do
+            local t = playerTarget(plist[i])
+            if t then out[#out + 1] = t end
+        end
+        pcall(scanNPCs, out)
+        targets = out
+        task.wait(0.15)
+    end
+end)
+
+-- kill aura: one pass over every target, then 0.01s -------------------
+
+task.spawn(function()
+    while running do
+        if cfg.aura and Attack then
+            local char = lp.Character
+            local myRoot = char and char:FindFirstChild('HumanoidRootPart')
+            if myRoot then
+                local myPos = myRoot.Position
+                local eye = myPos + Vector3.new(0, 1.5, 0)
+                local list = targets
+                for i = 1, #list do
+                    if not running or not cfg.aura then break end
+                    local t = list[i]
+                    local root
+                    if t.plr then
+                        local ch = t.plr.Character
+                        root = ch and ch:FindFirstChild('HumanoidRootPart')
+                    else
+                        root = t.model:FindFirstChild('HumanoidRootPart')
+                    end
+                    if root and root.Parent then
+                        local pos = root.Position
+                        if (pos - myPos).Magnitude <= RANGE then
+                            fireAt(t.model, eye, pos)
+                        end
+                    end
+                end
+            end
+            task.wait(0.01)
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+-- health bars: every frame, live position and health, smoothed ------
+
+trackConn(RunService.RenderStepped:Connect(function()
+    if not cfg.bars then
+        for i = 1, POOL do
+            local e = pool[i]
+            e.bg.Visible    = false
+            e.fill.Visible  = false
+            e.label.Visible = false
+            e.px, e.py, e.pw = nil, nil, nil
+        end
+        return
+    end
+
+    local list = targets
+    local n = 0
+
+    for i = 1, #list do
+        if n >= POOL then break end
+        local t = list[i]
+
+        local model, root
+        if t.plr then
+            model = t.plr.Character
+            root  = model and model:FindFirstChild('HumanoidRootPart')
+        else
+            model = t.model
+            root  = model and model:FindFirstChild('HumanoidRootPart')
+        end
+
+        if model and root and root.Parent then
+            local hp = hpOf(model)
+            if type(hp) == 'number' and hp > 0 then
+                local pos = root.Position
+                local top, v1 = WorldToScreen(pos + Vector3.new(0, 2.6, 0))
+                local bot, v2 = WorldToScreen(pos - Vector3.new(0, 2.4, 0))
+                if v1 and v2 then
+                    local hgt = bot.Y - top.Y
+                    if hgt > 8 then
+                        n = n + 1
+                        local e = pool[n]
+                        local w = hgt * 0.55
+                        if w < 16 then w = 16 end
+
+                        local barH = 4
+                        local tx = top.X - w * 0.5
+                        local ty = top.Y - 10
+
+                        if e.px == nil then
+                            e.px, e.py, e.pw = tx, ty, w
+                        else
+                            e.px = e.px + (tx - e.px) * ALPHA
+                            e.py = e.py + (ty - e.py) * ALPHA
+                            e.pw = e.pw + (w  - e.pw) * ALPHA
+                        end
+
+                        local maxhp = t.maxhp
+                        if type(maxhp) ~= 'number' or maxhp <= 0 then maxhp = 20 end
+                        local frac = hp / maxhp
+                        if frac < 0 then frac = 0 end
+                        if frac > 1 then frac = 1 end
+
+                        e.bg.Position = Vector2.new(e.px, e.py)
+                        e.bg.Size     = Vector2.new(e.pw, barH)
+                        e.bg.Visible  = true
+
+                        local fillW = e.pw * frac
+                        e.fill.Position = Vector2.new(e.px, e.py)
+                        e.fill.Size     = Vector2.new(fillW, barH)
+                        e.fill.Color    = Color3.fromRGB(math.floor(255 * (1 - frac)) + 20, math.floor(200 * frac) + 30, 60)
+                        e.fill.Visible  = fillW > 0.5
+
+                        local txt = math.floor(hp) .. '/' .. math.floor(maxhp)
+                        if e.lastText ~= txt then
+                            e.label.Text = txt
+                            e.lastText   = txt
+                        end
+                        e.label.Position = Vector2.new(e.px + e.pw * 0.5, e.py - 14)
+                        e.label.Visible  = true
+                    end
+                end
+            end
+        end
+    end
+
+    for i = n + 1, POOL do
+        local e = pool[i]
+        e.bg.Visible    = false
+        e.fill.Visible  = false
+        e.label.Visible = false
+        e.px, e.py, e.pw = nil, nil, nil
+    end
+end))
+
+-- stop ---------------------------------------------------------------
+
+local function stop()
+    running = false
+    cfg.aura = false
+    cfg.bars = false
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    conns = {}
+    for i = 1, #drawings do
+        pcall(function() drawings[i]:Remove() end)
+    end
+    drawings = {}
+    pool = {}
+    if HAS_UI then
+        pcall(function() UI.RemoveTab('Kill Aura') end)
+    end
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ' - open the Kill Aura tab')
