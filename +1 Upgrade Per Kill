@@ -1,14 +1,15 @@
--- +1 Upgrade Per Kill - kill aura (crit) + smooth health bars - Matcha LuauVM
--- One Kill Aura toggle: every 0.01s it swings at every combatant in reach,
--- players and NPCs/bots, with crit = true on every swing.
--- Health bars (health only, no names) are driven from RenderStepped, keyed
--- per combatant so a bar never jumps between enemies. Tracking uses a high
--- smoothing rate plus a snap when the raw position jumps, so fast movement
--- stays locked on instead of trailing behind.
+-- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
+-- The aura now prefers crits: the game only counts a swing as a crit when the
+-- attacker is falling (CombatController: crit = fallDistance > 0 and not
+-- onGround / inWater / onLadder). So we read our own vertical velocity and
+-- only swing while it is negative (falling), which is the real crit window.
+-- Crit Only toggle: on = swing only in that window. Off = swing constantly.
+-- Health bars: health only, no names, keyed per combatant, snapped on big
+-- movement so they never trail.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.2'
+local VERSION = 'v3.3'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -32,6 +33,7 @@ local SMOOTH_RATE   = 90      -- higher = snappier tracking
 local SNAP_PX       = 10      -- snap onto the target past this jump, px
 local COLLECT_EVERY = 0.1     -- target list refresh, seconds
 local FORGET_AFTER  = 2.0     -- drop a bar key not seen for this long
+local CRIT_VEL_Y    = -1.5    -- falling faster than this = crit window
 
 local EXCLUDE = {
     ['o_csf']        = true,
@@ -45,8 +47,10 @@ local built   = false
 local targets = {}
 
 local cfg = {
-    aura = true,
-    bars = true,
+    aura     = true,
+    bars     = true,
+    critOnly = true,
+    critInd  = true,
 }
 
 local conns    = {}
@@ -69,7 +73,23 @@ local function setBool(key, v)
     end
 end
 
--- health bar pool ----------------------------------------------------
+-- crit window ---------------------------------------------------------
+
+local function myRoot()
+    local c = lp.Character
+    if not c then return nil end
+    return c:FindFirstChild('HumanoidRootPart')
+end
+
+-- true while we are falling, which is what the game checks for a crit
+local function critOpen(root)
+    if not root then return false end
+    local v = root.AssemblyLinearVelocity
+    if typeof(v) ~= 'Vector3' then return false end
+    return v.Y < CRIT_VEL_Y
+end
+
+-- health bar pool -----------------------------------------------------
 
 local pool     = {}
 local entryKey = {}
@@ -141,7 +161,17 @@ local function acquire(key, now)
     return oldest
 end
 
--- targeting ----------------------------------------------------------
+-- crit indicator ------------------------------------------------------
+
+local critText = trackDraw(Drawing.new('Text'))
+critText.Size    = 18
+critText.Center  = true
+critText.Outline = true
+critText.Color   = Color3.fromRGB(255, 210, 90)
+critText.Text    = 'CRIT'
+critText.Visible = false
+
+-- targeting -----------------------------------------------------------
 
 local function excluded(name)
     if type(name) ~= 'string' then return false end
@@ -215,9 +245,9 @@ local function scanNPCs(out)
     end
 end
 
--- swinging -----------------------------------------------------------
+-- swinging ------------------------------------------------------------
 
-local function fireAt(model, eye, targetPos)
+local function fireAt(model, eye, targetPos, crit)
     local dir = targetPos - eye
     if dir.Magnitude < 0.001 then
         dir = Vector3.new(0, -1, 0)
@@ -226,7 +256,7 @@ local function fireAt(model, eye, targetPos)
     end
     local payload = {
         sprint = false,
-        crit   = true,
+        crit   = crit,
         eye    = eye,
         dir    = dir,
         block  = false,
@@ -239,7 +269,7 @@ local function fireAt(model, eye, targetPos)
     end)
 end
 
--- menu ---------------------------------------------------------------
+-- menu ----------------------------------------------------------------
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 
@@ -286,8 +316,10 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Kill Aura',   'aura', true, function(v) setBool('aura', v) end)
-        mkToggle(sec, 'Health Bars', 'bars', true, function(v) setBool('bars', v) end)
+        mkToggle(sec, 'Kill Aura',       'aura',      true, function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Crit Only',       'crit_only', true, function(v) setBool('critOnly', v) end)
+        mkToggle(sec, 'Crit Indicator',  'crit_ind',  true, function(v) setBool('critInd', v) end)
+        mkToggle(sec, 'Health Bars',     'bars',      true, function(v) setBool('bars', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -311,7 +343,7 @@ else
     warn('[' .. NAME .. '] no UI table - menu unavailable')
 end
 
--- poll the menu ------------------------------------------------------
+-- poll the menu -------------------------------------------------------
 
 task.spawn(function()
     while running do
@@ -324,6 +356,14 @@ task.spawn(function()
                 local b = UI.GetValue('bars')
                 if type(b) ~= 'boolean' then b = UI.GetValue('Health Bars') end
                 if type(b) == 'boolean' then cfg.bars = b end
+
+                local co = UI.GetValue('crit_only')
+                if type(co) ~= 'boolean' then co = UI.GetValue('Crit Only') end
+                if type(co) == 'boolean' then cfg.critOnly = co end
+
+                local ci = UI.GetValue('crit_ind')
+                if type(ci) ~= 'boolean' then ci = UI.GetValue('Crit Indicator') end
+                if type(ci) == 'boolean' then cfg.critInd = ci end
             end)
         end
         task.wait(0.1)
@@ -346,31 +386,34 @@ task.spawn(function()
     end
 end)
 
--- kill aura: one pass over every target, then 0.01s -------------------
+-- kill aura: swings only inside the crit window unless Crit Only is off --
 
 task.spawn(function()
     while running do
         if cfg.aura and Attack then
-            local char = lp.Character
-            local myRoot = char and char:FindFirstChild('HumanoidRootPart')
-            if myRoot then
-                local myPos = myRoot.Position
-                local eye = myPos + Vector3.new(0, 1.5, 0)
-                local list = targets
-                for i = 1, #list do
-                    if not running or not cfg.aura then break end
-                    local t = list[i]
-                    local root
-                    if t.plr then
-                        local ch = t.plr.Character
-                        root = ch and ch:FindFirstChild('HumanoidRootPart')
-                    else
-                        root = t.model:FindFirstChild('HumanoidRootPart')
-                    end
-                    if root and root.Parent then
-                        local pos = root.Position
-                        if (pos - myPos).Magnitude <= RANGE then
-                            fireAt(t.model, eye, pos)
+            local root = myRoot()
+            if root then
+                local open = critOpen(root)
+                local swing = (not cfg.critOnly) or open
+                if swing then
+                    local myPos = root.Position
+                    local eye = myPos + Vector3.new(0, 1.5, 0)
+                    local list = targets
+                    for i = 1, #list do
+                        if not running or not cfg.aura then break end
+                        local t = list[i]
+                        local tr
+                        if t.plr then
+                            local ch = t.plr.Character
+                            tr = ch and ch:FindFirstChild('HumanoidRootPart')
+                        else
+                            tr = t.model:FindFirstChild('HumanoidRootPart')
+                        end
+                        if tr and tr.Parent then
+                            local pos = tr.Position
+                            if (pos - myPos).Magnitude <= RANGE then
+                                fireAt(t.model, eye, pos, true)
+                            end
                         end
                     end
                 end
@@ -382,11 +425,28 @@ task.spawn(function()
     end
 end)
 
--- health bars: live position + live health every frame, snap + smooth -
+-- health bars + crit indicator, every frame --------------------------
 
 trackConn(RunService.RenderStepped:Connect(function(dt)
     local now = os.clock()
 
+    -- crit indicator
+    if cfg.critInd then
+        local root = myRoot()
+        local open = critOpen(root)
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize
+        if open and vp then
+            critText.Position = Vector2.new(vp.X * 0.5, vp.Y - 130)
+            critText.Visible  = true
+        else
+            critText.Visible  = false
+        end
+    else
+        critText.Visible = false
+    end
+
+    -- health bars
     if not cfg.bars then
         for i = 1, #pool do
             local e = pool[i]
@@ -441,7 +501,6 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
                                 local dx = tx - e.x
                                 local dy = ty - e.y
                                 if (dx * dx + dy * dy) > snapSq then
-                                    -- moving fast: pin to the target, no trail
                                     e.x, e.y = tx, ty
                                 else
                                     e.x = e.x + dx * alpha
@@ -503,7 +562,7 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
     end
 end))
 
--- stop ---------------------------------------------------------------
+-- stop ----------------------------------------------------------------
 
 local function stop()
     running = false
