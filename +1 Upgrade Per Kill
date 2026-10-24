@@ -1,13 +1,14 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- Every swing is sent with crit = true, continuously. In this game a crit can
--- land while grounded, so the aura does NOT wait for a jump or a fall; the
--- falling-window check is kept only as an optional toggle, default off.
+-- Crit is unconditional: every swing is sent with crit = true and there is no
+-- falling gate and no crit cooldown of any kind. The swing loop has no real
+-- delay either - it rotates one target per tick and yields with the smallest
+-- wait the VM honours, so the rate is limited by the scheduler, not by us.
 -- Health bars: health only, no names, keyed per combatant, snapped on big
 -- movement so they never trail.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.4'
+local VERSION = 'v3.5'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -31,7 +32,7 @@ local SMOOTH_RATE   = 90      -- higher = snappier tracking
 local SNAP_PX       = 10      -- snap onto the target past this jump, px
 local COLLECT_EVERY = 0.1     -- target list refresh, seconds
 local FORGET_AFTER  = 2.0     -- drop a bar key not seen for this long
-local CRIT_VEL_Y    = -1.5    -- falling faster than this = falling window
+local SWING_WAIT    = 0.001   -- smallest yield; no attack throttle
 
 local EXCLUDE = {
     ['o_csf']        = true,
@@ -45,10 +46,8 @@ local built   = false
 local targets = {}
 
 local cfg = {
-    aura      = true,
-    bars      = true,
-    critOnly  = false,   -- false: swing always, crit = true on every swing
-    critInd   = true,
+    aura = true,
+    bars = true,
 }
 
 local conns    = {}
@@ -71,19 +70,10 @@ local function setBool(key, v)
     end
 end
 
--- falling window (optional gate only) --------------------------------
-
 local function myRoot()
     local c = lp.Character
     if not c then return nil end
     return c:FindFirstChild('HumanoidRootPart')
-end
-
-local function falling(root)
-    if not root then return false end
-    local v = root.AssemblyLinearVelocity
-    if typeof(v) ~= 'Vector3' then return false end
-    return v.Y < CRIT_VEL_Y
 end
 
 -- health bar pool -----------------------------------------------------
@@ -157,16 +147,6 @@ local function acquire(key, now)
     entryKey[key]   = oldest
     return oldest
 end
-
--- crit indicator ------------------------------------------------------
-
-local critText = trackDraw(Drawing.new('Text'))
-critText.Size    = 18
-critText.Center  = true
-critText.Outline = true
-critText.Color   = Color3.fromRGB(255, 210, 90)
-critText.Text    = 'CRIT'
-critText.Visible = false
 
 -- targeting -----------------------------------------------------------
 
@@ -253,7 +233,7 @@ local function fireAt(model, eye, targetPos)
     end
     local payload = {
         sprint = false,
-        crit   = true,          -- every swing asks for a crit
+        crit   = true,          -- unconditional crit
         eye    = eye,
         dir    = dir,
         block  = false,
@@ -313,10 +293,8 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Kill Aura',      'aura',      true,  function(v) setBool('aura', v) end)
-        mkToggle(sec, 'Health Bars',    'bars',      true,  function(v) setBool('bars', v) end)
-        mkToggle(sec, 'Crit Indicator', 'crit_ind',  true,  function(v) setBool('critInd', v) end)
-        mkToggle(sec, 'Falling Only',   'crit_only', false, function(v) setBool('critOnly', v) end)
+        mkToggle(sec, 'Kill Aura',   'aura', true, function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Health Bars', 'bars', true, function(v) setBool('bars', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -353,14 +331,6 @@ task.spawn(function()
                 local b = UI.GetValue('bars')
                 if type(b) ~= 'boolean' then b = UI.GetValue('Health Bars') end
                 if type(b) == 'boolean' then cfg.bars = b end
-
-                local co = UI.GetValue('crit_only')
-                if type(co) ~= 'boolean' then co = UI.GetValue('Falling Only') end
-                if type(co) == 'boolean' then cfg.critOnly = co end
-
-                local ci = UI.GetValue('crit_ind')
-                if type(ci) ~= 'boolean' then ci = UI.GetValue('Crit Indicator') end
-                if type(ci) == 'boolean' then cfg.critInd = ci end
             end)
         end
         task.wait(0.1)
@@ -383,68 +353,47 @@ task.spawn(function()
     end
 end)
 
--- kill aura: every swing carries crit = true -------------------------
+-- kill aura: no throttle, rotates one target per tick ----------------
 
 task.spawn(function()
+    local idx = 0
     while running do
         if cfg.aura and Attack then
             local root = myRoot()
             if root then
-                -- Falling Only is off by default: swing whether or not we are
-                -- airborne, because crits land on the ground in this game.
-                local swing = true
-                if cfg.critOnly then
-                    swing = falling(root)
-                end
-
-                if swing then
-                    local myPos = root.Position
-                    local eye = myPos + Vector3.new(0, 1.5, 0)
-                    local list = targets
-                    for i = 1, #list do
-                        if not running or not cfg.aura then break end
-                        local t = list[i]
-                        local tr
-                        if t.plr then
-                            local ch = t.plr.Character
-                            tr = ch and ch:FindFirstChild('HumanoidRootPart')
-                        else
-                            tr = t.model:FindFirstChild('HumanoidRootPart')
-                        end
-                        if tr and tr.Parent then
-                            local pos = tr.Position
-                            if (pos - myPos).Magnitude <= RANGE then
-                                fireAt(t.model, eye, pos)
-                            end
+                local myPos = root.Position
+                local eye = myPos + Vector3.new(0, 1.5, 0)
+                local list = targets
+                local total = #list
+                if total > 0 then
+                    idx = idx % total + 1
+                    local t = list[idx]
+                    local tr
+                    if t.plr then
+                        local ch = t.plr.Character
+                        tr = ch and ch:FindFirstChild('HumanoidRootPart')
+                    else
+                        tr = t.model:FindFirstChild('HumanoidRootPart')
+                    end
+                    if tr and tr.Parent then
+                        local pos = tr.Position
+                        if (pos - myPos).Magnitude <= RANGE then
+                            fireAt(t.model, eye, pos)
                         end
                     end
                 end
             end
-            task.wait(0.01)
+            task.wait(SWING_WAIT)
         else
-            task.wait(0.1)
+            task.wait(0.05)
         end
     end
 end)
 
--- health bars + falling indicator, every frame -----------------------
+-- health bars: live position + live health every frame, snap + smooth -
 
 trackConn(RunService.RenderStepped:Connect(function(dt)
     local now = os.clock()
-
-    if cfg.critInd then
-        local root = myRoot()
-        local cam = workspace.CurrentCamera
-        local vp = cam and cam.ViewportSize
-        if falling(root) and vp then
-            critText.Position = Vector2.new(vp.X * 0.5, vp.Y - 130)
-            critText.Visible  = true
-        else
-            critText.Visible  = false
-        end
-    else
-        critText.Visible = false
-    end
 
     if not cfg.bars then
         for i = 1, #pool do
