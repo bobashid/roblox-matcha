@@ -2,12 +2,13 @@
 -- One Kill Aura toggle: every 0.01s it swings at every combatant in reach,
 -- players and NPCs/bots, with crit = true on every swing.
 -- Health bars (health only, no names) are driven from RenderStepped, keyed
--- per combatant so a bar never jumps between enemies, and exponentially
--- smoothed so they glide with the head instead of jittering.
+-- per combatant so a bar never jumps between enemies. Tracking uses a high
+-- smoothing rate plus a snap when the raw position jumps, so fast movement
+-- stays locked on instead of trailing behind.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.1'
+local VERSION = 'v3.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -27,7 +28,8 @@ end
 
 local RANGE         = 30      -- maxed reach, studs
 local POOL          = 40      -- max simultaneous health bars
-local SMOOTH_RATE   = 28      -- higher = snappier, lower = smoother
+local SMOOTH_RATE   = 90      -- higher = snappier tracking
+local SNAP_PX       = 10      -- snap onto the target past this jump, px
 local COLLECT_EVERY = 0.1     -- target list refresh, seconds
 local FORGET_AFTER  = 2.0     -- drop a bar key not seen for this long
 
@@ -380,7 +382,7 @@ task.spawn(function()
     end
 end)
 
--- health bars: live position + live health every frame, smoothed -----
+-- health bars: live position + live health every frame, snap + smooth -
 
 trackConn(RunService.RenderStepped:Connect(function(dt)
     local now = os.clock()
@@ -398,9 +400,10 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
 
     local alpha = 1 - math.exp(-SMOOTH_RATE * (dt or 0.016))
     if alpha > 1 then alpha = 1 end
-    if alpha < 0.2 then alpha = 0.2 end
+    if alpha < 0.35 then alpha = 0.35 end
 
-    local list = targets
+    local snapSq = SNAP_PX * SNAP_PX
+    local list   = targets
 
     for i = 1, #list do
         local t = list[i]
@@ -435,8 +438,15 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
                             if e.x == nil then
                                 e.x, e.y, e.w, e.h = tx, ty, w, hgt
                             else
-                                e.x = e.x + (tx  - e.x) * alpha
-                                e.y = e.y + (ty  - e.y) * alpha
+                                local dx = tx - e.x
+                                local dy = ty - e.y
+                                if (dx * dx + dy * dy) > snapSq then
+                                    -- moving fast: pin to the target, no trail
+                                    e.x, e.y = tx, ty
+                                else
+                                    e.x = e.x + dx * alpha
+                                    e.y = e.y + dy * alpha
+                                end
                                 e.w = e.w + (w   - e.w) * alpha
                                 e.h = e.h + (hgt - e.h) * alpha
                             end
