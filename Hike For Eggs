@@ -1,21 +1,26 @@
 --==================================================================
---  Hike For Eggs  |  Auto Treadmill (from anywhere)
+--  Hike For Eggs  |  Auto Portable Treadmill
 --  Matcha LuaVM  -  built-in tab (UI.AddTab)
 --
---  The Treadmill button only does this:
+--  How it really works (probed in game):
+--    The Treadmill button only sends
 --      ReplicatedStorage.SwimAdventure.Remotes.Action
 --          :FireServer("PortableTreadmill")
---  with a 0.6s client cooldown. The server then gives the player a
---  portable treadmill at their current position, so repeating the
---  call works from anywhere on the map - no teleporting needed.
+--    It is a TOGGLE. Your own portable treadmill already lives in
+--    workspace.PortableTreadmills as "Portable_<UserId>" and the
+--    server places it at your position when it turns on. There is
+--    no teleport to make: the parts spawn next to you, and firing
+--    again turns it back OFF.
 --
---  MENU: Auto Treadmill toggle, Fire Once button.
---  Config is driven by the poller reading UI.GetValue.
+--  So this script fires only while the treadmill is off, which
+--  keeps it on instead of flickering it every cooldown.
+--
+--  MENU: Auto Treadmill toggle, Turn On, Turn Off.
 --==================================================================
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local VERSION = "v1.0"
+local VERSION = "v1.1"
 local NAME = "HikeForEggs"
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -27,7 +32,7 @@ local Config = {
 local running = true
 local fired = 0
 local lastFire = 0
-local MIN_GAP = 0.62
+local MIN_GAP = 0.65          -- client cooldown on the real button
 
 local Action = game:GetService("ReplicatedStorage")
     :WaitForChild("SwimAdventure")
@@ -35,11 +40,31 @@ local Action = game:GetService("ReplicatedStorage")
     :WaitForChild("Action")
 
 --------------------------------------------------------------------
--- FIRE - same call the Treadmill button makes
+-- STATE
 --------------------------------------------------------------------
-local function fire()
+local function isOn()
+    return LP:GetAttribute("PortableTreadmill") == true
+end
+
+local function myPortable()
+    local f = workspace:FindFirstChild("PortableTreadmills")
+    if not f then return nil end
+    local uid = tostring(LP.UserId)
+    local kids = f:GetChildren()
+    for i = 1, #kids do
+        if string.find(kids[i].Name, uid, 1, true) then return kids[i] end
+    end
+    return nil
+end
+
+--------------------------------------------------------------------
+-- FIRE
+-- force = ignore the on/off state (used by the buttons)
+--------------------------------------------------------------------
+local function fire(force)
     local now = os.clock()
     if now - lastFire < MIN_GAP then return false end
+    if not force and isOn() then return false end
     lastFire = now
     local ok = pcall(function() Action:FireServer("PortableTreadmill") end)
     if ok then fired = fired + 1 end
@@ -109,13 +134,22 @@ local function buildTab(tab)
         local sec = makeSection(tab, "Treadmill", "Left")
         if not sec then return end
 
-        if safeToggle(sec, "Auto Treadmill (anywhere)", "hike_autotm", true, applyBool("Auto")) then
-            TOGGLES[#TOGGLES + 1] = { key = "Auto", id = "hike_autotm", name = "Auto Treadmill (anywhere)" }
+        if safeToggle(sec, "Auto Treadmill (keep on)", "hike_autotm", true, applyBool("Auto")) then
+            TOGGLES[#TOGGLES + 1] = { key = "Auto", id = "hike_autotm", name = "Auto Treadmill (keep on)" }
         end
 
-        safeButton(sec, "Fire Once", "hike_fireonce", function()
-            local ok = fire()
-            print("[Hike For Eggs] manual fire " .. (ok and "sent" or "throttled"))
+        safeButton(sec, "Turn On", "hike_on", function()
+            local ok = fire(false)
+            print("[Hike For Eggs] turn on " .. (ok and "sent" or "already on / throttled"))
+        end)
+
+        safeButton(sec, "Turn Off", "hike_off", function()
+            if not isOn() then
+                print("[Hike For Eggs] already off")
+                return
+            end
+            local ok = fire(true)
+            print("[Hike For Eggs] turn off " .. (ok and "sent" or "throttled"))
         end)
     end)
 end
@@ -154,14 +188,14 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- MAIN LOOP
+-- MAIN LOOP - only fires when it is OFF, so it never toggles off
 --------------------------------------------------------------------
 task.spawn(function()
     while running do
-        if Config.Auto then
-            fire()
+        if Config.Auto and not isOn() then
+            fire(false)
         end
-        task.wait(0.05)
+        task.wait(0.15)
     end
 end)
 
@@ -173,5 +207,5 @@ end
 
 _G[NAME] = { stop = stop, version = VERSION }
 
-notify("Hike For Eggs", "Loaded " .. VERSION .. " - auto treadmill", 4)
+notify("Hike For Eggs", "Loaded " .. VERSION .. " - portable treadmill", 4)
 print("[Hike For Eggs] " .. VERSION .. " loaded")
