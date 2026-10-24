@@ -1,74 +1,171 @@
 --==================================================================
---  Hike For Eggs  |  Auto Portable Treadmill
+--  Hike For Eggs  |  Cross-Map Egg Grab + Rarity Toggles
 --  Matcha LuaVM  -  built-in tab (UI.AddTab)
 --
---  How it really works (probed in game):
---    The Treadmill button only sends
---      ReplicatedStorage.SwimAdventure.Remotes.Action
---          :FireServer("PortableTreadmill")
---    It is a TOGGLE. Your own portable treadmill already lives in
---    workspace.PortableTreadmills as "Portable_<UserId>" and the
---    server places it at your position when it turns on. There is
---    no teleport to make: the parts spawn next to you, and firing
---    again turns it back OFF.
+--  Nest eggs are client clones in workspace.LocalNests.Eggs:
+--  one Model per egg, Name = egg id, attribute "Rarity".
+--  Grab = ReplicatedStorage.SwimAdventure.Remotes.EggGrab
+--              :InvokeServer(eggId)
 --
---  So this script fires only while the treadmill is off, which
---  keeps it on instead of flickering it every cooldown.
+--  The server range-checks the grab, so each pass:
+--    1. fires the remote from where you stand (works up close)
+--    2. if the egg is still not carried, blinks the character onto
+--       the egg for ~0.4s, fires again, and blinks straight back.
+--  One egg per pass, 0.55s cooldown, failed ids blacklisted 30s.
 --
---  MENU: Auto Treadmill toggle, Turn On, Turn Off.
+--  MENU: Auto Grab, Teleport Fallback, Grab Now, one toggle per
+--  rarity that actually exists in the current nest cycle.
 --==================================================================
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local VERSION = "v1.1"
+local VERSION = "v1.0"
 local NAME = "HikeForEggs"
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
-local Config = {
-    Auto = true,
+local RARITY_ORDER = {
+    "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic",
+    "Secret", "Godly", "Divine", "Celestial", "Eternal",
+    "Transcendent", "Cosmic", "Ascendant", "Primordial",
 }
 
-local running = true
-local fired = 0
-local lastFire = 0
-local MIN_GAP = 0.65          -- client cooldown on the real button
+local Config = { Auto = true, TP = true }
+local RarityOn = {}
+for i = 1, #RARITY_ORDER do RarityOn[RARITY_ORDER[i]] = true end
 
-local Action = game:GetService("ReplicatedStorage")
+local running = true
+local grabbed = 0
+local lastGrab = 0
+local GRAB_GAP = 0.55
+local TP_HOVER = 3
+local BAN_TIME = 30
+
+local posCache = {}
+local banUntil = {}
+
+local EggGrab = game:GetService("ReplicatedStorage")
     :WaitForChild("SwimAdventure")
     :WaitForChild("Remotes")
-    :WaitForChild("Action")
+    :WaitForChild("EggGrab")
 
 --------------------------------------------------------------------
--- STATE
+-- HELPERS
 --------------------------------------------------------------------
-local function isOn()
-    return LP:GetAttribute("PortableTreadmill") == true
+local function carrying()
+    local c = LP:GetAttribute("CarryRarity")
+    if c == nil or c == "" then return nil end
+    return c
 end
 
-local function myPortable()
-    local f = workspace:FindFirstChild("PortableTreadmills")
-    if not f then return nil end
-    local uid = tostring(LP.UserId)
-    local kids = f:GetChildren()
-    for i = 1, #kids do
-        if string.find(kids[i].Name, uid, 1, true) then return kids[i] end
+local function playerHRP()
+    local char = LP.Character
+    return char and char:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function eggFolder()
+    local ln = workspace:FindFirstChild("LocalNests")
+    return ln and ln:FindFirstChild("Eggs") or nil
+end
+
+local function eggPos(m)
+    local cached = posCache[m.Name]
+    if cached then return cached end
+    local pp = m.PrimaryPart
+    local pos = pp and pp.Position or nil
+    if not pos then
+        local kids = m:GetDescendants()
+        for i = 1, #kids do
+            local d = kids[i]
+            local cn = d.ClassName
+            if (cn == "Part" or cn == "MeshPart") and d.Position then
+                pos = d.Position
+                break
+            end
+        end
     end
-    return nil
+    if pos then posCache[m.Name] = pos end
+    return pos
+end
+
+local function isBanned(id)
+    local t = banUntil[id]
+    return t ~= nil and os.clock() < t
 end
 
 --------------------------------------------------------------------
--- FIRE
--- force = ignore the on/off state (used by the buttons)
+-- GRAB
 --------------------------------------------------------------------
-local function fire(force)
+local function tryInvoke(id)
+    local ok, ret = pcall(function() return EggGrab:InvokeServer(id) end)
+    return ok, ret
+end
+
+local function grabOne(force)
+    if not force and carrying() then return false end
     local now = os.clock()
-    if now - lastFire < MIN_GAP then return false end
-    if not force and isOn() then return false end
-    lastFire = now
-    local ok = pcall(function() Action:FireServer("PortableTreadmill") end)
-    if ok then fired = fired + 1 end
-    return ok
+    if now - lastGrab < GRAB_GAP then return false end
+    local eggs = eggFolder()
+    local hrp = playerHRP()
+    if not eggs or not hrp then return false end
+
+    local myPos = hrp.Position
+    local best, bestD = nil, nil
+    local kids = eggs:GetChildren()
+    for i = 1, #kids do
+        local m = kids[i]
+        if m.ClassName == "Model" then
+            local r = m:GetAttribute("Rarity")
+            if r and RarityOn[r] and not isBanned(m.Name) then
+                local pos = eggPos(m)
+                if pos then
+                    local d = (pos - myPos).Magnitude
+                    if not bestD or d < bestD then
+                        best, bestD = m, d
+                    end
+                end
+            end
+        end
+    end
+    if not best then return false end
+
+    lastGrab = now
+    local id = best.Name
+
+    -- 1: remote from where we stand
+    tryInvoke(id)
+    task.wait(0.16)
+    if carrying() then
+        grabbed = grabbed + 1
+        print("[Hike For Eggs] grabbed " .. id .. " (" .. tostring(best:GetAttribute("Rarity")) .. ") remote")
+        return true
+    end
+
+    -- 2: blink to the egg, grab, blink back
+    if not Config.TP then
+        banUntil[id] = os.clock() + BAN_TIME
+        return false
+    end
+    local pos = eggPos(best)
+    if not pos then return false end
+    local back = hrp.CFrame
+    pcall(function() hrp.CFrame = CFrame.new(pos.X, pos.Y + TP_HOVER, pos.Z) end)
+    task.wait(0.18)
+    tryInvoke(id)
+    task.wait(0.16)
+    tryInvoke(id)
+    task.wait(0.14)
+    pcall(function() hrp.CFrame = back end)
+
+    if carrying() then
+        grabbed = grabbed + 1
+        print("[Hike For Eggs] grabbed " .. id .. " (" .. tostring(best:GetAttribute("Rarity")) .. ") tp")
+        return true
+    end
+
+    banUntil[id] = os.clock() + BAN_TIME
+    print("[Hike For Eggs] failed " .. id .. " - ban 30s")
+    return false
 end
 
 --------------------------------------------------------------------
@@ -77,14 +174,18 @@ end
 local TOGGLES = {}
 local getterWorks = {}
 
-local function applyBool(key)
+local function applyBool(tbl, key)
     return function(...)
-        if getterWorks[key] then return end
+        if getterWorks[tbl] and getterWorks[tbl][key] then return end
         local n = select("#", ...)
         for i = 1, n do
             local v = select(i, ...)
             if type(v) == "boolean" then
-                Config[key] = v
+                if tbl == "cfg" then
+                    Config[key] = v
+                else
+                    RarityOn[key] = v
+                end
                 return
             end
         end
@@ -124,38 +225,71 @@ end
 -- MENU
 --------------------------------------------------------------------
 local tabBuilt = false
+local tabRef = nil
+local rarityBuilt = false
 
-local function buildTab(tab)
-    if tabBuilt then return end
-    if type(tab) ~= "table" then return end
-    tabBuilt = true
+local function buildMain(tab)
+    local sec = makeSection(tab, "Egg Grab", "Left")
+    if not sec then return end
 
-    pcall(function()
-        local sec = makeSection(tab, "Treadmill", "Left")
-        if not sec then return end
-
-        if safeToggle(sec, "Auto Treadmill (keep on)", "hike_autotm", true, applyBool("Auto")) then
-            TOGGLES[#TOGGLES + 1] = { key = "Auto", id = "hike_autotm", name = "Auto Treadmill (keep on)" }
-        end
-
-        safeButton(sec, "Turn On", "hike_on", function()
-            local ok = fire(false)
-            print("[Hike For Eggs] turn on " .. (ok and "sent" or "already on / throttled"))
-        end)
-
-        safeButton(sec, "Turn Off", "hike_off", function()
-            if not isOn() then
-                print("[Hike For Eggs] already off")
-                return
-            end
-            local ok = fire(true)
-            print("[Hike For Eggs] turn off " .. (ok and "sent" or "throttled"))
-        end)
+    if safeToggle(sec, "Auto Grab Eggs", "hike_autograb", true, applyBool("cfg", "Auto")) then
+        TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "Auto", id = "hike_autograb", name = "Auto Grab Eggs" }
+    end
+    if safeToggle(sec, "Teleport Fallback", "hike_tpfall", true, applyBool("cfg", "TP")) then
+        TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "TP", id = "hike_tpfall", name = "Teleport Fallback" }
+    end
+    safeButton(sec, "Grab Nearest Now", "hike_grabnow", function()
+        local ok = grabOne(true)
+        print("[Hike For Eggs] manual grab " .. (ok and "ok" or "nothing"))
     end)
 end
 
+local function buildRarity(tab, present)
+    if rarityBuilt then return end
+    rarityBuilt = true
+    local sec = makeSection(tab, "Rarity", "Right")
+    if not sec then return end
+    local seen = {}
+    for i = 1, #RARITY_ORDER do
+        local r = RARITY_ORDER[i]
+        if present[r] and not seen[r] then
+            seen[r] = true
+            local id = "hike_r_" .. string.lower(r)
+            if safeToggle(sec, r, id, true, applyBool("rar", r)) then
+                TOGGLES[#TOGGLES + 1] = { kind = "rar", key = r, id = id, name = r }
+            end
+        end
+    end
+end
+
 pcall(function()
-    UI.AddTab("Hike For Eggs", function(tab) buildTab(tab) end)
+    UI.AddTab("Hike For Eggs", function(tab)
+        if tabBuilt then return end
+        if type(tab) ~= "table" then return end
+        tabBuilt = true
+        tabRef = tab
+        pcall(function() buildMain(tab) end)
+    end)
+end)
+
+-- rarity section is built once the nest eggs have replicated
+task.spawn(function()
+    while running and not rarityBuilt do
+        local eggs = eggFolder()
+        if eggs and tabRef then
+            local present = {}
+            local kids = eggs:GetChildren()
+            for i = 1, #kids do
+                local r = kids[i]:GetAttribute("Rarity")
+                if r then present[r] = true end
+            end
+            if next(present) ~= nil then
+                pcall(function() buildRarity(tabRef, present) end)
+                break
+            end
+        end
+        task.wait(0.5)
+    end
 end)
 
 --------------------------------------------------------------------
@@ -176,36 +310,44 @@ task.spawn(function()
             end
 
             if val ~= nil then
-                getterWorks[t.key] = true
-                if Config[t.key] ~= val then
-                    Config[t.key] = val
-                    print("[Hike For Eggs] " .. t.key .. " = " .. tostring(val))
+                getterWorks[t.kind] = getterWorks[t.kind] or {}
+                getterWorks[t.kind][t.key] = true
+                if t.kind == "cfg" then
+                    if Config[t.key] ~= val then
+                        Config[t.key] = val
+                        print("[Hike For Eggs] " .. t.key .. " = " .. tostring(val))
+                    end
+                else
+                    if RarityOn[t.key] ~= val then
+                        RarityOn[t.key] = val
+                        print("[Hike For Eggs] " .. t.key .. " = " .. tostring(val))
+                    end
                 end
             end
-        end
-        task.wait(0.1)
-    end
-end)
-
---------------------------------------------------------------------
--- MAIN LOOP - only fires when it is OFF, so it never toggles off
---------------------------------------------------------------------
-task.spawn(function()
-    while running do
-        if Config.Auto and not isOn() then
-            fire(false)
         end
         task.wait(0.15)
     end
 end)
 
 --------------------------------------------------------------------
+-- MAIN LOOP
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.Auto and not carrying() then
+            pcall(grabOne, false)
+        end
+        task.wait(0.2)
+    end
+end)
+
+--------------------------------------------------------------------
 local function stop()
     running = false
-    print("[Hike For Eggs] stopped after " .. tostring(fired) .. " fires")
+    print("[Hike For Eggs] stopped after " .. tostring(grabbed) .. " eggs")
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
 
-notify("Hike For Eggs", "Loaded " .. VERSION .. " - portable treadmill", 4)
+notify("Hike For Eggs", "Loaded " .. VERSION .. " - egg grab", 4)
 print("[Hike For Eggs] " .. VERSION .. " loaded")
