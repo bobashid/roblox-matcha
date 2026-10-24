@@ -1,15 +1,13 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- The aura now prefers crits: the game only counts a swing as a crit when the
--- attacker is falling (CombatController: crit = fallDistance > 0 and not
--- onGround / inWater / onLadder). So we read our own vertical velocity and
--- only swing while it is negative (falling), which is the real crit window.
--- Crit Only toggle: on = swing only in that window. Off = swing constantly.
+-- Every swing is sent with crit = true, continuously. In this game a crit can
+-- land while grounded, so the aura does NOT wait for a jump or a fall; the
+-- falling-window check is kept only as an optional toggle, default off.
 -- Health bars: health only, no names, keyed per combatant, snapped on big
 -- movement so they never trail.
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v3.3'
+local VERSION = 'v3.4'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -33,7 +31,7 @@ local SMOOTH_RATE   = 90      -- higher = snappier tracking
 local SNAP_PX       = 10      -- snap onto the target past this jump, px
 local COLLECT_EVERY = 0.1     -- target list refresh, seconds
 local FORGET_AFTER  = 2.0     -- drop a bar key not seen for this long
-local CRIT_VEL_Y    = -1.5    -- falling faster than this = crit window
+local CRIT_VEL_Y    = -1.5    -- falling faster than this = falling window
 
 local EXCLUDE = {
     ['o_csf']        = true,
@@ -47,10 +45,10 @@ local built   = false
 local targets = {}
 
 local cfg = {
-    aura     = true,
-    bars     = true,
-    critOnly = true,
-    critInd  = true,
+    aura      = true,
+    bars      = true,
+    critOnly  = false,   -- false: swing always, crit = true on every swing
+    critInd   = true,
 }
 
 local conns    = {}
@@ -73,7 +71,7 @@ local function setBool(key, v)
     end
 end
 
--- crit window ---------------------------------------------------------
+-- falling window (optional gate only) --------------------------------
 
 local function myRoot()
     local c = lp.Character
@@ -81,8 +79,7 @@ local function myRoot()
     return c:FindFirstChild('HumanoidRootPart')
 end
 
--- true while we are falling, which is what the game checks for a crit
-local function critOpen(root)
+local function falling(root)
     if not root then return false end
     local v = root.AssemblyLinearVelocity
     if typeof(v) ~= 'Vector3' then return false end
@@ -247,7 +244,7 @@ end
 
 -- swinging ------------------------------------------------------------
 
-local function fireAt(model, eye, targetPos, crit)
+local function fireAt(model, eye, targetPos)
     local dir = targetPos - eye
     if dir.Magnitude < 0.001 then
         dir = Vector3.new(0, -1, 0)
@@ -256,7 +253,7 @@ local function fireAt(model, eye, targetPos, crit)
     end
     local payload = {
         sprint = false,
-        crit   = crit,
+        crit   = true,          -- every swing asks for a crit
         eye    = eye,
         dir    = dir,
         block  = false,
@@ -316,10 +313,10 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Kill Aura',       'aura',      true, function(v) setBool('aura', v) end)
-        mkToggle(sec, 'Crit Only',       'crit_only', true, function(v) setBool('critOnly', v) end)
-        mkToggle(sec, 'Crit Indicator',  'crit_ind',  true, function(v) setBool('critInd', v) end)
-        mkToggle(sec, 'Health Bars',     'bars',      true, function(v) setBool('bars', v) end)
+        mkToggle(sec, 'Kill Aura',      'aura',      true,  function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Health Bars',    'bars',      true,  function(v) setBool('bars', v) end)
+        mkToggle(sec, 'Crit Indicator', 'crit_ind',  true,  function(v) setBool('critInd', v) end)
+        mkToggle(sec, 'Falling Only',   'crit_only', false, function(v) setBool('critOnly', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -358,7 +355,7 @@ task.spawn(function()
                 if type(b) == 'boolean' then cfg.bars = b end
 
                 local co = UI.GetValue('crit_only')
-                if type(co) ~= 'boolean' then co = UI.GetValue('Crit Only') end
+                if type(co) ~= 'boolean' then co = UI.GetValue('Falling Only') end
                 if type(co) == 'boolean' then cfg.critOnly = co end
 
                 local ci = UI.GetValue('crit_ind')
@@ -386,15 +383,20 @@ task.spawn(function()
     end
 end)
 
--- kill aura: swings only inside the crit window unless Crit Only is off --
+-- kill aura: every swing carries crit = true -------------------------
 
 task.spawn(function()
     while running do
         if cfg.aura and Attack then
             local root = myRoot()
             if root then
-                local open = critOpen(root)
-                local swing = (not cfg.critOnly) or open
+                -- Falling Only is off by default: swing whether or not we are
+                -- airborne, because crits land on the ground in this game.
+                local swing = true
+                if cfg.critOnly then
+                    swing = falling(root)
+                end
+
                 if swing then
                     local myPos = root.Position
                     local eye = myPos + Vector3.new(0, 1.5, 0)
@@ -412,7 +414,7 @@ task.spawn(function()
                         if tr and tr.Parent then
                             local pos = tr.Position
                             if (pos - myPos).Magnitude <= RANGE then
-                                fireAt(t.model, eye, pos, true)
+                                fireAt(t.model, eye, pos)
                             end
                         end
                     end
@@ -425,18 +427,16 @@ task.spawn(function()
     end
 end)
 
--- health bars + crit indicator, every frame --------------------------
+-- health bars + falling indicator, every frame -----------------------
 
 trackConn(RunService.RenderStepped:Connect(function(dt)
     local now = os.clock()
 
-    -- crit indicator
     if cfg.critInd then
         local root = myRoot()
-        local open = critOpen(root)
         local cam = workspace.CurrentCamera
         local vp = cam and cam.ViewportSize
-        if open and vp then
+        if falling(root) and vp then
             critText.Position = Vector2.new(vp.X * 0.5, vp.Y - 130)
             critText.Visible  = true
         else
@@ -446,7 +446,6 @@ trackConn(RunService.RenderStepped:Connect(function(dt)
         critText.Visible = false
     end
 
-    -- health bars
     if not cfg.bars then
         for i = 1, #pool do
             local e = pool[i]
