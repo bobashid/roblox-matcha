@@ -1,0 +1,177 @@
+--==================================================================
+--  Hike For Eggs  |  Auto Treadmill (from anywhere)
+--  Matcha LuaVM  -  built-in tab (UI.AddTab)
+--
+--  The Treadmill button only does this:
+--      ReplicatedStorage.SwimAdventure.Remotes.Action
+--          :FireServer("PortableTreadmill")
+--  with a 0.6s client cooldown. The server then gives the player a
+--  portable treadmill at their current position, so repeating the
+--  call works from anywhere on the map - no teleporting needed.
+--
+--  MENU: Auto Treadmill toggle, Fire Once button.
+--  Config is driven by the poller reading UI.GetValue.
+--==================================================================
+local Players = game:GetService("Players")
+local LP = Players.LocalPlayer
+
+local VERSION = "v1.0"
+local NAME = "HikeForEggs"
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+
+local Config = {
+    Auto = true,
+}
+
+local running = true
+local fired = 0
+local lastFire = 0
+local MIN_GAP = 0.62
+
+local Action = game:GetService("ReplicatedStorage")
+    :WaitForChild("SwimAdventure")
+    :WaitForChild("Remotes")
+    :WaitForChild("Action")
+
+--------------------------------------------------------------------
+-- FIRE - same call the Treadmill button makes
+--------------------------------------------------------------------
+local function fire()
+    local now = os.clock()
+    if now - lastFire < MIN_GAP then return false end
+    lastFire = now
+    local ok = pcall(function() Action:FireServer("PortableTreadmill") end)
+    if ok then fired = fired + 1 end
+    return ok
+end
+
+--------------------------------------------------------------------
+-- TOGGLE SYNC
+--------------------------------------------------------------------
+local TOGGLES = {}
+local getterWorks = {}
+
+local function applyBool(key)
+    return function(...)
+        if getterWorks[key] then return end
+        local n = select("#", ...)
+        for i = 1, n do
+            local v = select(i, ...)
+            if type(v) == "boolean" then
+                Config[key] = v
+                return
+            end
+        end
+    end
+end
+
+local function safeToggle(sec, name, id, default, cb)
+    local v = {
+        function() sec:Toggle(name, id, default, cb) end,
+        function() sec:Toggle(id, name, default, cb) end,
+    }
+    for i = 1, #v do if pcall(v[i]) then return true end end
+    warn("[Hike For Eggs] Toggle failed: " .. tostring(name))
+    return false
+end
+
+local function safeButton(sec, name, id, cb)
+    local v = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, id, cb) end,
+        function() sec:Button(id, name, cb) end,
+    }
+    for i = 1, #v do if pcall(v[i]) then return true end end
+    warn("[Hike For Eggs] Button failed: " .. tostring(name))
+    return false
+end
+
+local function makeSection(tab, name, side)
+    local ok, sec = pcall(function() return tab:Section(name, side) end)
+    if ok and type(sec) == "table" then return sec end
+    ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and type(sec) == "table" then return sec end
+    return nil
+end
+
+--------------------------------------------------------------------
+-- MENU
+--------------------------------------------------------------------
+local tabBuilt = false
+
+local function buildTab(tab)
+    if tabBuilt then return end
+    if type(tab) ~= "table" then return end
+    tabBuilt = true
+
+    pcall(function()
+        local sec = makeSection(tab, "Treadmill", "Left")
+        if not sec then return end
+
+        if safeToggle(sec, "Auto Treadmill (anywhere)", "hike_autotm", true, applyBool("Auto")) then
+            TOGGLES[#TOGGLES + 1] = { key = "Auto", id = "hike_autotm", name = "Auto Treadmill (anywhere)" }
+        end
+
+        safeButton(sec, "Fire Once", "hike_fireonce", function()
+            local ok = fire()
+            print("[Hike For Eggs] manual fire " .. (ok and "sent" or "throttled"))
+        end)
+    end)
+end
+
+pcall(function()
+    UI.AddTab("Hike For Eggs", function(tab) buildTab(tab) end)
+end)
+
+--------------------------------------------------------------------
+-- TOGGLE POLLER
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t = TOGGLES[i]
+            local val = nil
+
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == "boolean" then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                if ok2 and type(v2) == "boolean" then val = v2 end
+            end
+
+            if val ~= nil then
+                getterWorks[t.key] = true
+                if Config[t.key] ~= val then
+                    Config[t.key] = val
+                    print("[Hike For Eggs] " .. t.key .. " = " .. tostring(val))
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+--------------------------------------------------------------------
+-- MAIN LOOP
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        if Config.Auto then
+            fire()
+        end
+        task.wait(0.05)
+    end
+end)
+
+--------------------------------------------------------------------
+local function stop()
+    running = false
+    print("[Hike For Eggs] stopped after " .. tostring(fired) .. " fires")
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+
+notify("Hike For Eggs", "Loaded " .. VERSION .. " - auto treadmill", 4)
+print("[Hike For Eggs] " .. VERSION .. " loaded")
