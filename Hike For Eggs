@@ -2,15 +2,16 @@
 --  Hike For Eggs  |  Egg Grab + Rarity Toggles
 --  Matcha LuaVM  -  built-in tab (UI.AddTab)
 --
---  v1.2 - crash fix
---    Most likely cause: the teleport blink. It wrote CFrame every
---    pass with no re-entry guard, and Grab Now ran it inline on the
---    UI callback. Now:
---      * remote-only by default, teleport is an opt-in toggle
---      * busy flag, so only one grab can ever be in flight
---      * buttons run inside task.spawn, never on the UI callback
---      * egg position read from PrimaryPart / direct children only
---        (no GetDescendants over every model)
+--  v1.3
+--    * Every rarity now gets its own toggle, built up front from
+--      RarityConfig's order, not only the ones in the current nest.
+--    * Travel is a tween, not an instant CFrame snap. The server
+--      rejects cross-map jumps, so the character is moved in 24
+--      small steps over a distance-scaled duration, grabs, then
+--      tweens back the same way.
+--    * Teleport stays opt-in (off by default); remote-only grabs
+--      still happen first from wherever you stand.
+--    * Single flight guard, buttons run in task.spawn.
 --
 --  Eggs = workspace.LocalNests.Eggs (Models, attribute Rarity)
 --  Grab = ReplicatedStorage.SwimAdventure.Remotes.EggGrab
@@ -19,7 +20,7 @@
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
-local VERSION = "v1.2"
+local VERSION = "v1.3"
 local NAME = "HikeForEggs"
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -41,6 +42,12 @@ local lastGrab = 0
 local GRAB_GAP = 0.55
 local TP_HOVER = 3
 local BAN_TIME = 45
+
+-- tween tuning
+local TWEEN_STEPS = 24
+local SPEED = 150          -- studs per second the tween aims for
+local MIN_DUR = 0.25
+local MAX_DUR = 1.10
 
 local posCache = {}
 local banUntil = {}
@@ -112,6 +119,24 @@ local function tryInvoke(id)
     return ok, ret
 end
 
+-- step the character instead of snapping it, so the server sees a
+-- plausible move
+local function tweenTo(hrp, targetCF, dist)
+    local dur = dist / SPEED
+    if dur < MIN_DUR then dur = MIN_DUR end
+    if dur > MAX_DUR then dur = MAX_DUR end
+    local startCF = hrp.CFrame
+    local stepTime = dur / TWEEN_STEPS
+    for i = 1, TWEEN_STEPS do
+        if not running then return false end
+        local cf = startCF:Lerp(targetCF, i / TWEEN_STEPS)
+        local ok = pcall(function() hrp.CFrame = cf end)
+        if not ok then return false end
+        task.wait(stepTime)
+    end
+    return true
+end
+
 --------------------------------------------------------------------
 -- GRAB CORE
 --------------------------------------------------------------------
@@ -158,7 +183,7 @@ local function grabInner(force)
         return true
     end
 
-    -- 2: optional blink, off by default
+    -- 2: tween over, grab, tween back
     if not Config.TP then
         banUntil[id] = os.clock() + BAN_TIME
         return false
@@ -166,15 +191,17 @@ local function grabInner(force)
     local pos = eggPos(best)
     if not pos then return false end
     local back = hrp.CFrame
-    pcall(function() hrp.CFrame = CFrame.new(pos.X, pos.Y + TP_HOVER, pos.Z) end)
-    task.wait(0.22)
-    tryInvoke(id)
-    task.wait(0.18)
-    pcall(function() hrp.CFrame = back end)
+    local okGo = tweenTo(hrp, CFrame.new(pos.X, pos.Y + TP_HOVER, pos.Z), bestD or 0)
+    if okGo then
+        task.wait(0.14)
+        tryInvoke(id)
+        task.wait(0.20)
+        tweenTo(hrp, back, bestD or 0)
+    end
 
     if carrying() then
         grabbed = grabbed + 1
-        print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ") tp")
+        print("[Hike For Eggs] grabbed " .. id .. " (" .. rarity .. ") travel")
         return true
     end
 
@@ -253,74 +280,45 @@ end
 -- MENU
 --------------------------------------------------------------------
 local tabBuilt = false
-local tabRef = nil
-local rarityBuilt = false
 
-local function buildMain(tab)
-    local sec = makeSection(tab, "Egg Grab", "Left")
-    if not sec then return end
+local function buildTab(tab)
+    if tabBuilt then return end
+    if type(tab) ~= "table" then return end
+    tabBuilt = true
 
-    if safeToggle(sec, "Auto Grab Eggs", "hike_autograb", true, applyBool("cfg", "Auto")) then
-        TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "Auto", id = "hike_autograb", name = "Auto Grab Eggs" }
-    end
-    if safeToggle(sec, "Teleport Fallback", "hike_tpfall", false, applyBool("cfg", "TP")) then
-        TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "TP", id = "hike_tpfall", name = "Teleport Fallback" }
-    end
-
-    safeButton(sec, "Grab Nearest Now", "hike_grabnow", function()
-        task.spawn(function()
-            local ok = grabOne(true)
-            print("[Hike For Eggs] manual grab " .. (ok and "ok" or "nothing"))
-        end)
+    pcall(function()
+        local sec = makeSection(tab, "Egg Grab", "Left")
+        if sec then
+            if safeToggle(sec, "Auto Grab Eggs", "hike_autograb", true, applyBool("cfg", "Auto")) then
+                TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "Auto", id = "hike_autograb", name = "Auto Grab Eggs" }
+            end
+            if safeToggle(sec, "Travel To Egg", "hike_tpfall", false, applyBool("cfg", "TP")) then
+                TOGGLES[#TOGGLES + 1] = { kind = "cfg", key = "TP", id = "hike_tpfall", name = "Travel To Egg" }
+            end
+            safeButton(sec, "Grab Nearest Now", "hike_grabnow", function()
+                task.spawn(function()
+                    local ok = grabOne(true)
+                    print("[Hike For Eggs] manual grab " .. (ok and "ok" or "nothing"))
+                end)
+            end)
+        end
     end)
-end
 
-local function buildRarity(tab, present)
-    if rarityBuilt then return end
-    rarityBuilt = true
-    local sec = makeSection(tab, "Rarity", "Right")
-    if not sec then return end
-    local seen = {}
-    for i = 1, #RARITY_ORDER do
-        local r = RARITY_ORDER[i]
-        if present[r] and not seen[r] then
-            seen[r] = true
+    pcall(function()
+        local sec = makeSection(tab, "Rarity", "Right")
+        if not sec then return end
+        for i = 1, #RARITY_ORDER do
+            local r = RARITY_ORDER[i]
             local id = "hike_r_" .. string.lower(r)
             if safeToggle(sec, r, id, true, applyBool("rar", r)) then
                 TOGGLES[#TOGGLES + 1] = { kind = "rar", key = r, id = id, name = r }
             end
         end
-    end
+    end)
 end
 
 pcall(function()
-    UI.AddTab("Hike For Eggs", function(tab)
-        if tabBuilt then return end
-        if type(tab) ~= "table" then return end
-        tabBuilt = true
-        tabRef = tab
-        pcall(function() buildMain(tab) end)
-    end)
-end)
-
--- rarity section is built once the nest eggs have replicated
-task.spawn(function()
-    while running and not rarityBuilt do
-        local eggs = eggFolder()
-        if eggs and tabRef then
-            local present = {}
-            local kids = eggs:GetChildren()
-            for i = 1, #kids do
-                local r = kids[i]:GetAttribute("Rarity")
-                if r then present[r] = true end
-            end
-            if next(present) ~= nil then
-                pcall(function() buildRarity(tabRef, present) end)
-                break
-            end
-        end
-        task.wait(0.5)
-    end
+    UI.AddTab("Hike For Eggs", function(tab) buildTab(tab) end)
 end)
 
 --------------------------------------------------------------------
