@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v2.2: Ride A Dino - Always Gain Stamina mounts via the dino prompt.
 -- v2.1: Ride A Dino - Always Gain Stamina (anchor + hold still).
 -- v2.0: Ride A Dino - Auto Gain Energy is a hold-still toggle.
 -- v1.9: Ride A Dino rebuilt - one toggle (auto gain energy).
@@ -19,7 +20,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v2.1'
+local VERSION = 'v2.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
