@@ -1,26 +1,34 @@
 -- What If Disasters - Matcha LuauVM
 -- Place 109440485612336
--- Confirmed in game this session:
---   place id 109440485612336, title "What If Disasters", hybrid mode on.
---   LocalPlayer attributes: InRound, GoalSafe, GoalShift, Level, Streak,
---     BestStreak, Equipment (string), Title, Spectators.
---   ReplicatedStorage.Remotes includes Revive, Impact, BloomCure, RoundResults,
---     Narrative, RequestEquip, SetAFK, Spectating, Watching.
---   Decompiled Players.<local>.PlayerScripts.Client.ReviveController:
---       Remotes.Revive:FireServer(true)    -- the "Get Up" button
---       Remotes.Revive:FireServer("reset") -- give-up path (NOT used here)
--- v1.2: this build rejected a Drawing Text property at load
---   ("Matcha:67: Unknown property FontSize") and the error killed the script
---   before any menu or HUD existed. Every Drawing property write now goes
---   through a pcall, and the font size is attempted under both FontSize and
---   TextSize so whichever this build supports is the one that sticks.
--- UNVERIFIED: meaning/units of GoalShift (numeric); printed raw only.
--- UNVERIFIED: server acceptance of Revive(true) without the local button press;
---   the auto get-up toggle re-checks state and backs off on repeats.
--- No teleport, no input simulation, no stat writes.
+-- FOCUS: AUTO WIN.
+--
+-- Confirmed in game this session (probes, 2026-10-25):
+--   ReplicatedStorage.DisasterState attributes: Active, GoalCheck (JSON string),
+--     GoalText, GoalSafeText, GoalEnds, GoalShowAt, plus ~80 disaster env values.
+--   ReplicatedStorage.RoundState attributes: Phase, PhaseEnds, MapName, DisasterId,
+--     Alive, Participants, MapCenter, MapSize.
+--   LocalPlayer attributes: InRound, GoalSafe, GoalShift, Level, Streak, BestStreak.
+--   Decompiled ReplicatedStorage.Shared.GoalCheck:
+--       Decode(str) -> { {k=..., ...}, ... }
+--       Eval(goals, position, player) -> true only if EVERY node passes
+--     Node kinds: Clean, Indoors, Sealed, Warm, Walls, Above, Below, Away,
+--       From, Ray, Cover, Any.  SHELTER_RAY = 50 (Shared.Config).
+--   Decompiled Client.HudController: if GoalCheck decodes, the client itself
+--     runs Eval(goals, HumanoidRootPart.Position, LocalPlayer) and marks the goal
+--     green; if the attribute is empty it falls back to the server-set GoalSafe.
+--   => the win condition is a POSITION predicate the client can evaluate, so the
+--      honest auto win is: evaluate it locally, find the nearest passing spot,
+--      walk there.  require(instance) does not work in Matcha, so Eval is
+--      re-implemented below straight from that decompile.
+--
+-- UNVERIFIED: whether the server judges with the identical predicate each round;
+--   the script only ever moves the character, never fakes the result.
+-- UNVERIFIED: CollectionService:GetTagged support in this VM (Warm falls back to
+--   the wall check when it is unavailable).
+-- No teleport, no input simulation, no attribute writes, no remote firing.
 
 local NAME    = 'WhatIfDisasters'
-local VERSION = 'v1.2'
+local VERSION = 'v2.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -35,27 +43,18 @@ local conns, draws = {}, {}
 local function track(c) conns[#conns + 1] = c return c end
 local function trackD(d) draws[#draws + 1] = d return d end
 
--- One unsupported property on a Drawing object throws, and a bare assignment
--- at load time kills the whole chunk. Every write goes through here.
+-- A single unsupported Drawing property throws and a bare write at load time
+-- kills the whole chunk (v1.1 did exactly that on FontSize), so guard them all.
 local function sset(obj, prop, val)
     pcall(function() obj[prop] = val end)
 end
 
--- ---- remotes (resolved once, guarded at call time) ----
-local Remotes = RS:FindFirstChild('Remotes')
-local Revive  = Remotes and Remotes:FindFirstChild('Revive')
-if not Revive then
-    warn('[' .. NAME .. '] Remotes.Revive not found - auto get-up idle')
-end
-
 -- ---- config ----
 local CFG = {
-    roundHud   = true,
-    safeHud    = true,
-    statsHud   = true,
-    downedHud  = true,
-    alerts     = true,
+    autoWin    = true,
     autoRevive = true,
+    hud        = true,
+    alerts     = true,
 }
 
 local function setBool(key, v)
@@ -64,43 +63,249 @@ local function setBool(key, v)
     print('[' .. NAME .. '] ' .. tostring(key) .. ' = ' .. tostring(v))
 end
 
--- ---- hud drawings (created once, pooled) ----
-local FONT = 2
-if Drawing.Fonts ~= nil and Drawing.Fonts.SystemBold ~= nil then FONT = Drawing.Fonts.SystemBold end
+-- ---- shared state ----
+local downState = false
+local winState  = { text = 'starting', safe = false, spot = nil }
 
-local function mkText(y, r, g, b)
-    local t = trackD(Drawing.new('Text'))
-    sset(t, 'Text', '')
-    sset(t, 'Color', Color3.fromRGB(r, g, b))
-    sset(t, 'Outline', true)
-    sset(t, 'Center', false)
-    sset(t, 'Font', FONT)
-    pcall(function() t.FontSize = 16 end)
-    pcall(function() t.TextSize = 16 end)
-    sset(t, 'Transparency', 1)
-    sset(t, 'Position', Vector2.new(20, y))
-    sset(t, 'Visible', false)
+-- =====================================================================
+-- GoalCheck (re-implemented from ReplicatedStorage.Shared.GoalCheck)
+-- =====================================================================
+local SHELTER_RAY = 50
+
+local CollectionService = nil
+pcall(function() CollectionService = game:GetService('CollectionService') end)
+
+local prmInc = RaycastParams.new()
+local prmMap = RaycastParams.new()
+pcall(function() prmInc.FilterType = Enum.RaycastFilterType.Include end)
+pcall(function() prmMap.FilterType = Enum.RaycastFilterType.Include end)
+
+local filtersReady = false
+
+local function refreshFilters()
+    local map = workspace:FindFirstChild('Map')
+    if not map then
+        filtersReady = false
+        return false
+    end
+    local fx = workspace:FindFirstChild('Effects')
+    pcall(function() prmInc.FilterDescendantsInstances = fx and { map, fx } or { map } end)
+    pcall(function() prmMap.FilterDescendantsInstances = { map } end)
+    filtersReady = true
+    return true
+end
+
+local function rc(origin, dir, prm)
+    local ok, r = pcall(function() return workspace:Raycast(origin, dir, prm) end)
+    if ok then return r end
+    return nil
+end
+
+-- how many distinct vertical wall faces surround this point (max 2)
+local function wallCount(pos)
+    local dirs = {}
+    for i = 0, 7 do
+        local a = i * math.pi / 4
+        local r = rc(pos, Vector3.new(math.cos(a), 0, math.sin(a)) * 5, prmMap)
+        if r then
+            local n = r.Normal
+            local collide = false
+            pcall(function() collide = r.Instance.CanCollide end)
+            if math.abs(n.Y) < 0.5 and collide then
+                local h = Vector3.new(n.X, 0, n.Z)
+                if h.Magnitude > 0.001 then
+                    h = h.Unit
+                    local dup = false
+                    for k = 1, #dirs do
+                        if dirs[k]:Dot(h) > 0.5 then
+                            dup = true
+                            break
+                        end
+                    end
+                    if not dup then
+                        dirs[#dirs + 1] = h
+                        if #dirs >= 2 then return 2 end
+                    end
+                end
+            end
+        end
+    end
+    return #dirs
+end
+
+-- any CollectionService "HeatSource" part with Active + radius covering pos
+local function nearHeat(pos)
+    if not CollectionService then return false end
+    local ok, list = pcall(function() return CollectionService:GetTagged('HeatSource') end)
+    if not ok or type(list) ~= 'table' then return false end
+    for i = 1, #list do
+        local p = list[i]
+        local good, hit = pcall(function()
+            if p.Size == nil then return false end
+            if p:GetAttribute('Active') ~= true then return false end
+            if not p:IsDescendantOf(workspace) then return false end
+            local rad = tonumber(p:GetAttribute('HeatRadius')) or 12
+            return (p.Position - pos).Magnitude <= rad
+        end)
+        if good and hit then return true end
+    end
+    return false
+end
+
+-- distance to the nearest shelter in `dir`, sampling at foot and chest height
+local function coverDist(pos, dir)
+    if typeof(dir) ~= 'Vector3' or dir.Magnitude < 0.001 then return nil end
+    local best = nil
+    local offs = { 0, 1.5 }
+    for i = 1, #offs do
+        local r = rc(pos + Vector3.new(0, offs[i], 0), dir.Unit * SHELTER_RAY, prmInc)
+        if r and (best == nil or r.Distance < best) then best = r.Distance end
+    end
+    return best
+end
+
+local evalNode
+
+evalNode = function(node, pos, player)
+    if type(node) ~= 'table' then return false end
+    local k = node.k
+
+    if k == 'Clean' then
+        if player == nil then return false end
+        local ok, v = pcall(function() return player:GetAttribute('Infected') end)
+        if not ok then return false end
+        return not v
+
+    elseif k == 'Indoors' then
+        return rc(pos + Vector3.new(0, 2, 0), Vector3.new(0, 160, 0), prmInc) ~= nil
+
+    elseif k == 'Sealed' then
+        if rc(pos + Vector3.new(0, 2, 0), Vector3.new(0, 160, 0), prmInc) == nil then return false end
+        for i = 0, 7 do
+            local a = i * math.pi / 4
+            if rc(pos, Vector3.new(math.cos(a), 0, math.sin(a)) * 70, prmInc) == nil then return false end
+        end
+        return true
+
+    elseif k == 'Warm' then
+        return nearHeat(pos) or wallCount(pos) >= 2
+
+    elseif k == 'Walls' then
+        return wallCount(pos) >= (tonumber(node.n) or 1)
+
+    elseif k == 'Above' then
+        return pos.Y > (tonumber(node.y) or 0)
+
+    elseif k == 'Below' then
+        return pos.Y < (tonumber(node.y) or 0)
+
+    elseif k == 'Away' then
+        local at = node.at
+        if typeof(at) ~= 'Vector3' then return false end
+        return Vector3.new(pos.X - at.X, 0, pos.Z - at.Z).Magnitude > (tonumber(node.r) or 0)
+
+    elseif k == 'From' then
+        local at = node.at
+        if typeof(at) ~= 'Vector3' then return false end
+        local d = at - pos
+        if d.Magnitude < 1 then return false end
+        local dist = math.min(d.Magnitude, tonumber(node.d) or SHELTER_RAY)
+        return rc(pos, d.Unit * dist, prmInc) ~= nil
+
+    elseif k == 'Ray' then
+        local dir = node.dir
+        if typeof(dir) ~= 'Vector3' or dir.Magnitude < 0.001 then return false end
+        return rc(pos, dir.Unit * (tonumber(node.len) or SHELTER_RAY), prmInc) ~= nil
+
+    elseif k == 'Cover' then
+        local dir = node.dir
+        if typeof(dir) ~= 'Vector3' then return false end
+        local c = coverDist(pos, dir)
+        if c == nil then return false end
+        return c <= (tonumber(node.d) or SHELTER_RAY)
+
+    elseif k == 'Any' then
+        local of = node.of
+        if type(of) ~= 'table' then return false end
+        for i = 1, #of do
+            if evalNode(of[i], pos, player) then return true end
+        end
+        return false
+    end
+
+    return false
+end
+
+local function evalGoals(goals, pos, player)
+    if type(goals) ~= 'table' or #goals == 0 then return false end
+    if not filtersReady and not refreshFilters() then return false end
+    for i = 1, #goals do
+        if not evalNode(goals[i], pos, player) then return false end
+    end
+    return true
+end
+
+local HttpService = game:GetService('HttpService')
+
+local function decodeGoals(s)
+    if type(s) ~= 'string' or s == '' then return nil end
+    local ok, t = pcall(function() return HttpService:JSONDecode(s) end)
+    if not ok or type(t) ~= 'table' then return nil end
+    if #t == 0 then return nil end
+    for i = 1, #t do
+        local node = t[i]
+        if type(node) == 'table' then
+            local keys = { 'at', 'dir' }
+            for k = 1, #keys do
+                local v = node[keys[k]]
+                if type(v) == 'table' then
+                    node[keys[k]] = Vector3.new(tonumber(v[1]) or 0, tonumber(v[2]) or 0, tonumber(v[3]) or 0)
+                end
+            end
+        end
+    end
     return t
 end
 
-local hudRound = mkText(120, 120, 220, 255)
-local hudSafe  = mkText(142, 120, 255, 160)
-local hudStats = mkText(164, 255, 220, 120)
-local hudDown  = mkText(186, 255, 140, 140)
+-- spiral outward from the player; nearest passing ring wins
+local function findSafeSpot(goals, origin, player)
+    if evalGoals(goals, origin, player) then return origin, 0 end
 
-local function setText(obj, on, s)
-    pcall(function()
-        if on and s ~= '' then
-            if obj.Text ~= s then obj.Text = s end
-            if not obj.Visible then obj.Visible = true end
-        elseif obj.Visible then
-            obj.Visible = false
+    local radii = { 8, 16, 26, 38, 52 }
+    for ri = 1, #radii do
+        local rad = radii[ri]
+        local best, bestD = nil, math.huge
+        for ai = 0, 11 do
+            local a = ai * math.pi / 6
+            local cand = Vector3.new(origin.X + math.cos(a) * rad, origin.Y, origin.Z + math.sin(a) * rad)
+            -- drop to the ground under the candidate (RaycastResult.Position is not
+            -- relied on; Distance is the field the game's own module uses)
+            local downDir = Vector3.new(0, -1, 0)
+            local hit = rc(cand + Vector3.new(0, 6, 0), downDir * 40, prmMap)
+            if hit then
+                cand = cand + Vector3.new(0, 6 - hit.Distance, 0)
+                cand = cand + Vector3.new(0, 3, 0)
+                if evalGoals(goals, cand, player) then
+                    local d = (cand - origin).Magnitude
+                    if d < bestD then
+                        best, bestD = cand, d
+                    end
+                end
+            end
         end
-    end)
+        if best then return best, bestD end
+    end
+    return nil, nil
 end
 
--- ---- revive ----
-local downState = false
+-- =====================================================================
+-- revive (Remotes.Revive:FireServer(true) - the game's own Get Up button)
+-- =====================================================================
+local Remotes = RS:FindFirstChild('Remotes')
+local Revive  = Remotes and Remotes:FindFirstChild('Revive')
+if not Revive then
+    warn('[' .. NAME .. '] Remotes.Revive not found - auto get-up idle')
+end
 
 local function fireRevive(tag)
     if not Revive then return false end
@@ -113,7 +318,6 @@ local function fireRevive(tag)
     return ok
 end
 
--- The game builds a "GetUp" button only while you are down; visible == down.
 local function isDowned()
     local pg = lp:FindFirstChild('PlayerGui')
     if not pg then return false end
@@ -132,16 +336,53 @@ local function isDowned()
     return false
 end
 
--- ---- menu ----
+-- =====================================================================
+-- HUD
+-- =====================================================================
+local FONT = 2
+if Drawing.Fonts ~= nil and Drawing.Fonts.SystemBold ~= nil then FONT = Drawing.Fonts.SystemBold end
+
+local function mkText(y, r, g, b)
+    local t = trackD(Drawing.new('Text'))
+    sset(t, 'Text', '')
+    sset(t, 'Color', Color3.fromRGB(r, g, b))
+    sset(t, 'Outline', true)
+    sset(t, 'Center', false)
+    sset(t, 'Font', FONT)
+    pcall(function() t.FontSize = 16 end)
+    pcall(function() t.TextSize = 16 end)
+    sset(t, 'Transparency', 1)
+    sset(t, 'Position', Vector2.new(20, y))
+    sset(t, 'Visible', false)
+    return t
+end
+
+local hudWin  = mkText(120, 120, 255, 150)
+local hudGoal = mkText(142, 200, 220, 255)
+local hudInfo = mkText(164, 255, 220, 120)
+local hudDown = mkText(186, 255, 140, 140)
+
+local function setText(obj, on, s)
+    pcall(function()
+        if on and s ~= '' then
+            if obj.Text ~= s then obj.Text = s end
+            if not obj.Visible then obj.Visible = true end
+        elseif obj.Visible then
+            obj.Visible = false
+        end
+    end)
+end
+
+-- =====================================================================
+-- menu
+-- =====================================================================
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local getterWorks = {}
 
 local TOGGLES = {
+    { key = 'autoWin',    id = 'wid_win',    name = 'Auto win' },
     { key = 'autoRevive', id = 'wid_revive', name = 'Auto get up' },
-    { key = 'downedHud',  id = 'wid_downed', name = 'Downed indicator' },
-    { key = 'roundHud',   id = 'wid_round',  name = 'Round status' },
-    { key = 'safeHud',    id = 'wid_safe',   name = 'Safe indicator' },
-    { key = 'statsHud',   id = 'wid_stats',  name = 'Player stats' },
+    { key = 'hud',        id = 'wid_hud',    name = 'HUD' },
     { key = 'alerts',     id = 'wid_alerts', name = 'Alerts' },
 }
 
@@ -199,24 +440,32 @@ local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
-        local sec = mkSection(tab, 'Revive')
+        local sec = mkSection(tab, 'Auto win')
         if sec then
+            mkToggle(sec, 'Auto win', 'wid_win', true, applyBool('autoWin'))
             mkToggle(sec, 'Auto get up', 'wid_revive', true, applyBool('autoRevive'))
-            mkToggle(sec, 'Downed indicator', 'wid_downed', true, applyBool('downedHud'))
-            mkButton(sec, 'Test: fire get up now', function()
-                print('[' .. NAME .. '] manual get-up test')
-                local d = isDowned()
-                print('[' .. NAME .. '] downed = ' .. tostring(d))
-                fireRevive('manual')
+            mkToggle(sec, 'Alerts', 'wid_alerts', true, applyBool('alerts'))
+            mkButton(sec, 'Test: evaluate goal now', function()
+                local ds = RS:FindFirstChild('DisasterState')
+                local raw = ds and ds:GetAttribute('GoalCheck')
+                local goals = decodeGoals(raw)
+                local ch = lp.Character
+                local hrp = ch and ch:FindFirstChild('HumanoidRootPart')
+                print('[' .. NAME .. '] GoalCheck raw = ' .. tostring(raw))
+                if not goals then
+                    print('[' .. NAME .. '] no position goal this round - server judges it')
+                    return
+                end
+                if not hrp then print('[' .. NAME .. '] no HumanoidRootPart') return end
+                print('[' .. NAME .. '] goal passes here = ' .. tostring(evalGoals(goals, hrp.Position, lp)))
+                local spot, dist = findSafeSpot(goals, hrp.Position, lp)
+                print('[' .. NAME .. '] spot = ' .. tostring(spot) .. ' dist = ' .. tostring(dist))
             end)
         end
 
         local hsec = mkSection(tab, 'HUD')
         if hsec then
-            mkToggle(hsec, 'Round status', 'wid_round', true, applyBool('roundHud'))
-            mkToggle(hsec, 'Safe indicator', 'wid_safe', true, applyBool('safeHud'))
-            mkToggle(hsec, 'Player stats', 'wid_stats', true, applyBool('statsHud'))
-            mkToggle(hsec, 'Alerts', 'wid_alerts', true, applyBool('alerts'))
+            mkToggle(hsec, 'HUD', 'wid_hud', true, applyBool('hud'))
         end
     end)
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
@@ -237,7 +486,6 @@ else
     print('[' .. NAME .. '] no UI, running with defaults')
 end
 
--- ---- toggle poller: getter is authoritative once it answers ----
 if HAS_UI then
     task.spawn(function()
         while running do
@@ -261,11 +509,101 @@ if HAS_UI then
     end)
 end
 
--- ---- revive loop ----
-local DOWN_POLL   = 0.25
-local REVIVE_GAP  = 1.0
-local MAX_TRIES   = 5
-local BACKOFF     = 15
+-- =====================================================================
+-- auto win loop: evaluate the goal, walk to the nearest passing spot
+-- =====================================================================
+local SEARCH_INTERVAL = 1.0
+local REACHED         = 5
+
+task.spawn(function()
+    local next = 0
+    local prevSafe = nil
+
+    while running do
+        local ok, err = pcall(function()
+            refreshFilters()
+
+            local ds   = RS:FindFirstChild('DisasterState')
+            local rstr = RS:FindFirstChild('RoundState')
+            local goalAttr = ds and ds:GetAttribute('GoalCheck')
+            local goalText = (ds and ds:GetAttribute('GoalText')) or ''
+            local phase    = rstr and rstr:GetAttribute('Phase')
+            local disaster = (rstr and rstr:GetAttribute('DisasterId')) or ''
+
+            local ch  = lp.Character
+            local hrp = ch and ch:FindFirstChild('HumanoidRootPart')
+            local hum = ch and ch:FindFirstChildOfClass('Humanoid')
+
+            if not hrp or not hum then
+                winState.text = 'no character'
+                winState.safe = false
+            elseif lp:GetAttribute('InRound') ~= true then
+                winState.text = 'waiting (' .. tostring(phase) .. ')'
+                winState.safe = false
+            elseif downState then
+                winState.text = 'down - getting up'
+            else
+                local goals = decodeGoals(goalAttr)
+                local pos = hrp.Position
+
+                if goals then
+                    local safeNow = evalGoals(goals, pos, lp)
+                    winState.safe = safeNow
+                    if safeNow then
+                        winState.text = 'GOAL PASSES - holding position'
+                        winState.spot = nil
+                    elseif CFG.autoWin then
+                        if winState.spot and (winState.spot - pos).Magnitude <= REACHED then
+                            winState.spot = nil
+                        end
+                        if os.clock() >= next then
+                            next = os.clock() + SEARCH_INTERVAL
+                            local spot, dist = findSafeSpot(goals, pos, lp)
+                            if spot then
+                                winState.spot = spot
+                                winState.text = string.format('moving to safe spot (%.0f studs)', dist or 0)
+                                pcall(function() hum:MoveTo(spot) end)
+                            else
+                                winState.spot = nil
+                                winState.text = 'no safe spot in reach'
+                            end
+                        elseif winState.spot then
+                            pcall(function() hum:MoveTo(winState.spot) end)
+                        else
+                            winState.text = 'unsafe - searching'
+                        end
+                    else
+                        winState.text = 'unsafe (auto win off)'
+                    end
+                else
+                    local gs = lp:GetAttribute('GoalSafe') == true
+                    winState.safe = gs
+                    winState.spot = nil
+                    winState.text = 'server goal: ' .. (gs and 'SAFE' or 'UNSAFE')
+                end
+
+                if CFG.alerts and prevSafe ~= nil and winState.safe ~= prevSafe and goals then
+                    pcall(notify, winState.safe and 'Goal now passes' or 'Goal no longer passes', NAME, 3)
+                end
+                prevSafe = winState.safe
+                winState.disaster = disaster
+                winState.goalText = goalText
+            end
+        end)
+        if not ok then
+            winState.text = 'error'
+        end
+        task.wait(0.4)
+    end
+end)
+
+-- =====================================================================
+-- revive loop
+-- =====================================================================
+local DOWN_POLL  = 0.25
+local REVIVE_GAP = 1.0
+local MAX_TRIES  = 5
+local BACKOFF    = 15
 
 task.spawn(function()
     local wasDown, warnedNoRemote = false, false
@@ -310,45 +648,35 @@ task.spawn(function()
     end
 end)
 
--- ---- hud loop ----
+-- =====================================================================
+-- hud loop
+-- =====================================================================
 task.spawn(function()
     local warned = false
-    local prevRound, prevSafe = nil, nil
 
     while running do
         local ok, err = pcall(function()
-            local inRound  = lp:GetAttribute('InRound')
-            local goalSafe = lp:GetAttribute('GoalSafe')
-            local shift    = lp:GetAttribute('GoalShift')
-            local level    = lp:GetAttribute('Level')
-            local streak   = lp:GetAttribute('Streak')
-            local best     = lp:GetAttribute('BestStreak')
-            local eq       = lp:GetAttribute('Equipment')
+            local level  = lp:GetAttribute('Level')
+            local streak = lp:GetAttribute('Streak')
+            local best   = lp:GetAttribute('BestStreak')
+            local shift  = lp:GetAttribute('GoalShift')
 
-            setText(hudRound, CFG.roundHud, 'Round: ' .. ((inRound == true) and 'ACTIVE' or 'idle'))
+            setText(hudWin, CFG.hud, 'WIN: ' .. tostring(winState.text))
 
-            local safeStr = (goalSafe == true) and 'YES' or 'NO'
-            if type(shift) == 'number' then
-                safeStr = safeStr .. '   shift ' .. string.format('%.1f', shift)
+            local g = tostring(winState.goalText or '')
+            if g == '' then g = 'goal n/a' end
+            if winState.disaster and winState.disaster ~= '' then
+                g = g .. '   [' .. tostring(winState.disaster) .. ']'
             end
-            setText(hudSafe, CFG.safeHud, 'Safe: ' .. safeStr)
+            setText(hudGoal, CFG.hud, g)
 
-            local eqStr = (type(eq) == 'string' and eq ~= '') and ('   ' .. eq) or ''
-            setText(hudStats, CFG.statsHud,
+            local shiftStr = ''
+            if type(shift) == 'number' then shiftStr = string.format('   shift %.1f', shift) end
+            setText(hudInfo, CFG.hud,
                 'Lv ' .. tostring(level) .. '   Streak ' .. tostring(streak) ..
-                '   Best ' .. tostring(best) .. eqStr)
+                '   Best ' .. tostring(best) .. shiftStr)
 
-            setText(hudDown, CFG.downedHud, downState and 'DOWN - getting up' or 'up')
-
-            if CFG.alerts then
-                if prevRound ~= nil and inRound ~= prevRound then
-                    pcall(notify, inRound and 'Round started' or 'Round ended', NAME, 3)
-                end
-                if prevSafe ~= nil and goalSafe ~= prevSafe then
-                    pcall(notify, (goalSafe == true) and 'You are safe' or 'You are NOT safe', NAME, 3)
-                end
-            end
-            prevRound, prevSafe = inRound, goalSafe
+            setText(hudDown, CFG.hud, downState and 'DOWN - getting up' or 'up')
         end)
         if not ok and not warned then
             warned = true
