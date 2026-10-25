@@ -1,32 +1,34 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.6  -  fixes the 'Unknown property __y' log spam
+--  v11.7
 --
---  WHAT WAS WRONG
---    v11.5 tracked HUD changes by writing my own fields onto the
---    Drawing object (panelBack.__y, panelBack.__h). Drawing rejects
---    unknown properties, so the HUD connection threw every single
---    frame - hundreds of log lines a second. That is what made the
---    script feel heavy and why farm kill looked like it was barely
---    hitting: the frame work was going into error text.
+--  HIDE UNDER FARM  (fixed: it stays under now)
+--    1. Every BasePart of the character is anchored, not just the
+--       HumanoidRootPart, so a script that unanchors your root cannot
+--       drop the body.
+--    2. The root CFrame and both velocities are written every frame.
+--    3. Drift no longer switches the hide off. It used to bail after
+--       ~0.75 s of drift, which is exactly what you were seeing. Now
+--       it just re-writes and carries on; it prints one line the
+--       first time drift is seen and nothing else.
+--    4. On respawn the new character is teleported to the hide spot
+--       first, then anchored, so the body never sits at spawn.
+--    5. Only two things switch it off: 3 deaths in 25 s, or health
+--       falling below 30% of what it was when you hid.
 --
---  WHAT IT DOES NOW
---    1. Those two values live in plain locals, not on the Drawing.
---       Only Position/Size/Visible are ever written.
---    2. The whole HUD per-frame body is wrapped in pcall, so if
---       anything else ever trips there it stops writing instead of
---       flooding the log.
---    3. Actor remote lookup no longer caches a failed lookup for the
---       full 3 s. If Attack/PlaySound were not found yet (actor
---       folder still loading), it retries after 0.4 s instead of
---       going touch-only for 3 s.
+--  EGG PICKUP  (stealth)
+--    With Hide Under Farm on, the body stays anchored under the map
+--    and only the root moves for the pickup, so nothing of you is
+--    visible above ground. The hop is: settle 0.06 s, fire, 0.03 s,
+--    fire again, back. No no-clip on the body unless it is not hidden,
+--    and the root is put back in the same pass. Per-egg cooldown 0.6 s
+--    so it does not hammer the prompt.
 --
 --  UNCHANGED
---    Farm Kill: size cycle, firetouchinterest on up to 4 boss parts,
---    Attack/PlaySound burst, no reset, one-line diagnostic.
---    Auto Reset (Main): 10 s with no weapon out and a weapon in the
---    backpack. Hide Under Farm: anchored float + watchdogs.
+--    Farm Kill: size cycle, firetouchinterest, Attack/PlaySound burst,
+--    never resets you. Auto Reset (Main): 10 s with no weapon out and
+--    a weapon in the backpack. Change-only HUD, memoised lookups.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -37,7 +39,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.6'
+local VERSION = 'v11.7'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -64,9 +66,9 @@ local RESET_MAX_WAIT = 15.0
 local HIDE_DEPTH   = 25
 local HIDE_LIFT    = 6
 local HIDE_TOL     = 8
-local HIDE_FALLMAX = 60
-local HIDE_FALLFR  = 45
-local HIDE_BAIL_HP = 0.7
+local HIDE_BAIL_HP = 0.3
+local HIDE_DEATHS  = 3
+local HIDE_DEATH_W = 25.0
 
 local AP_SMALL  = 2
 local AP_HOLD   = 0.03
@@ -78,10 +80,10 @@ local PART_TTL  = 2.0
 local EGG_TTL   = 2.0
 
 local PICK_RATE     = 0.1
-local PICK_COOLDOWN = 0.15
+local PICK_COOLDOWN = 0.6
 local TP_DEPTH      = 3
-local TP_SETTLE     = 0.1
-local TP_HOLD       = 0.12
+local TP_SETTLE     = 0.06
+local TP_FIRE_GAP   = 0.03
 local TP_MAX        = 3.0
 
 -- memo lifetimes
@@ -187,13 +189,16 @@ local pickingNow    = false
 local pickStartedAt = 0
 
 local hideSpot, hideSurface = nil, nil
-local hideChar, hideAnchor  = nil, nil
+local hideChar, hideRoot    = nil, nil
 local hideDeaths, hideHP0   = 0, nil
 local hideFallFrames        = 0
 local hideLocked            = false
 local hideConn              = nil
 local hideResetAt           = nil
 local hideRetryAt           = 0
+local hideWarned            = false
+local hideDeathAt           = {}
+local anchored              = {}
 
 local tpHome, tpAway = nil, false
 local tpSaved        = {}
@@ -483,8 +488,6 @@ local function remotesOfActor(name)
     return ev:FindFirstChild('Attack'), ev:FindFirstChild('PlaySound')
 end
 
--- a failed lookup is only remembered briefly, so a late-loading
--- actor folder does not leave farm kill touch-only for 3 s
 local function actorInfo(tool)
     if not tool then return nil, nil, nil end
 
@@ -948,8 +951,35 @@ local function memoPrune()
 end
 
 --------------------------------------------------------------------
--- HIDE UNDER FARM  (anchored float + watchdogs)
+-- HIDE UNDER FARM  (sticky anchored float)
 --------------------------------------------------------------------
+local function unanchorAll()
+    for i = 1, #anchored do
+        local e = anchored[i]
+        if e.part then pcall(function() e.part.Anchored = e.was end) end
+    end
+
+    anchored = {}
+end
+
+local function anchorAll()
+    local c = LP.Character
+    if not c then return end
+
+    local ok, desc = pcall(function() return c:GetDescendants() end)
+    if not ok or not desc then return end
+
+    for i = 1, #desc do
+        local d = desc[i]
+
+        if isBasePart(d) then
+            local okA, was = pcall(function() return d.Anchored end)
+            anchored[#anchored + 1] = { part = d, was = (okA and was == true) }
+            pcall(function() d.Anchored = true end)
+        end
+    end
+end
+
 local function computeSpots()
     local part = myBasePart()
     if not part then return nil, nil end
@@ -970,14 +1000,6 @@ local function stopHideLoop()
     end
 end
 
-local function unanchorHide()
-    if hideAnchor and hideAnchor.part then
-        local p, was = hideAnchor.part, hideAnchor.was
-        pcall(function() p.Anchored = was end)
-    end
-    hideAnchor = nil
-end
-
 local function surfaceNow()
     local hrp = rootPart()
     if not hrp or not hideSurface then return end
@@ -992,13 +1014,16 @@ end
 local function bailHide(why)
     stopHideLoop()
     surfaceNow()
-    unanchorHide()
+    unanchorAll()
 
     hideLocked     = true
     hideDeaths     = 0
+    hideDeathAt    = {}
     hideHP0        = nil
     hideFallFrames = 0
     hideResetAt    = nil
+    hideWarned     = false
+    hideRoot       = nil
 
     print('[' .. NAME .. '] hide under farm off: ' .. why)
     notifyUser('Hide stopped - flip the toggle off and on to retry', 6)
@@ -1008,14 +1033,14 @@ local function holdAt(spot)
     local hrp = rootPart()
     if not hrp or not spot then return false end
 
-    if hideAnchor == nil or hideAnchor.part ~= hrp then
-        unanchorHide()
-        local ok, was = pcall(function() return hrp.Anchored end)
-        hideAnchor = { part = hrp, was = (ok and was == true) }
+    if hideRoot ~= hrp then
+        hideRoot = hrp
+        unanchorAll()
+        pcall(function() hrp.CFrame = spot end)
+        anchorAll()
     end
 
     pcall(function()
-        hrp.Anchored                = true
         hrp.CFrame                  = spot
         hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
         hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
@@ -1035,7 +1060,11 @@ local function hideFrame()
         end
     end
 
-    if not alive() then return end
+    if not alive() then
+        hideRoot = nil
+        unanchorAll()
+        return
+    end
 
     local hrp = rootPart()
     if not hrp then return end
@@ -1046,19 +1075,30 @@ local function hideFrame()
         hideChar       = LP.Character
         hideHP0        = nil
         hideFallFrames = 0
+        hideWarned     = false
+        hideRoot       = nil
+        unanchorAll()
 
         if ownReset then
             hideResetAt = nil
         else
-            hideDeaths = hideDeaths + 1
+            local now  = tick()
+            local keep = {}
 
-            if hideDeaths >= 2 then
-                bailHide('you died down there twice, that spot is not safe')
-                return
+            for i = 1, #hideDeathAt do
+                if (now - hideDeathAt[i]) < HIDE_DEATH_W then
+                    keep[#keep + 1] = hideDeathAt[i]
+                end
             end
 
-            if hideSurface then
-                pcall(function() hrp.CFrame = hideSurface end)
+            keep[#keep + 1] = now
+            hideDeathAt    = keep
+            hideDeaths     = #keep
+
+            if hideDeaths >= HIDE_DEATHS then
+                bailHide('you died down there ' .. tostring(HIDE_DEATHS)
+                    .. ' times in ' .. tostring(math.floor(HIDE_DEATH_W)) .. 's')
+                return
             end
         end
     end
@@ -1080,7 +1120,7 @@ local function hideFrame()
         if hideHP0 == nil then hideHP0 = hum.Health end
 
         if hideHP0 and hideHP0 > 0 and hum.Health < hideHP0 * HIDE_BAIL_HP then
-            bailHide('something down there is damaging you')
+            bailHide('health fell below ' .. tostring(math.floor(HIDE_BAIL_HP * 100)) .. '%')
             return
         end
     end
@@ -1094,12 +1134,14 @@ local function hideFrame()
 
         if drift > HIDE_TOL then
             hideFallFrames = hideFallFrames + 1
+
+            if hideFallFrames == 60 and not hideWarned then
+                hideWarned = true
+                print('[' .. NAME .. '] hide: the game keeps moving you - re-writing every frame')
+            end
         else
             hideFallFrames = 0
-        end
-
-        if drift > HIDE_FALLMAX or hideFallFrames > HIDE_FALLFR then
-            bailHide('the game keeps pulling you down, Anchored is not sticking here')
+            hideWarned     = false
         end
     end
 end
@@ -1115,16 +1157,19 @@ end
 local function leaveHide()
     stopHideLoop()
     surfaceNow()
-    unanchorHide()
+    unanchorAll()
 
     hideSpot       = nil
     hideSurface    = nil
     hideChar       = nil
+    hideRoot       = nil
     hideDeaths     = 0
+    hideDeathAt    = {}
     hideHP0        = nil
     hideFallFrames = 0
     hideResetAt    = nil
     hideRetryAt    = 0
+    hideWarned     = false
 
     print('[' .. NAME .. '] hide under farm off (put back on the surface)')
 end
@@ -1215,9 +1260,9 @@ local function startHud()
 
     buildHud()
 
-    local vpH, vpAt    = 1080, 0
-    local pbY, pbH     = nil, nil
-    local pbOn         = false
+    local vpH, vpAt = 1080, 0
+    local pbY, pbH  = nil, nil
+    local pbOn      = false
 
     hudConn = RunService.RenderStepped:Connect(function()
         pcall(function()
@@ -1526,23 +1571,26 @@ task.spawn(function()
 
             if Config.HideUnder then
                 stopHideLoop()
-                unanchorHide()
+                unanchorAll()
 
                 baseMemo       = nil
                 baseMemoAt     = 0
                 hideSpot, hideSurface = computeSpots()
 
                 hideChar       = LP.Character
+                hideRoot       = nil
                 hideDeaths     = 0
+                hideDeathAt    = {}
                 hideHP0        = nil
                 hideFallFrames = 0
                 hideResetAt    = nil
                 hideRetryAt    = 0
+                hideWarned     = false
 
                 startHideLoop()
             elseif hideLocked then
                 stopHideLoop()
-                unanchorHide()
+                unanchorAll()
             else
                 leaveHide()
             end
@@ -1734,9 +1782,10 @@ task.spawn(function()
                                     local hrp  = rootPart()
 
                                     if epos and hrp then
-                                        local home = nil
+                                        local hidden = (Config.HideUnder and hideSpot ~= nil)
+                                        local home   = nil
 
-                                        if Config.HideUnder and hideSpot then
+                                        if hidden then
                                             home = hideSpot
                                         else
                                             local okH, cf = pcall(function() return hrp.CFrame end)
@@ -1749,7 +1798,7 @@ task.spawn(function()
                                             tpHome        = home
                                             tpAway        = true
 
-                                            noClipOn()
+                                            if not hidden then noClipOn() end
 
                                             pcall(function()
                                                 hrp.CFrame = CFrame.new(epos.X, epos.Y - TP_DEPTH, epos.Z)
@@ -1759,16 +1808,14 @@ task.spawn(function()
 
                                             if running and Config.Pickup then
                                                 pcall(function() fireproximityprompt(prompt) end)
-                                                task.wait(0.05)
+                                                task.wait(TP_FIRE_GAP)
                                                 pcall(function() fireproximityprompt(prompt) end)
                                             end
 
-                                            task.wait(TP_HOLD)
+                                            local back = rootPart() or hrp
+                                            pcall(function() back.CFrame = home end)
 
-                                            local hrp2 = rootPart()
-                                            pcall(function() (hrp2 or hrp).CFrame = home end)
-
-                                            noClipOff()
+                                            if not hidden then noClipOff() end
 
                                             tpAway     = false
                                             tpHome     = nil
@@ -1790,7 +1837,8 @@ task.spawn(function()
                                                 if okD and type(d) == 'number' then dist = d end
 
                                                 print('[' .. NAME .. '] tp pickup on ' .. tostring(egg.name)
-                                                    .. '  was ' .. tostring(math.floor(dist)) .. ' away')
+                                                    .. '  was ' .. tostring(math.floor(dist)) .. ' away'
+                                                    .. (hidden and '  (hidden hop)' or ''))
                                             end
                                         end
                                     end
@@ -1902,6 +1950,8 @@ task.spawn(function()
                                         hideHP0        = h.Health
                                         hideFallFrames = 0
                                         hideResetAt    = nil
+                                        hideRoot       = nil
+                                        unanchorAll()
                                         holdAt(hideSpot)
                                     end
 
@@ -2167,7 +2217,7 @@ local function stop()
     running = false
 
     pcall(stopHideLoop)
-    pcall(unanchorHide)
+    pcall(unanchorAll)
     pcall(noClipOff)
     pcall(stopHud)
     pcall(restoreAttackParts)
@@ -2185,10 +2235,13 @@ local function stop()
     baseMemo       = nil
     baseMemoAt     = 0
     wepMemo        = nil
+    anchored       = {}
     hideSpot       = nil
     hideSurface    = nil
     hideLocked     = false
     hideResetAt    = nil
+    hideRoot       = nil
+    hideDeathAt    = {}
     pickingNow     = false
     tpAway         = false
     tpHome         = nil
@@ -2200,5 +2253,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - v11.6, HUD spam fixed', 5)
+notifyUser('Loaded - sticky float hide + hidden egg hop', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
