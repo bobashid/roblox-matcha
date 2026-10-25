@@ -1,7 +1,14 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.0
+--  v11.1
+--
+--  v11.1  -  the no-weapon auto reset works while hiding again
+--    v11.0 turned the reset off completely under the map to stop the
+--    death loop, which also meant you sat there with nothing out.
+--    Now it resets, but the reset is marked as YOUR OWN: the hide
+--    loop sees the new character, does not count it as a death down
+--    there, and re-anchors you on the hide spot.
 --
 --  WHY v10.20/21 STILL DROPPED YOU
 --    Writing the CFrame on a timer, or even every frame, does not
@@ -20,9 +27,10 @@
 --       was when the hide started, same bail-out.
 --    4. Death watchdog: if you die while hiding, the new character is
 --       put on the surface (never back under the map). Two deaths and
---       the hide switches itself off.
---    5. The no-weapon auto reset does NOT run while hiding, so it can
---       no longer respawn you straight back under the farm in a loop.
+--       the hide switches itself off. A death caused by our own reset
+--       is not counted.
+--    5. The no-weapon auto reset runs while hiding, and the respawned
+--       character is walked straight back to the hide spot.
 --    6. A stale pickup flag can no longer freeze the hold: after
 --       TP_MAX seconds the flag clears and the float resumes.
 --
@@ -43,7 +51,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.0'
+local VERSION = 'v11.1'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -193,6 +201,7 @@ local hideDeaths, hideHP0   = 0, nil
 local hideFallFrames        = 0
 local hideLocked            = false
 local hideConn              = nil
+local hideResetAt           = nil
 
 local tpHome, tpAway = nil, false
 local tpSaved        = {}
@@ -843,6 +852,7 @@ local function bailHide(why)
     hideDeaths     = 0
     hideHP0        = nil
     hideFallFrames = 0
+    hideResetAt    = nil
 
     print('[' .. NAME .. '] hide under farm off: ' .. why)
     notifyUser('Hide stopped - flip the toggle off and on to retry', 6)
@@ -885,17 +895,26 @@ local function hideFrame()
     if not hrp then return end
 
     if LP.Character ~= hideChar then
-        hideChar   = LP.Character
-        hideDeaths = hideDeaths + 1
-        hideHP0    = nil
+        local ownReset = hideResetAt ~= nil and (tick() - hideResetAt) < FAST_MAX_WAIT
 
-        if hideDeaths >= 2 then
-            bailHide('you died down there twice, that spot is not safe')
-            return
-        end
+        hideChar       = LP.Character
+        hideHP0        = nil
+        hideFallFrames = 0
 
-        if hideSurface then
-            pcall(function() hrp.CFrame = hideSurface end)
+        if ownReset then
+            hideResetAt = nil
+            print('[' .. NAME .. '] back from the reset, holding the spot again')
+        else
+            hideDeaths = hideDeaths + 1
+
+            if hideDeaths >= 2 then
+                bailHide('you died down there twice, that spot is not safe')
+                return
+            end
+
+            if hideSurface then
+                pcall(function() hrp.CFrame = hideSurface end)
+            end
         end
     end
 
@@ -951,6 +970,7 @@ local function leaveHide()
     hideDeaths     = 0
     hideHP0        = nil
     hideFallFrames = 0
+    hideResetAt    = nil
 
     print('[' .. NAME .. '] hide under farm off (put back on the surface)')
 end
@@ -1366,6 +1386,7 @@ task.spawn(function()
                 hideDeaths     = 0
                 hideHP0        = nil
                 hideFallFrames = 0
+                hideResetAt    = nil
 
                 startHideLoop()
             elseif hideLocked then
@@ -1667,7 +1688,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO RESET  (never while hiding)
+-- AUTO RESET  (runs while hiding too, and is marked as our own death)
 --------------------------------------------------------------------
 task.spawn(function()
     local lastKill   = 0
@@ -1677,7 +1698,7 @@ task.spawn(function()
     local watching   = false
 
     while running do
-        if Config.Farm and not Config.HideUnder and alive() and not watching then
+        if Config.Farm and alive() and not watching then
             if LP.Character ~= lastChar then
                 lastChar   = LP.Character
                 emptySince = nil
@@ -1700,11 +1721,13 @@ task.spawn(function()
                     local okKill, why = killCharacter()
 
                     if okKill then
-                        lastKill   = now
-                        emptySince = nil
-                        watching   = true
+                        lastKill    = now
+                        emptySince  = nil
+                        watching    = true
+                        hideResetAt = now
 
-                        print('[' .. NAME .. '] no weapon in hand: resetting')
+                        print('[' .. NAME .. '] no weapon in hand: resetting'
+                            .. (Config.HideUnder and ' (hiding - will hold the spot again)' or ''))
 
                         task.spawn(function()
                             local waited = 0
@@ -1726,6 +1749,7 @@ task.spawn(function()
                             if running then
                                 print('[' .. NAME .. '] still no new character after '
                                     .. tostring(FAST_MAX_WAIT) .. 's - reset once by hand')
+                                hideResetAt = nil
                             end
 
                             watching = false
@@ -1973,6 +1997,7 @@ local function stop()
     hideSpot       = nil
     hideSurface    = nil
     hideLocked     = false
+    hideResetAt    = nil
     pickingNow     = false
     tpAway         = false
     tpHome         = nil
