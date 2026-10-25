@@ -1,0 +1,225 @@
+-- What If Disasters - Matcha LuauVM
+-- Place 109440485612336
+-- Confirmed in game this session: place id, title "What If Disasters", hybrid mode on,
+--   local player attributes InRound / GoalSafe / GoalShift / Level / Streak / BestStreak.
+-- UNVERIFIED: the meaning of GoalShift (numeric, -3.6 at probe time); shown raw.
+-- Read-only script: no remotes fired, no teleport, no input simulation.
+
+local NAME    = 'WhatIfDisasters'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players = game:GetService('Players')
+local lp      = Players.LocalPlayer
+local running = true
+local conns, draws = {}, {}
+
+local function track(c) conns[#conns + 1] = c return c end
+local function trackD(d) draws[#draws + 1] = d return d end
+
+-- ---- config ----
+local CFG = { roundHud = true, safeHud = true, statsHud = true, alerts = true }
+
+local function setBool(key, v)
+    if CFG[key] == v then return end
+    CFG[key] = v
+    print('[' .. NAME .. '] ' .. tostring(key) .. ' = ' .. tostring(v))
+end
+
+-- ---- hud drawings (created once, pooled) ----
+local FONT = 2
+if Drawing.Fonts ~= nil and Drawing.Fonts.SystemBold ~= nil then FONT = Drawing.Fonts.SystemBold end
+
+local function mkText(y, r, g, b)
+    local t = trackD(Drawing.new('Text'))
+    t.Text = ''
+    t.Color = Color3.fromRGB(r, g, b)
+    t.Outline = true
+    t.Center = false
+    t.Font = FONT
+    t.FontSize = 16
+    t.Transparency = 1
+    t.Position = Vector2.new(20, y)
+    t.Visible = false
+    return t
+end
+
+local hudRound = mkText(120, 120, 220, 255)
+local hudSafe  = mkText(142, 120, 255, 160)
+local hudStats = mkText(164, 255, 220, 120)
+
+local function setText(obj, on, s)
+    if on and s ~= '' then
+        if obj.Text ~= s then obj.Text = s end
+        if not obj.Visible then obj.Visible = true end
+    elseif obj.Visible then
+        obj.Visible = false
+    end
+end
+
+-- ---- menu ----
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local getterWorks = {}
+
+local TOGGLES = {
+    { key = 'roundHud', id = 'wid_round',  name = 'Round status' },
+    { key = 'safeHud',  id = 'wid_safe',   name = 'Safe indicator' },
+    { key = 'statsHud', id = 'wid_stats',  name = 'Player stats' },
+    { key = 'alerts',   id = 'wid_alerts', name = 'Alerts' },
+}
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function applyBool(key)
+    return function(...)
+        if getterWorks[key] then return end
+        local v = firstBool(...)
+        if v ~= nil then setBool(key, v) end
+    end
+end
+
+local function mkSection(tab, nm)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(nm, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(nm) end)
+    if ok and sec ~= nil then return sec end
+    warn('[' .. NAME .. '] section ' .. tostring(nm) .. ' failed')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, cb)
+    local tries = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. tostring(label))
+    return false
+end
+
+local built = false
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'HUD')
+        if not sec then return end
+        mkToggle(sec, 'Round status',   'wid_round',  true, applyBool('roundHud'))
+        mkToggle(sec, 'Safe indicator', 'wid_safe',   true, applyBool('safeHud'))
+        mkToggle(sec, 'Player stats',   'wid_stats',  true, applyBool('statsHud'))
+        mkToggle(sec, 'Alerts',         'wid_alerts', true, applyBool('alerts'))
+    end)
+    if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
+    print('[' .. NAME .. '] tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('What If Disasters', function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+else
+    print('[' .. NAME .. '] no UI, running with defaults')
+end
+
+-- ---- toggle poller: getter is authoritative once it answers ----
+if HAS_UI then
+    task.spawn(function()
+        while running do
+            for i = 1, #TOGGLES do
+                local t = TOGGLES[i]
+                local val = nil
+                local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+                if ok1 and type(v1) == 'boolean' then
+                    val = v1
+                else
+                    local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                    if ok2 and type(v2) == 'boolean' then val = v2 end
+                end
+                if val ~= nil then
+                    getterWorks[t.key] = true
+                    setBool(t.key, val)
+                end
+            end
+            task.wait(0.15)
+        end
+    end)
+end
+
+-- ---- hud loop ----
+task.spawn(function()
+    local warned = false
+    local prevRound, prevSafe = nil, nil
+    while running do
+        local ok, err = pcall(function()
+            local inRound  = lp:GetAttribute('InRound')
+            local goalSafe = lp:GetAttribute('GoalSafe')
+            local shift    = lp:GetAttribute('GoalShift')
+            local level    = lp:GetAttribute('Level')
+            local streak   = lp:GetAttribute('Streak')
+            local best     = lp:GetAttribute('BestStreak')
+
+            setText(hudRound, CFG.roundHud, 'Round: ' .. ((inRound == true) and 'ACTIVE' or 'idle'))
+
+            local safeStr = (goalSafe == true) and 'YES' or 'NO'
+            if type(shift) == 'number' then
+                safeStr = safeStr .. '   shift ' .. string.format('%.1f', shift)
+            end
+            setText(hudSafe, CFG.safeHud, 'Safe: ' .. safeStr)
+
+            setText(hudStats, CFG.statsHud, 'Lv ' .. tostring(level) .. '   Streak ' .. tostring(streak) .. '   Best ' .. tostring(best))
+
+            if CFG.alerts then
+                if prevRound ~= nil and inRound ~= prevRound then
+                    pcall(notify, inRound and 'Round started' or 'Round ended', NAME, 3)
+                end
+                if prevSafe ~= nil and goalSafe ~= prevSafe then
+                    pcall(notify, (goalSafe == true) and 'You are safe' or 'You are NOT safe', NAME, 3)
+                end
+            end
+            prevRound, prevSafe = inRound, goalSafe
+        end)
+        if not ok and not warned then
+            warned = true
+            warn('[' .. NAME .. '] hud error: ' .. tostring(err))
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- ---- stop ----
+local function stop()
+    if not running then return end
+    running = false
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    for i = 1, #draws do pcall(function() draws[i]:Remove() end) end
+    draws = {}
+    if HAS_UI then pcall(function() UI.RemoveTab('What If Disasters') end) end
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] loaded ' .. VERSION)
+pcall(notify, 'What If Disasters loaded', NAME, 4)
