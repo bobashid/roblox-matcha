@@ -1,0 +1,106 @@
+-- Hub (universal loader) - Matcha LuauVM
+-- Load it once in any game. It picks the script for the place you are in:
+--   1) exact place id in PLACES
+--   2) game name matched against the repo's file names / aliases
+-- No menu, no input, nothing interactable. If nothing matches it just prints
+-- the place id and game name so you can add one line to PLACES.
+--
+-- Manual load: _G.Hub.load('Dogs')
+
+local NAME    = 'Hub'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local BASE = 'https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/'
+
+-- place id -> file name. Wins over name matching. Add lines as you learn ids.
+local PLACES = {
+    [94009908234110] = 'Dogs',
+}
+
+-- file name + the names/aliases this place might show up as.
+-- keys are normalised: lowercase, letters and digits only.
+local SCRIPTS = {
+    { file = '+1 Upgrade Per Kill', keys = { '1upgradeperkill', 'upgradeperkill' } },
+    { file = 'Auto Roll',           keys = { 'autoroll', 'autoRollGame' } },
+    { file = 'BBC ESP',             keys = { 'bbc', 'bbcesp' } },
+    { file = 'Chop A Forest',       keys = { 'chopaforest', 'chopforest' } },
+    { file = 'Clean Everything',    keys = {} },
+    { file = 'Dogs',                keys = { 'dogs' } },
+    { file = 'Feed A Mosquito',     keys = { 'feedamosquito', 'mosquito' } },
+    { file = 'Hike For Eggs',       keys = { 'hikeforeggs', 'hike' } },
+    { file = 'PRISON LIFE TRIGGERBOT', keys = { 'prisonlifetriggerbot', 'triggerbot' } },
+    { file = 'Prison Life HvH',     keys = { 'prisonlifehvh', 'hvh' } },
+    { file = 'Tower Incremental',   keys = { 'towerincremental' } },
+}
+
+local function norm(s)
+    return (string.lower(tostring(s or '')):gsub('[^%w]', ''))
+end
+
+local function load(file)
+    if type(file) ~= 'string' or file == '' then return false end
+    local enc = file:gsub('%+', '%%2B')
+    enc = enc:gsub(' ', '%%20')
+    print('[' .. NAME .. '] loading ' .. file)
+    local ok, err = pcall(function()
+        local src = game:HttpGet(BASE .. enc, true)
+        local fn = loadstring(src)
+        if not fn then error('compile failed') end
+        fn()
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] load failed for ' .. file .. ': ' .. tostring(err))
+    end
+    return ok
+end
+
+local function pick()
+    local gname = norm(game.Name)
+    local best, bestScore, tie = nil, 0, false
+    for i = 1, #SCRIPTS do
+        local e = SCRIPTS[i]
+        local keys = { norm(e.file) }
+        for j = 1, #e.keys do keys[#keys + 1] = norm(e.keys[j]) end
+        for j = 1, #keys do
+            local k = keys[j]
+            local score = 0
+            if k ~= '' and k == gname then
+                score = 1000 + #k
+            elseif #k >= 4 and #gname >= 4 and (string.find(gname, k, 1, true) or string.find(k, gname, 1, true)) then
+                score = #k
+            end
+            if score > bestScore then
+                bestScore, best, tie = score, e.file, false
+            elseif score > 0 and score == bestScore and e.file ~= best then
+                tie = true
+            end
+        end
+    end
+    if tie then return nil, 'ambiguous game name' end
+    return best, nil
+end
+
+local target, why = PLACES[game.PlaceId], nil
+if not target then
+    target, why = pick()
+end
+
+if target then
+    load(target)
+else
+    print('[' .. NAME .. '] no script for place ' .. tostring(game.PlaceId) .. ' (' .. tostring(game.Name) .. ')' .. (why and (' - ' .. why) or ''))
+    pcall(function() notify('Hub', 'no script for ' .. tostring(game.Name), 4) end)
+end
+
+local function stop()
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, load = load, places = PLACES, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' done - place ' .. tostring(game.PlaceId) .. ' (' .. tostring(game.Name) .. ')')
