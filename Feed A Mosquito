@@ -1,34 +1,38 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.7
+--  v11.8  -  farm kill keeps hitting without a manual M1
 --
---  HIDE UNDER FARM  (fixed: it stays under now)
---    1. Every BasePart of the character is anchored, not just the
---       HumanoidRootPart, so a script that unanchors your root cannot
---       drop the body.
---    2. The root CFrame and both velocities are written every frame.
---    3. Drift no longer switches the hide off. It used to bail after
---       ~0.75 s of drift, which is exactly what you were seeing. Now
---       it just re-writes and carries on; it prints one line the
---       first time drift is seen and nothing else.
---    4. On respawn the new character is teleported to the hide spot
---       first, then anchored, so the body never sits at spawn.
---    5. Only two things switch it off: 3 deaths in 25 s, or health
---       falling below 30% of what it was when you hid.
+--  THE TWO CONDITIONS THAT STOPPED THE HITS
+--    1. The AttackPart was memoised for 2 s per tool. A lot of these
+--       games destroy and rebuild AttackPart on every swing, so after
+--       the first burst the cache pointed at a dead part and every
+--       firetouchinterest went to nothing. The cache is now only
+--       trusted while the part is still a child of the tool; a dead
+--       or rebuilt part is re-resolved on the spot.
+--    2. The touch pair was only ever pressed (state 0). Roblox fires a
+--       Touch once per pair and then ignores it until the pair is
+--       released (state 1). So the first touch landed, and after that
+--       the same AttackPart vs boss part pair was permanently hot -
+--       nothing landed again until the game tore the pair down, which
+--       is exactly what your manual M1 did. Every pass now presses
+--       (0), waits TOUCH_HOLD, then releases (1), so each pass is a
+--       fresh touch.
 --
---  EGG PICKUP  (stealth)
---    With Hide Under Farm on, the body stays anchored under the map
---    and only the root moves for the pickup, so nothing of you is
---    visible above ground. The hop is: settle 0.06 s, fire, 0.03 s,
---    fire again, back. No no-clip on the body unless it is not hidden,
---    and the root is put back in the same pass. Per-egg cooldown 0.6 s
---    so it does not hammer the prompt.
+--  ALSO
+--    3. CanTouch is re-asserted on the AttackPart each pass, in case
+--       the game turns it off when the swing animation ends.
+--    4. Tool:Activate() is called each pass when the VM exposes it -
+--       that is the API an M1 click goes through, and some games only
+--       count a hit while their own swing state is running. Wrapped in
+--       pcall, and it prints once if the VM does not have it.
 --
 --  UNCHANGED
---    Farm Kill: size cycle, firetouchinterest, Attack/PlaySound burst,
---    never resets you. Auto Reset (Main): 10 s with no weapon out and
---    a weapon in the backpack. Change-only HUD, memoised lookups.
+--    Hide Under Farm: every part anchored, root re-written every
+--    frame, drift never switches it off, 3 deaths in 25 s or health
+--    under 30% does. Hidden egg hop moves only the root.
+--    Auto Reset (Main): 10 s with no weapon out. Farm Kill never
+--    resets you. Change-only HUD, memoised lookups.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -39,7 +43,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.7'
+local VERSION = 'v11.8'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -56,6 +60,7 @@ local HEAL_REFIRE  = 1.0
 local COLLECT_RATE = 1.5
 local HIT_RATE     = 0.12
 local TOUCH_PARTS  = 4
+local TOUCH_HOLD   = 0.035
 local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
@@ -270,6 +275,8 @@ local function itemTypeOf(tool)
     return nil
 end
 
+-- the cached part is only trusted while it is still a child of the tool:
+-- these games rebuild AttackPart on every swing
 local function attackPartOf(tool)
     if not tool then return nil end
 
@@ -277,7 +284,13 @@ local function attackPartOf(tool)
     local now = tick()
 
     local rec = k and apMemo[k]
-    if rec and (now - rec.at) < MEMO_AP then return rec.ap end
+
+    if rec and (now - rec.at) < MEMO_AP then
+        local p = rec.ap
+
+        if p == nil then return nil end
+        if p.Parent == tool then return p end
+    end
 
     local ap = tool:FindFirstChild('AttackPart')
 
@@ -1988,7 +2001,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL  (no reset here, reports what it sees)
+-- FARM KILL  (touch is pressed and released every pass)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == 'function')
@@ -1997,13 +2010,15 @@ task.spawn(function()
     local warnedTool = false
     local warnedAct  = false
     local warnedRmt  = false
+    local warnedSw   = false
     local staleWarn  = false
     local noBossWarn = false
 
-    local lastSum  = nil
-    local stale    = 0
-    local cachedId = nil
+    local lastSum   = nil
+    local stale     = 0
+    local cachedId  = nil
     local cachedAtk, cachedPs = nil, nil
+    local swingOk   = nil
 
     while running do
         if Config.Farm and alive() then
@@ -2041,12 +2056,21 @@ task.spawn(function()
                         warnedRmt = false
                     end
 
+                    -- an M1 click is Tool:Activate(); some games only count
+                    -- a hit while their own swing state is running
+                    if swingOk == nil then
+                        swingOk = pcall(function() tool:Activate() end)
+                    else
+                        pcall(function() tool:Activate() end)
+                    end
+
                     if not wasOn then
                         wasOn = true
                         print('[' .. NAME .. '] farm kill on: ' .. tostring(tool.Name)
                             .. ' / ' .. tostring(ap.Name)
                             .. ' / touch=' .. tostring(hasTouch)
-                            .. ' / burst=' .. tostring(cachedAtk ~= nil))
+                            .. ' / burst=' .. tostring(cachedAtk ~= nil)
+                            .. ' / swing=' .. tostring(swingOk))
                     end
 
                     if not cachedAtk and not warnedRmt then
@@ -2055,7 +2079,15 @@ task.spawn(function()
                             .. tostring(id) .. ' - touch only')
                     end
 
+                    if swingOk == false and not warnedSw then
+                        warnedSw = true
+                        print('[' .. NAME .. '] Tool:Activate is not available here - touch only')
+                    end
+
                     rememberPart(ap)
+
+                    -- the game can turn touch off when a swing ends
+                    pcall(function() ap.CanTouch = true end)
 
                     local big, seen = mapSize()
 
@@ -2075,6 +2107,8 @@ task.spawn(function()
                         if hasTouch then
                             pruneParts()
 
+                            local targets = {}
+
                             for i = 1, #list do
                                 local boss = list[i]
                                 local hp   = bossHealth(boss)
@@ -2083,9 +2117,24 @@ task.spawn(function()
                                     local parts = bossParts(boss)
 
                                     for j = 1, #parts do
-                                        local part = parts[j]
-                                        pcall(function() firetouchinterest(ap, part, 0) end)
+                                        targets[#targets + 1] = parts[j]
                                     end
+                                end
+                            end
+
+                            for j = 1, #targets do
+                                local part = targets[j]
+                                pcall(function() firetouchinterest(ap, part, 0) end)
+                            end
+
+                            -- a Touch only fires once per pair until the pair
+                            -- is released, so release it again every pass
+                            if #targets > 0 then
+                                task.wait(TOUCH_HOLD)
+
+                                for j = 1, #targets do
+                                    local part = targets[j]
+                                    pcall(function() firetouchinterest(ap, part, 1) end)
                                 end
                             end
                         end
@@ -2144,10 +2193,12 @@ task.spawn(function()
             warnedTool = false
             warnedAct  = false
             warnedRmt  = false
+            warnedSw   = false
             stale      = 0
             staleWarn  = false
             noBossWarn = false
             lastSum    = nil
+            swingOk    = nil
             cachedId, cachedAtk, cachedPs = nil, nil, nil
 
             if reachOn then restoreAttackParts() end
@@ -2253,5 +2304,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - sticky float hide + hidden egg hop', 5)
+notifyUser('Loaded - v11.8, hits re-touch every pass', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
