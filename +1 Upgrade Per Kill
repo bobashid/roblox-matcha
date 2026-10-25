@@ -1,20 +1,21 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- Confirmed in game: the server only accepts crit = true while the attacker is
--- actually falling, which is why you had to jump. Crit Only mode now jumps for
--- you: when no crit window is open it applies ONE upward velocity impulse to
--- the HumanoidRootPart (throttled), waits until the falling check passes, then
--- swings. So crits land without you pressing space.
---   Crit Only ON  (default): self-jump, swing only while falling, verify each
---                   swing by the target's health dropping, retry instantly if
---                   the swing was rejected.
---   Crit Only OFF (Spam):   constant swings, no jump assist, no pending gate.
--- Auto Jump can be turned off if you would rather jump yourself.
--- Health bars: collector 3 Hz, health 10 Hz, per-frame renderer only reads
--- Position and writes pooled Drawings, with a distance cull.
+-- v4.1 - two fixes for "works for me, not for my friend":
+--   1. The old build hardcoded EXCLUDE = { o_csf, fakeaimboton }. Every player
+--      carrying one of those names was dropped from the target list, so two
+--      accounts testing on each other could never damage each other. Now ONLY
+--      the local player is excluded, by UserId, plus an optional name list.
+--   2. Crit Only swung exclusively while falling. If the jump impulse did not
+--      take on that client, no swing ever fired, which looks exactly like a
+--      dead aura. After CRIT_STALL seconds without a crit window the aura
+--      swings anyway; crit stays true in the payload.
+-- Also: NPC scanning now skips player characters via GetPlayerFromCharacter,
+-- so the local player can never be picked up as a "bot" target.
+-- Debug toggle prints targets / in range / swings / confirms every 5 s.
+-- Payload: { crit, sprint, charge, vt, dir, eye, t } (confirmed in game).
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v4.0'
+local VERSION = 'v4.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -44,20 +45,20 @@ local HURT_WINDOW   = 1.0     -- HurtResistantTicks 20 at 20 tps
 local VERIFY_AFTER  = 0.12    -- wait this long before judging a swing
 local MAX_BAR_DIST  = 220     -- do not draw bars past this many studs
 
--- jump assist (only used by Crit Only mode). One impulse per JUMP_COOLDOWN;
--- a velocity write is expensive, so it never happens per frame.
-local JUMP_VEL      = 26      -- upward studs/s; raise if you never leave the ground
+-- jump assist (Crit Only mode). One impulse per JUMP_COOLDOWN; a velocity
+-- write is expensive, so it never happens per frame.
+local JUMP_VEL      = 26      -- upward studs/s
 local JUMP_COOLDOWN = 0.45    -- seconds between auto jumps
 local CRIT_VEL_Y    = -1.5    -- falling faster than this counts as airborne
+local CRIT_STALL    = 1.5     -- no crit window for this long -> swing anyway
 
 local HEAD_OFFSET = Vector3.new(0, 2.6, 0)
 local FEET_OFFSET = Vector3.new(0, 2.4, 0)
 local EYE_OFFSET  = Vector3.new(0, 1.5, 0)
 
-local EXCLUDE = {
-    ['o_csf']        = true,
-    ['fakeaimboton'] = true,
-}
+-- Only the local player is excluded automatically. Add lowercase names here
+-- if you ever want to skip someone specific:  ['name'] = true
+local EXCLUDE = {}
 
 local NPC_FOLDERS = { 'Bots', 'NPCs', 'Npcs', 'Enemies', 'Dummies', 'AI' }
 
@@ -67,12 +68,16 @@ local targets  = {}
 local lastHit  = {}
 local pending  = {}
 local lastJump = 0
+local lastCrit = 0
+
+local statTargets, statZoneSkip, statSwings, statConfirms = 0, 0, 0, 0
 
 local cfg = {
     aura     = true,
     bars     = true,
     critMode = true,
     autoJump = true,
+    debug    = false,
 }
 
 local conns    = {}
@@ -99,6 +104,14 @@ local function myRoot()
     local c = lp.Character
     if not c then return nil end
     return c:FindFirstChild('HumanoidRootPart')
+end
+
+local function myZone()
+    local c = lp.Character
+    if not c then return 'none' end
+    local ok, v = pcall(function() return c:GetAttribute('Zone') end)
+    if ok then return tostring(v) end
+    return 'nil'
 end
 
 -- true while actually falling, which is what the server checks for a crit
@@ -245,8 +258,14 @@ local function scanNPCs(out)
         local inst = kids[i]
         local cls = inst.ClassName
         if cls == 'Model' then
-            local t = buildTarget(inst, 'n' .. tostring(inst.Address), nil)
-            if t and inst:GetAttribute('Zone') ~= 'Lobby' then out[#out + 1] = t end
+            -- a player character is not an NPC; it is already handled by the
+            -- player pass (and this is what used to let the aura target you)
+            local okp, owner = pcall(function() return Players:GetPlayerFromCharacter(inst) end)
+            local isChar = okp and owner ~= nil
+            if not isChar then
+                local t = buildTarget(inst, 'n' .. tostring(inst.Address), nil)
+                if t and inst:GetAttribute('Zone') ~= 'Lobby' then out[#out + 1] = t end
+            end
         elseif cls == 'Folder' then
             local wanted = false
             for k = 1, #NPC_FOLDERS do
@@ -257,8 +276,11 @@ local function scanNPCs(out)
                 for j = 1, #sub do
                     local m = sub[j]
                     if m.ClassName == 'Model' then
-                        local t = buildTarget(m, 'n' .. tostring(m.Address), nil)
-                        if t then out[#out + 1] = t end
+                        local okm, owner2 = pcall(function() return Players:GetPlayerFromCharacter(m) end)
+                        if not (okm and owner2 ~= nil) then
+                            local t = buildTarget(m, 'n' .. tostring(m.Address), nil)
+                            if t then out[#out + 1] = t end
+                        end
                     end
                 end
             end
@@ -322,8 +344,8 @@ local function mkToggle(sec, label, id, default, apply)
         if v ~= nil then apply(v) end
     end
     local tries = {
-        function() sec:Toggle(label, id, default, cb) end,
         function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
         function() sec:Toggle(label, default, cb) end,
     }
     for i = 1, #tries do
@@ -339,10 +361,11 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Kill Aura')
         if not sec then return end
-        mkToggle(sec, 'Kill Aura',   'aura',      true, function(v) setBool('aura', v) end)
-        mkToggle(sec, 'Crit Only',   'crit_mode', true, function(v) setBool('critMode', v) end)
-        mkToggle(sec, 'Auto Jump',   'auto_jump', true, function(v) setBool('autoJump', v) end)
-        mkToggle(sec, 'Health Bars', 'bars',      true, function(v) setBool('bars', v) end)
+        mkToggle(sec, 'Kill Aura',   'aura',      true,  function(v) setBool('aura', v) end)
+        mkToggle(sec, 'Crit Only',   'crit_mode', true,  function(v) setBool('critMode', v) end)
+        mkToggle(sec, 'Auto Jump',   'auto_jump', true,  function(v) setBool('autoJump', v) end)
+        mkToggle(sec, 'Health Bars', 'bars',      true,  function(v) setBool('bars', v) end)
+        mkToggle(sec, 'Debug',       'debug',     false, function(v) setBool('debug', v) end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -387,6 +410,10 @@ task.spawn(function()
                 local j = UI.GetValue('auto_jump')
                 if type(j) ~= 'boolean' then j = UI.GetValue('Auto Jump') end
                 if type(j) == 'boolean' then cfg.autoJump = j end
+
+                local d = UI.GetValue('debug')
+                if type(d) ~= 'boolean' then d = UI.GetValue('Debug') end
+                if type(d) == 'boolean' then cfg.debug = d end
             end)
         end
         task.wait(0.1)
@@ -398,19 +425,28 @@ end)
 task.spawn(function()
     while running do
         local out = {}
+        local skipped = 0
         local plist = Players:GetPlayers()
         for i = 1, #plist do
             local plr = plist[i]
-            if plr ~= lp and not excluded(plr.Name) then
+            local isSelf = (plr.UserId == lp.UserId)
+            if not isSelf and not excluded(plr.Name) then
                 local c = plr.Character
-                if c and c:GetAttribute('Zone') == 'Arena' then
-                    local t = buildTarget(c, 'p' .. tostring(plr.UserId), plr)
-                    if t then out[#out + 1] = t end
+                if c then
+                    local zone = c:GetAttribute('Zone')
+                    if zone == 'Arena' then
+                        local t = buildTarget(c, 'p' .. tostring(plr.UserId), plr)
+                        if t then out[#out + 1] = t end
+                    else
+                        skipped = skipped + 1
+                    end
                 end
             end
         end
         pcall(scanNPCs, out)
-        targets = out
+        targets      = out
+        statTargets  = #out
+        statZoneSkip = skipped
         task.wait(COLLECT_EVERY)
     end
 end)
@@ -445,7 +481,8 @@ task.spawn(function()
                     end
                 end
                 if cur ~= nil and cur < p.hp - 0.01 then
-                    lastHit[key] = p.t
+                    lastHit[key]   = p.t
+                    statConfirms   = statConfirms + 1
                 end
             end
         end
@@ -454,7 +491,36 @@ task.spawn(function()
     end
 end)
 
--- kill aura: Crit Only self-jumps and swings only while falling ------
+-- DEBUG: one line every 5 s, only when the Debug toggle is on ---------
+
+task.spawn(function()
+    while running do
+        task.wait(5)
+        if cfg.debug then
+            local inRange = 0
+            local root = myRoot()
+            if root then
+                local myPos = root.Position
+                local list  = targets
+                for i = 1, #list do
+                    local tr = list[i].root
+                    if tr and tr.Parent and (tr.Position - myPos).Magnitude <= RANGE then
+                        inRange = inRange + 1
+                    end
+                end
+            end
+            print('[' .. NAME .. '] targets=' .. statTargets ..
+                  ' skippedZone=' .. statZoneSkip ..
+                  ' inRange=' .. inRange ..
+                  ' swings=' .. statSwings ..
+                  ' confirms=' .. statConfirms ..
+                  ' zone=' .. myZone() ..
+                  ' crit=' .. tostring(falling(root)))
+        end
+    end
+end)
+
+-- kill aura: Crit Only self-jumps, and never goes fully silent ---------
 
 task.spawn(function()
     local idx = 0
@@ -469,11 +535,14 @@ task.spawn(function()
                 local swingOk  = true
 
                 if cfg.critMode then
-                    -- the server only credits a crit while falling
-                    swingOk = airborne
-                    if not airborne and cfg.autoJump then
+                    if airborne then
+                        lastCrit = now
+                    elseif cfg.autoJump then
                         tryJump(root, now)
                     end
+                    -- if no crit window has opened for CRIT_STALL seconds,
+                    -- swing anyway: a dead aura is worse than a missed crit
+                    swingOk = airborne or (now - lastCrit) >= CRIT_STALL
                 end
 
                 if swingOk then
@@ -503,6 +572,7 @@ task.spawn(function()
                                         local hpBefore = t.hp
                                         fireAt(t.model, eye, pos)
                                         pending[t.key] = { t = now, hp = hpBefore }
+                                        statSwings = statSwings + 1
                                         fired = true
                                         break
                                     end
