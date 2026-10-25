@@ -1,38 +1,39 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.8  -  farm kill keeps hitting without a manual M1
+--  v11.9  -  egg pickup without teleporting (same trick as the killing)
 --
---  THE TWO CONDITIONS THAT STOPPED THE HITS
---    1. The AttackPart was memoised for 2 s per tool. A lot of these
---       games destroy and rebuild AttackPart on every swing, so after
---       the first burst the cache pointed at a dead part and every
---       firetouchinterest went to nothing. The cache is now only
---       trusted while the part is still a child of the tool; a dead
---       or rebuilt part is re-resolved on the spot.
---    2. The touch pair was only ever pressed (state 0). Roblox fires a
---       Touch once per pair and then ignores it until the pair is
---       released (state 1). So the first touch landed, and after that
---       the same AttackPart vs boss part pair was permanently hot -
---       nothing landed again until the game tore the pair down, which
---       is exactly what your manual M1 did. Every pass now presses
---       (0), waits TOUCH_HOLD, then releases (1), so each pass is a
---       fresh touch.
+--  WHY THE OLD PICKUP RETRIED AND FAILED
+--    It only fired the egg's ProximityPrompt. The server checks how
+--    far you are from the egg, so from your base the prompt is fired
+--    and ignored - that is the retry loop you were seeing.
 --
---  ALSO
---    3. CanTouch is re-asserted on the AttackPart each pass, in case
---       the game turns it off when the swing animation ends.
---    4. Tool:Activate() is called each pass when the VM exposes it -
---       that is the API an M1 click goes through, and some games only
---       count a hit while their own swing state is running. Wrapped in
---       pcall, and it prints once if the VM does not have it.
+--  WHAT IT DOES NOW
+--    Auto Pickup (with TP Pickup off) picks the egg up the same way
+--    farm kill hits mosquitos: firetouchinterest between your
+--    HumanoidRootPart and the egg's parts, pressed then released.
+--    A touch report is client side, so distance does not matter - it
+--    reaches across the map and you never move. The prompt is then
+--    fired once as a second trigger, in case this game picks up on
+--    the prompt rather than the touch.
+--
+--    After each attempt it waits PICK_VERIFY and checks whether the
+--    egg is still parented. If it is gone, that egg is done. If not,
+--    the egg gets a fail count and is skipped for PICK_FAIL_W once it
+--    reaches PICK_FAIL_MAX, so it stops hammering a dead egg.
+--
+--    It prints once which of the two worked. If it says touch/prompt
+--    is not taking eggs, leave Auto Pickup on and also turn on
+--    TP Pickup - that hop is the guaranteed fallback.
+--
+--    TP Pickup still does the hidden hop when Hide Under Farm is on.
 --
 --  UNCHANGED
+--    Farm Kill: size cycle, press+release touch every pass, stale
+--    AttackPart re-resolve, Attack/PlaySound burst, never resets you.
 --    Hide Under Farm: every part anchored, root re-written every
---    frame, drift never switches it off, 3 deaths in 25 s or health
---    under 30% does. Hidden egg hop moves only the root.
---    Auto Reset (Main): 10 s with no weapon out. Farm Kill never
---    resets you. Change-only HUD, memoised lookups.
+--    frame, drift never switches it off; 3 deaths in 25 s or health
+--    under 30% does. Auto Reset (Main): 10 s with no weapon out.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -43,7 +44,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.8'
+local VERSION = 'v11.9'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -86,6 +87,9 @@ local EGG_TTL   = 2.0
 
 local PICK_RATE     = 0.1
 local PICK_COOLDOWN = 0.6
+local PICK_VERIFY   = 0.25
+local PICK_FAIL_MAX = 4
+local PICK_FAIL_W   = 8.0
 local TP_DEPTH      = 3
 local TP_SETTLE     = 0.06
 local TP_FIRE_GAP   = 0.03
@@ -401,6 +405,34 @@ local function eggPosition(model)
     local ok, p = pcall(function() return r.Position end)
     if ok and p then return p end
     return nil
+end
+
+-- the parts a touch can be reported against on an egg
+local function eggParts(model)
+    local out = {}
+    if not model then return out end
+
+    local r = model:FindFirstChild('HumanoidRootPart')
+    if r and isBasePart(r) then out[#out + 1] = r end
+
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+
+    if ok and desc then
+        for i = 1, #desc do
+            if #out >= TOUCH_PARTS then break end
+            local d = desc[i]
+            if isBasePart(d) and d ~= r then out[#out + 1] = d end
+        end
+    end
+
+    return out
+end
+
+local function stillThere(model)
+    if not model then return false end
+    local ok, p = pcall(function() return model.Parent end)
+    if not ok then return false end
+    return p ~= nil
 end
 
 --------------------------------------------------------------------
@@ -1751,17 +1783,47 @@ local function anyRarityOn()
     return false
 end
 
+-- fake touch on the egg, the same thing farm kill does to mosquitos.
+-- a touch report is client side, so range does not matter.
+local function touchEgg(egg, hrp)
+    if type(firetouchinterest) ~= 'function' then return 0 end
+
+    local parts = eggParts(egg.model)
+    if #parts == 0 then return 0 end
+
+    for i = 1, #parts do
+        local part = parts[i]
+        pcall(function() firetouchinterest(hrp, part, 0) end)
+    end
+
+    task.wait(TOUCH_HOLD)
+
+    for i = 1, #parts do
+        local part = parts[i]
+        pcall(function() firetouchinterest(hrp, part, 1) end)
+    end
+
+    return #parts
+end
+
 task.spawn(function()
     local hasPrompt = (type(fireproximityprompt) == 'function')
 
-    local warned = false
-    local wasOn  = false
-    local taken  = 0
-    local lastAt = {}
-    local diag   = false
+    local warned    = false
+    local wasOn     = false
+    local taken     = 0
+    local lastAt    = {}
+    local failAt    = {}
+    local saidTouch = false
+    local saidFail  = false
+    local diag      = false
 
     if not hasPrompt then
         print('[' .. NAME .. '] fireproximityprompt missing - re-run the Matcha loader')
+    end
+
+    if type(firetouchinterest) ~= 'function' then
+        print('[' .. NAME .. '] firetouchinterest missing - egg pickup is prompt only')
     end
 
     while running do
@@ -1786,15 +1848,24 @@ task.spawn(function()
                             if (now - lastAt[k]) < PICK_COOLDOWN then ready = false end
                         end
 
+                        if ready and k ~= nil then
+                            local f = failAt[k]
+
+                            if f and f.n >= PICK_FAIL_MAX
+                                and (now - f.at) < PICK_FAIL_W then
+                                ready = false
+                            end
+                        end
+
                         if ready then
                             local prompt = eggPrompt(egg.model)
+                            local hrp    = rootPart()
 
-                            if prompt then
+                            if prompt and hrp then
                                 if Config.TPPickup then
                                     local epos = eggPosition(egg.model)
-                                    local hrp  = rootPart()
 
-                                    if epos and hrp then
+                                    if epos then
                                         local hidden = (Config.HideUnder and hideSpot ~= nil)
                                         local home   = nil
 
@@ -1838,7 +1909,10 @@ task.spawn(function()
                                             taken        = taken + 1
                                             lastPickupAt = tick()
 
-                                            if k ~= nil then lastAt[k] = tick() end
+                                            if k ~= nil then
+                                                lastAt[k] = tick()
+                                                failAt[k] = nil
+                                            end
 
                                             if not diag then
                                                 diag = true
@@ -1856,13 +1930,46 @@ task.spawn(function()
                                         end
                                     end
                                 else
-                                    pcall(function() fireproximityprompt(prompt) end)
+                                    -- no teleport: touch the egg, then fire the prompt
+                                    local n = touchEgg(egg, hrp)
 
-                                    done         = true
-                                    taken        = taken + 1
-                                    lastPickupAt = tick()
+                                    if running and Config.Pickup then
+                                        pcall(function() fireproximityprompt(prompt) end)
+                                        task.wait(TP_FIRE_GAP)
+                                        pcall(function() fireproximityprompt(prompt) end)
+                                    end
 
-                                    if k ~= nil then lastAt[k] = tick() end
+                                    task.wait(PICK_VERIFY)
+
+                                    done = true
+
+                                    if not stillThere(egg.model) then
+                                        taken        = taken + 1
+                                        lastPickupAt = tick()
+
+                                        if k ~= nil then
+                                            lastAt[k] = tick()
+                                            failAt[k] = nil
+                                        end
+
+                                        if not saidTouch then
+                                            saidTouch = true
+                                            print('[' .. NAME .. '] egg pickup: touch took '
+                                                .. tostring(egg.name) .. ' (' .. tostring(n)
+                                                .. ' parts) - no teleport needed')
+                                        end
+                                    elseif k ~= nil then
+                                        local f = failAt[k] or { n = 0, at = 0 }
+
+                                        f.n  = f.n + 1
+                                        f.at = tick()
+                                        failAt[k] = f
+
+                                        if f.n >= PICK_FAIL_MAX and not saidFail then
+                                            saidFail = true
+                                            print('[' .. NAME .. '] egg pickup: touch and prompt are not taking eggs - turn on TP Pickup')
+                                        end
+                                    end
                                 end
                             end
                         end
@@ -1876,7 +1983,7 @@ task.spawn(function()
                 if not wasOn then
                     wasOn = true
                     print('[' .. NAME .. '] auto pickup on ('
-                        .. (Config.TPPickup and 'tp under egg' or 'prompt') .. ')')
+                        .. (Config.TPPickup and 'tp under egg' or 'touch, no teleport') .. ')')
                 end
             elseif not warned then
                 warned = true
@@ -2304,5 +2411,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - v11.8, hits re-touch every pass', 5)
+notifyUser('Loaded - egg pickup is touch based, no teleport needed', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
