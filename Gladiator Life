@@ -1,7 +1,7 @@
 -- Gladiator Life (place 136567192786299) - ESP + manual stat scan - Matcha LuauVM
 --
--- v1.1 SAFE MODE: getgc no longer runs at load. It only runs when you press
--- Scan, because a boot-time heap scan is the most likely cause of the last crash.
+-- v1.1 SAFE MODE: getgc does NOT run at load. It only runs when you press Scan,
+-- because a heap scan at boot is the most likely cause of the last crash.
 -- ESP uses the two-loop pattern: a slow collector and a per-frame renderer.
 
 local NAME    = 'GladiatorLife'
@@ -33,7 +33,7 @@ local cfg = {
     engVal = 500,
 }
 
--- real field names from the decompiled duel state: x, maxHp, maxEnergy, en, down
+-- field names taken from the decompiled duel state: maxHp, maxEnergy, en, down
 local SCAN_KEYS   = { 'WalkSpeed', 'maxEnergy', 'Stamina', 'Energy' }
 local SPEED_KEYS  = { 'WalkSpeed' }
 local ENERGY_KEYS = { 'maxEnergy', 'Stamina', 'Energy' }
@@ -283,7 +283,7 @@ end
 
 -- boot: nothing expensive here ---------------------------------------
 
-print('[' .. NAME .. '] ESP on. Scan is manual now - open the Gladiator tab and press Scan while in a battle.')
+print('[' .. NAME .. '] ESP active. Scan is manual - open the Gladiator tab, press Scan during a battle.')
 
 local function stop()
     running = false
