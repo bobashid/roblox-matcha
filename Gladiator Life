@@ -1,11 +1,11 @@
--- Gladiator Life (place 136567192786299) - ESP + manual stat scan - Matcha LuauVM
+-- Gladiator Life (place 136567192786299) - ESP + stat tools - Matcha LuauVM
 --
--- v1.1 SAFE MODE: getgc does NOT run at load. It only runs when you press Scan,
--- because a heap scan at boot is the most likely cause of the last crash.
--- ESP uses the two-loop pattern: a slow collector and a per-frame renderer.
+-- v1.2: no player has a Character in this game (turn-based). The fighters are
+-- custom rigs in workspace.FightView and workspace.Figures, so ESP targets those.
+-- getgc runs only when you press Scan, never at load.
 
 local NAME    = 'GladiatorLife'
-local VERSION = 'v1.1'
+local VERSION = 'v1.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -15,7 +15,7 @@ print('[' .. NAME .. '] ' .. VERSION)
 local Players    = game:GetService('Players')
 local RunService = game:GetService('RunService')
 local ws         = game:GetService('Workspace')
-local lp         = Players.LocalPlayer
+local cam        = ws:FindFirstChild('Camera')
 
 local running  = true
 local built    = false
@@ -25,22 +25,23 @@ local conn     = nil
 local nHits    = 0
 
 local cfg = {
-    plr    = true,
-    npc    = true,
-    speed  = false,
-    energy = false,
-    spdVal = 60,
-    engVal = 500,
+    fighters = true,
+    npcs     = false,
+    names    = true,
+    dist     = true,
+    speed    = false,
+    energy   = false,
+    spdVal   = 60,
+    engVal   = 500,
 }
 
--- field names taken from the decompiled duel state: maxHp, maxEnergy, en, down
-local SCAN_KEYS   = { 'WalkSpeed', 'maxEnergy', 'Stamina', 'Energy' }
 local SPEED_KEYS  = { 'WalkSpeed' }
 local ENERGY_KEYS = { 'maxEnergy', 'Stamina', 'Energy' }
+local SCAN_KEYS   = { 'WalkSpeed', 'maxEnergy', 'Stamina', 'Energy' }
 
--- esp pool -----------------------------------------------------------
+-- drawing pool -------------------------------------------------------
 
-local POOL    = 24
+local POOL    = 32
 local targets = {}
 local pool    = {}
 
@@ -48,7 +49,7 @@ for i = 1, POOL do
     local box = Drawing.new('Square')
     box.Thickness = 1
     box.Filled    = false
-    box.Color     = Color3.fromRGB(255, 80, 80)
+    box.Color     = Color3.fromRGB(255, 90, 90)
     box.Visible   = false
     local tag = Drawing.new('Text')
     tag.Size    = 13
@@ -56,34 +57,53 @@ for i = 1, POOL do
     tag.Outline = true
     tag.Color   = Color3.fromRGB(255, 255, 255)
     tag.Visible = false
-    pool[i] = { box = box, tag = tag }
+    local info = Drawing.new('Text')
+    info.Size    = 12
+    info.Center  = true
+    info.Outline = true
+    info.Color   = Color3.fromRGB(200, 230, 255)
+    info.Visible = false
+    pool[i] = { box = box, tag = tag, info = info }
+end
+
+-- collector ----------------------------------------------------------
+
+local function rigParts(m)
+    local root = m:FindFirstChild('HumanoidRootPart')
+    if not root then root = m:FindFirstChild('Torso') end
+    if not root then root = m:FindFirstChild('Head') end
+    if not root then return nil, nil end
+    local head = m:FindFirstChild('Head')
+    if not head then head = root end
+    return head, root
+end
+
+local function addRig(out, m)
+    if m.ClassName ~= 'Model' then return end
+    local head, root = rigParts(m)
+    if not head or not root then return end
+    local hum = m:FindFirstChildOfClass('Humanoid')
+    if not hum then return end
+    local hp = hum.Health or 0
+    if hp <= 0 then return end
+    out[#out + 1] = { name = m.Name, head = head, root = root }
 end
 
 local function collect()
     local out = {}
-    if cfg.plr then
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= lp then
-                local char = plr.Character
-                local root = char and char:FindFirstChild('HumanoidRootPart')
-                local head = char and char:FindFirstChild('Head')
-                if root and head then
-                    out[#out + 1] = { name = plr.Name, head = head, root = root }
-                end
+    if cfg.fighters then
+        local fv = ws:FindFirstChild('FightView')
+        if fv then
+            for k, m in ipairs(fv:GetChildren()) do
+                addRig(out, m)
             end
         end
     end
-    if cfg.npc then
-        local folders = { ws:FindFirstChild('Arena'), ws:FindFirstChild('Figures') }
-        for _, f in ipairs(folders) do
-            if f then
-                for _, m in ipairs(f:GetChildren()) do
-                    local root = m:FindFirstChild('HumanoidRootPart')
-                    local hum  = m:FindFirstChildOfClass('Humanoid')
-                    if root and hum then
-                        out[#out + 1] = { name = m.Name, head = root, root = root }
-                    end
-                end
+    if cfg.npcs then
+        local fg = ws:FindFirstChild('Figures')
+        if fg then
+            for k, m in ipairs(fg:GetChildren()) do
+                addRig(out, m)
             end
         end
     end
@@ -100,34 +120,51 @@ end)
 -- renderer -----------------------------------------------------------
 
 conn = RunService.RenderStepped:Connect(function()
-    local list = targets
-    local n = 0
-    for i = 1, #list do
-        if n >= POOL then break end
-        local t = list[i]
-        local top, v1 = WorldToScreen(t.head.Position + Vector3.new(0, 0.8, 0))
-        local bot, v2 = WorldToScreen(t.root.Position - Vector3.new(0, 3.0, 0))
-        if v1 and v2 then
-            n = n + 1
-            local e = pool[n]
-            local h = bot.Y - top.Y
-            if h < 4 then h = 4 end
-            local w = h * 0.5
-            e.box.Position = Vector2.new(top.X - w * 0.5, top.Y)
-            e.box.Size = Vector2.new(w, h)
-            e.box.Visible = true
-            e.tag.Text = t.name
-            e.tag.Position = Vector2.new(top.X, top.Y - 16)
-            e.tag.Visible = true
+    local ok, err = pcall(function()
+        local list = targets
+        local camPos = cam and cam.Position or Vector3.new(0, 0, 0)
+        local n = 0
+        for i = 1, #list do
+            if n >= POOL then break end
+            local t = list[i]
+            local top, v1 = WorldToScreen(t.head.Position + Vector3.new(0, 0.9, 0))
+            local bot, v2 = WorldToScreen(t.root.Position - Vector3.new(0, 2.8, 0))
+            if v1 and v2 then
+                n = n + 1
+                local e = pool[n]
+                local h = bot.Y - top.Y
+                if h < 6 then h = 6 end
+                local w = h * 0.45
+                e.box.Position = Vector2.new(top.X - w * 0.5, top.Y)
+                e.box.Size = Vector2.new(w, h)
+                e.box.Visible = true
+                if cfg.names then
+                    e.tag.Text = t.name
+                    e.tag.Position = Vector2.new(top.X, top.Y - 16)
+                    e.tag.Visible = true
+                else
+                    e.tag.Visible = false
+                end
+                if cfg.dist then
+                    local d = math.floor((t.root.Position - camPos).Magnitude)
+                    e.info.Text = tostring(d) .. 'm'
+                    e.info.Position = Vector2.new(top.X, bot.Y + 2)
+                    e.info.Visible = true
+                else
+                    e.info.Visible = false
+                end
+            end
         end
-    end
-    for i = n + 1, POOL do
-        pool[i].box.Visible = false
-        pool[i].tag.Visible = false
-    end
+        for i = n + 1, POOL do
+            pool[i].box.Visible = false
+            pool[i].tag.Visible = false
+            pool[i].info.Visible = false
+        end
+    end)
+    if not ok then warn('[' .. NAME .. '] draw: ' .. tostring(err)) end
 end)
 
--- gc scan: MANUAL ONLY ------------------------------------------------
+-- gc scan: manual only -----------------------------------------------
 
 local function scan()
     if scanning then return end
@@ -138,11 +175,12 @@ local function scan()
         cache = res
         nHits = #res
     else
+        cache = nil
         nHits = 0
     end
     print('[' .. NAME .. '] scan done: ' .. nHits .. ' hits')
     if nHits == 0 then
-        pcall(notify, 'Gladiator', 'scan found nothing - press Scan during a battle', 4)
+        pcall(notify, 'Gladiator', 'scan found nothing - press Scan during a fight', 4)
     end
     scanning = false
 end
@@ -153,13 +191,13 @@ task.spawn(function()
     while running do
         if cache then
             if cfg.speed then
-                for _, k in ipairs(SPEED_KEYS) do
-                    pcall(applygc, cache, k, cfg.spdVal)
+                for k, key in ipairs(SPEED_KEYS) do
+                    pcall(applygc, cache, key, cfg.spdVal)
                 end
             end
             if cfg.energy then
-                for _, k in ipairs(ENERGY_KEYS) do
-                    pcall(applygc, cache, k, cfg.engVal)
+                for k, key in ipairs(ENERGY_KEYS) do
+                    pcall(applygc, cache, key, cfg.engVal)
                 end
             end
         end
@@ -244,10 +282,12 @@ local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
-        local vis = mkSection(tab, 'Visuals')
+        local vis = mkSection(tab, 'ESP')
         if vis then
-            mkToggle(vis, 'Player ESP', 'gl_plr', true, function(v) cfg.plr = v end)
-            mkToggle(vis, 'NPC ESP',    'gl_npc', true, function(v) cfg.npc = v end)
+            mkToggle(vis, 'Fighters (FightView)', 'gl_fighters', true,  function(v) cfg.fighters = v end)
+            mkToggle(vis, 'Town NPCs (Figures)',  'gl_npcs',     false, function(v) cfg.npcs = v end)
+            mkToggle(vis, 'Names',                'gl_names',    true,  function(v) cfg.names = v end)
+            mkToggle(vis, 'Distance',             'gl_dist',     true,  function(v) cfg.dist = v end)
         end
         local st = mkSection(tab, 'Stats')
         if st then
@@ -255,7 +295,7 @@ local function buildTab(tab)
             mkSlider(st, 'Speed Value',  'gl_spdval', 16, 200, 60,  function(v) cfg.spdVal = v end)
             mkToggle(st, 'Energy',       'gl_energy', false, function(v) cfg.energy = v end)
             mkSlider(st, 'Energy Value', 'gl_engval', 100, 2000, 500, function(v) cfg.engVal = v end)
-            mkButton(st, 'Scan (slow)', function()
+            mkButton(st, 'Scan for stats', function()
                 print('[' .. NAME .. '] scan pressed')
                 task.spawn(scan)
             end)
@@ -281,9 +321,9 @@ else
     warn('[' .. NAME .. '] no UI table - menu unavailable')
 end
 
--- boot: nothing expensive here ---------------------------------------
+-- boot ---------------------------------------------------------------
 
-print('[' .. NAME .. '] ESP active. Scan is manual - open the Gladiator tab, press Scan during a battle.')
+print('[' .. NAME .. '] ESP is on for FightView fighters. Open the Gladiator tab for options.')
 
 local function stop()
     running = false
@@ -291,7 +331,10 @@ local function stop()
     for i = 1, POOL do
         pcall(function() pool[i].box:Remove() end)
         pcall(function() pool[i].tag:Remove() end)
+        pcall(function() pool[i].info:Remove() end)
     end
+    pool = {}
+    targets = {}
     if HAS_UI then pcall(function() UI.RemoveTab('Gladiator') end) end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
