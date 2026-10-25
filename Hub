@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v1.9: Ride A Dino rebuilt - one toggle (auto gain energy).
 -- v1.8: Ride A Dino pinned by place id.
 -- v1.7: Realistic Home Defense pinned by place id.
 -- v1.6: What If Disasters pinned by place id.
@@ -16,7 +17,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v1.8'
+local VERSION = 'v1.9'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
