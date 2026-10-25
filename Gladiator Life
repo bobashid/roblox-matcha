@@ -1,12 +1,11 @@
--- Gladiator Life (place 136567192786299) - ESP + Speed + Energy - Matcha LuauVM
+-- Gladiator Life (place 136567192786299) - ESP + manual stat scan - Matcha LuauVM
 --
--- one Matcha menu tab 'Gladiator' (toggles + sliders, no keybinds).
--- getgc on this build is slow: it runs ONCE in the background and
--- again only when you press Rescan. Never inside a loop.
+-- v1.1 SAFE MODE: getgc no longer runs at load. It only runs when you press
+-- Scan, because a boot-time heap scan is the most likely cause of the last crash.
 -- ESP uses the two-loop pattern: a slow collector and a per-frame renderer.
 
 local NAME    = 'GladiatorLife'
-local VERSION = 'v1.0'
+local VERSION = 'v1.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -22,8 +21,8 @@ local running  = true
 local built    = false
 local cache    = nil
 local scanning = false
-local nHits    = 0
 local conn     = nil
+local nHits    = 0
 
 local cfg = {
     plr    = true,
@@ -34,13 +33,14 @@ local cfg = {
     engVal = 500,
 }
 
+-- real field names from the decompiled duel state: x, maxHp, maxEnergy, en, down
+local SCAN_KEYS   = { 'WalkSpeed', 'maxEnergy', 'Stamina', 'Energy' }
 local SPEED_KEYS  = { 'WalkSpeed' }
-local ENERGY_KEYS = { 'Energy', 'Stamina', 'CurrentStamina', 'MaxStamina', 'StaminaValue' }
-local ALL_KEYS    = { 'WalkSpeed', 'Energy', 'Stamina', 'CurrentStamina', 'MaxStamina', 'StaminaValue' }
+local ENERGY_KEYS = { 'maxEnergy', 'Stamina', 'Energy' }
 
 -- esp pool -----------------------------------------------------------
 
-local POOL    = 32
+local POOL    = 24
 local targets = {}
 local pool    = {}
 
@@ -93,54 +93,57 @@ end
 task.spawn(function()
     while running do
         pcall(collect)
-        task.wait(0.4)
+        task.wait(0.5)
     end
 end)
 
 -- renderer -----------------------------------------------------------
 
 conn = RunService.RenderStepped:Connect(function()
-    pcall(function()
-        local list = targets
-        local n = 0
-        for i = 1, #list do
-            if n >= POOL then break end
-            local t = list[i]
-            local top, v1 = WorldToScreen(t.head.Position + Vector3.new(0, 0.8, 0))
-            local bot, v2 = WorldToScreen(t.root.Position - Vector3.new(0, 3.0, 0))
-            if v1 and v2 then
-                n = n + 1
-                local e = pool[n]
-                local h = bot.Y - top.Y
-                if h < 4 then h = 4 end
-                local w = h * 0.5
-                e.box.Position = Vector2.new(top.X - w * 0.5, top.Y)
-                e.box.Size = Vector2.new(w, h)
-                e.box.Visible = true
-                e.tag.Text = t.name
-                e.tag.Position = Vector2.new(top.X, top.Y - 16)
-                e.tag.Visible = true
-            end
+    local list = targets
+    local n = 0
+    for i = 1, #list do
+        if n >= POOL then break end
+        local t = list[i]
+        local top, v1 = WorldToScreen(t.head.Position + Vector3.new(0, 0.8, 0))
+        local bot, v2 = WorldToScreen(t.root.Position - Vector3.new(0, 3.0, 0))
+        if v1 and v2 then
+            n = n + 1
+            local e = pool[n]
+            local h = bot.Y - top.Y
+            if h < 4 then h = 4 end
+            local w = h * 0.5
+            e.box.Position = Vector2.new(top.X - w * 0.5, top.Y)
+            e.box.Size = Vector2.new(w, h)
+            e.box.Visible = true
+            e.tag.Text = t.name
+            e.tag.Position = Vector2.new(top.X, top.Y - 16)
+            e.tag.Visible = true
         end
-        for i = n + 1, POOL do
-            pool[i].box.Visible = false
-            pool[i].tag.Visible = false
-        end
-    end)
+    end
+    for i = n + 1, POOL do
+        pool[i].box.Visible = false
+        pool[i].tag.Visible = false
+    end
 end)
 
--- gc scan ------------------------------------------------------------
+-- gc scan: MANUAL ONLY ------------------------------------------------
 
 local function scan()
     if scanning then return end
     scanning = true
-    nHits = 0
-    local ok, res = pcall(getgc, ALL_KEYS)
+    print('[' .. NAME .. '] scanning, this can take 10-20s and may hitch')
+    local ok, res = pcall(getgc, SCAN_KEYS)
     if ok and type(res) == 'table' and #res > 0 then
         cache = res
         nHits = #res
+    else
+        nHits = 0
     end
-    print('[' .. NAME .. '] scan: ' .. nHits .. ' hits')
+    print('[' .. NAME .. '] scan done: ' .. nHits .. ' hits')
+    if nHits == 0 then
+        pcall(notify, 'Gladiator', 'scan found nothing - press Scan during a battle', 4)
+    end
     scanning = false
 end
 
@@ -252,8 +255,8 @@ local function buildTab(tab)
             mkSlider(st, 'Speed Value',  'gl_spdval', 16, 200, 60,  function(v) cfg.spdVal = v end)
             mkToggle(st, 'Energy',       'gl_energy', false, function(v) cfg.energy = v end)
             mkSlider(st, 'Energy Value', 'gl_engval', 100, 2000, 500, function(v) cfg.engVal = v end)
-            mkButton(st, 'Rescan', function()
-                print('[' .. NAME .. '] rescan')
+            mkButton(st, 'Scan (slow)', function()
+                print('[' .. NAME .. '] scan pressed')
                 task.spawn(scan)
             end)
         end
@@ -278,9 +281,9 @@ else
     warn('[' .. NAME .. '] no UI table - menu unavailable')
 end
 
--- boot ---------------------------------------------------------------
+-- boot: nothing expensive here ---------------------------------------
 
-task.spawn(scan)
+print('[' .. NAME .. '] ESP on. Scan is manual now - open the Gladiator tab and press Scan while in a battle.')
 
 local function stop()
     running = false
@@ -294,5 +297,5 @@ local function stop()
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, rescan = scan, version = VERSION }
+_G[NAME] = { stop = stop, scan = scan, version = VERSION }
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI))
