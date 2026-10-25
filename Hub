@@ -6,9 +6,12 @@
 -- the place id and game name so you can add one line to PLACES.
 --
 -- Manual load: _G.Hub.load('Dogs')
+--
+-- v1.3: the inner fetch carries a unique ?v= so the raw CDN never hands back
+-- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v1.2'
+local VERSION = 'v1.3'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -50,13 +53,23 @@ local function norm(s)
     return (string.lower(tostring(s or '')):gsub('[^%w]', ''))
 end
 
+-- unique query string: makes the CDN treat it as a new URL, no stale file
+local function bust()
+    local t = 0
+    if type(tick) == 'function' then
+        t = math.floor(tick() * 1000)
+    end
+    return '?v=' .. tostring(t) .. '_' .. tostring(math.random(100000, 999999))
+end
+
 local function load(file)
     if type(file) ~= 'string' or file == '' then return false end
     local enc = file:gsub('%+', '%%2B')
     enc = enc:gsub(' ', '%%20')
+    local url = BASE .. enc .. bust()
     print('[' .. NAME .. '] loading ' .. file)
     local ok, err = pcall(function()
-        local src = game:HttpGet(BASE .. enc, true)
+        local src = game:HttpGet(url, true)
         local fn = loadstring(src)
         if not fn then error('compile failed') end
         fn()
