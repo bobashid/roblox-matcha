@@ -1,24 +1,31 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.3
+--  v11.4
 --
---  CHANGES
---    1. Auto reset is no longer part of farm kill. Farm Kill only
---       fights; it never kills your character. The only thing that
---       resets you is Main -> Auto Reset.
---    2. Auto Reset: if you have no weapon out and a weapon is in your
---       backpack, you are reset after 10 s of that state. Nothing
---       else triggers it.
---    3. Auto Hatch removed - it did not hatch anything.
+--  FARM KILL DIAGNOSTIC
+--    Farm kill itself was not changed - the hit block (size cycle,
+--    firetouchinterest, actor Attack/PlaySound burst) is the same as
+--    the version that was killing bosses. What changed is that it now
+--    says what it is looking at, once per state change, instead of
+--    sitting there silently:
+--      - no tool in hand  -> tells you to equip a weapon
+--      - tool in hand but no AttackPart -> prints the tool name and
+--        its children, so we can see what the part is really called
+--      - AttackPart found but the actor folder has no Attack remote ->
+--        says touch-only, so no burst
+--      - no boss found -> says so
 --
---  HIDE UNDER FARM
---    Anchors the HumanoidRootPart and re-writes it every frame with
---    velocity zeroed, so gravity cannot pull you down. Drift
---    watchdog, damage watchdog (70%), two-death watchdog, and a
---    TP_MAX stale-flag clear so a pickup cannot freeze the hold.
---    A reset caused by Auto Reset is not counted as a death down
---    there, and the new character is put straight back on the spot.
+--    equippedTool also no longer requires an ActorId child. Any tool
+--    in hand with an AttackPart is used; if no tool has one, the tool
+--    with an ActorId, then any non-egg tool, is used so the diagnostic
+--    can report it.
+--
+--  UNCHANGED
+--    Auto Reset: Main toggle, resets you after 10 s with no weapon out
+--    while a weapon is in the backpack. Never part of farm kill.
+--    Hide Under Farm: anchored float + drift/damage/two-death
+--    watchdogs. Auto Hatch removed.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -29,7 +36,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.3'
+local VERSION = 'v11.4'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -49,7 +56,7 @@ local TOUCH_PARTS  = 4
 local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
-local RESET_AFTER   = 10.0
+local RESET_AFTER    = 10.0
 local RESET_COOLDOWN = 15.0
 local RESET_MAX_WAIT = 15.0
 
@@ -164,8 +171,8 @@ local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
 
-local lastPickupAt = 0
-local pickingNow   = false
+local lastPickupAt  = 0
+local pickingNow    = false
 local pickStartedAt = 0
 
 local hideSpot, hideSurface = nil, nil
@@ -251,6 +258,21 @@ local function attackPartOf(tool)
     end
 
     return nil
+end
+
+local function namesOf(inst, limit)
+    local out = ''
+    if not inst then return out end
+
+    local ok, kids = pcall(function() return inst:GetChildren() end)
+    if not ok or not kids then return out end
+
+    for i = 1, #kids do
+        if i > (limit or 10) then break end
+        out = out .. kids[i].Name .. ' '
+    end
+
+    return out
 end
 
 local function areaRarity(areaName)
@@ -359,18 +381,29 @@ local function equippedTool()
     local c = LP.Character
     if not c then return nil end
 
-    local kids = c:GetChildren()
-    local fallback = nil
+    local ok, kids = pcall(function() return c:GetChildren() end)
+    if not ok or not kids then return nil end
+
+    local anyTool   = nil
+    local actorTool = nil
 
     for i = 1, #kids do
         local t = kids[i]
-        if t.ClassName == 'Tool' and t:FindFirstChild('ActorId') then
+
+        if t.ClassName == 'Tool' then
             if attackPartOf(t) then return t end
-            if fallback == nil then fallback = t end
+
+            if actorTool == nil and t:FindFirstChild('ActorId') then
+                actorTool = t
+            end
+
+            if anyTool == nil and itemTypeOf(t) ~= 'Egg' then
+                anyTool = t
+            end
         end
     end
 
-    return fallback
+    return actorTool or anyTool
 end
 
 local function actorIdOf(tool)
@@ -1669,7 +1702,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL  (no reset here)
+-- FARM KILL  (no reset here, now reports what it sees)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == 'function')
@@ -1677,6 +1710,7 @@ task.spawn(function()
     local wasOn      = false
     local warnedTool = false
     local warnedAct  = false
+    local warnedRmt  = false
     local staleWarn  = false
     local noBossWarn = false
 
@@ -1692,39 +1726,48 @@ task.spawn(function()
             if not tool then
                 if not warnedTool then
                     warnedTool = true
-                    print('[' .. NAME .. '] farm kill: equip a weapon')
+                    print('[' .. NAME .. '] farm kill: no weapon in hand - equip one')
                 end
+
                 cachedId, cachedAtk, cachedPs = nil, nil, nil
                 task.wait(0.25)
             else
                 warnedTool = false
-
-                local id = actorIdOf(tool)
-
-                if id ~= cachedId then
-                    cachedId = id
-                    cachedAtk, cachedPs = remotesOfActor(id)
-
-                    if cachedAtk then
-                        print('[' .. NAME .. '] live actor ' .. tostring(id))
-                    end
-                end
 
                 local ap = attackPartOf(tool)
 
                 if not ap then
                     if not warnedAct then
                         warnedAct = true
-                        print('[' .. NAME .. '] farm kill: no AttackPart on this tool')
+                        print('[' .. NAME .. '] farm kill: ' .. tostring(tool.Name)
+                            .. ' has no AttackPart. children: ' .. namesOf(tool, 12))
                     end
-                    cachedId = nil
+
+                    cachedId, cachedAtk, cachedPs = nil, nil, nil
                     task.wait(0.25)
                 else
                     warnedAct = false
 
+                    local id = actorIdOf(tool)
+
+                    if id ~= cachedId then
+                        cachedId = id
+                        cachedAtk, cachedPs = remotesOfActor(id)
+                        warnedRmt = false
+                    end
+
                     if not wasOn then
                         wasOn = true
-                        print('[' .. NAME .. '] farm kill on (size cycle per pass)')
+                        print('[' .. NAME .. '] farm kill on: ' .. tostring(tool.Name)
+                            .. ' / ' .. tostring(ap.Name)
+                            .. ' / touch=' .. tostring(hasTouch)
+                            .. ' / burst=' .. tostring(cachedAtk ~= nil))
+                    end
+
+                    if not cachedAtk and not warnedRmt then
+                        warnedRmt = true
+                        print('[' .. NAME .. '] no actor Attack remote for '
+                            .. tostring(id) .. ' - touch only')
                     end
 
                     rememberPart(ap)
@@ -1815,6 +1858,7 @@ task.spawn(function()
 
             warnedTool = false
             warnedAct  = false
+            warnedRmt  = false
             stale      = 0
             staleWarn  = false
             noBossWarn = false
@@ -1904,5 +1948,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - Auto Reset resets you after 10s with no weapon', 5)
+notifyUser('Loaded - farm kill now reports what it sees', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
