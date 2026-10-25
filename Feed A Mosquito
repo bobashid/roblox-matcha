@@ -1,31 +1,38 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.4
+--  v11.5  -  performance pass (no feature removed)
 --
---  FARM KILL DIAGNOSTIC
---    Farm kill itself was not changed - the hit block (size cycle,
---    firetouchinterest, actor Attack/PlaySound burst) is the same as
---    the version that was killing bosses. What changed is that it now
---    says what it is looking at, once per state change, instead of
---    sitting there silently:
---      - no tool in hand  -> tells you to equip a weapon
---      - tool in hand but no AttackPart -> prints the tool name and
---        its children, so we can see what the part is really called
---      - AttackPart found but the actor folder has no Attack remote ->
---        says touch-only, so no burst
---      - no boss found -> says so
+--  WHAT WAS EATING FRAMES
+--    1. attackPartOf() ran tool:GetDescendants() every 0.12 s from
+--       farm kill, and again from needsWeapon/backpackHasWeapon every
+--       0.2 s. Now memoised per tool address (2 s).
+--    2. The actor remote lookup (actorIdOf + remotesOfActor) rebuilt
+--       its path every farm pass. Now memoised per tool (3 s).
+--    3. myBasePart() walked Workspace:GetDescendants() and hideFrame
+--       called it on EVERY frame while no base was found. Now cached
+--       (3 s) and the hide loop only retries once a second.
+--    4. holdAt() did five separate pcalls and five property writes
+--       per frame. Now one pcall, one block.
+--    5. The boss HUD rewrote ~10 Drawing properties per row per frame.
+--       Now it only writes what changed, and the viewport height is
+--       read once a second instead of every frame.
+--    6. bossHealth() was read by the HUD every frame and by farm kill
+--       every 0.12 s. Now cached for 0.1 s per boss.
+--    7. eggPrompt() ran GetDescendants() per egg every 0.1 s. Now
+--       memoised per egg (1.5 s), and the whole pickup loop sleeps
+--       without scanning eggs when no rarity is ticked.
+--    8. needsWeapon / backpackHasWeapon shared a 0.5 s memo.
+--    9. Toggle polling no longer tries both UI.GetValue key forms on
+--       every pass - it remembers which form works. Poll rate 0.15.
+--   10. Egg scan TTL 1 s -> 2 s (only pickup reads it now).
 --
---    equippedTool also no longer requires an ActorId child. Any tool
---    in hand with an AttackPart is used; if no tool has one, the tool
---    with an ActorId, then any non-egg tool, is used so the diagnostic
---    can report it.
---
---  UNCHANGED
---    Auto Reset: Main toggle, resets you after 10 s with no weapon out
---    while a weapon is in the backpack. Never part of farm kill.
---    Hide Under Farm: anchored float + drift/damage/two-death
---    watchdogs. Auto Hatch removed.
+--  BEHAVIOUR
+--    Farm Kill: no reset, never kills you. Reports what it sees once
+--    per state change (no tool / no AttackPart / no Attack remote).
+--    Auto Reset (Main): resets you after 10 s with no weapon out and
+--    a weapon in the backpack. Only this toggle resets you.
+--    Hide Under Farm: anchored float, drift/damage/two-death watchdog.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -36,7 +43,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.4'
+local VERSION = 'v11.5'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -47,7 +54,7 @@ local running = true
 local built   = false
 
 -- tuning
-local POLL_RATE    = 0.1
+local POLL_RATE    = 0.15
 local HEAL_RATE    = 0.25
 local HEAL_REFIRE  = 1.0
 local COLLECT_RATE = 1.5
@@ -74,7 +81,7 @@ local REACH_MIN = 60
 local REACH_MAX = 4000
 local BOSS_TTL  = 0.6
 local PART_TTL  = 2.0
-local EGG_TTL   = 1.0
+local EGG_TTL   = 2.0
 
 local PICK_RATE     = 0.1
 local PICK_COOLDOWN = 0.15
@@ -82,6 +89,14 @@ local TP_DEPTH      = 3
 local TP_SETTLE     = 0.1
 local TP_HOLD       = 0.12
 local TP_MAX        = 3.0
+
+-- memo lifetimes
+local MEMO_AP     = 2.0
+local MEMO_TOOL   = 3.0
+local MEMO_HP     = 0.10
+local MEMO_BASE   = 3.0
+local MEMO_PROMPT = 1.5
+local MEMO_WEP    = 0.5
 
 local PANEL_ROWS  = 6
 local ROW_H       = 34
@@ -170,6 +185,7 @@ end
 local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
+local KEY_FORM    = {}
 
 local lastPickupAt  = 0
 local pickingNow    = false
@@ -182,9 +198,20 @@ local hideFallFrames        = 0
 local hideLocked            = false
 local hideConn              = nil
 local hideResetAt           = nil
+local hideRetryAt           = 0
 
 local tpHome, tpAway = nil, false
 local tpSaved        = {}
+
+-- memos
+local apMemo     = {}
+local toolMemo   = {}
+local hpMemo     = {}
+local promptMemo = {}
+local baseMemo   = nil
+local baseMemoAt = 0
+local wepMemo    = nil
+local wepMemoAt  = 0
 
 --------------------------------------------------------------------
 -- Helpers
@@ -246,18 +273,32 @@ end
 local function attackPartOf(tool)
     if not tool then return nil end
 
-    local ap = tool:FindFirstChild('AttackPart')
-    if ap and isBasePart(ap) then return ap end
+    local k   = keyOf(tool)
+    local now = tick()
 
-    local ok, desc = pcall(function() return tool:GetDescendants() end)
-    if ok and desc then
-        for j = 1, #desc do
-            local d = desc[j]
-            if isBasePart(d) and d.Name == 'AttackPart' then return d end
+    local rec = k and apMemo[k]
+    if rec and (now - rec.at) < MEMO_AP then return rec.ap end
+
+    local ap = tool:FindFirstChild('AttackPart')
+
+    if not (ap and isBasePart(ap)) then
+        ap = nil
+
+        local ok, desc = pcall(function() return tool:GetDescendants() end)
+
+        if ok and desc then
+            for j = 1, #desc do
+                local d = desc[j]
+                if isBasePart(d) and d.Name == 'AttackPart' then
+                    ap = d
+                    break
+                end
+            end
         end
     end
 
-    return nil
+    if k then apMemo[k] = { at = now, ap = ap } end
+    return ap
 end
 
 local function namesOf(inst, limit)
@@ -307,20 +348,37 @@ local function mosquitoId(eggName)
 end
 
 local function eggPrompt(model)
+    if not model then return nil end
+
+    local k   = keyOf(model)
+    local now = tick()
+
+    local rec = k and promptMemo[k]
+    if rec and (now - rec.at) < MEMO_PROMPT then return rec.prompt end
+
+    local prompt = nil
     local ok, desc = pcall(function() return model:GetDescendants() end)
-    if not ok or not desc then return nil end
 
-    local first = nil
+    if ok and desc then
+        local first = nil
 
-    for i = 1, #desc do
-        local d = desc[i]
-        if d.ClassName == 'ProximityPrompt' then
-            if d.Name == 'CarryPrompt' then return d end
-            if first == nil then first = d end
+        for i = 1, #desc do
+            local d = desc[i]
+
+            if d.ClassName == 'ProximityPrompt' then
+                if d.Name == 'CarryPrompt' then
+                    first = d
+                    break
+                end
+                if first == nil then first = d end
+            end
         end
+
+        prompt = first
     end
 
-    return first
+    if k then promptMemo[k] = { at = now, prompt = prompt } end
+    return prompt
 end
 
 local function eggPosition(model)
@@ -430,6 +488,27 @@ local function remotesOfActor(name)
     return ev:FindFirstChild('Attack'), ev:FindFirstChild('PlaySound')
 end
 
+local function actorInfo(tool)
+    if not tool then return nil, nil, nil end
+
+    local k   = keyOf(tool)
+    local now = tick()
+
+    local rec = k and toolMemo[k]
+    if rec and (now - rec.at) < MEMO_TOOL then
+        return rec.id, rec.atk, rec.ps
+    end
+
+    local id     = actorIdOf(tool)
+    local atk, ps = remotesOfActor(id)
+
+    if k then
+        toolMemo[k] = { at = now, id = id, atk = atk, ps = ps }
+    end
+
+    return id, atk, ps
+end
+
 --------------------------------------------------------------------
 -- Boss lookup
 --------------------------------------------------------------------
@@ -472,8 +551,12 @@ end
 local function bossList()
     local now = tick()
     if (now - bossStamp) < BOSS_TTL then return bossCache end
+
     bossCache = collectBosses()
     bossStamp = now
+
+    if #bossCache == 0 then hpMemo = {} end
+
     return bossCache
 end
 
@@ -492,15 +575,27 @@ end
 
 local function bossHealth(boss)
     if not boss then return nil end
+
+    local k   = keyOf(boss)
+    local now = tick()
+
+    local rec = k and hpMemo[k]
+    if rec and (now - rec.at) < MEMO_HP then return rec.hp end
+
+    local hp = nil
     local okP, parent = pcall(function() return boss.Parent end)
-    if not okP or parent == nil then return nil end
 
-    local h = boss:FindFirstChild('Humanoid')
-    if not h then return nil end
+    if okP and parent ~= nil then
+        local h = boss:FindFirstChild('Humanoid')
 
-    local okH, hp = pcall(function() return h.Health end)
-    if okH and type(hp) == 'number' then return hp end
-    return nil
+        if h then
+            local okH, v = pcall(function() return h.Health end)
+            if okH and type(v) == 'number' then hp = v end
+        end
+    end
+
+    if k then hpMemo[k] = { at = now, hp = hp } end
+    return hp
 end
 
 local function bossMaxHealth(boss)
@@ -691,7 +786,7 @@ end
 --------------------------------------------------------------------
 -- Reset helpers
 --------------------------------------------------------------------
-local function needsWeapon()
+local function needsWeaponRaw()
     local c = LP.Character
     if not c then return false end
 
@@ -709,7 +804,7 @@ local function needsWeapon()
     return true
 end
 
-local function backpackHasWeapon()
+local function backpackHasWeaponRaw()
     local bp = LP:FindFirstChild('Backpack')
     if not bp then return false end
 
@@ -722,6 +817,22 @@ local function backpackHasWeapon()
     end
 
     return false
+end
+
+local function weaponState()
+    local now = tick()
+
+    if wepMemo and (now - wepMemoAt) < MEMO_WEP then
+        return wepMemo.needs, wepMemo.has
+    end
+
+    local needs = needsWeaponRaw()
+    local has   = backpackHasWeaponRaw()
+
+    wepMemo   = { needs = needs, has = has }
+    wepMemoAt = now
+
+    return needs, has
 end
 
 local function handSignature()
@@ -759,7 +870,7 @@ local function killCharacter()
     return true, nil
 end
 
-local function myBasePart()
+local function myBasePartRaw()
     local ok, desc = pcall(function() return WS:GetDescendants() end)
     if not ok or not desc then return nil end
 
@@ -807,6 +918,36 @@ local function myBasePart()
     return best
 end
 
+local function myBasePart()
+    local now = tick()
+    if baseMemo and (now - baseMemoAt) < MEMO_BASE then return baseMemo end
+
+    baseMemoAt = now
+    baseMemo   = myBasePartRaw()
+
+    return baseMemo
+end
+
+local function memoPrune()
+    local now = tick()
+
+    for k, v in pairs(apMemo) do
+        if (now - v.at) > 10 then apMemo[k] = nil end
+    end
+
+    for k, v in pairs(toolMemo) do
+        if (now - v.at) > 10 then toolMemo[k] = nil end
+    end
+
+    for k, v in pairs(hpMemo) do
+        if (now - v.at) > 10 then hpMemo[k] = nil end
+    end
+
+    for k, v in pairs(promptMemo) do
+        if (now - v.at) > 10 then promptMemo[k] = nil end
+    end
+end
+
 --------------------------------------------------------------------
 -- HIDE UNDER FARM  (anchored float + watchdogs)
 --------------------------------------------------------------------
@@ -842,8 +983,8 @@ local function surfaceNow()
     local hrp = rootPart()
     if not hrp or not hideSurface then return end
 
-    pcall(function() hrp.CFrame = hideSurface end)
     pcall(function()
+        hrp.CFrame = hideSurface
         hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
         hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
     end)
@@ -874,9 +1015,9 @@ local function holdAt(spot)
         hideAnchor = { part = hrp, was = (ok and was == true) }
     end
 
-    pcall(function() hrp.Anchored = true end)
-    pcall(function() hrp.CFrame = spot end)
     pcall(function()
+        hrp.Anchored                = true
+        hrp.CFrame                  = spot
         hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
         hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
     end)
@@ -923,8 +1064,16 @@ local function hideFrame()
         end
     end
 
-    if not hideSpot then hideSpot, hideSurface = computeSpots() end
-    if not hideSpot then return end
+    if not hideSpot then
+        local now = tick()
+
+        if (now - hideRetryAt) > 1.0 then
+            hideRetryAt = now
+            hideSpot, hideSurface = computeSpots()
+        end
+
+        if not hideSpot then return end
+    end
 
     local hum = humanoid()
 
@@ -976,12 +1125,13 @@ local function leaveHide()
     hideHP0        = nil
     hideFallFrames = 0
     hideResetAt    = nil
+    hideRetryAt    = 0
 
     print('[' .. NAME .. '] hide under farm off (put back on the surface)')
 end
 
 --------------------------------------------------------------------
--- HUD
+-- HUD  (writes only what changed)
 --------------------------------------------------------------------
 local hudPool   = {}
 local panelBack = nil
@@ -1028,11 +1178,21 @@ local function buildHud()
         fill.Color       = COL_FILL
         fill.Visible     = false
 
-        hudPool[i] = { nameTag = nameTag, hpTag = hpTag, back = back, fill = fill }
+        hudPool[i] = {
+            nameTag = nameTag,
+            hpTag   = hpTag,
+            back    = back,
+            fill    = fill,
+            shown   = false,
+        }
     end
 end
 
 local function hideSlot(slot)
+    if not slot.shown then return end
+
+    slot.shown           = false
+    slot.rowY            = nil
     slot.nameTag.Visible = false
     slot.hpTag.Visible   = false
     slot.back.Visible    = false
@@ -1053,8 +1213,17 @@ local function startHud()
 
     buildHud()
 
+    local vpH, vpAt = 1080, 0
+
     hudConn = RunService.RenderStepped:Connect(function()
-        local baseY = viewportHeight() - PANEL_LIFT
+        local now = tick()
+
+        if (now - vpAt) > 1.0 then
+            vpAt = now
+            vpH  = viewportHeight()
+        end
+
+        local baseY = vpH - PANEL_LIFT
         local list  = bossList()
         local n     = 0
 
@@ -1076,22 +1245,45 @@ local function startHud()
                 local slot = hudPool[n]
                 local rowY = baseY - (n - 1) * ROW_H
 
-                slot.nameTag.Text     = boss.Name
-                slot.nameTag.Position = Vector2.new(PANEL_X, rowY)
-                slot.nameTag.Visible  = true
+                if not slot.shown then
+                    slot.shown           = true
+                    slot.nameTag.Visible = true
+                    slot.back.Visible    = true
+                    slot.fill.Visible    = true
+                    slot.hpTag.Visible   = true
+                    slot.rowY            = nil
+                    slot.name            = nil
+                    slot.hp              = nil
+                    slot.w               = nil
+                    slot.back.Size       = Vector2.new(PANEL_BAR_W, PANEL_BAR_H)
+                end
 
-                slot.back.Position = Vector2.new(PANEL_X, rowY + 19)
-                slot.back.Size     = Vector2.new(PANEL_BAR_W, PANEL_BAR_H)
-                slot.back.Visible  = true
+                if slot.rowY ~= rowY then
+                    slot.rowY             = rowY
+                    slot.nameTag.Position = Vector2.new(PANEL_X, rowY)
+                    slot.back.Position    = Vector2.new(PANEL_X, rowY + 19)
+                    slot.fill.Position    = Vector2.new(PANEL_X, rowY + 19)
+                    slot.hpTag.Position   = Vector2.new(PANEL_X + PANEL_BAR_W + 10, rowY + 2)
+                end
 
-                slot.fill.Position = Vector2.new(PANEL_X, rowY + 19)
-                slot.fill.Size     = Vector2.new(PANEL_BAR_W * frac, PANEL_BAR_H)
-                slot.fill.Visible  = true
+                if slot.name ~= boss.Name then
+                    slot.name         = boss.Name
+                    slot.nameTag.Text = boss.Name
+                end
 
-                slot.hpTag.Text     = tostring(math.floor(hp))
+                local w = PANEL_BAR_W * frac
+                if slot.w ~= w then
+                    slot.w         = w
+                    slot.fill.Size = Vector2.new(w, PANEL_BAR_H)
+                end
+
+                local label = tostring(math.floor(hp))
                     .. ' / ' .. tostring(math.floor(maxHp))
-                slot.hpTag.Position = Vector2.new(PANEL_X + PANEL_BAR_W + 10, rowY + 2)
-                slot.hpTag.Visible  = true
+
+                if slot.hp ~= label then
+                    slot.hp         = label
+                    slot.hpTag.Text = label
+                end
             end
         end
 
@@ -1105,11 +1297,20 @@ local function startHud()
                 local topY   = baseY - (n - 1) * ROW_H - PAD_TOP
                 local height = (n - 1) * ROW_H + ROW_H + PAD_TOP + PAD_BOTTOM
 
-                panelBack.Position = Vector2.new(PANEL_X - PAD_X, topY)
-                panelBack.Size     = Vector2.new(PANEL_W, height)
-                panelBack.Visible  = true
-            else
+                if not panelBack.Visible then
+                    panelBack.Visible = true
+                end
+
+                if panelBack.__y ~= topY or panelBack.__h ~= height then
+                    panelBack.__y      = topY
+                    panelBack.__h      = height
+                    panelBack.Position = Vector2.new(PANEL_X - PAD_X, topY)
+                    panelBack.Size     = Vector2.new(PANEL_W, height)
+                end
+            elseif panelBack.Visible then
                 panelBack.Visible = false
+                panelBack.__y     = nil
+                panelBack.__h     = nil
             end
         end
     end)
@@ -1197,7 +1398,9 @@ local function addRarity(sec, rarity)
     end
 
     if safeToggle(sec, rarity, id, false, cb) then
-        RARITY_IDS[#RARITY_IDS + 1] = { rarity = rarity, id = id, name = rarity }
+        RARITY_IDS[#RARITY_IDS + 1] = {
+            key = rarity, rarity = rarity, id = id, name = rarity,
+        }
     end
 end
 
@@ -1259,21 +1462,41 @@ end
 --------------------------------------------------------------------
 -- POLLER
 --------------------------------------------------------------------
+local function readToggle(t)
+    local form = KEY_FORM[t.key]
+
+    if form == 'id' then
+        local ok, v = pcall(function() return UI.GetValue(t.id) end)
+        if ok and type(v) == 'boolean' then return v end
+        KEY_FORM[t.key] = nil
+    elseif form == 'name' then
+        local ok, v = pcall(function() return UI.GetValue(t.name) end)
+        if ok and type(v) == 'boolean' then return v end
+        KEY_FORM[t.key] = nil
+    end
+
+    local ok, v = pcall(function() return UI.GetValue(t.id) end)
+    if ok and type(v) == 'boolean' then
+        KEY_FORM[t.key] = 'id'
+        return v
+    end
+
+    ok, v = pcall(function() return UI.GetValue(t.name) end)
+    if ok and type(v) == 'boolean' then
+        KEY_FORM[t.key] = 'name'
+        return v
+    end
+
+    return nil
+end
+
 task.spawn(function()
     local hideWas = false
 
     while running do
         for i = 1, #TOGGLES do
             local t   = TOGGLES[i]
-            local val = nil
-
-            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
-            if ok1 and type(v1) == 'boolean' then
-                val = v1
-            else
-                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
-                if ok2 and type(v2) == 'boolean' then val = v2 end
-            end
+            local val = readToggle(t)
 
             if val ~= nil then
                 getterWorks[t.key] = true
@@ -1297,12 +1520,16 @@ task.spawn(function()
                 stopHideLoop()
                 unanchorHide()
 
+                baseMemo       = nil
+                baseMemoAt     = 0
                 hideSpot, hideSurface = computeSpots()
+
                 hideChar       = LP.Character
                 hideDeaths     = 0
                 hideHP0        = nil
                 hideFallFrames = 0
                 hideResetAt    = nil
+                hideRetryAt    = 0
 
                 startHideLoop()
             elseif hideLocked then
@@ -1315,15 +1542,7 @@ task.spawn(function()
 
         for i = 1, #RARITY_IDS do
             local r   = RARITY_IDS[i]
-            local val = nil
-
-            local ok1, v1 = pcall(function() return UI.GetValue(r.id) end)
-            if ok1 and type(v1) == 'boolean' then
-                val = v1
-            else
-                local ok2, v2 = pcall(function() return UI.GetValue(r.name) end)
-                if ok2 and type(v2) == 'boolean' then val = v2 end
-            end
+            local val = readToggle(r)
 
             if val ~= nil then
                 getterWorks[r.rarity] = true
@@ -1456,6 +1675,13 @@ local function restoreHome()
     pickingNow = false
 end
 
+local function anyRarityOn()
+    for i = 1, #RARITIES do
+        if PickCfg[RARITIES[i]] then return true end
+    end
+    return false
+end
+
 task.spawn(function()
     local hasPrompt = (type(fireproximityprompt) == 'function')
 
@@ -1470,7 +1696,7 @@ task.spawn(function()
     end
 
     while running do
-        if Config.Pickup and hasPrompt and alive() then
+        if Config.Pickup and hasPrompt and alive() and anyRarityOn() then
             local eggs = eggList()
             local now  = tick()
             local done = false
@@ -1598,7 +1824,7 @@ task.spawn(function()
             pcall(restoreHome)
             pcall(noClipOff)
             pickingNow = false
-            task.wait(0.2)
+            task.wait(0.25)
         end
     end
 end)
@@ -1631,7 +1857,9 @@ task.spawn(function()
                 emptySince = nil
             end
 
-            if needsWeapon() and backpackHasWeapon() then
+            local needs, has = weaponState()
+
+            if needs and has then
                 if emptySince == nil then emptySince = now end
 
                 if (now - emptySince) >= RESET_AFTER
@@ -1702,7 +1930,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL  (no reset here, now reports what it sees)
+-- FARM KILL  (no reset here, reports what it sees)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == 'function')
@@ -1748,11 +1976,10 @@ task.spawn(function()
                 else
                     warnedAct = false
 
-                    local id = actorIdOf(tool)
+                    local id, atk, ps = actorInfo(tool)
 
-                    if id ~= cachedId then
-                        cachedId = id
-                        cachedAtk, cachedPs = remotesOfActor(id)
+                    if id ~= cachedId or atk ~= cachedAtk then
+                        cachedId, cachedAtk, cachedPs = id, atk, ps
                         warnedRmt = false
                     end
 
@@ -1916,6 +2143,16 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
+-- MEMO HOUSEKEEPING
+--------------------------------------------------------------------
+task.spawn(function()
+    while running do
+        pcall(memoPrune)
+        task.wait(5)
+    end
+end)
+
+--------------------------------------------------------------------
 -- STOP
 --------------------------------------------------------------------
 local function stop()
@@ -1933,6 +2170,13 @@ local function stop()
     eggCache       = {}
     eggStamp       = 0
     partCache      = {}
+    apMemo         = {}
+    toolMemo       = {}
+    hpMemo         = {}
+    promptMemo     = {}
+    baseMemo       = nil
+    baseMemoAt     = 0
+    wepMemo        = nil
     hideSpot       = nil
     hideSurface    = nil
     hideLocked     = false
@@ -1948,5 +2192,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - farm kill now reports what it sees', 5)
+notifyUser('Loaded - v11.5 performance pass', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
