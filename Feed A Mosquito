@@ -1,38 +1,32 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.5  -  performance pass (no feature removed)
+--  v11.6  -  fixes the 'Unknown property __y' log spam
 --
---  WHAT WAS EATING FRAMES
---    1. attackPartOf() ran tool:GetDescendants() every 0.12 s from
---       farm kill, and again from needsWeapon/backpackHasWeapon every
---       0.2 s. Now memoised per tool address (2 s).
---    2. The actor remote lookup (actorIdOf + remotesOfActor) rebuilt
---       its path every farm pass. Now memoised per tool (3 s).
---    3. myBasePart() walked Workspace:GetDescendants() and hideFrame
---       called it on EVERY frame while no base was found. Now cached
---       (3 s) and the hide loop only retries once a second.
---    4. holdAt() did five separate pcalls and five property writes
---       per frame. Now one pcall, one block.
---    5. The boss HUD rewrote ~10 Drawing properties per row per frame.
---       Now it only writes what changed, and the viewport height is
---       read once a second instead of every frame.
---    6. bossHealth() was read by the HUD every frame and by farm kill
---       every 0.12 s. Now cached for 0.1 s per boss.
---    7. eggPrompt() ran GetDescendants() per egg every 0.1 s. Now
---       memoised per egg (1.5 s), and the whole pickup loop sleeps
---       without scanning eggs when no rarity is ticked.
---    8. needsWeapon / backpackHasWeapon shared a 0.5 s memo.
---    9. Toggle polling no longer tries both UI.GetValue key forms on
---       every pass - it remembers which form works. Poll rate 0.15.
---   10. Egg scan TTL 1 s -> 2 s (only pickup reads it now).
+--  WHAT WAS WRONG
+--    v11.5 tracked HUD changes by writing my own fields onto the
+--    Drawing object (panelBack.__y, panelBack.__h). Drawing rejects
+--    unknown properties, so the HUD connection threw every single
+--    frame - hundreds of log lines a second. That is what made the
+--    script feel heavy and why farm kill looked like it was barely
+--    hitting: the frame work was going into error text.
 --
---  BEHAVIOUR
---    Farm Kill: no reset, never kills you. Reports what it sees once
---    per state change (no tool / no AttackPart / no Attack remote).
---    Auto Reset (Main): resets you after 10 s with no weapon out and
---    a weapon in the backpack. Only this toggle resets you.
---    Hide Under Farm: anchored float, drift/damage/two-death watchdog.
+--  WHAT IT DOES NOW
+--    1. Those two values live in plain locals, not on the Drawing.
+--       Only Position/Size/Visible are ever written.
+--    2. The whole HUD per-frame body is wrapped in pcall, so if
+--       anything else ever trips there it stops writing instead of
+--       flooding the log.
+--    3. Actor remote lookup no longer caches a failed lookup for the
+--       full 3 s. If Attack/PlaySound were not found yet (actor
+--       folder still loading), it retries after 0.4 s instead of
+--       going touch-only for 3 s.
+--
+--  UNCHANGED
+--    Farm Kill: size cycle, firetouchinterest on up to 4 boss parts,
+--    Attack/PlaySound burst, no reset, one-line diagnostic.
+--    Auto Reset (Main): 10 s with no weapon out and a weapon in the
+--    backpack. Hide Under Farm: anchored float + watchdogs.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -43,7 +37,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.5'
+local VERSION = 'v11.6'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -93,6 +87,7 @@ local TP_MAX        = 3.0
 -- memo lifetimes
 local MEMO_AP     = 2.0
 local MEMO_TOOL   = 3.0
+local MEMO_FAIL   = 0.4
 local MEMO_HP     = 0.10
 local MEMO_BASE   = 3.0
 local MEMO_PROMPT = 1.5
@@ -488,6 +483,8 @@ local function remotesOfActor(name)
     return ev:FindFirstChild('Attack'), ev:FindFirstChild('PlaySound')
 end
 
+-- a failed lookup is only remembered briefly, so a late-loading
+-- actor folder does not leave farm kill touch-only for 3 s
 local function actorInfo(tool)
     if not tool then return nil, nil, nil end
 
@@ -495,11 +492,13 @@ local function actorInfo(tool)
     local now = tick()
 
     local rec = k and toolMemo[k]
-    if rec and (now - rec.at) < MEMO_TOOL then
-        return rec.id, rec.atk, rec.ps
+
+    if rec then
+        local life = rec.atk and MEMO_TOOL or MEMO_FAIL
+        if (now - rec.at) < life then return rec.id, rec.atk, rec.ps end
     end
 
-    local id     = actorIdOf(tool)
+    local id      = actorIdOf(tool)
     local atk, ps = remotesOfActor(id)
 
     if k then
@@ -1131,7 +1130,7 @@ local function leaveHide()
 end
 
 --------------------------------------------------------------------
--- HUD  (writes only what changed)
+-- HUD  (writes only what changed, never unknown properties)
 --------------------------------------------------------------------
 local hudPool   = {}
 local panelBack = nil
@@ -1193,6 +1192,9 @@ local function hideSlot(slot)
 
     slot.shown           = false
     slot.rowY            = nil
+    slot.name            = nil
+    slot.hp              = nil
+    slot.w               = nil
     slot.nameTag.Visible = false
     slot.hpTag.Visible   = false
     slot.back.Visible    = false
@@ -1213,106 +1215,112 @@ local function startHud()
 
     buildHud()
 
-    local vpH, vpAt = 1080, 0
+    local vpH, vpAt    = 1080, 0
+    local pbY, pbH     = nil, nil
+    local pbOn         = false
 
     hudConn = RunService.RenderStepped:Connect(function()
-        local now = tick()
+        pcall(function()
+            local now = tick()
 
-        if (now - vpAt) > 1.0 then
-            vpAt = now
-            vpH  = viewportHeight()
-        end
+            if (now - vpAt) > 1.0 then
+                vpAt = now
+                vpH  = viewportHeight()
+            end
 
-        local baseY = vpH - PANEL_LIFT
-        local list  = bossList()
-        local n     = 0
+            local baseY = vpH - PANEL_LIFT
+            local list  = bossList()
+            local n     = 0
 
-        for i = 1, #list do
-            if n >= PANEL_ROWS then break end
+            for i = 1, #list do
+                if n >= PANEL_ROWS then break end
 
-            local boss = list[i]
-            local hp   = bossHealth(boss)
+                local boss = list[i]
+                local hp   = bossHealth(boss)
 
-            if hp and hp > 0 then
-                local maxHp = bossMaxHealth(boss)
-                local frac  = hp / maxHp
+                if hp and hp > 0 then
+                    local maxHp = bossMaxHealth(boss)
+                    local frac  = hp / maxHp
 
-                if frac < 0 then frac = 0 end
-                if frac > 1 then frac = 1 end
+                    if frac < 0 then frac = 0 end
+                    if frac > 1 then frac = 1 end
 
-                n = n + 1
+                    n = n + 1
 
-                local slot = hudPool[n]
-                local rowY = baseY - (n - 1) * ROW_H
+                    local slot = hudPool[n]
+                    local rowY = baseY - (n - 1) * ROW_H
 
-                if not slot.shown then
-                    slot.shown           = true
-                    slot.nameTag.Visible = true
-                    slot.back.Visible    = true
-                    slot.fill.Visible    = true
-                    slot.hpTag.Visible   = true
-                    slot.rowY            = nil
-                    slot.name            = nil
-                    slot.hp              = nil
-                    slot.w               = nil
-                    slot.back.Size       = Vector2.new(PANEL_BAR_W, PANEL_BAR_H)
-                end
+                    if not slot.shown then
+                        slot.shown           = true
+                        slot.rowY            = nil
+                        slot.name            = nil
+                        slot.hp              = nil
+                        slot.w               = nil
+                        slot.nameTag.Visible = true
+                        slot.back.Visible    = true
+                        slot.fill.Visible    = true
+                        slot.hpTag.Visible   = true
+                        slot.back.Size       = Vector2.new(PANEL_BAR_W, PANEL_BAR_H)
+                    end
 
-                if slot.rowY ~= rowY then
-                    slot.rowY             = rowY
-                    slot.nameTag.Position = Vector2.new(PANEL_X, rowY)
-                    slot.back.Position    = Vector2.new(PANEL_X, rowY + 19)
-                    slot.fill.Position    = Vector2.new(PANEL_X, rowY + 19)
-                    slot.hpTag.Position   = Vector2.new(PANEL_X + PANEL_BAR_W + 10, rowY + 2)
-                end
+                    if slot.rowY ~= rowY then
+                        slot.rowY             = rowY
+                        slot.nameTag.Position = Vector2.new(PANEL_X, rowY)
+                        slot.back.Position    = Vector2.new(PANEL_X, rowY + 19)
+                        slot.fill.Position    = Vector2.new(PANEL_X, rowY + 19)
+                        slot.hpTag.Position   = Vector2.new(PANEL_X + PANEL_BAR_W + 10, rowY + 2)
+                    end
 
-                if slot.name ~= boss.Name then
-                    slot.name         = boss.Name
-                    slot.nameTag.Text = boss.Name
-                end
+                    if slot.name ~= boss.Name then
+                        slot.name         = boss.Name
+                        slot.nameTag.Text = boss.Name
+                    end
 
-                local w = PANEL_BAR_W * frac
-                if slot.w ~= w then
-                    slot.w         = w
-                    slot.fill.Size = Vector2.new(w, PANEL_BAR_H)
-                end
+                    local w = PANEL_BAR_W * frac
+                    if slot.w ~= w then
+                        slot.w         = w
+                        slot.fill.Size = Vector2.new(w, PANEL_BAR_H)
+                    end
 
-                local label = tostring(math.floor(hp))
-                    .. ' / ' .. tostring(math.floor(maxHp))
+                    local label = tostring(math.floor(hp))
+                        .. ' / ' .. tostring(math.floor(maxHp))
 
-                if slot.hp ~= label then
-                    slot.hp         = label
-                    slot.hpTag.Text = label
+                    if slot.hp ~= label then
+                        slot.hp         = label
+                        slot.hpTag.Text = label
+                    end
                 end
             end
-        end
 
-        for i = n + 1, PANEL_ROWS do
-            local slot = hudPool[i]
-            if slot then hideSlot(slot) end
-        end
+            for i = n + 1, PANEL_ROWS do
+                local slot = hudPool[i]
+                if slot then hideSlot(slot) end
+            end
 
-        if panelBack then
+            if not panelBack then return end
+
             if n > 0 then
                 local topY   = baseY - (n - 1) * ROW_H - PAD_TOP
                 local height = (n - 1) * ROW_H + ROW_H + PAD_TOP + PAD_BOTTOM
 
-                if not panelBack.Visible then
+                if not pbOn then
+                    pbOn              = true
                     panelBack.Visible = true
                 end
 
-                if panelBack.__y ~= topY or panelBack.__h ~= height then
-                    panelBack.__y      = topY
-                    panelBack.__h      = height
+                if pbY ~= topY or pbH ~= height then
+                    pbY                = topY
+                    pbH                = height
                     panelBack.Position = Vector2.new(PANEL_X - PAD_X, topY)
                     panelBack.Size     = Vector2.new(PANEL_W, height)
                 end
-            elseif panelBack.Visible then
+            elseif pbOn then
+                pbOn              = false
+                pbY               = nil
+                pbH               = nil
                 panelBack.Visible = false
-                panelBack.__y     = nil
-                panelBack.__h     = nil
             end
-        end
+        end)
     end)
 end
 
@@ -2192,5 +2200,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - v11.5 performance pass', 5)
+notifyUser('Loaded - v11.6, HUD spam fixed', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
