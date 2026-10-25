@@ -1,0 +1,412 @@
+-- [[ Realistic Home Defense - Weapon Mod Menu ]]  place 105527962898452
+-- ACS engine (ACS_Engine.ToolStorage / ACS_Settings / per-tool RepValues).
+-- Confirmed in game: ToolStorage = HK416, AR-15, MCX, RPG-7; ACS_Settings carries
+--   ShootRate, MinSpread/MaxSpread, camRecoil/gunRecoil, AmmoInGun; equipped tools
+--   expose a RepValues folder.
+-- v1.1: no GC scan at load (it lagged and disturbed the equipped gun). Scanning is a
+--   button, GC writes only run while GC mods are armed, and Restore puts the captured
+--   original values back.
+-- UNVERIFIED: server-side damage is untouched; GC writes are client-side only.
+-- Aimbot / Silent Aim / Trigger Bot are Matcha built-ins and are not rebuilt here.
+
+local NAME    = 'RHD Weapon Mods'
+local VERSION = 'v1.1'
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+
+local Players = game:GetService('Players')
+local RS      = game:GetService('ReplicatedStorage')
+local lp      = Players.LocalPlayer
+
+local running = true
+local conns   = {}
+local function track(c) conns[#conns + 1] = c; return c end
+
+print('[' .. NAME .. '] ' .. VERSION)
+
+-- ---- config -------------------------------------------------------------
+local CFG = {
+    noRecoil = false,
+    noSpread = false,
+    rapid    = false,
+    infAmmo  = false,
+    rpm      = 100,
+    ammoCap  = 250,
+}
+
+-- ---- helpers ------------------------------------------------------------
+local function getEquipped()
+    local ch = lp.Character
+    if not ch then return nil end
+    local kids = ch:GetChildren()
+    for i = 1, #kids do
+        if kids[i].ClassName == 'Tool' then return kids[i] end
+    end
+    return nil
+end
+
+local function toolStorage()
+    local eng = RS:FindFirstChild('ACS_Engine')
+    if not eng then return nil end
+    return eng:FindFirstChild('ToolStorage')
+end
+
+local function refillRep(tool)
+    local rep = tool:FindFirstChild('RepValues')
+    if not rep then return end
+    local kids = rep:GetChildren()
+    for i = 1, #kids do
+        local c = kids[i]
+        if c.ClassName == 'NumberValue' or c.ClassName == 'IntValue' then
+            local n = string.lower(c.Name)
+            if string.find(n, 'ammo', 1, true) or string.find(n, 'mag', 1, true) then
+                pcall(function() c.Value = CFG.ammoCap end)
+            end
+        end
+    end
+end
+
+-- ---- GC levers (armed by hand, never at load) ---------------------------
+local GC_KEYS = { 'ShootRate', 'MinSpread', 'MaxSpread', 'camRecoil', 'gunRecoil' }
+
+local ZERO_CAM = {
+    camRecoilUp = { 0, 0 }, camRecoilTilt = { 0, 0 },
+    camRecoilLeft = { 0, 0 }, camRecoilRight = { 0, 0 },
+}
+local ZERO_GUN = {
+    gunRecoilUp = { 0, 0 }, gunRecoilTilt = { 0, 0 },
+    gunRecoilLeft = { 0, 0 }, gunRecoilRight = { 0, 0 },
+}
+
+local cache, originals = nil, {}
+local gcReady, gcEnabled, gcBusy = false, false, false
+local lastWrite = {}
+
+local function rebuildCache()
+    if gcBusy then return end
+    gcBusy = true
+    task.spawn(function()
+        print('[' .. NAME .. '] scanning GC, 10-20s ...')
+        local res = nil
+        local ok = pcall(function() res = getgc(GC_KEYS) end)
+        if not (ok and type(res) == 'table' and #res > 0) then
+            res = {}
+            for i = 1, #GC_KEYS do
+                local ok2, r2 = pcall(function() return getgc(GC_KEYS[i]) end)
+                if ok2 and type(r2) == 'table' then
+                    for j = 1, #r2 do res[#res + 1] = r2[j] end
+                end
+            end
+        end
+        if type(res) == 'table' and #res > 0 then
+            cache = res
+            originals = {}
+            for i = 1, #res do
+                local e = res[i]
+                local k = e.key
+                if type(k) == 'string' and originals[k] == nil then
+                    if e.type == 'number' or e.type == 'table' then
+                        originals[k] = e.value
+                    end
+                end
+            end
+            gcReady = true
+            lastWrite = {}
+            print('[' .. NAME .. '] GC ready: ' .. tostring(#res) .. ' entries')
+            pcall(notify, 'GC ready - arm GC mods', NAME, 4)
+        else
+            gcReady = false
+            warn('[' .. NAME .. '] getgc returned nothing, try again next round')
+        end
+        gcBusy = false
+    end)
+end
+
+local function setKey(key, value)
+    if not (gcReady and gcEnabled and cache) then return end
+    if lastWrite[key] == value and type(lastWrite[key]) == type(value) then return end
+    pcall(applygc, cache, key, value)
+    lastWrite[key] = value
+end
+
+local function restoreGC()
+    gcEnabled = false
+    lastWrite = {}
+    if gcReady and cache then
+        for i = 1, #GC_KEYS do
+            local k = GC_KEYS[i]
+            if originals[k] ~= nil then pcall(applygc, cache, k, originals[k]) end
+        end
+        print('[' .. NAME .. '] original values put back')
+    end
+end
+
+task.spawn(function()
+    while running do
+        if gcEnabled and gcReady then
+            if CFG.noRecoil then
+                setKey('camRecoil', ZERO_CAM)
+                setKey('gunRecoil', ZERO_GUN)
+            end
+            if CFG.noSpread then
+                setKey('MinSpread', 0)
+                setKey('MaxSpread', 0)
+            end
+            if CFG.rapid then
+                setKey('ShootRate', CFG.rpm)
+            end
+        end
+        if CFG.infAmmo then
+            local t = getEquipped()
+            if t then refillRep(t) end
+        end
+        task.wait(0.4)
+    end
+end)
+
+-- ---- weapon giver -------------------------------------------------------
+local givenTools = {}
+
+local function giveWeapon(tool)
+    local bp = lp:FindFirstChild('Backpack')
+    if not bp then
+        warn('[' .. NAME .. '] no Backpack yet')
+        return false
+    end
+    local clone = nil
+    pcall(function() clone = tool:Clone() end)
+    if clone ~= nil then
+        local ok = pcall(function() clone.Parent = bp end)
+        if ok then
+            print('[' .. NAME .. '] ' .. tool.Name .. ' -> Backpack (copy)')
+            return true
+        end
+    end
+    givenTools[#givenTools + 1] = { tool = tool, parent = tool.Parent }
+    local ok = pcall(function() tool.Parent = bp end)
+    if ok then
+        print('[' .. NAME .. '] ' .. tool.Name .. ' -> Backpack (moved)')
+    else
+        warn('[' .. NAME .. '] could not move ' .. tool.Name)
+    end
+    return ok
+end
+
+local function restoreTools()
+    for i = 1, #givenTools do
+        local e = givenTools[i]
+        if e.parent ~= nil then pcall(function() e.tool.Parent = e.parent end) end
+    end
+    givenTools = {}
+end
+
+-- ---- UI helpers ---------------------------------------------------------
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local TOGGLES, getterWorks = {}, {}
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    warn('[' .. NAME .. '] section ' .. name .. ' failed')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. label)
+    return false
+end
+
+local function mkText(sec, s)
+    pcall(function() sec:Text(s) end)
+end
+
+local function registerToggle(key, id)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = id }
+end
+
+-- ---- build the tab ------------------------------------------------------
+local built = false
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'Weapon Mods')
+        if sec then
+            mkButton(sec, 'Arm GC mods (scan 10-20s)', function()
+                gcEnabled = true
+                print('[' .. NAME .. '] GC mods armed')
+                rebuildCache()
+            end)
+            mkButton(sec, 'Restore original values', function() restoreGC() end)
+
+            mkToggle(sec, 'No Recoil', 'rhd_norecoil', false, function(v)
+                CFG.noRecoil = v
+                print('[' .. NAME .. '] No Recoil = ' .. tostring(v))
+            end)
+            registerToggle('noRecoil', 'rhd_norecoil')
+
+            mkToggle(sec, 'No Spread', 'rhd_nospread', false, function(v)
+                CFG.noSpread = v
+                print('[' .. NAME .. '] No Spread = ' .. tostring(v))
+            end)
+            registerToggle('noSpread', 'rhd_nospread')
+
+            mkToggle(sec, 'Rapid Fire', 'rhd_rapid', false, function(v)
+                CFG.rapid = v
+                print('[' .. NAME .. '] Rapid Fire = ' .. tostring(v))
+            end)
+            registerToggle('rapid', 'rhd_rapid')
+
+            mkSlider(sec, 'Fire Rate (RPM)', 'rhd_rpm', 30, 800, 100, function(v)
+                CFG.rpm = math.floor(v)
+                print('[' .. NAME .. '] RPM = ' .. tostring(CFG.rpm))
+            end)
+
+            mkToggle(sec, 'Infinite Ammo (client)', 'rhd_ammo', false, function(v)
+                CFG.infAmmo = v
+                print('[' .. NAME .. '] Infinite Ammo = ' .. tostring(v))
+            end)
+            registerToggle('infAmmo', 'rhd_ammo')
+
+            mkText(sec, 'No Recoil / No Spread / Rapid need Arm GC mods first.')
+            mkText(sec, 'Nothing is scanned at load now, so the gun stays clean.')
+        end
+
+        local sec2 = mkSection(tab, 'Give Weapon')
+        if sec2 then
+            local ts = toolStorage()
+            if ts then
+                local kids = ts:GetChildren()
+                local n = 0
+                for i = 1, #kids do
+                    local t = kids[i]
+                    if t.ClassName == 'Tool' then
+                        n = n + 1
+                        mkButton(sec2, t.Name, function() giveWeapon(t) end)
+                    end
+                end
+                if n == 0 then mkText(sec2, 'ToolStorage is empty right now.') end
+            else
+                mkText(sec2, 'ACS_Engine.ToolStorage not found.')
+            end
+            mkButton(sec2, 'Put weapons back', function() restoreTools() end)
+            mkText(sec2, 'Giving is client-side; the shop may refuse to use it.')
+        end
+    end)
+    if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
+    print('[' .. NAME .. '] tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Weapon Mods', function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+end
+
+-- ---- widget poller ------------------------------------------------------
+if HAS_UI then
+    task.spawn(function()
+        while running do
+            for i = 1, #TOGGLES do
+                local t = TOGGLES[i]
+                local val = nil
+                local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+                if ok1 and type(v1) == 'boolean' then
+                    val = v1
+                else
+                    local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                    if ok2 and type(v2) == 'boolean' then val = v2 end
+                end
+                if val ~= nil then
+                    getterWorks[t.key] = true
+                    if CFG[t.key] ~= val then
+                        CFG[t.key] = val
+                        print('[' .. NAME .. '] ' .. t.key .. ' = ' .. tostring(val))
+                    end
+                end
+            end
+            local okr, vr = pcall(function() return UI.GetValue('rhd_rpm') end)
+            if okr and type(vr) == 'number' then CFG.rpm = math.floor(vr) end
+            task.wait(0.12)
+        end
+    end)
+end
+
+-- ---- go -----------------------------------------------------------------
+pcall(notify, NAME .. ' ' .. VERSION, 'loaded - Arm GC mods when ready', 4)
+print('[' .. NAME .. '] loaded ' .. VERSION .. ' - open the Weapon Mods tab')
+
+local function stop()
+    running = false
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    restoreGC()
+    restoreTools()
+    if HAS_UI then pcall(function() UI.RemoveTab('Weapon Mods') end) end
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
