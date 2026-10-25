@@ -1,6 +1,6 @@
 -- What If Disasters - Matcha LuauVM
 -- Place 109440485612336
--- FOCUS: AUTO WIN.
+-- FOCUS: AUTO WIN (teleport edition).
 --
 -- Confirmed in game this session (probes, 2026-10-25):
 --   ReplicatedStorage.DisasterState attributes: Active, GoalCheck (JSON string),
@@ -17,18 +17,22 @@
 --     runs Eval(goals, HumanoidRootPart.Position, LocalPlayer) and marks the goal
 --     green; if the attribute is empty it falls back to the server-set GoalSafe.
 --   => the win condition is a POSITION predicate the client can evaluate, so the
---      honest auto win is: evaluate it locally, find the nearest passing spot,
---      walk there.  require(instance) does not work in Matcha, so Eval is
---      re-implemented below straight from that decompile.
+--      honest auto win is: evaluate it locally, find a passing spot, go there.
+--      require(instance) does not work in Matcha, so Eval is re-implemented below
+--      straight from that decompile.
 --
+-- v2.1: teleports the HumanoidRootPart to the found safe spot instead of walking
+--   ("Teleport to safe spot" toggle, default ON). CFrame writes are the risky
+--   part of this script: 3 failed/unhelpful tps in a row and it falls back to
+--   walking on its own. Toggle it off to get the walk-only v2.0 behaviour.
 -- UNVERIFIED: whether the server judges with the identical predicate each round;
 --   the script only ever moves the character, never fakes the result.
 -- UNVERIFIED: CollectionService:GetTagged support in this VM (Warm falls back to
 --   the wall check when it is unavailable).
--- No teleport, no input simulation, no attribute writes, no remote firing.
+-- No input simulation, no attribute writes, no remote firing except Revive.
 
 local NAME    = 'WhatIfDisasters'
-local VERSION = 'v2.0'
+local VERSION = 'v2.1'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -52,6 +56,7 @@ end
 -- ---- config ----
 local CFG = {
     autoWin    = true,
+    teleport   = true,
     autoRevive = true,
     hud        = true,
     alerts     = true,
@@ -271,7 +276,7 @@ end
 local function findSafeSpot(goals, origin, player)
     if evalGoals(goals, origin, player) then return origin, 0 end
 
-    local radii = { 8, 16, 26, 38, 52 }
+    local radii = { 8, 16, 26, 38, 52, 70 }
     for ri = 1, #radii do
         local rad = radii[ri]
         local best, bestD = nil, math.huge
@@ -280,8 +285,7 @@ local function findSafeSpot(goals, origin, player)
             local cand = Vector3.new(origin.X + math.cos(a) * rad, origin.Y, origin.Z + math.sin(a) * rad)
             -- drop to the ground under the candidate (RaycastResult.Position is not
             -- relied on; Distance is the field the game's own module uses)
-            local downDir = Vector3.new(0, -1, 0)
-            local hit = rc(cand + Vector3.new(0, 6, 0), downDir * 40, prmMap)
+            local hit = rc(cand + Vector3.new(0, 6, 0), Vector3.new(0, -1, 0) * 40, prmMap)
             if hit then
                 cand = cand + Vector3.new(0, 6 - hit.Distance, 0)
                 cand = cand + Vector3.new(0, 3, 0)
@@ -381,6 +385,7 @@ local getterWorks = {}
 
 local TOGGLES = {
     { key = 'autoWin',    id = 'wid_win',    name = 'Auto win' },
+    { key = 'teleport',   id = 'wid_tp',     name = 'Teleport to safe spot' },
     { key = 'autoRevive', id = 'wid_revive', name = 'Auto get up' },
     { key = 'hud',        id = 'wid_hud',    name = 'HUD' },
     { key = 'alerts',     id = 'wid_alerts', name = 'Alerts' },
@@ -443,6 +448,7 @@ local function buildTab(tab)
         local sec = mkSection(tab, 'Auto win')
         if sec then
             mkToggle(sec, 'Auto win', 'wid_win', true, applyBool('autoWin'))
+            mkToggle(sec, 'Teleport to safe spot', 'wid_tp', true, applyBool('teleport'))
             mkToggle(sec, 'Auto get up', 'wid_revive', true, applyBool('autoRevive'))
             mkToggle(sec, 'Alerts', 'wid_alerts', true, applyBool('alerts'))
             mkButton(sec, 'Test: evaluate goal now', function()
@@ -510,21 +516,25 @@ if HAS_UI then
 end
 
 -- =====================================================================
--- auto win loop: evaluate the goal, walk to the nearest passing spot
+-- auto win loop: evaluate the goal, teleport (or walk) to a passing spot
 -- =====================================================================
-local SEARCH_INTERVAL = 1.0
+local SEARCH_INTERVAL = 0.6
+local TP_GAP          = 1.2
+local TP_MAX_FAILS    = 3
 local REACHED         = 5
 
 task.spawn(function()
     local next = 0
-    local prevSafe = nil
+    local prevSafe   = nil
+    local tpNext     = 0
+    local tpFails    = 0
 
     while running do
         local ok, err = pcall(function()
             refreshFilters()
 
-            local ds   = RS:FindFirstChild('DisasterState')
-            local rstr = RS:FindFirstChild('RoundState')
+            local ds       = RS:FindFirstChild('DisasterState')
+            local rstr     = RS:FindFirstChild('RoundState')
             local goalAttr = ds and ds:GetAttribute('GoalCheck')
             local goalText = (ds and ds:GetAttribute('GoalText')) or ''
             local phase    = rstr and rstr:GetAttribute('Phase')
@@ -537,9 +547,13 @@ task.spawn(function()
             if not hrp or not hum then
                 winState.text = 'no character'
                 winState.safe = false
+                winState.spot = nil
+                tpFails = 0
             elseif lp:GetAttribute('InRound') ~= true then
                 winState.text = 'waiting (' .. tostring(phase) .. ')'
                 winState.safe = false
+                winState.spot = nil
+                tpFails = 0
             elseif downState then
                 winState.text = 'down - getting up'
             else
@@ -549,27 +563,52 @@ task.spawn(function()
                 if goals then
                     local safeNow = evalGoals(goals, pos, lp)
                     winState.safe = safeNow
+
                     if safeNow then
                         winState.text = 'GOAL PASSES - holding position'
                         winState.spot = nil
+                        tpFails = 0
                     elseif CFG.autoWin then
                         if winState.spot and (winState.spot - pos).Magnitude <= REACHED then
                             winState.spot = nil
                         end
+
                         if os.clock() >= next then
                             next = os.clock() + SEARCH_INTERVAL
                             local spot, dist = findSafeSpot(goals, pos, lp)
-                            if spot then
-                                winState.spot = spot
-                                winState.text = string.format('moving to safe spot (%.0f studs)', dist or 0)
-                                pcall(function() hum:MoveTo(spot) end)
-                            else
-                                winState.spot = nil
+                            winState.spot = spot
+
+                            if not spot then
                                 winState.text = 'no safe spot in reach'
+                            elseif CFG.teleport and tpFails < TP_MAX_FAILS then
+                                if os.clock() >= tpNext then
+                                    tpNext = os.clock() + TP_GAP
+                                    local okTp = pcall(function()
+                                        hrp.CFrame = CFrame.new(spot.X, spot.Y + 3, spot.Z)
+                                    end)
+                                    if okTp then
+                                        tpFails = tpFails + 1
+                                        winState.text = string.format('tp to safe spot (%.0f studs)', dist or 0)
+                                        print('[' .. NAME .. '] tp to safe spot, ' .. string.format('%.0f', dist or 0) .. ' studs')
+                                    else
+                                        tpFails = tpFails + 1
+                                        winState.text = 'tp failed'
+                                        warn('[' .. NAME .. '] teleport CFrame write failed')
+                                    end
+                                else
+                                    winState.text = 'tp cooling down'
+                                end
+                            else
+                                if tpFails >= TP_MAX_FAILS then
+                                    winState.text = 'tp not helping - walking'
+                                else
+                                    winState.text = string.format('walking to safe spot (%.0f studs)', dist or 0)
+                                end
+                                pcall(function() hum:MoveTo(spot) end)
                             end
-                        elseif winState.spot then
+                        elseif winState.spot and not CFG.teleport then
                             pcall(function() hum:MoveTo(winState.spot) end)
-                        else
+                        elseif not winState.spot then
                             winState.text = 'unsafe - searching'
                         end
                     else
@@ -593,7 +632,7 @@ task.spawn(function()
         if not ok then
             winState.text = 'error'
         end
-        task.wait(0.4)
+        task.wait(0.35)
     end
 end)
 
