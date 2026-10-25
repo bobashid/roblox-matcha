@@ -1,82 +1,72 @@
--- Gladiator Life (place 136567192786299) - combat tools - Matcha LuauVM
+-- Gladiator Life (place 136567192786299) - combat - Matcha LuauVM
 --
--- v2.0: all ESP removed. This build is energy only.
--- getgc never runs at load - press Scan once while you are in a fight.
--- Energy lives in the duel state table (keys en / maxEnergy), not on a
--- property, so it is written through applygc. The server may re-sync it
--- after a turn; if the number snaps back, that is the server, not the script.
+-- v3.0: the gc scan is gone. Energy is not a client number in this game
+-- (29 hits for en/maxEnergy, zero numeric), so an inf-energy toggle cannot
+-- work from the client. What does work is the game's own remote:
+--   SS.Remote:InvokeServer("DuelAct", { id = <action> })
+-- with "Action" as the fallback name. Action ids come from the game's own
+-- pose table: quick, normal, power, charge, shove, throw, taunt, rest.
 
 local NAME    = 'GladiatorCombat'
-local VERSION = 'v2.0'
+local VERSION = 'v3.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 print('[' .. NAME .. '] ' .. VERSION)
 
-local running  = true
-local built    = false
-local cache    = nil
-local scanning = false
-local nHits    = 0
-local warned   = false
+local SS     = game:GetService('ReplicatedStorage'):FindFirstChild('SS')
+local Remote = SS and SS:FindFirstChild('Remote')
+
+local running = true
+local built   = false
 
 local cfg = {
-    energy = false,
-    engVal = 500,
-    warn   = true,
-    warnAt = 20,
+    auto   = false,
+    action = 'power',
+    delay  = 0.8,
 }
 
-local ENERGY_KEYS = { 'en', 'maxEnergy' }
+local ACTIONS = { 'quick', 'normal', 'power', 'charge', 'shove', 'throw', 'taunt', 'rest' }
 
--- scan ---------------------------------------------------------------
+-- remote -------------------------------------------------------------
 
-local function scan()
-    if scanning then return end
-    scanning = true
-    print('[' .. NAME .. '] scanning, about 10-20s')
-    local ok, res = pcall(getgc, ENERGY_KEYS)
-    if ok and type(res) == 'table' and #res > 0 then
-        cache = res
-        nHits = #res
-    else
-        cache = nil
-        nHits = 0
-    end
-    print('[' .. NAME .. '] scan done: ' .. nHits .. ' hits')
-    if nHits == 0 then
-        pcall(notify, 'Gladiator', 'no energy fields found - press Scan during a fight', 4)
-    end
-    scanning = false
+local function send(name, payload)
+    if not Remote then return false, 'no remote' end
+    local ok, res = pcall(function()
+        return Remote:InvokeServer(name, payload)
+    end)
+    if not ok then return false, res end
+    return true, res
 end
 
--- apply / watch loop -------------------------------------------------
+local function act(id)
+    if not Remote then
+        print('[' .. NAME .. '] no SS.Remote found')
+        return false
+    end
+    local ok1, res1 = send('DuelAct', { id = id })
+    if ok1 and type(res1) == 'table' and res1.ok then
+        print('[' .. NAME .. '] ' .. id .. ' sent via DuelAct')
+        return true
+    end
+    local ok2, res2 = send('Action', { id = id })
+    if ok2 and type(res2) == 'table' and res2.ok then
+        print('[' .. NAME .. '] ' .. id .. ' sent via Action')
+        return true
+    end
+    print('[' .. NAME .. '] ' .. id .. ' failed: ' .. tostring(res2 or res1))
+    return false
+end
 
 task.spawn(function()
     while running do
-        if cache then
-            if cfg.energy then
-                for k, key in ipairs(ENERGY_KEYS) do
-                    pcall(applygc, cache, key, cfg.engVal)
-                end
-                warned = false
-            elseif cfg.warn then
-                local low = false
-                for k, e in ipairs(cache) do
-                    if e.key == 'en' and type(e.value) == 'number' then
-                        if e.value <= cfg.warnAt then low = true end
-                    end
-                end
-                if low and not warned then
-                    warned = true
-                    pcall(notify, 'Gladiator', 'energy low', 2)
-                elseif not low then
-                    warned = false
-                end
-            end
+        if cfg.auto then
+            act(cfg.action)
+            task.wait(cfg.delay)
+        else
+            task.wait(0.2)
         end
-        task.wait(0.5)
     end
 end)
 
@@ -153,23 +143,34 @@ local function mkButton(sec, label, cb)
     return false
 end
 
+local function setAction(id)
+    cfg.action = id
+    print('[' .. NAME .. '] action set to ' .. id)
+end
+
 local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
-        local en = mkSection(tab, 'Energy')
-        if en then
-            mkToggle(en, 'Inf Energy', 'gc_energy', false, function(v) cfg.energy = v end)
-            mkSlider(en, 'Energy Value', 'gc_engval', 100, 2000, 500, function(v) cfg.engVal = v end)
-            mkButton(en, 'Scan for energy', function()
-                print('[' .. NAME .. '] scan pressed')
-                task.spawn(scan)
-            end)
+        local c = mkSection(tab, 'Combat')
+        if c then
+            mkToggle(c, 'Auto Attack', 'gc_auto', false, function(v) cfg.auto = v end)
+            mkSlider(c, 'Delay (ms)', 'gc_delay', 200, 2000, 800, function(v) cfg.delay = v / 1000 end)
+            mkButton(c, 'Use Quick', function() setAction('quick') end)
+            mkButton(c, 'Use Normal', function() setAction('normal') end)
+            mkButton(c, 'Use Power', function() setAction('power') end)
+            mkButton(c, 'Use Charge', function() setAction('charge') end)
         end
-        local ex = mkSection(tab, 'Extras')
-        if ex then
-            mkToggle(ex, 'Low energy warning', 'gc_warn', true, function(v) cfg.warn = v end)
-            mkSlider(ex, 'Warn below', 'gc_warnat', 1, 200, 20, function(v) cfg.warnAt = v end)
+        local a = mkSection(tab, 'Actions')
+        if a then
+            mkButton(a, 'Use Shove', function() setAction('shove') end)
+            mkButton(a, 'Use Throw', function() setAction('throw') end)
+            mkButton(a, 'Use Taunt', function() setAction('taunt') end)
+            mkButton(a, 'Use Rest', function() setAction('rest') end)
+            mkButton(a, 'Send Action Once', function()
+                print('[' .. NAME .. '] sending ' .. cfg.action)
+                act(cfg.action)
+            end)
         end
     end)
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
@@ -194,14 +195,18 @@ end
 
 -- boot ---------------------------------------------------------------
 
-print('[' .. NAME .. '] ready. Open the Gladiator tab, press Scan for energy during a fight, then toggle Inf Energy.')
+if not Remote then
+    warn('[' .. NAME .. '] SS.Remote not found - combat buttons will do nothing')
+end
+print('[' .. NAME .. '] ready. Combat tab: pick an action, then Auto Attack. Remote found=' .. tostring(Remote ~= nil))
 
 local function stop()
     running = false
+    cfg.auto = false
     if HAS_UI then pcall(function() UI.RemoveTab('Gladiator') end) end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
-_G[NAME] = { stop = stop, scan = scan, version = VERSION }
+_G[NAME] = { stop = stop, act = act, version = VERSION }
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI))
