@@ -1,0 +1,266 @@
+-- Build And Kill Zombies (place 105011592530400) - Matcha LuauVM
+-- Version: 3.1.0
+-- Loader:
+-- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Build%20And%20Kill%20Zombies",true))()
+--
+-- (renamed from 'Auto Roll' - logic unchanged. The global is still _G.AutoRoll
+--  so old stop calls keep working.)
+
+local VERSION = "3.1.0"
+print("[Build And Kill Zombies] v" .. VERSION)
+
+if _G.AutoRoll and _G.AutoRoll.stop then
+    pcall(_G.AutoRoll.stop)
+end
+
+local Players = game:GetService("Players")
+local lp = Players.LocalPlayer
+
+local CONFIG = {
+    Key       = Enum.KeyCode.E,
+    AutoRoll  = true,
+    AutoBuy   = true,
+    Teleport  = true,
+    BuyAll    = true,
+    RollDelay = 1.8,
+    BuyHold   = 1.0,
+    TapTime   = 0.12,
+    Settle    = 0.25,
+    PostBuy   = 0.6,
+    StopAfter = 0,
+}
+
+local running = true
+local conns = {}
+local itemToggles = {}
+
+local function stop()
+    running = false
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    conns = {}
+    pcall(function() setrobloxinput(CONFIG.Key, false) end)
+end
+
+_G.AutoRoll = { stop = stop, version = VERSION }
+
+local function getChar()
+    local c = lp.Character
+    return c, c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function dist(a, b)
+    return (a - b).Magnitude
+end
+
+local function getPlots()
+    local g = workspace:FindFirstChild("Game")
+    local lobby = g and g:FindFirstChild("Lobby")
+    return lobby and lobby:FindFirstChild("Plots")
+end
+
+local function nearestCategory()
+    local _, root = getChar()
+    if not root then return nil end
+    local plots = getPlots()
+    if not plots then return nil end
+    local best, bestD = nil, math.huge
+    for i, plot in ipairs(plots:GetChildren()) do
+        local rolls = plot:FindFirstChild("Rolls")
+        if rolls then
+            for k, cat in ipairs(rolls:GetChildren()) do
+                local roll = cat:FindFirstChild("Roll")
+                if roll then
+                    local d = dist(root.Position, roll.Position)
+                    if d < bestD then bestD = d; best = cat end
+                end
+            end
+        end
+    end
+    return best, bestD
+end
+
+local function tpTo(pos, offsetY)
+    local _, root = getChar()
+    if not root then return false end
+    local p = pos + Vector3.new(0, offsetY or 4, 0)
+    pcall(function() root.CFrame = CFrame.new(p) end)
+    return true
+end
+
+local function keyOn()
+    pcall(function() setrobloxinput(CONFIG.Key, true) end)
+end
+
+local function keyOff()
+    pcall(function() setrobloxinput(CONFIG.Key, false) end)
+end
+
+local function tapKey()
+    keyOn()
+    task.wait(CONFIG.TapTime)
+    keyOff()
+end
+
+local function holdKey(seconds)
+    keyOn()
+    task.wait(seconds)
+    keyOff()
+end
+
+local function currentItemName(cat)
+    local info = cat:FindFirstChild("Info")
+    if info then
+        local nm = info:FindFirstChild("ItemName")
+        if nm and nm.ClassName == "TextLabel" then
+            local t = nm.Text
+            if t and t ~= "" and t ~= "???" then return t end
+        end
+    end
+    local ip = cat:FindFirstChild("ItemPlace")
+    local normal = ip and ip:FindFirstChild("Normal")
+    if normal then
+        for i, p in ipairs(normal:GetChildren()) do
+            if p.ClassName == "MeshPart" and string.find(p.Name, "weapon") then
+                return p.Name
+            end
+        end
+    end
+    return nil
+end
+
+local function discoverItemNames()
+    local names, seen = {}, {}
+    local plots = getPlots()
+    if plots then
+        for i, plot in ipairs(plots:GetChildren()) do
+            local rolls = plot:FindFirstChild("Rolls")
+            if rolls then
+                for k, cat in ipairs(rolls:GetChildren()) do
+                    local n = currentItemName(cat)
+                    if n and not seen[n] then
+                        seen[n] = true
+                        names[#names + 1] = n
+                    end
+                end
+            end
+        end
+    end
+    local pg = lp:FindFirstChild("PlayerGui")
+    if pg then
+        local ok, desc = pcall(function() return pg:GetDescendants() end)
+        if ok and desc then
+            for i, d in ipairs(desc) do
+                local nm = d.Name
+                if string.sub(nm, 1, 5) == "node_" and not seen[nm] then
+                    seen[nm] = true
+                    names[#names + 1] = nm
+                end
+            end
+        end
+    end
+    return names
+end
+
+local function safeToggle(sec, name, id, default, cb)
+    local variants = {
+        function() sec:Toggle(name, id, default, cb) end,
+        function() sec:Toggle(id, name, default, cb) end,
+        function() sec:Toggle(name, default, cb) end,
+    }
+    for i = 1, #variants do
+        if pcall(variants[i]) then return true end
+    end
+    return false
+end
+
+local function safeSlider(sec, name, id, min, max, default, cb)
+    local variants = {
+        function() sec:SliderInt(name, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, name, min, max, default, cb) end,
+    }
+    for i = 1, #variants do
+        if pcall(variants[i]) then return true end
+    end
+    return false
+end
+
+local function safeButton(sec, name, cb)
+    local variants = {
+        function() sec:Button(name, cb) end,
+        function() sec:Button(name, name, cb) end,
+    }
+    for i = 1, #variants do
+        if pcall(variants[i]) then return true end
+    end
+    return false
+end
+
+if UI then
+    pcall(function()
+        UI.AddTab("Build And Kill Zombies", function(tab)
+            local auto = tab:Section("Automation", "Left")
+            safeToggle(auto, "Auto Roll", "ar_autoroll", CONFIG.AutoRoll, function(v) CONFIG.AutoRoll = v end)
+            safeToggle(auto, "Auto Buy", "ar_autobuy", CONFIG.AutoBuy, function(v) CONFIG.AutoBuy = v end)
+            safeToggle(auto, "Teleport", "ar_tp", CONFIG.Teleport, function(v) CONFIG.Teleport = v end)
+            safeToggle(auto, "Buy All Items", "ar_buyall", CONFIG.BuyAll, function(v) CONFIG.BuyAll = v end)
+            safeSlider(auto, "Roll Delay x10", "ar_rolldelay", 5, 60, math.floor(CONFIG.RollDelay * 10), function(v) CONFIG.RollDelay = v / 10 end)
+            safeSlider(auto, "Buy Hold x10", "ar_buyhold", 3, 30, math.floor(CONFIG.BuyHold * 10), function(v) CONFIG.BuyHold = v / 10 end)
+            safeButton(auto, "Stop", function() stop() end)
+
+            local items = tab:Section("Items", "Right")
+            local names = discoverItemNames()
+            if #names == 0 then
+                safeButton(items, "Rescan (no items found)", function()
+                    pcall(function() notify("Build And Kill Zombies", "Join a plot then reload", 3) end)
+                end)
+            else
+                for i, nm in ipairs(names) do
+                    itemToggles[nm] = true
+                    safeToggle(items, nm, "ar_item_" .. i, true, function(v) itemToggles[nm] = v end)
+                end
+            end
+        end)
+    end)
+end
+
+task.spawn(function()
+    local cycles = 0
+    while running do
+        local cat = nearestCategory()
+        if cat then
+            local roll = cat:FindFirstChild("Roll")
+            local ip = cat:FindFirstChild("ItemPlace")
+
+            if CONFIG.AutoRoll and roll then
+                if CONFIG.Teleport then tpTo(roll.Position, 4) end
+                task.wait(CONFIG.Settle)
+                tapKey()
+                task.wait(CONFIG.RollDelay)
+            end
+
+            if CONFIG.AutoBuy and ip and running then
+                local name = currentItemName(cat)
+                local allowed = CONFIG.BuyAll
+                if not allowed and name and itemToggles[name] then
+                    allowed = true
+                end
+                if allowed then
+                    if CONFIG.Teleport then tpTo(ip.Position, 4) end
+                    task.wait(CONFIG.Settle)
+                    holdKey(CONFIG.BuyHold)
+                    task.wait(CONFIG.PostBuy)
+                end
+            end
+        end
+
+        cycles = cycles + 1
+        if CONFIG.StopAfter > 0 and cycles >= CONFIG.StopAfter then break end
+        task.wait(0.2)
+    end
+    stop()
+end)
+
+pcall(function() notify("Build And Kill Zombies", "v" .. VERSION .. " loaded", 4) end)
+print("[Build And Kill Zombies] running. Stop with: _G.AutoRoll.stop()")
