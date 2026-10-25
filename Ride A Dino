@@ -1,25 +1,24 @@
 --==================================================================
---  Ride A Dino  |  one toggle: Auto Gain Energy (hold still)
+--  Ride A Dino  |  one toggle: Always Gain Stamina
 --  Matcha LuaVM  -  built-in Matcha menu tab (UI.AddTab)
 --
---  Same idea as the seat trick in Feed A Mosquito: the game only
---  pays out energy while you are stationary, so this simply holds
---  you exactly where you are.
---
---  WHAT THE TOGGLE DOES
---    On:  saves your HumanoidRootPart CFrame, then every render
---         frame writes it back and zeroes both velocities, so the
---         game keeps seeing you standing still and energy ticks.
---    Off: stops writing, you move normally again. Nothing else is
---         touched - no deposit, no teleport, no remotes.
---    Respawn: the spot is re-captured where the new character
---         spawns, so it keeps working without a re-toggle.
+--  Same method as Feed A Mosquito's "Hide Under Farm":
+--    - anchor every BasePart of your character
+--    - rewrite HumanoidRootPart.CFrame every render frame
+--    - zero both velocities every frame
+--  The game then always sees you at rest / seated, so the stamina
+--  that the saddle seat gives you keeps regenerating from anywhere.
 --
 --  Checked this session (place 93523763376122):
---   - Workspace has no Seat / VehicleSeat, and Humanoid.Sit and
---     Humanoid.SeatPart both read nil, so there is no seat to sit
---     in - holding the root CFrame is the equivalent.
+--   - The "seat" is a dino saddle (MountSeat / SeatSurface Attachments).
+--     There is no real Seat/VehicleSeat and Humanoid.Sit reads nil, so
+--     physically sitting is not how we reproduce it.
+--   - Stamina/grip is server-pushed through the Net "Stats" channel;
+--     there is no client-readable stamina value and no client function
+--     that grants it. That is why the at-rest hold is the working route
+--     (client memory / applygc would only change the local copy).
 --
+--  Nothing else is touched: no deposit, no remotes, no teleport.
 --  Stop with _G.RideADino.stop().
 --==================================================================
 local Players    = game:GetService('Players')
@@ -27,7 +26,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'RideADino'
-local VERSION = 'v1.2'
+local VERSION = 'v1.3'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -37,11 +36,12 @@ local conns   = {}
 
 local function track(c) conns[#conns + 1] = c return c end
 
-local Config = { Still = true }
+local Config = { Gain = true }
 
 local spot     = nil
 local heldChar = nil
-local holding  = false
+local anchored = {}
+local saidOn   = false
 
 -- ---- ui helpers -------------------------------------------------
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
@@ -97,10 +97,39 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
--- ---- hold still -------------------------------------------------
+-- ---- at-rest hold (Feed A Mosquito method) ----------------------
 local function rootPart()
-    local char = LP.Character
-    return char and char:FindFirstChild('HumanoidRootPart') or nil
+    local c = LP.Character
+    return c and c:FindFirstChild('HumanoidRootPart') or nil
+end
+
+local function isPart(p)
+    local cn = p.ClassName
+    return cn == 'Part' or cn == 'MeshPart' or cn == 'UnionOperation'
+        or cn == 'WedgePart' or cn == 'CornerWedgePart' or cn == 'TrussPart'
+        or cn == 'SpawnLocation'
+end
+
+local function unanchorAll()
+    for i = 1, #anchored do
+        local e = anchored[i]
+        if e.part then pcall(function() e.part.Anchored = e.was end) end
+    end
+    anchored = {}
+end
+
+local function anchorAll(char)
+    if not char then return end
+    local ok, desc = pcall(function() return char:GetDescendants() end)
+    if not ok or not desc then return end
+    for i = 1, #desc do
+        local d = desc[i]
+        if isPart(d) then
+            local okA, was = pcall(function() return d.Anchored end)
+            anchored[#anchored + 1] = { part = d, was = (okA and was == true) }
+            pcall(function() d.Anchored = true end)
+        end
+    end
 end
 
 local function captureSpot()
@@ -113,44 +142,50 @@ local function captureSpot()
     return true
 end
 
-local function releaseSpot()
+local function releaseHold()
+    unanchorAll()
     spot     = nil
     heldChar = nil
-    holding  = false
+    saidOn   = false
 end
 
 track(RunService.RenderStepped:Connect(function()
-    if not running or not Config.Still then return end
+    if not running or not Config.Gain then return end
 
-    local hrp = rootPart()
-    if not hrp then return end
+    local char = LP.Character
+    local hrp  = rootPart()
 
-    -- new character: grab the spot it spawned at instead of yanking
-    -- it back to where the last life was standing
-    if LP.Character ~= heldChar then
+    if not (char and hrp) then
+        if heldChar then unanchorAll() end
+        heldChar = nil
+        spot     = nil
+        return
+    end
+
+    -- new life: drop the old anchors, grab where we spawned, re-anchor
+    if char ~= heldChar then
+        unanchorAll()
         local ok, cf = pcall(function() return hrp.CFrame end)
         if ok and cf ~= nil then spot = cf end
-        heldChar = LP.Character
-        holding  = false
+        heldChar = char
+        anchorAll(char)
         return
     end
 
     if not spot then
-        if captureSpot() then
-            print('[' .. NAME .. '] holding position (energy)')
-        end
+        if captureSpot() then anchorAll(char) end
         return
     end
 
-    local ok = pcall(function()
+    pcall(function()
         hrp.CFrame                  = spot
         hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
         hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
     end)
 
-    if ok and not holding then
-        holding = true
-        print('[' .. NAME .. '] holding still - energy should tick')
+    if not saidOn then
+        saidOn = true
+        print('[' .. NAME .. '] holding still - stamina should regen')
     end
 end))
 
@@ -161,10 +196,10 @@ local function buildTab(tab)
     if tabBuilt then return end
     tabBuilt = true
     local ok, err = pcall(function()
-        local sec = mkSection(tab, 'Farm')
+        local sec = mkSection(tab, 'Stamina')
         if not sec then return end
-        if mkToggle(sec, 'Auto Gain Energy (hold still)', 'rad_still', true, applyBool('Still')) then
-            registerToggle('Still', 'rad_still', 'Auto Gain Energy (hold still)')
+        if mkToggle(sec, 'Always Gain Stamina', 'rad_gain', true, applyBool('Gain')) then
+            registerToggle('Gain', 'rad_gain', 'Always Gain Stamina')
         end
     end)
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
@@ -185,7 +220,7 @@ end
 
 -- ---- toggle poller ----------------------------------------------
 task.spawn(function()
-    local was = Config.Still
+    local was = Config.Gain
 
     while running do
         for i = 1, #TOGGLES do
@@ -207,17 +242,18 @@ task.spawn(function()
             end
         end
 
-        if Config.Still ~= was then
-            was = Config.Still
-            if Config.Still then
+        if Config.Gain ~= was then
+            was = Config.Gain
+            if Config.Gain then
                 if captureSpot() then
-                    print('[' .. NAME .. '] energy hold on (spot saved)')
+                    anchorAll(LP.Character)
+                    print('[' .. NAME .. '] stamina hold on (spot saved, anchored)')
                 else
-                    print('[' .. NAME .. '] energy hold on - waiting for a character')
+                    print('[' .. NAME .. '] stamina hold on - waiting for a character')
                 end
             else
-                releaseSpot()
-                print('[' .. NAME .. '] energy hold off')
+                releaseHold()
+                print('[' .. NAME .. '] stamina hold off')
             end
         end
 
@@ -230,7 +266,7 @@ local function stop()
     running = false
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
-    releaseSpot()
+    releaseHold()
     if HAS_UI then pcall(function() UI.RemoveTab('Ride a Dino') end) end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
