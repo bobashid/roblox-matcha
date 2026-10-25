@@ -1,35 +1,24 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.2
+--  v11.3
 --
---  WHAT v11.1 BROKE
---    v11.1 let the no-weapon reset run while hiding. But while you
---    are under the map with nothing in hand, "needsWeapon" stays
---    true forever, so the reset fired again every 30 s, killed you,
---    dropped you at spawn, and you never got a weapon out again.
---    That is why farm kill looked dead and why you were not staying
---    under the map after a reset.
+--  CHANGES
+--    1. Auto reset is no longer part of farm kill. Farm Kill only
+--       fights; it never kills your character. The only thing that
+--       resets you is Main -> Auto Reset.
+--    2. Auto Reset: if you have no weapon out and a weapon is in your
+--       backpack, you are reset after 10 s of that state. Nothing
+--       else triggers it.
+--    3. Auto Hatch removed - it did not hatch anything.
 --
---  WHAT IT DOES NOW
---    1. The reset is no longer tied to hiding. While hiding it only
---       runs if you turn on the new 'Auto Reset (no weapon)' toggle;
---       with Farm on and not hiding it behaves like it used to.
---    2. When a reset happens while hiding, the respawned character is
---       anchored and written straight back to the hide spot in the
---       same watcher pass, before farm kill resumes - no wait for the
---       next frame, no stop at spawn.
---    3. That reset is not counted as a death down there, and hideHP0 /
---       hideFallFrames are reset so the watchdogs do not trip on a
---       fresh spawn.
---    4. If the base has not been found yet (no hide spot), no reset
---       happens while hiding - otherwise it would leave you on the
---       surface with no way back.
---
---  HIDE ITSELF (unchanged)
+--  HIDE UNDER FARM
 --    Anchors the HumanoidRootPart and re-writes it every frame with
---    velocity zeroed. Drift watchdog, damage watchdog (70%), two-death
---    watchdog, and a TP_MAX stale-flag clear.
+--    velocity zeroed, so gravity cannot pull you down. Drift
+--    watchdog, damage watchdog (70%), two-death watchdog, and a
+--    TP_MAX stale-flag clear so a pickup cannot freeze the hold.
+--    A reset caused by Auto Reset is not counted as a death down
+--    there, and the new character is put straight back on the spot.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -40,7 +29,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.2'
+local VERSION = 'v11.3'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -60,13 +49,9 @@ local TOUCH_PARTS  = 4
 local ATK_BURST    = 2
 local STALE_LIMIT  = 40
 
-local HATCH_RATE     = 0.5
-local HATCH_GAP      = 0.03
-local HATCH_COOLDOWN = 1.5
-
-local FAST_SETTLE   = 3.0
-local FAST_COOLDOWN = 30.0
-local FAST_MAX_WAIT = 15.0
+local RESET_AFTER   = 10.0
+local RESET_COOLDOWN = 15.0
+local RESET_MAX_WAIT = 15.0
 
 local HIDE_DEPTH   = 25
 local HIDE_LIFT    = 6
@@ -165,7 +150,6 @@ local Config = {
     Pickup      = false,
     TPPickup    = false,
     BestEquip   = false,
-    AutoHatch   = false,
     HideUnder   = false,
     AutoReset   = false,
 }
@@ -180,9 +164,8 @@ local TOGGLES     = {}
 local getterWorks = {}
 local RARITY_IDS  = {}
 
-local lastPickupAt  = 0
-local hatchFired    = {}
-local pickingNow    = false
+local lastPickupAt = 0
+local pickingNow   = false
 local pickStartedAt = 0
 
 local hideSpot, hideSurface = nil, nil
@@ -885,7 +868,7 @@ local function hideFrame()
     if not hrp then return end
 
     if LP.Character ~= hideChar then
-        local ownReset = hideResetAt ~= nil and (tick() - hideResetAt) < FAST_MAX_WAIT
+        local ownReset = hideResetAt ~= nil and (tick() - hideResetAt) < RESET_MAX_WAIT
 
         hideChar       = LP.Character
         hideHP0        = nil
@@ -963,95 +946,6 @@ local function leaveHide()
 
     print('[' .. NAME .. '] hide under farm off (put back on the surface)')
 end
-
---------------------------------------------------------------------
--- AUTO HATCH
---------------------------------------------------------------------
-local function readyPrompt(model)
-    local ok, desc = pcall(function() return model:GetDescendants() end)
-    if not ok or not desc then return nil end
-
-    for i = 1, #desc do
-        local d = desc[i]
-
-        if d.ClassName == 'ProximityPrompt' and d.Name ~= 'CarryPrompt' then
-            local okA, act = pcall(function() return d.ActionText end)
-
-            if not (okA and act == 'Skip') then
-                local okE, en = pcall(function() return d.Enabled end)
-                if not okE or en ~= false then return d end
-            end
-        end
-    end
-
-    return nil
-end
-
-local function hatchReadyEggs()
-    local eggs  = eggList()
-    local now   = tick()
-    local fired = 0
-    local total = 0
-
-    for i = 1, #eggs do
-        local m = eggs[i].model
-        local k = keyOf(m)
-
-        if k ~= nil then
-            local last = hatchFired[k]
-
-            if last == nil or (now - last) >= HATCH_COOLDOWN then
-                local prompt = readyPrompt(m)
-
-                if prompt then
-                    total = total + 1
-
-                    if pcall(function() fireproximityprompt(prompt) end) then
-                        hatchFired[k] = now
-                        fired = fired + 1
-
-                        if HATCH_GAP > 0 then task.wait(HATCH_GAP) end
-                    end
-                end
-            end
-        end
-    end
-
-    return fired, total
-end
-
-task.spawn(function()
-    local wasOn   = false
-    local lastSay = false
-
-    while running do
-        if Config.AutoHatch then
-            local fired, ready = hatchReadyEggs()
-
-            if fired > 0 then
-                if not wasOn then
-                    wasOn = true
-                    print('[' .. NAME .. '] auto hatch on (' .. tostring(ready) .. ' eggs ready)')
-                end
-                lastSay = false
-            elseif not lastSay then
-                lastSay = true
-                print('[' .. NAME .. '] auto hatch: waiting for eggs to show a Hatch prompt')
-            end
-
-            task.wait(HATCH_RATE)
-        else
-            if wasOn then
-                wasOn = false
-                print('[' .. NAME .. '] auto hatch off')
-            end
-
-            hatchFired = {}
-            lastSay    = false
-            task.wait(0.2)
-        end
-    end
-end)
 
 --------------------------------------------------------------------
 -- HUD
@@ -1284,13 +1178,12 @@ local function buildTab(tab)
         if main then
             addToggle(main, 'Auto Health', 'auto_health', 'Heal', false)
             addToggle(main, 'Auto Collect', 'auto_collect', 'AutoCollect', false)
-            addToggle(main, 'Auto Reset (no weapon)', 'auto_reset', 'AutoReset', false)
+            addToggle(main, 'Auto Reset (no weapon 10s)', 'auto_reset', 'AutoReset', false)
         end
 
         local farm = makeSection(tab, 'Farm', 'Left')
         if farm then
             addToggle(farm, 'Farm Kill', 'farm_kill', 'Farm', false)
-            addToggle(farm, 'Auto Hatch', 'auto_hatch', 'AutoHatch', false)
             addToggle(farm, 'Auto Equip Best', 'auto_equip_best', 'BestEquip', false)
             addToggle(farm, 'Hide Under Farm', 'hide_under_farm', 'HideUnder', false)
         end
@@ -1678,7 +1571,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO RESET  (Farm when not hiding, or its own toggle)
+-- AUTO RESET  (only from the Auto Reset toggle)
 --------------------------------------------------------------------
 task.spawn(function()
     local lastKill   = 0
@@ -1688,10 +1581,9 @@ task.spawn(function()
     local watching   = false
 
     while running do
-        local wanted = Config.AutoReset or (Config.Farm and not Config.HideUnder)
         local canRestore = (not Config.HideUnder) or (hideSpot ~= nil)
 
-        if wanted and canRestore and alive() and not watching then
+        if Config.AutoReset and canRestore and alive() and not watching then
             if LP.Character ~= lastChar then
                 lastChar   = LP.Character
                 emptySince = nil
@@ -1709,8 +1601,8 @@ task.spawn(function()
             if needsWeapon() and backpackHasWeapon() then
                 if emptySince == nil then emptySince = now end
 
-                if (now - emptySince) >= FAST_SETTLE
-                    and (now - lastKill) >= FAST_COOLDOWN then
+                if (now - emptySince) >= RESET_AFTER
+                    and (now - lastKill) >= RESET_COOLDOWN then
                     local okKill, why = killCharacter()
 
                     if okKill then
@@ -1721,13 +1613,14 @@ task.spawn(function()
                         local restoring = (Config.HideUnder and hideSpot ~= nil)
                         if restoring then hideResetAt = now end
 
-                        print('[' .. NAME .. '] no weapon in hand: resetting'
+                        print('[' .. NAME .. '] no weapon for '
+                            .. tostring(math.floor(RESET_AFTER)) .. 's: resetting'
                             .. (restoring and ' (going straight back under)' or ''))
 
                         task.spawn(function()
                             local waited = 0
 
-                            while running and waited < FAST_MAX_WAIT do
+                            while running and waited < RESET_MAX_WAIT do
                                 task.wait(0.05)
                                 waited = waited + 0.05
 
@@ -1751,7 +1644,7 @@ task.spawn(function()
 
                             if running then
                                 print('[' .. NAME .. '] still no new character after '
-                                    .. tostring(FAST_MAX_WAIT) .. 's - reset once by hand')
+                                    .. tostring(RESET_MAX_WAIT) .. 's - reset once by hand')
                             end
 
                             hideResetAt = nil
@@ -1776,7 +1669,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- FARM KILL
+-- FARM KILL  (no reset here)
 --------------------------------------------------------------------
 task.spawn(function()
     local hasTouch = (type(firetouchinterest) == 'function')
@@ -1996,7 +1889,6 @@ local function stop()
     eggCache       = {}
     eggStamp       = 0
     partCache      = {}
-    hatchFired     = {}
     hideSpot       = nil
     hideSurface    = nil
     hideLocked     = false
@@ -2012,5 +1904,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - reset is off while hiding unless you turn on Auto Reset', 5)
+notifyUser('Loaded - Auto Reset resets you after 10s with no weapon', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
