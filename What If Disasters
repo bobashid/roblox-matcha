@@ -9,13 +9,18 @@
 --   Decompiled Players.<local>.PlayerScripts.Client.ReviveController:
 --       Remotes.Revive:FireServer(true)    -- the "Get Up" button
 --       Remotes.Revive:FireServer("reset") -- give-up path (NOT used here)
+-- v1.2: this build rejected a Drawing Text property at load
+--   ("Matcha:67: Unknown property FontSize") and the error killed the script
+--   before any menu or HUD existed. Every Drawing property write now goes
+--   through a pcall, and the font size is attempted under both FontSize and
+--   TextSize so whichever this build supports is the one that sticks.
 -- UNVERIFIED: meaning/units of GoalShift (numeric); printed raw only.
 -- UNVERIFIED: server acceptance of Revive(true) without the local button press;
 --   the auto get-up toggle re-checks state and backs off on repeats.
 -- No teleport, no input simulation, no stat writes.
 
 local NAME    = 'WhatIfDisasters'
-local VERSION = 'v1.1'
+local VERSION = 'v1.2'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -29,6 +34,12 @@ local conns, draws = {}, {}
 
 local function track(c) conns[#conns + 1] = c return c end
 local function trackD(d) draws[#draws + 1] = d return d end
+
+-- One unsupported property on a Drawing object throws, and a bare assignment
+-- at load time kills the whole chunk. Every write goes through here.
+local function sset(obj, prop, val)
+    pcall(function() obj[prop] = val end)
+end
 
 -- ---- remotes (resolved once, guarded at call time) ----
 local Remotes = RS:FindFirstChild('Remotes')
@@ -59,15 +70,16 @@ if Drawing.Fonts ~= nil and Drawing.Fonts.SystemBold ~= nil then FONT = Drawing.
 
 local function mkText(y, r, g, b)
     local t = trackD(Drawing.new('Text'))
-    t.Text = ''
-    t.Color = Color3.fromRGB(r, g, b)
-    t.Outline = true
-    t.Center = false
-    t.Font = FONT
-    t.FontSize = 16
-    t.Transparency = 1
-    t.Position = Vector2.new(20, y)
-    t.Visible = false
+    sset(t, 'Text', '')
+    sset(t, 'Color', Color3.fromRGB(r, g, b))
+    sset(t, 'Outline', true)
+    sset(t, 'Center', false)
+    sset(t, 'Font', FONT)
+    pcall(function() t.FontSize = 16 end)
+    pcall(function() t.TextSize = 16 end)
+    sset(t, 'Transparency', 1)
+    sset(t, 'Position', Vector2.new(20, y))
+    sset(t, 'Visible', false)
     return t
 end
 
@@ -77,12 +89,14 @@ local hudStats = mkText(164, 255, 220, 120)
 local hudDown  = mkText(186, 255, 140, 140)
 
 local function setText(obj, on, s)
-    if on and s ~= '' then
-        if obj.Text ~= s then obj.Text = s end
-        if not obj.Visible then obj.Visible = true end
-    elseif obj.Visible then
-        obj.Visible = false
-    end
+    pcall(function()
+        if on and s ~= '' then
+            if obj.Text ~= s then obj.Text = s end
+            if not obj.Visible then obj.Visible = true end
+        elseif obj.Visible then
+            obj.Visible = false
+        end
+    end)
 end
 
 -- ---- revive ----
