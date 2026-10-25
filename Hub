@@ -7,12 +7,13 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v1.5: Prison Life defaults to PRISON LIFE TRIGGERBOT (HvH via _G.Hub.load).
 -- v1.4: Chop A Forest pinned by place id.
 -- v1.3: the inner fetch carries a unique ?v= so the raw CDN never hands back
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v1.4'
+local VERSION = 'v1.5'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -26,7 +27,7 @@ local PLACES = {
     [113273588963037] = '+1 Upgrade Per Kill',
     [125310131519813] = 'Feed A Mosquito',
     [110432290690507] = 'Hike For Eggs',
-    [155615604]       = 'Prison Life HvH',
+    [155615604]       = 'PRISON LIFE TRIGGERBOT',
     [94009908234110]  = 'Dogs',
     [140576663170542] = 'Clean Everything',
     [101770480176177] = 'Command An Army',
