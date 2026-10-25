@@ -1,21 +1,22 @@
 -- +1 Upgrade Per Kill - crit kill aura + health bars - Matcha LuauVM
--- v4.1 - two fixes for "works for me, not for my friend":
---   1. The old build hardcoded EXCLUDE = { o_csf, fakeaimboton }. Every player
---      carrying one of those names was dropped from the target list, so two
---      accounts testing on each other could never damage each other. Now ONLY
---      the local player is excluded, by UserId, plus an optional name list.
---   2. Crit Only swung exclusively while falling. If the jump impulse did not
---      take on that client, no swing ever fired, which looks exactly like a
---      dead aura. After CRIT_STALL seconds without a crit window the aura
---      swings anyway; crit stays true in the payload.
--- Also: NPC scanning now skips player characters via GetPlayerFromCharacter,
--- so the local player can never be picked up as a "bot" target.
--- Debug toggle prints targets / in range / swings / confirms every 5 s.
+-- v4.2 - fixes taken from a live diagnostic run on a second account:
+--   1. Players:GetPlayerFromCharacter DOES NOT EXIST on this Matcha build.
+--      It errors with "attempt to call missing method 'GetPlayerFromCharacter'
+--      of Instance". It was used to tell a player character apart from an NPC,
+--      so every player model was ALSO scanned as a bot and the local player
+--      ended up in the target list as an NPC. Replaced with an Address set
+--      rebuilt each collector tick (no GetPlayerFromCharacter anywhere).
+--   2. RANGE was 30 studs. A live snapshot showed every other player 120-300
+--      studs away, so the aura had literally nobody in range. RANGE is 250
+--      now; lower it if the server starts rejecting swings.
+--   3. New "Test Swing" button: fires one swing at the nearest target and
+--      prints its health before, +0.4 s and +1.0 s. That answers "does the
+--      server accept my swing" per account, in one click.
 -- Payload: { crit, sprint, charge, vt, dir, eye, t } (confirmed in game).
 -- No Instance.new, no hooks, no input simulation.
 
 local NAME    = 'HitEveryone'
-local VERSION = 'v4.1'
+local VERSION = 'v4.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -33,17 +34,17 @@ if not Attack then
     warn('[' .. NAME .. '] Remotes.Attack not found - script idle')
 end
 
-local RANGE         = 30      -- maxed reach, studs
+local RANGE         = 250     -- reach, studs (was 30; the arena is bigger)
 local POOL          = 32      -- max simultaneous health bars
 local SMOOTH_RATE   = 90      -- higher = snappier tracking
 local SNAP_PX       = 10      -- snap onto the target past this jump, px
 local COLLECT_EVERY = 0.35    -- re-resolve characters (3 Hz)
 local HEALTH_EVERY  = 0.1     -- refresh cached health (10 Hz)
-local FORGET_AFTER  = 3.0     -- drop a cached target not seen for this long
+local FORGET_AFTER  = 3.0     -- drop a cached bar not seen for this long
 local SWING_WAIT    = 0.04    -- 25 swings/s = Config.Combat.MaxAttacksPerSecond
 local HURT_WINDOW   = 1.0     -- HurtResistantTicks 20 at 20 tps
 local VERIFY_AFTER  = 0.12    -- wait this long before judging a swing
-local MAX_BAR_DIST  = 220     -- do not draw bars past this many studs
+local MAX_BAR_DIST  = 400     -- do not draw bars past this many studs
 
 -- jump assist (Crit Only mode). One impulse per JUMP_COOLDOWN; a velocity
 -- write is expensive, so it never happens per frame.
@@ -56,8 +57,8 @@ local HEAD_OFFSET = Vector3.new(0, 2.6, 0)
 local FEET_OFFSET = Vector3.new(0, 2.4, 0)
 local EYE_OFFSET  = Vector3.new(0, 1.5, 0)
 
--- Only the local player is excluded automatically. Add lowercase names here
--- if you ever want to skip someone specific:  ['name'] = true
+-- Only the local player is excluded automatically (by UserId). Add lowercase
+-- names here if you ever want to skip someone specific:  ['name'] = true
 local EXCLUDE = {}
 
 local NPC_FOLDERS = { 'Bots', 'NPCs', 'Npcs', 'Enemies', 'Dummies', 'AI' }
@@ -214,7 +215,27 @@ local function excluded(name)
     return EXCLUDE[string.lower(name)] == true
 end
 
+local function addrOf(inst)
+    if not inst then return nil end
+    local ok, a = pcall(function() return inst.Address end)
+    if ok and type(a) == 'number' then return a end
+    return nil
+end
+
+-- Address -> true for every player character. Replaces
+-- Players:GetPlayerFromCharacter, which is missing on this build.
+local function playerCharSet()
+    local set = {}
+    local plist = Players:GetPlayers()
+    for i = 1, #plist do
+        local a = addrOf(plist[i].Character)
+        if a then set[a] = true end
+    end
+    return set
+end
+
 local function hpOf(model)
+    if not model then return nil end
     local h = model:GetAttribute('Health')
     if type(h) ~= 'number' then
         local hum = model:FindFirstChild('Humanoid')
@@ -252,17 +273,14 @@ local function buildTarget(model, key, plr)
     }
 end
 
-local function scanNPCs(out)
+local function scanNPCs(out, charSet)
     local kids = workspace:GetChildren()
     for i = 1, #kids do
         local inst = kids[i]
         local cls = inst.ClassName
         if cls == 'Model' then
-            -- a player character is not an NPC; it is already handled by the
-            -- player pass (and this is what used to let the aura target you)
-            local okp, owner = pcall(function() return Players:GetPlayerFromCharacter(inst) end)
-            local isChar = okp and owner ~= nil
-            if not isChar then
+            -- skip anything that is a player character, by Address
+            if not charSet[addrOf(inst)] then
                 local t = buildTarget(inst, 'n' .. tostring(inst.Address), nil)
                 if t and inst:GetAttribute('Zone') ~= 'Lobby' then out[#out + 1] = t end
             end
@@ -275,12 +293,9 @@ local function scanNPCs(out)
                 local sub = inst:GetChildren()
                 for j = 1, #sub do
                     local m = sub[j]
-                    if m.ClassName == 'Model' then
-                        local okm, owner2 = pcall(function() return Players:GetPlayerFromCharacter(m) end)
-                        if not (okm and owner2 ~= nil) then
-                            local t = buildTarget(m, 'n' .. tostring(m.Address), nil)
-                            if t then out[#out + 1] = t end
-                        end
+                    if m.ClassName == 'Model' and not charSet[addrOf(m)] then
+                        local t = buildTarget(m, 'n' .. tostring(m.Address), nil)
+                        if t then out[#out + 1] = t end
                     end
                 end
             end
@@ -311,6 +326,52 @@ local function fireAt(model, eye, targetPos)
     }
     pcall(function()
         Attack:FireServer(model, payload)
+    end)
+end
+
+-- one click test: swing at the nearest target and report its health ----
+
+local function testSwing()
+    if not Attack then
+        print('[' .. NAME .. '] test: Remotes.Attack missing')
+        return
+    end
+    local root = myRoot()
+    if not root then
+        print('[' .. NAME .. '] test: no HumanoidRootPart')
+        return
+    end
+
+    local myPos = root.Position
+    local best, bestD
+    local list = targets
+    for i = 1, #list do
+        local tr = list[i].root
+        if tr and tr.Parent then
+            local d = (tr.Position - myPos).Magnitude
+            if not bestD or d < bestD then
+                best, bestD = list[i], d
+            end
+        end
+    end
+
+    if not best then
+        print('[' .. NAME .. '] test: no target in the list (targets=' .. tostring(#list) .. ')')
+        return
+    end
+
+    local before = hpOf(best.model)
+    fireAt(best.model, myPos + EYE_OFFSET, best.root.Position)
+    print('[' .. NAME .. '] test swing at ' .. tostring(best.model.Name) ..
+          ' dist=' .. string.format('%.1f', bestD) ..
+          ' hp=' .. tostring(before))
+
+    task.spawn(function()
+        task.wait(0.4)
+        print('[' .. NAME .. '] test hp @0.4s = ' .. tostring(hpOf(best.model)))
+        task.wait(0.6)
+        print('[' .. NAME .. '] test hp @1.0s = ' .. tostring(hpOf(best.model)) ..
+              ' (unchanged = server rejected the swing)')
     end)
 end
 
@@ -355,6 +416,13 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. label)
+    return false
+end
+
 local function buildTab(tab)
     if built then return end
     built = true
@@ -366,6 +434,10 @@ local function buildTab(tab)
         mkToggle(sec, 'Auto Jump',   'auto_jump', true,  function(v) setBool('autoJump', v) end)
         mkToggle(sec, 'Health Bars', 'bars',      true,  function(v) setBool('bars', v) end)
         mkToggle(sec, 'Debug',       'debug',     false, function(v) setBool('debug', v) end)
+        mkButton(sec, 'Test Swing', function()
+            print('[' .. NAME .. '] test button pressed')
+            pcall(testSwing)
+        end)
     end)
     if not ok then
         warn('[' .. NAME .. '] build error: ' .. tostring(err))
@@ -420,21 +492,22 @@ task.spawn(function()
     end
 end)
 
--- COLLECTOR: resolves characters/roots at 3 Hz, cached in targets -----
+-- COLLECTOR: players + NPCs, player characters told apart by Address --
 
 task.spawn(function()
     while running do
         local out = {}
         local skipped = 0
+        local charSet = playerCharSet()
         local plist = Players:GetPlayers()
+
         for i = 1, #plist do
             local plr = plist[i]
             local isSelf = (plr.UserId == lp.UserId)
             if not isSelf and not excluded(plr.Name) then
                 local c = plr.Character
                 if c then
-                    local zone = c:GetAttribute('Zone')
-                    if zone == 'Arena' then
+                    if c:GetAttribute('Zone') == 'Arena' then
                         local t = buildTarget(c, 'p' .. tostring(plr.UserId), plr)
                         if t then out[#out + 1] = t end
                     else
@@ -443,7 +516,9 @@ task.spawn(function()
                 end
             end
         end
-        pcall(scanNPCs, out)
+
+        pcall(scanNPCs, out, charSet)
+
         targets      = out
         statTargets  = #out
         statZoneSkip = skipped
@@ -460,11 +535,8 @@ task.spawn(function()
 
         for i = 1, #list do
             local t = list[i]
-            local m = t.model
-            if m then
-                local h = hpOf(m)
-                if type(h) == 'number' then t.hp = h end
-            end
+            local h = hpOf(t.model)
+            if type(h) == 'number' then t.hp = h end
         end
 
         -- a swing only becomes a confirmed hit (and starts the hurt window)
@@ -481,8 +553,8 @@ task.spawn(function()
                     end
                 end
                 if cur ~= nil and cur < p.hp - 0.01 then
-                    lastHit[key]   = p.t
-                    statConfirms   = statConfirms + 1
+                    lastHit[key] = p.t
+                    statConfirms = statConfirms + 1
                 end
             end
         end
