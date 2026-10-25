@@ -1,45 +1,47 @@
 --==================================================================
---  Ride A Dino  |  one toggle: Auto Gain Energy
+--  Ride A Dino  |  one toggle: Auto Gain Energy (hold still)
 --  Matcha LuaVM  -  built-in Matcha menu tab (UI.AddTab)
 --
---  Confirmed in game this session (place 93523763376122):
---   - Own plot: Workspace.Pens.<Plot> where
---       plot:GetAttribute('Owner') == LocalPlayer.UserId
---     (read from the game's own HUD.Deposit module)
---   - Deposit prompt: plot.Sign.PenDepositPrompt
---   - Pen floor:      plot.Floor   (used for the fallback hop)
---   - Carried dino:   character child named 'CarriedDino'
---     (the game checks exactly this name before depositing)
+--  Same idea as the seat trick in Feed A Mosquito: the game only
+--  pays out energy while you are stationary, so this simply holds
+--  you exactly where you are.
 --
 --  WHAT THE TOGGLE DOES
---    While you carry a dino it fires your pen's deposit prompt so the
---    pen income keeps ticking. If two prompt fires do not take it, it
---    hops to the pen, fires again, and puts you straight back where
---    you were.
+--    On:  saves your HumanoidRootPart CFrame, then every render
+--         frame writes it back and zeroes both velocities, so the
+--         game keeps seeing you standing still and energy ticks.
+--    Off: stops writing, you move normally again. Nothing else is
+--         touched - no deposit, no teleport, no remotes.
+--    Respawn: the spot is re-captured where the new character
+--         spawns, so it keeps working without a re-toggle.
+--
+--  Checked this session (place 93523763376122):
+--   - Workspace has no Seat / VehicleSeat, and Humanoid.Sit and
+--     Humanoid.SeatPart both read nil, so there is no seat to sit
+--     in - holding the root CFrame is the equivalent.
 --
 --  Stop with _G.RideADino.stop().
 --==================================================================
 local Players    = game:GetService('Players')
 local RunService = game:GetService('RunService')
-local WS         = game:GetService('Workspace')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'RideADino'
-local VERSION = 'v1.1'
+local VERSION = 'v1.2'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
 
-local running  = true
-local conns    = {}
-local drawings = {}
+local running = true
+local conns   = {}
 
 local function track(c) conns[#conns + 1] = c return c end
 
-local Config = { Gain = true }
+local Config = { Still = true }
 
-local DEPOSIT_COOLDOWN = 1.0
-local TP_HOVER         = 4
+local spot     = nil
+local heldChar = nil
+local holding  = false
 
 -- ---- ui helpers -------------------------------------------------
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
@@ -95,88 +97,64 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
--- ---- game helpers ----------------------------------------------
-local warnedPrompt = false
-
-local function firePrompt(prompt)
-    if not prompt then return false end
-    if type(fireproximityprompt) ~= 'function' then
-        if not warnedPrompt then
-            warnedPrompt = true
-            warn('[' .. NAME .. '] fireproximityprompt missing - re-run the Matcha loader')
-        end
-        return false
-    end
-    local ok = pcall(fireproximityprompt, prompt)
-    return ok
-end
-
-local function myPlot()
-    local pens = WS:FindFirstChild('Pens')
-    if not pens then return nil end
-    local kids = pens:GetChildren()
-    for i = 1, #kids do
-        local plot = kids[i]
-        local ok, owner = pcall(function() return plot:GetAttribute('Owner') end)
-        if ok and owner ~= nil and owner == LP.UserId then return plot end
-    end
-    return nil
-end
-
-local function depositPrompt(plot)
-    if not plot then return nil end
-    local sign = plot:FindFirstChild('Sign')
-    if not sign then return nil end
-    return sign:FindFirstChild('PenDepositPrompt')
-end
-
-local function carryingDino()
-    local char = LP.Character
-    if not char then return false end
-    local ok, c = pcall(function() return char:FindFirstChild('CarriedDino') end)
-    return ok and c ~= nil
-end
-
+-- ---- hold still -------------------------------------------------
 local function rootPart()
     local char = LP.Character
     return char and char:FindFirstChild('HumanoidRootPart') or nil
 end
 
-local function deposit()
-    local plot   = myPlot()
-    local prompt = depositPrompt(plot)
-    if not prompt then return false end
-
-    firePrompt(prompt)
-    task.wait(0.20)
-    if not carryingDino() then return true end
-
-    firePrompt(prompt)
-    task.wait(0.25)
-    if not carryingDino() then return true end
-
-    -- still carrying: hop to the pen, fire, hop back
-    local hrp   = rootPart()
-    local floor = plot:FindFirstChild('Floor')
-    if not (hrp and floor) then return false end
-
-    local okPos, fp = pcall(function() return floor.Position end)
-    if not okPos or not fp then return false end
-
-    local home = hrp.CFrame
-    pcall(function() hrp.CFrame = CFrame.new(fp.X, fp.Y + TP_HOVER, fp.Z) end)
-    task.wait(0.20)
-    firePrompt(prompt)
-    task.wait(0.15)
-    firePrompt(prompt)
-    task.wait(0.12)
-    pcall(function() hrp.CFrame = home end)
-
-    print('[' .. NAME .. '] deposit hop used (back at start)')
+local function captureSpot()
+    local hrp = rootPart()
+    if not hrp then return false end
+    local ok, cf = pcall(function() return hrp.CFrame end)
+    if not ok or cf == nil then return false end
+    spot     = cf
+    heldChar = LP.Character
     return true
 end
 
--- ---- menu ------------------------------------------------------
+local function releaseSpot()
+    spot     = nil
+    heldChar = nil
+    holding  = false
+end
+
+track(RunService.RenderStepped:Connect(function()
+    if not running or not Config.Still then return end
+
+    local hrp = rootPart()
+    if not hrp then return end
+
+    -- new character: grab the spot it spawned at instead of yanking
+    -- it back to where the last life was standing
+    if LP.Character ~= heldChar then
+        local ok, cf = pcall(function() return hrp.CFrame end)
+        if ok and cf ~= nil then spot = cf end
+        heldChar = LP.Character
+        holding  = false
+        return
+    end
+
+    if not spot then
+        if captureSpot() then
+            print('[' .. NAME .. '] holding position (energy)')
+        end
+        return
+    end
+
+    local ok = pcall(function()
+        hrp.CFrame                  = spot
+        hrp.AssemblyLinearVelocity  = Vector3.new(0, 0, 0)
+        hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    end)
+
+    if ok and not holding then
+        holding = true
+        print('[' .. NAME .. '] holding still - energy should tick')
+    end
+end))
+
+-- ---- menu -------------------------------------------------------
 local tabBuilt = false
 
 local function buildTab(tab)
@@ -185,8 +163,8 @@ local function buildTab(tab)
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'Farm')
         if not sec then return end
-        if mkToggle(sec, 'Auto Gain Energy', 'rad_gain', true, applyBool('Gain')) then
-            registerToggle('Gain', 'rad_gain', 'Auto Gain Energy')
+        if mkToggle(sec, 'Auto Gain Energy (hold still)', 'rad_still', true, applyBool('Still')) then
+            registerToggle('Still', 'rad_still', 'Auto Gain Energy (hold still)')
         end
     end)
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
@@ -205,8 +183,10 @@ if HAS_UI then
     end
 end
 
--- ---- toggle poller (getter is authoritative once it answers) ----
+-- ---- toggle poller ----------------------------------------------
 task.spawn(function()
+    local was = Config.Still
+
     while running do
         for i = 1, #TOGGLES do
             local t = TOGGLES[i]
@@ -226,54 +206,31 @@ task.spawn(function()
                 end
             end
         end
+
+        if Config.Still ~= was then
+            was = Config.Still
+            if Config.Still then
+                if captureSpot() then
+                    print('[' .. NAME .. '] energy hold on (spot saved)')
+                else
+                    print('[' .. NAME .. '] energy hold on - waiting for a character')
+                end
+            else
+                releaseSpot()
+                print('[' .. NAME .. '] energy hold off')
+            end
+        end
+
         task.wait(0.15)
     end
 end)
 
--- ---- the one loop ----------------------------------------------
-task.spawn(function()
-    local lastAt  = 0
-    local wasOn   = false
-    local saidNone = false
-    while running do
-        if Config.Gain then
-            local now = os.clock()
-            if carryingDino() then
-                saidNone = false
-                if (now - lastAt) >= DEPOSIT_COOLDOWN then
-                    lastAt = now
-                    if not wasOn then
-                        wasOn = true
-                        print('[' .. NAME .. '] auto gain energy on')
-                    end
-                    local okd = deposit()
-                    if not okd then
-                        print('[' .. NAME .. '] deposit prompt not found on your plot')
-                    end
-                end
-            elseif not saidNone then
-                saidNone = true
-                print('[' .. NAME .. '] waiting for a dino in hand')
-            end
-        else
-            if wasOn then
-                wasOn = false
-                print('[' .. NAME .. '] auto gain energy off')
-            end
-            lastAt   = 0
-            saidNone = false
-        end
-        task.wait(0.25)
-    end
-end)
-
--- ---- stop ------------------------------------------------------
+-- ---- stop -------------------------------------------------------
 local function stop()
     running = false
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
-    for i = 1, #drawings do pcall(function() drawings[i]:Remove() end) end
-    drawings = {}
+    releaseSpot()
     if HAS_UI then pcall(function() UI.RemoveTab('Ride a Dino') end) end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
