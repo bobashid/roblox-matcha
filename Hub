@@ -7,11 +7,12 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v1.4: Chop A Forest pinned by place id.
 -- v1.3: the inner fetch carries a unique ?v= so the raw CDN never hands back
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v1.3'
+local VERSION = 'v1.4'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -31,6 +32,7 @@ local PLACES = {
     [101770480176177] = 'Command An Army',
     [75766778174856]  = 'Tower Incremental',
     [105011592530400] = 'Build And Kill Zombies',
+    [103363457515322] = 'Chop A Forest',
 }
 
 -- file name + the names/aliases this place might show up as.
