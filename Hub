@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v1.8: Ride A Dino pinned by place id.
 -- v1.7: Realistic Home Defense pinned by place id.
 -- v1.6: What If Disasters pinned by place id.
 -- v1.5: Prison Life defaults to PRISON LIFE TRIGGERBOT (HvH via _G.Hub.load).
@@ -15,7 +16,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v1.7'
+local VERSION = 'v1.8'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -38,6 +39,7 @@ local PLACES = {
     [103363457515322] = 'Chop A Forest',
     [109440485612336] = 'What If Disasters',
     [105527962898452] = 'Realistic Home Defense',
+    [93523763376122]  = 'Ride A Dino',
 }
 
 -- file name + the names/aliases this place might show up as.
@@ -54,6 +56,7 @@ local SCRIPTS = {
     { file = 'PRISON LIFE TRIGGERBOT',  keys = { 'prisonlifetriggerbot', 'triggerbot' } },
     { file = 'Prison Life HvH',         keys = { 'prisonlifehvh', 'hvh' } },
     { file = 'Realistic Home Defense',  keys = { 'realistichomedefense', 'homedefense' } },
+    { file = 'Ride A Dino',             keys = { 'rideadino', 'dino' } },
     { file = 'Tower Incremental',       keys = { 'towerincremental' } },
     { file = 'What If Disasters',       keys = { 'whatifdisasters', 'disasters' } },
 }
