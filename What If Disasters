@@ -17,23 +17,32 @@
 --     runs Eval(goals, HumanoidRootPart.Position, LocalPlayer); if the attribute
 --     is empty it falls back to the server-set GoalSafe.
 --   Workspace.Map.Spawns: 19 BaseParts named Spawn1..SpawnN (probed positions,
---     e.g. Spawn1 = -20, 20.7, -34).  Used as the "back to spawn" fallback.
+--     e.g. Spawn1 = -20, 20.7, -34).  Used as the "back to spawn" target.
+--   TELEPORT PROBE: hrp.CFrame = CFrame.new(...) returned ok and the position
+--     moved (delta 5.6 studs), so CFrame teleport sticks in this game.
 --
--- NO GOD MODE. Humanoid.Health writes fail in this VM and GoalSafe is set by the
--- server, so a god-mode toggle would only be a cosmetic lie. This script moves
--- the character and nothing else.
+-- NO GOD MODE. Humanoid.Health writes fail in this VM and damage/GoalSafe are
+-- set by the server, so a god-mode toggle would only be a cosmetic lie. This
+-- script moves the character and nothing else.
 --
--- v2.2: when the round has no position goal (GoalCheck empty - the common case,
---   e.g. EF5Tornado), or the goal predicate can't be satisfied nearby, it
---   teleports to a spawn point instead: the spawn that passes every goal node
---   if one does, otherwise the nearest spawn.
+-- v2.3: teleport no longer switches itself off mid-round. Older builds counted
+--   every teleport ATTEMPT against a cap, so after a handful of good teleports
+--   the script permanently fell back to walking. Now only a failed CFrame write
+--   counts; a successful write resets the counter. A spot the player is standing
+--   on while the goal still fails is marked bad for 20 s and the next spot is
+--   picked instead, so it walks its way through the map rather than bouncing
+--   between two points.
+-- v2.2: spawn fallback. When the round has no position goal (GoalCheck empty -
+--   the common case, e.g. EF5Tornado) it teleports to a spawn point and keeps
+--   re-checking; when a goal does exist, a spawn that passes every goal node is
+--   preferred after the ring search fails.
 -- UNVERIFIED: whether the server judges with the identical predicate each round.
 -- UNVERIFIED: CollectionService:GetTagged support in this VM (Warm falls back to
 --   the wall check when it is unavailable).
 -- No input simulation, no attribute writes, no remote firing except Revive.
 
 local NAME    = 'WhatIfDisasters'
-local VERSION = 'v2.2'
+local VERSION = 'v2.3'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -274,11 +283,35 @@ local function decodeGoals(s)
     return t
 end
 
+-- ---- spots that were tried and did not help (20 s ban) ----
+local badSpots = {}
+
+local function pruneBad()
+    local now = os.clock()
+    for i = #badSpots, 1, -1 do
+        if badSpots[i].until <= now then table.remove(badSpots, i) end
+    end
+end
+
+local function isBad(pos)
+    for i = 1, #badSpots do
+        if (badSpots[i].pos - pos).Magnitude < 8 then return true end
+    end
+    return false
+end
+
+local function markBad(pos)
+    pruneBad()
+    badSpots[#badSpots + 1] = { pos = pos, until = os.clock() + 20 }
+    print('[' .. NAME .. '] spot marked bad for 20s')
+end
+
 -- spiral outward from the player; nearest passing ring wins
 local function findSafeSpot(goals, origin, player)
+    pruneBad()
     if evalGoals(goals, origin, player) then return origin, 0 end
 
-    local radii = { 8, 16, 26, 38, 52, 70 }
+    local radii = { 8, 16, 26, 38, 52, 70, 95 }
     for ri = 1, #radii do
         local rad = radii[ri]
         local best, bestD = nil, math.huge
@@ -291,7 +324,7 @@ local function findSafeSpot(goals, origin, player)
             if hit then
                 cand = cand + Vector3.new(0, 6 - hit.Distance, 0)
                 cand = cand + Vector3.new(0, 3, 0)
-                if evalGoals(goals, cand, player) then
+                if not isBad(cand) and evalGoals(goals, cand, player) then
                     local d = (cand - origin).Magnitude
                     if d < bestD then
                         best, bestD = cand, d
@@ -305,28 +338,36 @@ local function findSafeSpot(goals, origin, player)
 end
 
 -- ---- spawn points (Workspace.Map.Spawns) ----
-local spawnCache = {}
+local spawnCache = { mapName = nil, points = {} }
 
 local function collectSpawns()
+    local rstr = RS:FindFirstChild('RoundState')
+    local mapName = ''
+    pcall(function() mapName = tostring(rstr:GetAttribute('MapName') or '') end)
+
+    if spawnCache.mapName == mapName and #spawnCache.points > 0 then
+        return spawnCache.points
+    end
+
+    spawnCache.mapName = mapName
+    spawnCache.points = {}
+
     local map = workspace:FindFirstChild('Map')
     local folder = map and map:FindFirstChild('Spawns')
-    if not folder then
-        spawnCache = {}
-        return spawnCache
-    end
-    local list = {}
-    local ok, desc = pcall(function() return folder:GetDescendants() end)
-    if ok and type(desc) == 'table' then
-        for i = 1, #desc do
-            local o = desc[i]
-            local okp, p = pcall(function() return o.Position end)
-            if okp and typeof(p) == 'Vector3' then
-                list[#list + 1] = p + Vector3.new(0, 3, 0)
+    if folder then
+        local ok, desc = pcall(function() return folder:GetDescendants() end)
+        if ok and type(desc) == 'table' then
+            for i = 1, #desc do
+                local o = desc[i]
+                local okp, p = pcall(function() return o.Position end)
+                if okp and typeof(p) == 'Vector3' then
+                    spawnCache.points[#spawnCache.points + 1] = p + Vector3.new(0, 3, 0)
+                end
             end
         end
     end
-    spawnCache = list
-    return list
+    print('[' .. NAME .. '] spawns cached: ' .. tostring(#spawnCache.points) .. ' on map ' .. mapName)
+    return spawnCache.points
 end
 
 -- returns spot, dist, passesGoal
@@ -334,11 +375,11 @@ local function findSpawn(goals, origin, player)
     local list = collectSpawns()
     if #list == 0 then return nil, nil, false end
 
-    local best, bestD = nil, math.huge
     if goals then
+        local best, bestD = nil, math.huge
         for i = 1, #list do
             local cand = list[i]
-            if evalGoals(goals, cand, player) then
+            if not isBad(cand) and evalGoals(goals, cand, player) then
                 local d = (cand - origin).Magnitude
                 if d < bestD then best, bestD = cand, d end
             end
@@ -347,11 +388,21 @@ local function findSpawn(goals, origin, player)
     end
 
     -- no spawn satisfies the goal (or there is no goal): nearest spawn anyway
-    best, bestD = nil, math.huge
+    local best, bestD = nil, math.huge
     for i = 1, #list do
         local cand = list[i]
-        local d = (cand - origin).Magnitude
-        if d < bestD then best, bestD = cand, d end
+        if not isBad(cand) then
+            local d = (cand - origin).Magnitude
+            if d < bestD then best, bestD = cand, d end
+        end
+    end
+    if best then return best, bestD, false end
+
+    -- everything is banned: fall back to the plain nearest spawn
+    best, bestD = nil, math.huge
+    for i = 1, #list do
+        local d = (list[i] - origin).Magnitude
+        if d < bestD then best, bestD = list[i], d end
     end
     return best, bestD, false
 end
@@ -526,7 +577,7 @@ local function buildTab(tab)
                 else
                     print('[' .. NAME .. '] goal passes here = ' .. tostring(evalGoals(goals, hrp.Position, lp)))
                     local spot, dist = findSafeSpot(goals, hrp.Position, lp)
-                    print('[' .. NAME .. '] spot = ' .. tostring(spot) .. ' dist = ' .. tostring(dist))
+                    print('[' .. NAME .. '] ring spot = ' .. tostring(spot) .. ' dist = ' .. tostring(dist))
                 end
                 local sp, sd, passes = findSpawn(goals, hrp.Position, lp)
                 print('[' .. NAME .. '] spawn = ' .. tostring(sp) .. ' dist = ' .. tostring(sd) .. ' passesGoal = ' .. tostring(passes))
@@ -592,21 +643,23 @@ end
 
 -- =====================================================================
 -- auto win loop
---   1. goal predicate present -> nearest passing spot (rings), else a spawn
---      that passes the predicate, else nearest spawn
---   2. no goal predicate (the usual case) -> teleport to a spawn point
+--   1. goal predicate present -> nearest passing spot, else a spawn that
+--      passes the predicate, else nearest spawn
+--   2. no goal predicate (the usual case) -> teleport to a spawn point and
+--      keep checking; the server owns the verdict there
 -- =====================================================================
 local SEARCH_INTERVAL = 0.6
 local SPAWN_RETRY     = 3.0
 local TP_GAP          = 1.2
-local TP_MAX_TRIES    = 6
-local REACHED         = 5
+local TP_MAX_ERRORS   = 6
+local LANDED          = 6
 
 task.spawn(function()
     local next      = 0
     local prevSafe  = nil
     local tpNext    = 0
-    local tpTries   = 0
+    local tpErrors  = 0
+    local lastSpot  = nil
     local lastPhase = nil
     local lastSpawn = nil
 
@@ -623,7 +676,8 @@ task.spawn(function()
 
             if phase ~= lastPhase then
                 lastPhase = phase
-                tpTries = 0
+                tpErrors  = 0
+                lastSpot  = nil
                 winState.spot = nil
             end
 
@@ -635,10 +689,12 @@ task.spawn(function()
                 winState.text = 'no character'
                 winState.safe = false
                 winState.spot = nil
+                tpErrors, lastSpot = 0, nil
             elseif lp:GetAttribute('InRound') ~= true then
                 winState.text = 'waiting (' .. tostring(phase) .. ')'
                 winState.safe = false
                 winState.spot = nil
+                tpErrors, lastSpot = 0, nil
             elseif downState then
                 winState.text = 'down - getting up'
             else
@@ -654,10 +710,15 @@ task.spawn(function()
                     if safeNow then
                         winState.text = 'GOAL PASSES - holding position'
                         winState.spot = nil
-                        tpTries = 0
+                        lastSpot = nil
+                        tpErrors = 0
                     elseif CFG.autoWin then
-                        if winState.spot and (winState.spot - pos).Magnitude <= REACHED then
-                            winState.spot = nil
+                        -- landed on a spot and the goal still fails: that spot is
+                        -- no good, ban it and look again right away.
+                        if lastSpot and (lastSpot - pos).Magnitude <= LANDED then
+                            markBad(lastSpot)
+                            lastSpot = nil
+                            next = 0
                         end
 
                         if os.clock() >= next then
@@ -669,20 +730,18 @@ task.spawn(function()
                                 local passes
                                 spot, dist, passes = findSpawn(goals, pos, lp)
                                 viaSpawn = true
-                                if spot then
-                                    winState.spawnPasses = passes
-                                end
+                                winState.spawnPasses = passes
                             end
                             winState.spot = spot
 
                             if not spot then
                                 winState.text = 'no safe spot and no spawn'
-                            elseif CFG.teleport and tpTries < TP_MAX_TRIES then
+                            elseif CFG.teleport and tpErrors < TP_MAX_ERRORS then
                                 if os.clock() >= tpNext then
                                     tpNext = os.clock() + TP_GAP
-                                    local okTp = writeTp(hrp, spot)
-                                    tpTries = tpTries + 1
-                                    if okTp then
+                                    if writeTp(hrp, spot) then
+                                        tpErrors = 0
+                                        lastSpot = spot
                                         if viaSpawn then
                                             winState.text = string.format('tp to spawn (%.0f studs)', dist or 0)
                                         else
@@ -690,15 +749,16 @@ task.spawn(function()
                                         end
                                         print('[' .. NAME .. '] ' .. winState.text)
                                     else
-                                        winState.text = 'tp failed'
+                                        tpErrors = tpErrors + 1
+                                        winState.text = 'tp write failed'
                                         warn('[' .. NAME .. '] teleport CFrame write failed')
                                     end
                                 else
                                     winState.text = 'tp cooling down'
                                 end
                             else
-                                if tpTries >= TP_MAX_TRIES then
-                                    winState.text = 'tp not sticking - walking'
+                                if tpErrors >= TP_MAX_ERRORS then
+                                    winState.text = 'tp failing - walking'
                                 else
                                     winState.text = string.format('walking to safe spot (%.0f studs)', dist or 0)
                                 end
@@ -722,34 +782,31 @@ task.spawn(function()
 
                     if gs then
                         winState.text = 'server goal: SAFE'
-                    elseif CFG.autoWin and CFG.spawnFallback and CFG.teleport then
+                        lastSpot = nil
+                    elseif CFG.autoWin and CFG.spawnFallback then
                         if os.clock() >= next then
                             next = os.clock() + SPAWN_RETRY
                             local sp, sd = findSpawn(nil, pos, lp)
                             if not sp then
                                 winState.text = 'no goal - no spawn found'
-                            elseif os.clock() >= tpNext then
+                            elseif CFG.teleport and os.clock() >= tpNext then
                                 tpNext = os.clock() + TP_GAP
-                                local okTp = writeTp(hrp, sp)
-                                if okTp then
+                                if writeTp(hrp, sp) then
                                     lastSpawn = sp
                                     winState.text = string.format('no goal - tp to spawn (%.0f studs)', sd or 0)
                                     print('[' .. NAME .. '] ' .. winState.text)
                                 else
                                     winState.text = 'no goal - tp to spawn failed'
                                 end
-                            else
+                            elseif CFG.teleport then
                                 winState.text = 'no goal - spawn tp cooldown'
+                            else
+                                lastSpawn = sp
+                                winState.text = 'no goal - walking to spawn'
+                                pcall(function() hum:MoveTo(sp) end)
                             end
-                        else
-                            winState.text = 'server goal: UNSAFE'
-                        end
-                    elseif CFG.autoWin and CFG.spawnFallback then
-                        local sp = lastSpawn or select(1, findSpawn(nil, pos, lp))
-                        if sp then
-                            lastSpawn = sp
-                            winState.text = 'no goal - walking to spawn'
-                            pcall(function() hum:MoveTo(sp) end)
+                        elseif lastSpawn and not CFG.teleport then
+                            pcall(function() hum:MoveTo(lastSpawn) end)
                         else
                             winState.text = 'server goal: UNSAFE'
                         end
