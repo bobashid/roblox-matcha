@@ -1,0 +1,494 @@
+--==================================================================
+--  Ride A Dino  |  Dino ESP + Auto Deposit + Auto Pen Upgrade
+--  Matcha LuaVM  -  built-in Matcha menu tab (UI.AddTab)
+--
+--  Confirmed in game this session (place 93523763376122):
+--   - ReplicatedStorage.RideADinoNet is channel based:
+--       FireServer(channelName, payload)   (channels in Shared.Net)
+--   - Pens: Workspace.Pens.PlotN, own plot keyed by
+--       plot:GetAttribute(Owner) == LocalPlayer.UserId
+--   - Own plot prompts: plot.Sign.PenDepositPrompt / PenUpgradePrompt
+--   - Dinos: plot.Dinos.Slot_XX with a MountDinosaur ProximityPrompt
+--   - Carried dino: character child named CarriedDino
+--
+--  UNVERIFIED: the PenDeposit remote payload shape, so deposit is done
+--  with fireproximityprompt on the pen prompt instead of guessing the
+--  remote arguments. If a fire* call does nothing, re-run the Matcha
+--  loader (Pro interaction functions).
+--==================================================================
+local Players    = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local WS         = game:GetService('Workspace')
+
+local LP = Players.LocalPlayer
+
+local NAME    = 'RideADino'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local running  = true
+local conns    = {}
+local drawings = {}
+
+local function track(c) conns[#conns + 1] = c return c end
+local function trackD(d) drawings[#drawings + 1] = d return d end
+
+local Config = {
+    AutoDeposit = true,
+    DepositTP   = false,
+    AutoUpgrade = false,
+    ESPDinos    = true,
+    ESPPrompts  = false,
+}
+
+local COL_MINE   = Color3.fromRGB(120, 255, 150)
+local COL_OTHER  = Color3.fromRGB(255, 150, 150)
+local COL_PROMPT = Color3.fromRGB(255, 220, 120)
+
+local dinoList   = {}
+local promptList = {}
+
+-- ---- ui helpers ----
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local TOGGLES = {}
+local getterWorks = {}
+
+local function registerToggle(key, id, name)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name }
+end
+
+local function applyBool(key)
+    return function(...)
+        if getterWorks[key] then return end
+        local v = firstBool(...)
+        if v ~= nil then Config[key] = v end
+    end
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. label)
+    return false
+end
+
+-- ---- game helpers ----
+local warnedPrompt = false
+local function firePrompt(prompt)
+    if not prompt then return false end
+    if type(fireproximityprompt) ~= 'function' then
+        if not warnedPrompt then
+            warnedPrompt = true
+            warn('[' .. NAME .. '] fireproximityprompt missing - re-run the Matcha loader')
+        end
+        return false
+    end
+    local ok, err = pcall(fireproximityprompt, prompt)
+    if not ok then warn('[' .. NAME .. '] prompt fire failed: ' .. tostring(err)) end
+    return ok
+end
+
+local function myPlot()
+    local pens = WS:FindFirstChild('Pens')
+    if not pens then return nil end
+    local kids = pens:GetChildren()
+    for i = 1, #kids do
+        local plot = kids[i]
+        local ok, owner = pcall(function() return plot:GetAttribute('Owner') end)
+        if ok and owner ~= nil and owner == LP.UserId then return plot end
+    end
+    return nil
+end
+
+local function getDepositPrompt(plot)
+    if not plot then return nil end
+    local sign = plot:FindFirstChild('Sign')
+    if not sign then return nil end
+    return sign:FindFirstChild('PenDepositPrompt')
+end
+
+local function getUpgradePrompt(plot)
+    if not plot then return nil end
+    local sign = plot:FindFirstChild('Sign')
+    if not sign then return nil end
+    return sign:FindFirstChild('PenUpgradePrompt')
+end
+
+local function modelCenter(m)
+    local ok, cf = pcall(function() return (m:GetBoundingBox()) end)
+    if ok and cf then return cf.Position end
+    local names = { 'Root', 'RootPart', 'Body' }
+    for i = 1, #names do
+        local p = m:FindFirstChild(names[i])
+        if p then
+            local ok2, pos = pcall(function() return p.Position end)
+            if ok2 and pos then return pos end
+        end
+    end
+    return nil
+end
+
+local function promptPos(prompt)
+    local par = prompt.Parent
+    if not par then return nil end
+    local ok, pos = pcall(function() return par.Position end)
+    if ok and pos then return pos end
+    return modelCenter(par)
+end
+
+local function slotName(slot)
+    local keys = { 'Species', 'SpecId', 'Dino' }
+    for i = 1, #keys do
+        local ok, v = pcall(function() return slot:GetAttribute(keys[i]) end)
+        if ok and type(v) == 'string' and v ~= '' then return v end
+    end
+    return slot.Name
+end
+
+local function findMountPrompt(slot)
+    local kids = slot:GetChildren()
+    for i = 1, #kids do
+        local c = kids[i]
+        if c.ClassName == 'ProximityPrompt' and c.Name == 'MountDinosaur' then return c end
+        local gk = c:GetChildren()
+        for j = 1, #gk do
+            local g = gk[j]
+            if g.ClassName == 'ProximityPrompt' and g.Name == 'MountDinosaur' then return g end
+            local gg = g:GetChildren()
+            for k = 1, #gg do
+                local h = gg[k]
+                if h.ClassName == 'ProximityPrompt' and h.Name == 'MountDinosaur' then return h end
+            end
+        end
+    end
+    return nil
+end
+
+local function carryingDino()
+    local char = LP.Character
+    if not char then return false end
+    local ok, c = pcall(function() return char:FindFirstChild('CarriedDino') end)
+    return ok and c ~= nil
+end
+
+local function doDeposit()
+    local plot = myPlot()
+    local prompt = getDepositPrompt(plot)
+    if not prompt then return false end
+    if Config.DepositTP then
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild('HumanoidRootPart')
+        local floor = plot and plot:FindFirstChild('Floor')
+        if hrp and floor then
+            local home = hrp.CFrame
+            local fp = floor.Position
+            pcall(function() hrp.CFrame = CFrame.new(fp.X, fp.Y + 4, fp.Z) end)
+            task.wait(0.2)
+            firePrompt(prompt)
+            task.wait(0.15)
+            firePrompt(prompt)
+            task.wait(0.1)
+            pcall(function() hrp.CFrame = home end)
+            return true
+        end
+    end
+    return firePrompt(prompt)
+end
+
+-- ---- menu ----
+local tabBuilt = false
+local function buildTab(tab)
+    if tabBuilt then return end
+    tabBuilt = true
+    local ok, err = pcall(function()
+        local secA = mkSection(tab, 'Automation')
+        if secA then
+            if mkToggle(secA, 'Auto Deposit', 'rad_autodeposit', true, applyBool('AutoDeposit')) then
+                registerToggle('AutoDeposit', 'rad_autodeposit', 'Auto Deposit')
+            end
+            if mkToggle(secA, 'Deposit Teleport', 'rad_deposittp', false, applyBool('DepositTP')) then
+                registerToggle('DepositTP', 'rad_deposittp', 'Deposit Teleport')
+            end
+            if mkToggle(secA, 'Auto Pen Upgrade', 'rad_autoupgrade', false, applyBool('AutoUpgrade')) then
+                registerToggle('AutoUpgrade', 'rad_autoupgrade', 'Auto Pen Upgrade')
+            end
+            mkButton(secA, 'Deposit Now', function()
+                task.spawn(function()
+                    local okd = doDeposit()
+                    print('[' .. NAME .. '] manual deposit: ' .. tostring(okd))
+                end)
+            end)
+            mkButton(secA, 'Mount My Dino', function()
+                task.spawn(function()
+                    local best, bestD = nil, nil
+                    local char = LP.Character
+                    local hrp = char and char:FindFirstChild('HumanoidRootPart')
+                    if not hrp then return end
+                    for i = 1, #dinoList do
+                        local d = dinoList[i]
+                        if d.mine then
+                            local dist = (d.pos - hrp.Position).Magnitude
+                            if bestD == nil or dist < bestD then
+                                best, bestD = d, dist
+                            end
+                        end
+                    end
+                    if best then
+                        firePrompt(best.prompt)
+                        print('[' .. NAME .. '] mount fired: ' .. tostring(best.label))
+                    else
+                        print('[' .. NAME .. '] no own dino found')
+                    end
+                end)
+            end)
+        end
+        local secE = mkSection(tab, 'ESP')
+        if secE then
+            if mkToggle(secE, 'Dino ESP', 'rad_espdinos', true, applyBool('ESPDinos')) then
+                registerToggle('ESPDinos', 'rad_espdinos', 'Dino ESP')
+            end
+            if mkToggle(secE, 'Pen Prompt ESP', 'rad_espprompts', false, applyBool('ESPPrompts')) then
+                registerToggle('ESPPrompts', 'rad_espprompts', 'Pen Prompt ESP')
+            end
+        end
+    end)
+    if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
+    print('[' .. NAME .. '] tab built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Ride a Dino', function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+end
+
+-- ---- toggle poller ----
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t = TOGGLES[i]
+            local val = nil
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == 'boolean' then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                if ok2 and type(v2) == 'boolean' then val = v2 end
+            end
+            if val ~= nil then
+                getterWorks[t.key] = true
+                if Config[t.key] ~= val then
+                    Config[t.key] = val
+                    print('[' .. NAME .. '] ' .. t.key .. ' = ' .. tostring(val))
+                end
+            end
+        end
+        task.wait(0.15)
+    end
+end)
+
+-- ---- collectors ----
+task.spawn(function()
+    while running do
+        local outD, outP = {}, {}
+        local pens = WS:FindFirstChild('Pens')
+        if pens then
+            local plots = pens:GetChildren()
+            for i = 1, #plots do
+                local plot = plots[i]
+                local ok, owner = pcall(function() return plot:GetAttribute('Owner') end)
+                local mine = (ok and owner ~= nil and owner == LP.UserId)
+                local dinos = plot:FindFirstChild('Dinos')
+                if dinos then
+                    local slots = dinos:GetChildren()
+                    for j = 1, #slots do
+                        local slot = slots[j]
+                        local mp = findMountPrompt(slot)
+                        if mp then
+                            local pos = modelCenter(slot)
+                            if pos then
+                                outD[#outD + 1] = {
+                                    model = slot, prompt = mp, pos = pos, mine = mine,
+                                    label = ((mine and '[MINE] ' or '') .. slotName(slot)),
+                                }
+                            end
+                        end
+                    end
+                end
+                if mine then
+                    local sign = plot:FindFirstChild('Sign')
+                    if sign then
+                        local dep = sign:FindFirstChild('PenDepositPrompt')
+                        local upg = sign:FindFirstChild('PenUpgradePrompt')
+                        if dep then
+                            outP[#outP + 1] = { prompt = dep, pos = promptPos(dep), label = 'Deposit' }
+                        end
+                        if upg then
+                            outP[#outP + 1] = { prompt = upg, pos = promptPos(upg), label = 'Pen Upgrade' }
+                        end
+                    end
+                end
+            end
+        end
+        dinoList = outD
+        promptList = outP
+        task.wait(1.0)
+    end
+end)
+
+-- ---- drawing pools ----
+local DINO_POOL   = 80
+local PROMPT_POOL = 40
+
+local function mkTextPool(n, size)
+    local pool = {}
+    for i = 1, n do
+        local t = trackD(Drawing.new('Text'))
+        pcall(function() t.FontSize = size end)
+        pcall(function() t.Size = size end)
+        t.Center = true
+        t.Outline = true
+        t.Visible = false
+        pool[i] = t
+    end
+    return pool
+end
+
+local dinoPool   = mkTextPool(DINO_POOL, 14)
+local promptPool = mkTextPool(PROMPT_POOL, 13)
+
+-- ---- render ----
+track(RunService.RenderStepped:Connect(function()
+    local cam = WS.CurrentCamera
+    if not cam then return end
+    local camPos = cam.CFrame.Position
+
+    local n = 0
+    if Config.ESPDinos then
+        for i = 1, #dinoList do
+            if n >= DINO_POOL then break end
+            local d = dinoList[i]
+            local sp, on = WorldToScreen(d.pos)
+            if on then
+                n = n + 1
+                local t = dinoPool[n]
+                local dist = (d.pos - camPos).Magnitude
+                t.Text = string.format('%s  [%dm]', d.label, math.floor(dist))
+                t.Position = Vector2.new(sp.X, sp.Y - 10)
+                t.Color = d.mine and COL_MINE or COL_OTHER
+                t.Visible = true
+            end
+        end
+    end
+    for i = n + 1, DINO_POOL do dinoPool[i].Visible = false end
+
+    local m = 0
+    if Config.ESPPrompts then
+        for i = 1, #promptList do
+            if m >= PROMPT_POOL then break end
+            local p = promptList[i]
+            if p.pos then
+                local sp, on = WorldToScreen(p.pos)
+                if on then
+                    m = m + 1
+                    local t = promptPool[m]
+                    t.Text = p.label
+                    t.Position = Vector2.new(sp.X, sp.Y - 24)
+                    t.Color = COL_PROMPT
+                    t.Visible = true
+                end
+            end
+        end
+    end
+    for i = m + 1, PROMPT_POOL do promptPool[i].Visible = false end
+end))
+
+-- ---- actions ----
+task.spawn(function()
+    local lastDeposit = 0
+    local lastUpgrade = 0
+    while running do
+        if Config.AutoDeposit and carryingDino() then
+            local now = os.clock()
+            if now - lastDeposit >= 1.0 then
+                lastDeposit = now
+                local okd = doDeposit()
+                print('[' .. NAME .. '] auto deposit: ' .. tostring(okd))
+            end
+        end
+        if Config.AutoUpgrade then
+            local now = os.clock()
+            if now - lastUpgrade >= 3.0 then
+                lastUpgrade = now
+                local plot = myPlot()
+                local up = getUpgradePrompt(plot)
+                if up then
+                    firePrompt(up)
+                    print('[' .. NAME .. '] pen upgrade fired')
+                end
+            end
+        end
+        task.wait(0.25)
+    end
+end)
+
+-- ---- stop ----
+local function stop()
+    running = false
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    for i = 1, #drawings do pcall(function() drawings[i]:Remove() end) end
+    drawings = {}
+    if HAS_UI then pcall(function() UI.RemoveTab('Ride a Dino') end) end
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] loaded ' .. VERSION)
+pcall(function() notify('Ride a Dino', 'Loaded ' .. VERSION, 4) end)
