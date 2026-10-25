@@ -1,26 +1,51 @@
 -- What If Disasters - Matcha LuauVM
 -- Place 109440485612336
--- Confirmed in game this session: place id, title "What If Disasters", hybrid mode on,
---   local player attributes InRound / GoalSafe / GoalShift / Level / Streak / BestStreak.
--- UNVERIFIED: the meaning of GoalShift (numeric, -3.6 at probe time); shown raw.
--- Read-only script: no remotes fired, no teleport, no input simulation.
+-- Confirmed in game this session:
+--   place id 109440485612336, title "What If Disasters", hybrid mode on.
+--   LocalPlayer attributes: InRound, GoalSafe, GoalShift, Level, Streak,
+--     BestStreak, Equipment (string), Title, Spectators.
+--   ReplicatedStorage.Remotes includes Revive, Impact, BloomCure, RoundResults,
+--     Narrative, RequestEquip, SetAFK, Spectating, Watching.
+--   Decompiled Players.<local>.PlayerScripts.Client.ReviveController:
+--       Remotes.Revive:FireServer(true)    -- the "Get Up" button
+--       Remotes.Revive:FireServer("reset") -- give-up path (NOT used here)
+-- UNVERIFIED: meaning/units of GoalShift (numeric); printed raw only.
+-- UNVERIFIED: server acceptance of Revive(true) without the local button press;
+--   the auto get-up toggle re-checks state and backs off on repeats.
+-- No teleport, no input simulation, no stat writes.
 
 local NAME    = 'WhatIfDisasters'
-local VERSION = 'v1.0'
+local VERSION = 'v1.1'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
 
 local Players = game:GetService('Players')
+local RS      = game:GetService('ReplicatedStorage')
 local lp      = Players.LocalPlayer
+
 local running = true
 local conns, draws = {}, {}
 
 local function track(c) conns[#conns + 1] = c return c end
 local function trackD(d) draws[#draws + 1] = d return d end
 
+-- ---- remotes (resolved once, guarded at call time) ----
+local Remotes = RS:FindFirstChild('Remotes')
+local Revive  = Remotes and Remotes:FindFirstChild('Revive')
+if not Revive then
+    warn('[' .. NAME .. '] Remotes.Revive not found - auto get-up idle')
+end
+
 -- ---- config ----
-local CFG = { roundHud = true, safeHud = true, statsHud = true, alerts = true }
+local CFG = {
+    roundHud   = true,
+    safeHud    = true,
+    statsHud   = true,
+    downedHud  = true,
+    alerts     = true,
+    autoRevive = true,
+}
 
 local function setBool(key, v)
     if CFG[key] == v then return end
@@ -49,6 +74,7 @@ end
 local hudRound = mkText(120, 120, 220, 255)
 local hudSafe  = mkText(142, 120, 255, 160)
 local hudStats = mkText(164, 255, 220, 120)
+local hudDown  = mkText(186, 255, 140, 140)
 
 local function setText(obj, on, s)
     if on and s ~= '' then
@@ -59,15 +85,50 @@ local function setText(obj, on, s)
     end
 end
 
+-- ---- revive ----
+local downState = false
+
+local function fireRevive(tag)
+    if not Revive then return false end
+    local ok, err = pcall(function() Revive:FireServer(true) end)
+    if ok then
+        print('[' .. NAME .. '] Revive(true) fired (' .. tostring(tag) .. ')')
+    else
+        warn('[' .. NAME .. '] Revive fire failed (' .. tostring(tag) .. '): ' .. tostring(err))
+    end
+    return ok
+end
+
+-- The game builds a "GetUp" button only while you are down; visible == down.
+local function isDowned()
+    local pg = lp:FindFirstChild('PlayerGui')
+    if not pg then return false end
+    local ok, list = pcall(function() return pg:GetDescendants() end)
+    if not ok or type(list) ~= 'table' then return false end
+    local cap = #list
+    if cap > 600 then cap = 600 end
+    for i = 1, cap do
+        local d = list[i]
+        if d.Name == 'GetUp' then
+            local vis = true
+            pcall(function() if d.Visible == false then vis = false end end)
+            if vis then return true end
+        end
+    end
+    return false
+end
+
 -- ---- menu ----
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local getterWorks = {}
 
 local TOGGLES = {
-    { key = 'roundHud', id = 'wid_round',  name = 'Round status' },
-    { key = 'safeHud',  id = 'wid_safe',   name = 'Safe indicator' },
-    { key = 'statsHud', id = 'wid_stats',  name = 'Player stats' },
-    { key = 'alerts',   id = 'wid_alerts', name = 'Alerts' },
+    { key = 'autoRevive', id = 'wid_revive', name = 'Auto get up' },
+    { key = 'downedHud',  id = 'wid_downed', name = 'Downed indicator' },
+    { key = 'roundHud',   id = 'wid_round',  name = 'Round status' },
+    { key = 'safeHud',    id = 'wid_safe',   name = 'Safe indicator' },
+    { key = 'statsHud',   id = 'wid_stats',  name = 'Player stats' },
+    { key = 'alerts',     id = 'wid_alerts', name = 'Alerts' },
 }
 
 local function firstBool(...)
@@ -111,18 +172,38 @@ local function mkToggle(sec, label, id, default, cb)
     return false
 end
 
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. tostring(label))
+    return false
+end
+
 local built = false
 
 local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
-        local sec = mkSection(tab, 'HUD')
-        if not sec then return end
-        mkToggle(sec, 'Round status',   'wid_round',  true, applyBool('roundHud'))
-        mkToggle(sec, 'Safe indicator', 'wid_safe',   true, applyBool('safeHud'))
-        mkToggle(sec, 'Player stats',   'wid_stats',  true, applyBool('statsHud'))
-        mkToggle(sec, 'Alerts',         'wid_alerts', true, applyBool('alerts'))
+        local sec = mkSection(tab, 'Revive')
+        if sec then
+            mkToggle(sec, 'Auto get up', 'wid_revive', true, applyBool('autoRevive'))
+            mkToggle(sec, 'Downed indicator', 'wid_downed', true, applyBool('downedHud'))
+            mkButton(sec, 'Test: fire get up now', function()
+                print('[' .. NAME .. '] manual get-up test')
+                local d = isDowned()
+                print('[' .. NAME .. '] downed = ' .. tostring(d))
+                fireRevive('manual')
+            end)
+        end
+
+        local hsec = mkSection(tab, 'HUD')
+        if hsec then
+            mkToggle(hsec, 'Round status', 'wid_round', true, applyBool('roundHud'))
+            mkToggle(hsec, 'Safe indicator', 'wid_safe', true, applyBool('safeHud'))
+            mkToggle(hsec, 'Player stats', 'wid_stats', true, applyBool('statsHud'))
+            mkToggle(hsec, 'Alerts', 'wid_alerts', true, applyBool('alerts'))
+        end
     end)
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
     print('[' .. NAME .. '] tab widgets built')
@@ -166,10 +247,60 @@ if HAS_UI then
     end)
 end
 
+-- ---- revive loop ----
+local DOWN_POLL   = 0.25
+local REVIVE_GAP  = 1.0
+local MAX_TRIES   = 5
+local BACKOFF     = 15
+
+task.spawn(function()
+    local wasDown, warnedNoRemote = false, false
+    local nextTry, tries, pausedUntil = 0, 0, 0
+
+    while running do
+        local ok, err = pcall(function()
+            local down = isDowned()
+            downState = down
+
+            if down ~= wasDown then
+                wasDown = down
+                print('[' .. NAME .. '] downed = ' .. tostring(down))
+                if down then tries = 0 end
+                if CFG.alerts then
+                    pcall(notify, down and 'You are down' or 'You are up', NAME, 3)
+                end
+            end
+
+            if down and CFG.autoRevive then
+                if not Revive then
+                    if not warnedNoRemote then
+                        warnedNoRemote = true
+                        warn('[' .. NAME .. '] auto get-up idle: Remotes.Revive missing')
+                    end
+                elseif os.clock() >= pausedUntil and os.clock() >= nextTry then
+                    tries = tries + 1
+                    local fok = fireRevive('auto#' .. tostring(tries))
+                    nextTry = os.clock() + REVIVE_GAP
+                    if not fok then
+                        pausedUntil = os.clock() + BACKOFF
+                    elseif tries >= MAX_TRIES then
+                        tries = 0
+                        pausedUntil = os.clock() + BACKOFF
+                        print('[' .. NAME .. '] revive backed off ' .. tostring(BACKOFF) .. 's')
+                    end
+                end
+            end
+        end)
+        if not ok then warn('[' .. NAME .. '] revive loop: ' .. tostring(err)) end
+        task.wait(DOWN_POLL)
+    end
+end)
+
 -- ---- hud loop ----
 task.spawn(function()
     local warned = false
     local prevRound, prevSafe = nil, nil
+
     while running do
         local ok, err = pcall(function()
             local inRound  = lp:GetAttribute('InRound')
@@ -178,6 +309,7 @@ task.spawn(function()
             local level    = lp:GetAttribute('Level')
             local streak   = lp:GetAttribute('Streak')
             local best     = lp:GetAttribute('BestStreak')
+            local eq       = lp:GetAttribute('Equipment')
 
             setText(hudRound, CFG.roundHud, 'Round: ' .. ((inRound == true) and 'ACTIVE' or 'idle'))
 
@@ -187,7 +319,12 @@ task.spawn(function()
             end
             setText(hudSafe, CFG.safeHud, 'Safe: ' .. safeStr)
 
-            setText(hudStats, CFG.statsHud, 'Lv ' .. tostring(level) .. '   Streak ' .. tostring(streak) .. '   Best ' .. tostring(best))
+            local eqStr = (type(eq) == 'string' and eq ~= '') and ('   ' .. eq) or ''
+            setText(hudStats, CFG.statsHud,
+                'Lv ' .. tostring(level) .. '   Streak ' .. tostring(streak) ..
+                '   Best ' .. tostring(best) .. eqStr)
+
+            setText(hudDown, CFG.downedHud, downState and 'DOWN - getting up' or 'up')
 
             if CFG.alerts then
                 if prevRound ~= nil and inRound ~= prevRound then
