@@ -1,0 +1,66 @@
+# SKILL Learned
+
+Notes added by chats, kept separate from the core `SKILL.md` so the core stays small
+enough to rewrite safely. Read this in full whenever you read `SKILL.md` (section 13).
+
+Index: no split files yet.
+
+---
+
+## API facts and signatures
+
+(nothing confirmed yet)
+
+---
+
+## Errors and what they mean
+
+(nothing confirmed yet)
+
+---
+
+## Patterns that worked
+
+(nothing confirmed yet)
+
+---
+
+## Game notes
+
+(nothing confirmed yet)
+
+---
+
+## Corrections
+
+### Reply format after a push (user request, 2026-10-26)
+
+The core file (section 2 and 11.7) says the reply after a push is the loader line and
+nothing else. The user has since asked for a short fixed status block instead, so the
+per-turn reply ends like this:
+
+```
+Skill updated: yes
+- <what changed, one bullet per file or fact>
+Hub Version: <e.g. v2.3>
+Current Game Version: <the game script's VERSION, e.g. v1.4 (Ride A Dino)>
+Hub loadstring: <the Hub one-liner with ?v=" .. tostring(os.time())>
+GitHub: <https://github.com/bobashid/roblox-matcha/blob/main/File%20Name>
+```
+
+Rules that come with it:
+- `Skill updated: no` when nothing was added to `SKILL Learned` this turn. Do not
+  claim an update you did not push and read back.
+- `Hub Version` is read from the Hub read-back this turn, never from memory.
+- `Current Game Version` is the VERSION string of the script touched this turn. Omit
+  the whole line when the turn touched no game script.
+- The GitHub line is the blob URL (`/blob/main/`), spaces as `%20`, plus as `%2B`,
+  same encoding rules as the raw URL.
+- Every value must come from a tool result from this turn. If the Hub was not
+  updated, `Hub Version` is the version read back, not a bumped number.
+- This block replaces the "nothing else" rule for the reply body, but it does not
+  replace read-back verification: no claimed version without a tool result.
+
+Known conflict: core `SKILL.md` sections 2 and 11.7 still say the reply is the loader
+and nothing else, and section 13 says the core wins on delivery rules. Until the core
+is edited to match, say the block is per the user's 2026-10-26 request.
