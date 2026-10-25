@@ -1,46 +1,35 @@
 --==================================================================
 --  Feed A Mosquito  |  Matcha LuaVM menu tab (UI.AddTab)
 --
---  v11.1
+--  v11.2
 --
---  v11.1  -  the no-weapon auto reset works while hiding again
---    v11.0 turned the reset off completely under the map to stop the
---    death loop, which also meant you sat there with nothing out.
---    Now it resets, but the reset is marked as YOUR OWN: the hide
---    loop sees the new character, does not count it as a death down
---    there, and re-anchors you on the hide spot.
---
---  WHY v10.20/21 STILL DROPPED YOU
---    Writing the CFrame on a timer, or even every frame, does not
---    cancel gravity - it only resets the position after physics has
---    already moved you. If the Anchored write does not stick, the
---    velocity keeps building and you accelerate down under the map.
+--  WHAT v11.1 BROKE
+--    v11.1 let the no-weapon reset run while hiding. But while you
+--    are under the map with nothing in hand, "needsWeapon" stays
+--    true forever, so the reset fired again every 30 s, killed you,
+--    dropped you at spawn, and you never got a weapon out again.
+--    That is why farm kill looked dead and why you were not staying
+--    under the map after a reset.
 --
 --  WHAT IT DOES NOW
---    1. Anchors the HumanoidRootPart and re-writes it every frame,
---       zeroing linear and angular velocity on every write.
---    2. Watchdog: it reads your Y back each frame. If you drift more
---       than HIDE_TOL below the spot, or the Anchored write is not
---       holding, it puts you back on the SURFACE and switches the
---       toggle off instead of letting you fall to your death.
---    3. Damage watchdog: if your health drops below 70% of what it
---       was when the hide started, same bail-out.
---    4. Death watchdog: if you die while hiding, the new character is
---       put on the surface (never back under the map). Two deaths and
---       the hide switches itself off. A death caused by our own reset
---       is not counted.
---    5. The no-weapon auto reset runs while hiding, and the respawned
---       character is walked straight back to the hide spot.
---    6. A stale pickup flag can no longer freeze the hold: after
---       TP_MAX seconds the flag clears and the float resumes.
+--    1. The reset is no longer tied to hiding. While hiding it only
+--       runs if you turn on the new 'Auto Reset (no weapon)' toggle;
+--       with Farm on and not hiding it behaves like it used to.
+--    2. When a reset happens while hiding, the respawned character is
+--       anchored and written straight back to the hide spot in the
+--       same watcher pass, before farm kill resumes - no wait for the
+--       next frame, no stop at spawn.
+--    3. That reset is not counted as a death down there, and hideHP0 /
+--       hideFallFrames are reset so the watchdogs do not trip on a
+--       fresh spawn.
+--    4. If the base has not been found yet (no hide spot), no reset
+--       happens while hiding - otherwise it would leave you on the
+--       surface with no way back.
 --
---  PICKUP WHILE HIDING
---    The hold is skipped for the length of a TP pickup only. The root
---    stays anchored, so the hop is a plain CFrame write and cannot
---    drop you; it is written back to the hide spot afterwards.
---
---  When it bails it says why and leaves the toggle off. Flip it off
---  and on again to retry from your current base.
+--  HIDE ITSELF (unchanged)
+--    Anchors the HumanoidRootPart and re-writes it every frame with
+--    velocity zeroed. Drift watchdog, damage watchdog (70%), two-death
+--    watchdog, and a TP_MAX stale-flag clear.
 --
 --  Stop with _G.FeedAMosquito.stop().
 --==================================================================
@@ -51,7 +40,7 @@ local RunService = game:GetService('RunService')
 
 local LP      = Players.LocalPlayer
 local NAME    = 'Feed A Mosquito'
-local VERSION = 'v11.1'
+local VERSION = 'v11.2'
 
 if _G.FeedAMosquito and _G.FeedAMosquito.stop then
     pcall(_G.FeedAMosquito.stop)
@@ -178,6 +167,7 @@ local Config = {
     BestEquip   = false,
     AutoHatch   = false,
     HideUnder   = false,
+    AutoReset   = false,
 }
 
 local PickCfg = {}
@@ -903,7 +893,6 @@ local function hideFrame()
 
         if ownReset then
             hideResetAt = nil
-            print('[' .. NAME .. '] back from the reset, holding the spot again')
         else
             hideDeaths = hideDeaths + 1
 
@@ -1295,6 +1284,7 @@ local function buildTab(tab)
         if main then
             addToggle(main, 'Auto Health', 'auto_health', 'Heal', false)
             addToggle(main, 'Auto Collect', 'auto_collect', 'AutoCollect', false)
+            addToggle(main, 'Auto Reset (no weapon)', 'auto_reset', 'AutoReset', false)
         end
 
         local farm = makeSection(tab, 'Farm', 'Left')
@@ -1688,7 +1678,7 @@ task.spawn(function()
 end)
 
 --------------------------------------------------------------------
--- AUTO RESET  (runs while hiding too, and is marked as our own death)
+-- AUTO RESET  (Farm when not hiding, or its own toggle)
 --------------------------------------------------------------------
 task.spawn(function()
     local lastKill   = 0
@@ -1698,7 +1688,10 @@ task.spawn(function()
     local watching   = false
 
     while running do
-        if Config.Farm and alive() and not watching then
+        local wanted = Config.AutoReset or (Config.Farm and not Config.HideUnder)
+        local canRestore = (not Config.HideUnder) or (hideSpot ~= nil)
+
+        if wanted and canRestore and alive() and not watching then
             if LP.Character ~= lastChar then
                 lastChar   = LP.Character
                 emptySince = nil
@@ -1721,13 +1714,15 @@ task.spawn(function()
                     local okKill, why = killCharacter()
 
                     if okKill then
-                        lastKill    = now
-                        emptySince  = nil
-                        watching    = true
-                        hideResetAt = now
+                        lastKill   = now
+                        emptySince = nil
+                        watching   = true
+
+                        local restoring = (Config.HideUnder and hideSpot ~= nil)
+                        if restoring then hideResetAt = now end
 
                         print('[' .. NAME .. '] no weapon in hand: resetting'
-                            .. (Config.HideUnder and ' (hiding - will hold the spot again)' or ''))
+                            .. (restoring and ' (going straight back under)' or ''))
 
                         task.spawn(function()
                             local waited = 0
@@ -1740,6 +1735,14 @@ task.spawn(function()
                                 local h = c and c:FindFirstChildOfClass('Humanoid')
 
                                 if c and h and h.Health > 0 then
+                                    if restoring and Config.HideUnder and hideSpot then
+                                        hideChar       = c
+                                        hideHP0        = h.Health
+                                        hideFallFrames = 0
+                                        hideResetAt    = nil
+                                        holdAt(hideSpot)
+                                    end
+
                                     print('[' .. NAME .. '] respawned')
                                     watching = false
                                     return
@@ -1749,10 +1752,10 @@ task.spawn(function()
                             if running then
                                 print('[' .. NAME .. '] still no new character after '
                                     .. tostring(FAST_MAX_WAIT) .. 's - reset once by hand')
-                                hideResetAt = nil
                             end
 
-                            watching = false
+                            hideResetAt = nil
+                            watching    = false
                         end)
                     else
                         lastKill = now
@@ -2009,5 +2012,5 @@ end
 
 _G.FeedAMosquito = { stop = stop, version = VERSION }
 
-notifyUser('Loaded - hide is an anchored float with a fall watchdog', 5)
+notifyUser('Loaded - reset is off while hiding unless you turn on Auto Reset', 5)
 print('[' .. NAME .. '] ' .. VERSION .. ' loaded | menu=' .. tostring(HAS_UI))
