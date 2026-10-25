@@ -8,7 +8,7 @@
 -- Manual load: _G.Hub.load('Dogs')
 
 local NAME    = 'Hub'
-local VERSION = 'v1.0'
+local VERSION = 'v1.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -19,20 +19,24 @@ local BASE = 'https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/head
 
 -- place id -> file name. Wins over name matching. Add lines as you learn ids.
 local PLACES = {
-    [94009908234110] = 'Dogs',
+    [113273588963037]  = '+1 Upgrade Per Kill',
+    [125310131519813]  = 'Feed A Mosquito',
+    [110432290690507]  = 'Hike For Eggs',
+    [155615604]        = 'Prison Life HvH',
+    [94009908234110]   = 'Dogs',
 }
 
 -- file name + the names/aliases this place might show up as.
 -- keys are normalised: lowercase, letters and digits only.
 local SCRIPTS = {
     { file = '+1 Upgrade Per Kill', keys = { '1upgradeperkill', 'upgradeperkill' } },
-    { file = 'Auto Roll',           keys = { 'autoroll', 'autoRollGame' } },
+    { file = 'Auto Roll',           keys = { 'autoroll' } },
     { file = 'BBC ESP',             keys = { 'bbc', 'bbcesp' } },
     { file = 'Chop A Forest',       keys = { 'chopaforest', 'chopforest' } },
     { file = 'Clean Everything',    keys = {} },
     { file = 'Dogs',                keys = { 'dogs' } },
     { file = 'Feed A Mosquito',     keys = { 'feedamosquito', 'mosquito' } },
-    { file = 'Hike For Eggs',       keys = { 'hikeforeggs', 'hike' } },
+    { file = 'Hike For Eggs',       keys = { 'hikeforeggs' } },
     { file = 'PRISON LIFE TRIGGERBOT', keys = { 'prisonlifetriggerbot', 'triggerbot' } },
     { file = 'Prison Life HvH',     keys = { 'prisonlifehvh', 'hvh' } },
     { file = 'Tower Incremental',   keys = { 'towerincremental' } },
