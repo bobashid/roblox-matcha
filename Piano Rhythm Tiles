@@ -1,25 +1,29 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v1.2
-  Features:   auto play - taps lanes with firetouchinterest (no window focus needed), or a
-              mouse click, or keybinds; per-tile timing off spawn + chart clock; live HUD
+  Version:    v1.3
+  Features:   auto play - triggers on the tile crossing the judge line (learned live), falls
+              back to the spawn clock; touch / mouse / key output; live HUD diagnostics
   Controls:   menu tab "Piano Auto"
   Needs:      Matcha Pro
   Confirmed:  lanes at x 625/792/959/1126, width 167; tiles are Board.Tiles.Tile with
               TileIndex / ChartVersion attributes and a readable .Address
   Confirmed:  Client.Input picks a click's lane with Board.laneAt(position.X) - X only
+  Confirmed:  lanes container and Flash1..Flash4 exist; Character and HumanoidRootPart exist
+  Confirmed:  tiles spawn at y = 1104 and vanish at y = 1104 in the idle state
+  Confirmed:  during a live chart tiles hold a spread of Y values (-194 up to 1004), so Y
+              does change while a song runs
   Confirmed:  mouse1press / mouse1click / mousemoveabs / firetouchinterest / keypress all
-              exist and do not error when called
-  Confirmed:  Shared.Config: Lanes 4, ApproachTime 1.5, LeadIn 2.4, DefaultKeys D F J K
+              exist and pcall returns ok=true
+  Confirmed:  Shared.Config: Lanes 4, ApproachTime 1.5, DefaultKeys D F J K
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
   Confirmed:  keypress(0x44) produced 0 InputBegan events while isrbxactive() was false
-  Confirmed:  a freshly spawned tile reads y = 364 and does not move until a song runs
-  UNVERIFIED: a tile is created exactly ApproachTime before its judged moment
+  Confirmed:  this VM caps a chunk at 200 local variables (error: too many local variables)
+  UNVERIFIED: which Y a tile must reach to be judged (line learned at runtime)
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v1.2'
+local VERSION = 'v1.3'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -38,10 +42,12 @@ end
 
 -- ---- config ----
 
--- mode: 1 = touch (firetouchinterest), 2 = mouse click, 3 = keybinds
 local cfg = {
     enabled    = true,
-    mode       = 1,
+    mode       = 1,       -- 1 touch, 2 mouse, 3 keys
+    timing     = 0,       -- 0 = line crossing, 1 = spawn clock
+    lineY      = nil,     -- learned judge line
+    lineTol    = 45,
     offsetMs   = 0,
     approachMs = 1500,
     holdMs     = 70,
@@ -49,29 +55,31 @@ local cfg = {
     laneX      = { 625, 792, 959, 1126 },
     laneW      = 167,
     keys       = { 0x44, 0x46, 0x4A, 0x4B },
+    spawnY     = 1104,
 }
 
 -- ---- state ----
 
-local rec          = {}
-local chartVersion = nil
-local presses      = 0
-local touchTaps    = 0
-local clicks       = 0
-local keyTaps      = 0
-local fails        = 0
-local lastErr      = ''
-local focused      = nil
-local focusAt      = 0
-local status       = 'waiting'
-local mouseHeld    = false
-local laneFlash    = {}
+local rec       = {}
+local chartVer  = nil
+local presses   = 0
+local touchN    = 0
+local clickN    = 0
+local keyN      = 0
+local fails     = 0
+local lastErr   = ''
+local focused   = nil
+local focusAt   = 0
+local status    = 'waiting'
+local mouseHeld = false
+local seenChart = false
+local movingN   = 0
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
 end
 
--- ---- board lookup ----
+-- ---- lookups ----
 
 local function board()
     local ok, b = pcall(function()
@@ -130,30 +138,31 @@ end
 local function noteErr(where, err)
     fails = fails + 1
     lastErr = where .. ': ' .. tostring(err)
-    status = lastErr
 end
 
--- ---- output paths: each returns true if the call was made ----
+-- ---- output ----
 
 local function tapTouch(lane)
     if type(firetouchinterest) ~= 'function' then
-        noteErr('touch', 'firetouchinterest missing')
+        noteErr('touch', 'missing')
         return false
     end
-    local b = board()
-    local char = lp.Character
-    local hrp = char and char:FindFirstChild('HumanoidRootPart')
-    local frame = laneFrame(b, lane)
+    local ch = lp.Character
+    local hrp = ch and ch:FindFirstChild('HumanoidRootPart')
+    local frame = laneFrame(board(), lane)
     if not hrp or not frame then
-        noteErr('touch', 'no hrp or lane frame')
+        noteErr('touch', 'no hrp/frame')
         return false
     end
-    local ok1, e1 = pcall(function() firetouchinterest(hrp, frame, 0) end)
-    touchTaps = touchTaps + 1
+    local ok, err = pcall(function() firetouchinterest(hrp, frame, 0) end)
+    if not ok then
+        noteErr('touch0', err)
+        return false
+    end
+    touchN = touchN + 1
     task.delay(math.max(cfg.holdMs, 30) / 1000, function()
         pcall(function() firetouchinterest(hrp, frame, 1) end)
     end)
-    if not ok1 then noteErr('touch0', e1) end
     return true
 end
 
@@ -161,24 +170,21 @@ local function tapMouse(lane)
     local cx = cfg.laneX[lane] + math.floor(cfg.laneW / 2)
     local cy = math.floor(viewportH() * (cfg.clickYpct / 100))
     local sx, sy = mousePos()
-    pcall(function() mousemoveabs(cx, cy) end)
-    local ok, err = pcall(function() mouse1press() end)
+    local ok, err = pcall(function()
+        mousemoveabs(cx, cy)
+        mouse1press()
+    end)
     if not ok then
-        noteErr('mouse1press', err)
-        local okc, errc = pcall(function() mouse1click() end)
-        if not okc then
-            noteErr('mouse1click', errc)
-            return false
-        end
-        clicks = clicks + 1
-        if sx then task.delay(0.02, function() pcall(function() mousemoveabs(sx, sy) end) end) end
-        return true
+        noteErr('mouse', err)
+        return false
     end
     mouseHeld = true
-    clicks = clicks + 1
+    clickN = clickN + 1
     task.delay(math.max(cfg.holdMs, 20) / 1000, function()
         releaseMouse()
-        if sx then task.delay(0.02, function() pcall(function() mousemoveabs(sx, sy) end) end) end
+        if sx and sy then
+            task.delay(0.02, function() pcall(function() mousemoveabs(sx, sy) end) end)
+        end
     end)
     return true
 end
@@ -186,7 +192,7 @@ end
 local function tapKey(lane)
     local vk = cfg.keys[lane]
     if not vk or type(keypress) ~= 'function' then
-        noteErr('key', 'keypress missing')
+        noteErr('key', 'missing')
         return false
     end
     local ok, err = pcall(function() keypress(vk) end)
@@ -194,7 +200,7 @@ local function tapKey(lane)
         noteErr('keypress', err)
         return false
     end
-    keyTaps = keyTaps + 1
+    keyN = keyN + 1
     task.delay(math.max(cfg.holdMs, 15) / 1000, function()
         pcall(function() keyrelease(vk) end)
     end)
@@ -204,16 +210,12 @@ end
 local function tap(lane)
     if not lane then return false end
     presses = presses + 1
-    laneFlash[lane] = os.clock()
-    if cfg.mode == 1 then
-        return tapTouch(lane)
-    elseif cfg.mode == 2 then
-        return tapMouse(lane)
-    end
+    if cfg.mode == 1 then return tapTouch(lane) end
+    if cfg.mode == 2 then return tapMouse(lane) end
     return tapKey(lane)
 end
 
--- ---- per-frame work ----
+-- ---- per-frame ----
 
 local function refreshFocus(now)
     if now - focusAt < 0.25 then return end
@@ -235,7 +237,7 @@ local function step()
     end
     local holder = b:FindFirstChild('Tiles')
     if not holder then
-        status = 'no tile holder'
+        status = 'no tiles folder'
         return
     end
 
@@ -243,48 +245,86 @@ local function step()
     refreshFocus(now)
 
     local list = holder:GetChildren()
-    local seen = {}
+    local live = {}
 
     for i = 1, #list do
         local t = list[i]
         if t.Name == 'Tile' then
             local okA, addr = pcall(function() return t.Address end)
-            local okP, pos  = pcall(function() return t.AbsolutePosition end)
+            local okP, pos = pcall(function() return t.AbsolutePosition end)
             if okA and addr and okP and pos then
-                seen[addr] = true
+                live[addr] = true
                 local r = rec[addr]
                 if not r then
                     local okV, cv = pcall(function() return t:GetAttribute('ChartVersion') end)
-                    if okV and cv ~= nil then chartVersion = cv end
-                    r = { spawn = now, done = false }
-                    r.lane = laneOf(pos.X)
-                    r.y0 = pos.Y
+                    if okV and cv ~= nil then
+                        if cv ~= chartVer then
+                            chartVer = cv
+                            seenChart = true
+                        end
+                    end
+                    r = { spawn = now, done = false, lane = laneOf(pos.X), y = pos.Y, y0 = pos.Y }
                     rec[addr] = r
                 end
                 if not r.lane then r.lane = laneOf(pos.X) end
+                if type(pos.Y) == 'number' then
+                    if math.abs(pos.Y - r.y) > 0.5 then
+                        r.moved = true
+                        movingN = movingN + 1
+                    end
+                    r.y = pos.Y
+                end
+
                 if cfg.enabled and not r.done and r.lane then
-                    local due = r.spawn + (cfg.approachMs + cfg.offsetMs) / 1000
-                    if now >= due then
+                    local fire = false
+                    if cfg.timing == 0 and cfg.lineY then
+                        local target = cfg.lineY
+                        if r.prevY and r.moved then
+                            local a, bY = r.prevY, r.y
+                            if (a >= target and bY <= target) or (a <= target and bY >= target) then
+                                fire = true
+                            elseif math.abs(bY - target) <= cfg.lineTol then
+                                fire = true
+                            end
+                        end
+                    end
+                    if not fire and (cfg.timing == 1 or not cfg.lineY) then
+                        if now >= r.spawn + (cfg.approachMs + cfg.offsetMs) / 1000 then
+                            fire = true
+                        end
+                    end
+                    if fire then
                         r.done = true
                         tap(r.lane)
                     end
                 end
+                r.prevY = r.y
             end
         end
     end
 
-    for addr in pairs(rec) do
-        if not seen[addr] then rec[addr] = nil end
+    for addr, r in pairs(rec) do
+        if not live[addr] then
+            if r.moved and type(r.y) == 'number' and r.y > 60 then
+                if cfg.lineY == nil then
+                    cfg.lineY = r.y
+                else
+                    cfg.lineY = cfg.lineY * 0.8 + r.y * 0.2
+                end
+            end
+            rec[addr] = nil
+        end
     end
 
     if not cfg.enabled then
         status = 'off'
     elseif fails > 0 then
-        status = 'tap failed - see lastErr'
+        status = 'tap failed - ' .. lastErr
     else
-        local modeName = (cfg.mode == 1 and 'touch') or (cfg.mode == 2 and 'mouse') or 'keys'
-        status = string.format('%s | %d taps (T%d C%d K%d) | chart %s | fails %d',
-            modeName, presses, touchTaps, clicks, keyTaps, tostring(chartVersion), fails)
+        local m = (cfg.mode == 1 and 'touch') or (cfg.mode == 2 and 'mouse') or 'keys'
+        status = string.format('%s | %d taps (T%d C%d K%d) | chart %s | line %s | moved %d',
+            m, presses, touchN, clickN, keyN, tostring(chartVer),
+            cfg.lineY and string.format('%.0f', cfg.lineY) or 'learning', movingN)
     end
 end
 
@@ -312,22 +352,18 @@ local function drawHud()
     hud.Visible = true
 end
 
--- ---- renderer ----
-
 local okRender = pcall(function()
     track(RunService.RenderStepped:Connect(function()
         pcall(step)
         pcall(drawHud)
     end))
 end)
-if not okRender then
-    log('RenderStepped connect failed')
-end
+if not okRender then log('RenderStepped connect failed') end
 
--- ---- menu helpers ----
+-- ---- menu ----
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
-local built  = false
+local built = false
 
 local function firstBool(...)
     for i = 1, select('#', ...) do
@@ -356,15 +392,15 @@ local function mkSection(tab, name)
     return nil
 end
 
-local function mkToggle(sec, label, id, default, apply)
+local function mkToggle(sec, label, id, def, apply)
     local cb = function(...)
         local v = firstBool(...)
         if v ~= nil then apply(v) end
     end
     local tries = {
-        function() sec:Toggle(id, label, default, cb) end,
-        function() sec:Toggle(label, id, default, cb) end,
-        function() sec:Toggle(label, default, cb) end,
+        function() sec:Toggle(id, label, def, cb) end,
+        function() sec:Toggle(label, id, def, cb) end,
+        function() sec:Toggle(label, def, cb) end,
     }
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
@@ -373,15 +409,15 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
-local function mkSlider(sec, label, id, min, max, default, apply)
+local function mkSlider(sec, label, id, min, max, def, apply)
     local cb = function(...)
         local v = firstNumber(...)
         if v ~= nil then apply(v) end
     end
     local tries = {
-        function() sec:SliderInt(id, label, min, max, default, cb) end,
-        function() sec:SliderInt(label, id, min, max, default, cb) end,
-        function() sec:SliderInt(label, min, max, default, cb) end,
+        function() sec:SliderInt(id, label, min, max, def, cb) end,
+        function() sec:SliderInt(label, id, min, max, def, cb) end,
+        function() sec:SliderInt(label, min, max, def, cb) end,
     }
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
@@ -412,9 +448,22 @@ if HAS_UI then
                     log('auto play ' .. (v and 'ON' or 'off'))
                 end)
 
-                mkToggle(sec, 'Use touch (off = mouse click)', 'pa_touch', cfg.mode == 1, function(v)
+                mkToggle(sec, 'Touch output (off = mouse)', 'pa_touch', cfg.mode == 1, function(v)
                     cfg.mode = v and 1 or 2
-                    log('mode ' .. (v and 'touch' or 'mouse click'))
+                    log('mode ' .. (v and 'touch' or 'mouse'))
+                end)
+
+                mkToggle(sec, 'Trigger on line (off = spawn clock)', 'pa_line', cfg.timing == 0, function(v)
+                    cfg.timing = v and 0 or 1
+                    log('timing ' .. (v and 'line' or 'clock'))
+                end)
+
+                mkSlider(sec, 'Line Y (0 = auto)', 'pa_ly', 0, 1400, 0, function(v)
+                    if v > 0 then cfg.lineY = v else cfg.lineY = nil end
+                end)
+
+                mkSlider(sec, 'Line tolerance px', 'pa_lt', 5, 200, cfg.lineTol, function(v)
+                    cfg.lineTol = v
                 end)
 
                 mkSlider(sec, 'Offset ms (- = earlier)', 'pa_off', -400, 400, cfg.offsetMs, function(v)
@@ -435,38 +484,41 @@ if HAS_UI then
 
                 mkButton(sec, 'Test touch lane 1', function()
                     log('test touch lane 1')
-                    tap(1)
+                    tapTouch(1)
+                    log('touchN=' .. touchN .. ' fails=' .. fails .. ' ' .. lastErr)
                 end)
 
-                mkButton(sec, 'Test click lane 1', function()
-                    log('test click lane 1')
-                    local was = cfg.mode
-                    cfg.mode = 2
+                mkButton(sec, 'Test mouse lane 1', function()
+                    log('test mouse lane 1')
                     tapMouse(1)
-                    cfg.mode = was
+                    log('clickN=' .. clickN .. ' fails=' .. fails .. ' ' .. lastErr)
                 end)
 
                 mkButton(sec, 'Test key lane 1', function()
                     log('test key lane 1')
                     tapKey(1)
+                    log('keyN=' .. keyN .. ' fails=' .. fails .. ' ' .. lastErr)
                 end)
 
                 mkButton(sec, 'Print status', function()
-                    log(string.format('presses=%d touch=%d clicks=%d keys=%d fails=%d chart=%s focus=%s mode=%d offset=%d approach=%d hold=%d',
-                        presses, touchTaps, clicks, keyTaps, fails, tostring(chartVersion),
-                        tostring(focused), cfg.mode, cfg.offsetMs, cfg.approachMs, cfg.holdMs))
+                    log(string.format('presses=%d T=%d C=%d K=%d fails=%d chart=%s line=%s focus=%s mode=%d timing=%d',
+                        presses, touchN, clickN, keyN, fails, tostring(chartVer),
+                        cfg.lineY and string.format('%.0f', cfg.lineY) or 'nil',
+                        tostring(focused), cfg.mode, cfg.timing))
                     if lastErr ~= '' then log('lastErr: ' .. lastErr) end
                 end)
 
                 mkButton(sec, 'Reset timing', function()
                     rec = {}
-                    chartVersion = nil
+                    chartVer = nil
                     presses = 0
-                    touchTaps = 0
-                    clicks = 0
-                    keyTaps = 0
+                    touchN = 0
+                    clickN = 0
+                    keyN = 0
                     fails = 0
                     lastErr = ''
+                    movingN = 0
+                    cfg.lineY = nil
                     log('timing reset')
                 end)
 
@@ -484,8 +536,6 @@ if HAS_UI then
     end
 end
 
--- ---- stop ----
-
 local function stop()
     running = false
     for i = 1, #conns do
@@ -500,13 +550,11 @@ local function stop()
         pcall(function() hud:Remove() end)
         hud = nil
     end
-    if HAS_UI then
-        pcall(function() UI.RemoveTab('Piano Auto') end)
-    end
+    if HAS_UI then pcall(function() UI.RemoveTab('Piano Auto') end) end
     _G[NAME] = nil
     log('stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - mode touch, offset ' .. tostring(cfg.offsetMs) .. ' ms')
+log(VERSION .. ' loaded - touch, line timing, offset ' .. tostring(cfg.offsetMs) .. ' ms')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
