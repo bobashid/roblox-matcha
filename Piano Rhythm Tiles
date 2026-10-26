@@ -1,27 +1,25 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v1.1
-  Features:   auto play - taps the lane with the mouse (or keys), timed off the tile spawn
-              clock, offset trim, click-Y slider, focus indicator, test buttons, HUD
+  Version:    v1.2
+  Features:   auto play - taps lanes with firetouchinterest (no window focus needed), or a
+              mouse click, or keybinds; per-tile timing off spawn + chart clock; live HUD
   Controls:   menu tab "Piano Auto"
-  Needs:      Matcha Pro; Roblox window FOCUSED (injected input does not reach a
-              background window - the HUD shows focus so this is never a mystery)
+  Needs:      Matcha Pro
   Confirmed:  lanes at x 625/792/959/1126, width 167; tiles are Board.Tiles.Tile with
               TileIndex / ChartVersion attributes and a readable .Address
-  Confirmed:  Client.Input maps a MOUSE click to a lane with Board.laneAt(position.X)
-              only - Y is not used to pick the lane, so any Y inside the window works
-  Confirmed:  Client.Input also maps KeyCode -> lane, using the user's keybinds
-  Confirmed:  a tile's AbsolutePosition.Y never changes in this VM, so screen Y cannot
-              drive hit timing; timing uses the spawn clock instead
+  Confirmed:  Client.Input picks a click's lane with Board.laneAt(position.X) - X only
+  Confirmed:  mouse1press / mouse1click / mousemoveabs / firetouchinterest / keypress all
+              exist and do not error when called
   Confirmed:  Shared.Config: Lanes 4, ApproachTime 1.5, LeadIn 2.4, DefaultKeys D F J K
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
   Confirmed:  keypress(0x44) produced 0 InputBegan events while isrbxactive() was false
+  Confirmed:  a freshly spawned tile reads y = 364 and does not move until a song runs
   UNVERIFIED: a tile is created exactly ApproachTime before its judged moment
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v1.1'
+local VERSION = 'v1.2'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -40,13 +38,14 @@ end
 
 -- ---- config ----
 
+-- mode: 1 = touch (firetouchinterest), 2 = mouse click, 3 = keybinds
 local cfg = {
     enabled    = true,
-    useMouse   = true,     -- click the lane instead of pressing a keybind
+    mode       = 1,
     offsetMs   = 0,
     approachMs = 1500,
-    holdMs     = 60,
-    clickYpct  = 55,       -- click Y as a % of viewport height (lane is picked by X only)
+    holdMs     = 70,
+    clickYpct  = 55,
     laneX      = { 625, 792, 959, 1126 },
     laneW      = 167,
     keys       = { 0x44, 0x46, 0x4A, 0x4B },
@@ -56,14 +55,17 @@ local cfg = {
 
 local rec          = {}
 local chartVersion = nil
-local justReset    = true
 local presses      = 0
+local touchTaps    = 0
 local clicks       = 0
 local keyTaps      = 0
+local fails        = 0
+local lastErr      = ''
 local focused      = nil
 local focusAt      = 0
 local status       = 'waiting'
 local mouseHeld    = false
+local laneFlash    = {}
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
@@ -71,22 +73,31 @@ end
 
 -- ---- board lookup ----
 
-local function tilesHolder()
-    local ok, holder = pcall(function()
+local function board()
+    local ok, b = pcall(function()
         local pg = lp:FindFirstChild('PlayerGui')
         local sg = pg and pg:FindFirstChild('PianoTiles')
-        local b  = sg and sg:FindFirstChild('Board')
-        if not b then return nil end
-        return b:FindFirstChild('Tiles')
+        return sg and sg:FindFirstChild('Board')
     end)
-    if ok then return holder end
+    if ok then return b end
+    return nil
+end
+
+local function laneFrame(b, lane)
+    if not b then return nil end
+    local ok, f = pcall(function()
+        local lanes = b:FindFirstChild('Lanes')
+        if not lanes then return nil end
+        return lanes:FindFirstChild('Flash' .. tostring(lane))
+    end)
+    if ok then return f end
     return nil
 end
 
 local function laneOf(x)
     if type(x) ~= 'number' then return nil end
     for i = 1, 4 do
-        if x >= cfg.laneX[i] - 10 and x < cfg.laneX[i] + cfg.laneW + 10 then
+        if x >= cfg.laneX[i] - 12 and x < cfg.laneX[i] + cfg.laneW + 12 then
             return i
         end
     end
@@ -94,22 +105,20 @@ local function laneOf(x)
 end
 
 local function viewportH()
-    local ok, vp = pcall(function()
-        return workspace.CurrentCamera.ViewportSize
-    end)
+    local ok, vp = pcall(function() return workspace.CurrentCamera.ViewportSize end)
     if ok and vp and type(vp.Y) == 'number' and vp.Y > 0 then return vp.Y end
     return 1080
 end
 
 local function mousePos()
     local ok, m = pcall(function() return lp:GetMouse() end)
-    if not ok or not m then return nil end
+    if not ok or not m then return nil, nil end
     local okx, x = pcall(function() return m.X end)
     local oky, y = pcall(function() return m.Y end)
     if okx and oky and type(x) == 'number' and type(y) == 'number' then
         return x, y
     end
-    return nil
+    return nil, nil
 end
 
 local function releaseMouse()
@@ -118,62 +127,90 @@ local function releaseMouse()
     pcall(function() mouse1release() end)
 end
 
--- ---- output: one lane tap ----
+local function noteErr(where, err)
+    fails = fails + 1
+    lastErr = where .. ': ' .. tostring(err)
+    status = lastErr
+end
+
+-- ---- output paths: each returns true if the call was made ----
+
+local function tapTouch(lane)
+    if type(firetouchinterest) ~= 'function' then
+        noteErr('touch', 'firetouchinterest missing')
+        return false
+    end
+    local b = board()
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild('HumanoidRootPart')
+    local frame = laneFrame(b, lane)
+    if not hrp or not frame then
+        noteErr('touch', 'no hrp or lane frame')
+        return false
+    end
+    local ok1, e1 = pcall(function() firetouchinterest(hrp, frame, 0) end)
+    touchTaps = touchTaps + 1
+    task.delay(math.max(cfg.holdMs, 30) / 1000, function()
+        pcall(function() firetouchinterest(hrp, frame, 1) end)
+    end)
+    if not ok1 then noteErr('touch0', e1) end
+    return true
+end
 
 local function tapMouse(lane)
     local cx = cfg.laneX[lane] + math.floor(cfg.laneW / 2)
     local cy = math.floor(viewportH() * (cfg.clickYpct / 100))
     local sx, sy = mousePos()
     pcall(function() mousemoveabs(cx, cy) end)
-    local ok = pcall(function() mouse1press() end)
+    local ok, err = pcall(function() mouse1press() end)
     if not ok then
-        ok = pcall(function() mouse1click() end)
-        if ok then
-            clicks = clicks + 1
-            if sx and sy then
-                task.delay(0.02, function() pcall(function() mousemoveabs(sx, sy) end) end)
-            end
-            return
+        noteErr('mouse1press', err)
+        local okc, errc = pcall(function() mouse1click() end)
+        if not okc then
+            noteErr('mouse1click', errc)
+            return false
         end
-        status = 'mouse press failed'
-        return
+        clicks = clicks + 1
+        if sx then task.delay(0.02, function() pcall(function() mousemoveabs(sx, sy) end) end) end
+        return true
     end
     mouseHeld = true
     clicks = clicks + 1
     task.delay(math.max(cfg.holdMs, 20) / 1000, function()
         releaseMouse()
-        if sx and sy then
-            task.delay(0.02, function() pcall(function() mousemoveabs(sx, sy) end) end)
-        end
+        if sx then task.delay(0.02, function() pcall(function() mousemoveabs(sx, sy) end) end) end
     end)
+    return true
 end
 
 local function tapKey(lane)
     local vk = cfg.keys[lane]
-    if not vk then return end
-    if type(keypress) ~= 'function' then
-        status = 'keypress missing'
-        return
+    if not vk or type(keypress) ~= 'function' then
+        noteErr('key', 'keypress missing')
+        return false
     end
-    local ok = pcall(function() keypress(vk) end)
+    local ok, err = pcall(function() keypress(vk) end)
     if not ok then
-        status = 'keypress failed'
-        return
+        noteErr('keypress', err)
+        return false
     end
     keyTaps = keyTaps + 1
     task.delay(math.max(cfg.holdMs, 15) / 1000, function()
         pcall(function() keyrelease(vk) end)
     end)
+    return true
 end
 
 local function tap(lane)
-    if not lane then return end
+    if not lane then return false end
     presses = presses + 1
-    if cfg.useMouse then
-        tapMouse(lane)
-    else
-        tapKey(lane)
+    laneFlash[lane] = os.clock()
+    if cfg.mode == 1 then
+        return tapTouch(lane)
+    elseif cfg.mode == 2 then
+        return tapMouse(lane)
     end
+    return tapKey(lane)
 end
 
 -- ---- per-frame work ----
@@ -191,13 +228,18 @@ end
 
 local function step()
     if not running then return end
-    local holder = tilesHolder()
-    if not holder then
+    local b = board()
+    if not b then
         status = 'no board'
         return
     end
+    local holder = b:FindFirstChild('Tiles')
+    if not holder then
+        status = 'no tile holder'
+        return
+    end
 
-    local now  = os.clock()
+    local now = os.clock()
     refreshFocus(now)
 
     local list = holder:GetChildren()
@@ -210,20 +252,17 @@ local function step()
             local okP, pos  = pcall(function() return t.AbsolutePosition end)
             if okA and addr and okP and pos then
                 seen[addr] = true
-                local okV, cv = pcall(function() return t:GetAttribute('ChartVersion') end)
-                if okV and cv ~= chartVersion then
-                    chartVersion = cv
-                    rec = {}
-                    justReset = true
-                end
                 local r = rec[addr]
                 if not r then
-                    r = { spawn = now, skip = justReset, done = false }
+                    local okV, cv = pcall(function() return t:GetAttribute('ChartVersion') end)
+                    if okV and cv ~= nil then chartVersion = cv end
+                    r = { spawn = now, done = false }
                     r.lane = laneOf(pos.X)
+                    r.y0 = pos.Y
                     rec[addr] = r
                 end
                 if not r.lane then r.lane = laneOf(pos.X) end
-                if cfg.enabled and not r.done and not r.skip and r.lane then
+                if cfg.enabled and not r.done and r.lane then
                     local due = r.spawn + (cfg.approachMs + cfg.offsetMs) / 1000
                     if now >= due then
                         r.done = true
@@ -237,15 +276,15 @@ local function step()
     for addr in pairs(rec) do
         if not seen[addr] then rec[addr] = nil end
     end
-    justReset = false
 
     if not cfg.enabled then
         status = 'off'
-    elseif focused == false then
-        status = 'window NOT focused - input will not land'
+    elseif fails > 0 then
+        status = 'tap failed - see lastErr'
     else
-        status = string.format('%d taps (%d click / %d key), chart %s',
-            presses, clicks, keyTaps, tostring(chartVersion))
+        local modeName = (cfg.mode == 1 and 'touch') or (cfg.mode == 2 and 'mouse') or 'keys'
+        status = string.format('%s | %d taps (T%d C%d K%d) | chart %s | fails %d',
+            modeName, presses, touchTaps, clicks, keyTaps, tostring(chartVersion), fails)
     end
 end
 
@@ -265,9 +304,7 @@ end)
 local hudLast = ''
 local function drawHud()
     if not hud then return end
-    local mode = cfg.useMouse and 'mouse' or 'keys'
-    local txt = string.format('[%s] %s | %s | focus %s',
-        NAME, status, mode, tostring(focused))
+    local txt = string.format('[%s] %s | focus %s', NAME, status, tostring(focused))
     if txt ~= hudLast then
         hud.Text = txt
         hudLast = txt
@@ -375,9 +412,9 @@ if HAS_UI then
                     log('auto play ' .. (v and 'ON' or 'off'))
                 end)
 
-                mkToggle(sec, 'Click lane (off = keys D F J K)', 'pa_mouse', cfg.useMouse, function(v)
-                    cfg.useMouse = v
-                    log('mode ' .. (v and 'mouse click' or 'keybinds'))
+                mkToggle(sec, 'Use touch (off = mouse click)', 'pa_touch', cfg.mode == 1, function(v)
+                    cfg.mode = v and 1 or 2
+                    log('mode ' .. (v and 'touch' or 'mouse click'))
                 end)
 
                 mkSlider(sec, 'Offset ms (- = earlier)', 'pa_off', -400, 400, cfg.offsetMs, function(v)
@@ -396,9 +433,17 @@ if HAS_UI then
                     cfg.clickYpct = v
                 end)
 
+                mkButton(sec, 'Test touch lane 1', function()
+                    log('test touch lane 1')
+                    tap(1)
+                end)
+
                 mkButton(sec, 'Test click lane 1', function()
                     log('test click lane 1')
+                    local was = cfg.mode
+                    cfg.mode = 2
                     tapMouse(1)
+                    cfg.mode = was
                 end)
 
                 mkButton(sec, 'Test key lane 1', function()
@@ -407,18 +452,21 @@ if HAS_UI then
                 end)
 
                 mkButton(sec, 'Print status', function()
-                    log(string.format('presses=%d clicks=%d keys=%d chart=%s focus=%s offset=%d approach=%d hold=%d y=%d%%',
-                        presses, clicks, keyTaps, tostring(chartVersion), tostring(focused),
-                        cfg.offsetMs, cfg.approachMs, cfg.holdMs, cfg.clickYpct))
+                    log(string.format('presses=%d touch=%d clicks=%d keys=%d fails=%d chart=%s focus=%s mode=%d offset=%d approach=%d hold=%d',
+                        presses, touchTaps, clicks, keyTaps, fails, tostring(chartVersion),
+                        tostring(focused), cfg.mode, cfg.offsetMs, cfg.approachMs, cfg.holdMs))
+                    if lastErr ~= '' then log('lastErr: ' .. lastErr) end
                 end)
 
                 mkButton(sec, 'Reset timing', function()
                     rec = {}
                     chartVersion = nil
-                    justReset = true
                     presses = 0
+                    touchTaps = 0
                     clicks = 0
                     keyTaps = 0
+                    fails = 0
+                    lastErr = ''
                     log('timing reset')
                 end)
 
@@ -460,5 +508,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - mode ' .. (cfg.useMouse and 'mouse click' or 'keys') .. ', offset ' .. tostring(cfg.offsetMs) .. ' ms')
+log(VERSION .. ' loaded - mode touch, offset ' .. tostring(cfg.offsetMs) .. ' ms')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
