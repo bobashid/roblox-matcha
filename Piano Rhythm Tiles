@@ -1,41 +1,40 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v2.10
-  Features:   auto play - ONE toggle and ONE slider. Keys only. Hold notes sustained.
+  Version:    v2.11
+  Features:   auto play - ONE toggle + ONE Fire Y slider. Keys only. Micro-jittered
+              timing, hold notes sustained for as long as their tile lives.
   Controls:   menu tab "Piano Auto" - one toggle, one slider. Nothing else.
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
 
-  v2.10 fixes the compile error in v2.9:
-    "Matcha:129: Expected identifier when parsing expression, got 'until'"
-    `until` is a Lua RESERVED KEYWORD, so it cannot be used as a bare table key.
-    v2.9 wrote  held[lane] = { until = ..., since = ... }  which never compiled,
-    so nothing ran at all. The field is now called `due`. Never name a table key
-    after a reserved word (until, end, for, do, then, else, in, not, and, or,
-    local, function, repeat, while, if, return, break, nil, true, false).
-
-  Carried over from v2.9:
-    1. ARMING. Any tile first seen above FIRE_Y is armed, so a dense passage can no
-       longer drop notes that skip past a narrow window between frames.
-    2. RELEASE. Keys are released on a per-frame deadline with a forced release
-       immediately before each press, so a stuck key cannot swallow later notes.
-       No task.delay is used for releases.
-    3. HOLDS. A hold tile persists past the line, so its lane key is kept down while
-       the tile is live and between FIRE_Y + 20 and FIRE_Y + HOLD_TAIL, then
-       released TAP_MS after it disappears, capped at MAX_HOLD.
+  Why v2.11:
+    1. HOLDS DID NOT WORK (user report). v2.10 only sustained a hold while its tile
+       was BOTH alive AND past the line (Y > FIRE_Y + 20). A hold tile very likely
+       stops moving at the judge position while its body drains, so Y never passes
+       that threshold and the sustain never engaged. v2.11 drops the Y test: a tile
+       still alive HOLD_GRACE (90 ms) after its press is treated as a hold, and the
+       lane key stays down until that tile disappears (MAX_HOLD cap). Tap tiles are
+       gone within a frame or two, so they still just tap.
+    2. TOO ROBOTIC (user report). Every note fired at exactly the same Y, which reads
+       as machine-perfect. Each tile now gets its own micro jitter of +/-MICRO px
+       (18 px, about a fifth of a note spacing) on its fire point, plus a random
+       35-55 ms key hold. The jittered point is clamped to PERFECT_MIN (625, the Y
+       reported as where the perfect window opens) so it can never fire before the
+       window and turn a hit into a miss.
 
   Confirmed:  keypress / keyrelease reach the game (v1.7 landed hits; v2.6 HUD showed
               KEYS mode with taps climbing)
+  Confirmed:  the perfect window opens around Y = 625 (user report); firing at 950
+              landed hits and 1034 was late
   Confirmed:  tiles sit at four X values: 630 / 798 / 965 / 1133 (left to right)
   Confirmed:  Shared.Config DefaultKeys = D F J K, left to right
   Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom
   Confirmed:  board is x 625..1292, bottom edge y ~ 1076; y = 1104 is the park spot
-  Confirmed:  FIRE_Y 950 landed hits; y >= 1034 was LATE; timing is settled
   Confirmed:  no hit/press remote exists - scoring is local, input is the only route
   Confirmed:  mousemoveabs / mousemoverel do not move the cursor in this game
   Confirmed:  a tile can report AbsolutePosition.X = 0 (rejected below)
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
-  UNVERIFIED: that a hold tile really does persist past the line (watch HUD "holds")
+  UNVERIFIED: that a hold tile persists after its press (watch HUD "holds")
   UNVERIFIED: the exact FIRE_Y you settle on
 
   SLIDER:  LOWER Fire Y = fires EARLIER   |   HIGHER Fire Y = fires LATER
@@ -43,7 +42,7 @@
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v2.10'
+local VERSION = 'v2.11'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -54,14 +53,17 @@ local lp         = Players.LocalPlayer
 
 -- ---- config ----
 
-local FIRE_Y    = 950                          -- the slider writes this
-local KEYS      = { 0x44, 0x46, 0x4A, 0x4B }   -- D F J K, left to right
-local FALLBACK  = { 630, 798, 965, 1133 }
-local TAP_MS    = 45
-local DOT_OFF   = 83
-local PAST      = 220
-local HOLD_TAIL = 700
-local MAX_HOLD  = 4.0
+local FIRE_Y      = 950                          -- the slider writes this
+local PERFECT_MIN = 625                          -- earliest Y the perfect window opens
+local MICRO       = 18                           -- px of per-note jitter (+/-)
+local KEYS        = { 0x44, 0x46, 0x4A, 0x4B }   -- D F J K, left to right
+local FALLBACK    = { 630, 798, 965, 1133 }
+local HOLD_GRACE  = 0.09                         -- s after a press before it counts as a hold
+local MAX_HOLD    = 6.0                          -- s, safety cap on one held lane
+local TAP_MIN     = 35                           -- ms, key down time range (humanized)
+local TAP_MAX     = 55
+local PAST        = 220
+local DOT_OFF     = 83
 
 -- ---- state ----
 
@@ -74,7 +76,7 @@ local chart   = nil
 local taps, holdsN, skipped, armedN = 0, 0, 0, 0
 local focused = nil
 local lastLane, lastKey = 0, 0
-local lastLive, lastPos = {}, {}
+local lastLive = {}
 local dots    = {}
 local lineFire, lineBottom, lineLabel, hud
 
@@ -121,31 +123,35 @@ end
 
 -- Force a release first: InputBegan only fires on the key transition, so a key left
 -- down would silently swallow every later note in that lane.
--- NOTE: the field is `due`, not `until` - `until` is a reserved Lua keyword.
+-- The field is `due`, never `until` - `until` is a reserved Lua keyword.
 local function pressLane(lane, now, addr)
     local vk = KEYS[lane]
     if not vk or type(keypress) ~= 'function' then return false end
     if held[lane] then releaseLane(lane) end
     if not pcall(keypress, vk) then return false end
-    held[lane] = { due = now + TAP_MS / 1000, since = now, addr = addr, hold = false }
+    local tapS = math.random(TAP_MIN, TAP_MAX) / 1000
+    held[lane] = { due = now + tapS, since = now, addr = addr, hold = false }
     taps = taps + 1
     lastLane, lastKey = lane, vk
     return true
 end
 
--- Deadline-driven release, plus hold extension. A tile still live and past the line
--- is a hold in progress, so its release deadline is pushed forward each frame.
+-- Deadline-driven release plus hold sustain. A tile still alive HOLD_GRACE after
+-- its press is a hold: the key stays down until the tile goes away. No Y test -
+-- a hold tile can stop moving at the judge position, which is what broke v2.10.
 local function serviceKeys(now)
     for lane = 1, 4 do
         local h = held[lane]
         if h then
-            local y = lastPos[h.addr]
-            if lastLive[h.addr] and type(y) == 'number'
-                and y > FIRE_Y + 20 and y < FIRE_Y + HOLD_TAIL then
-                h.due = now + TAP_MS / 1000
-                if not h.hold then h.hold = true; holdsN = holdsN + 1 end
+            local age = now - h.since
+            if lastLive[h.addr] and age > HOLD_GRACE then
+                h.due = now + 0.02
+                if not h.hold then
+                    h.hold = true
+                    holdsN = holdsN + 1
+                end
             end
-            if now >= h.due or (now - h.since) > MAX_HOLD then
+            if now >= h.due or age > MAX_HOLD then
                 releaseLane(lane)
             end
         end
@@ -231,7 +237,7 @@ local function step()
         end
     end
 
-    local live, pos, batch = {}, {}, {}
+    local live, batch = {}, {}
     local di, armed = 0, 0
 
     -- pass 1: read tiles, learn columns, arm, draw the note dots
@@ -243,15 +249,14 @@ local function step()
             if okA and addr and okP and p
                 and type(p.X) == 'number' and type(p.Y) == 'number' then
                 live[addr] = true
-                pos[addr]  = p.Y
                 noteLaneX(p.X)
 
                 local r = recs[addr]
                 if not r then
                     if p.Y < FIRE_Y then
-                        r = { armed = true, done = false }
+                        r = { armed = true, done = false, jit = math.random(-MICRO, MICRO) }
                     else
-                        r = { armed = false, done = true }
+                        r = { armed = false, done = true, jit = 0 }
                         skipped = skipped + 1
                     end
                     recs[addr] = r
@@ -304,21 +309,26 @@ local function step()
         lineLabel.Visible = true
     end
 
-    -- pass 2: fire once per tile
+    -- pass 2: fire once per tile, on its own jittered line
     if on and focused then
         for i = 1, #batch do
             local it = batch[i]
-            if it.r.armed and not it.r.done and it.y >= FIRE_Y then
-                local lane = laneOf(it.x)
-                if lane then pressLane(lane, now, it.addr) end
-                it.r.done = true
-            elseif not it.r.done and it.y > FIRE_Y + PAST then
-                it.r.done = true
+            local r  = it.r
+            if r.armed and not r.done then
+                local fy = FIRE_Y + (r.jit or 0)
+                if fy < PERFECT_MIN then fy = PERFECT_MIN end
+                if it.y >= fy then
+                    local lane = laneOf(it.x)
+                    if lane then pressLane(lane, now, it.addr) end
+                    r.done = true
+                end
+            elseif not r.done and it.y > FIRE_Y + PAST then
+                r.done = true
             end
         end
     end
 
-    lastLive, lastPos = live, pos
+    lastLive = live
 
     for addr in pairs(recs) do
         if not live[addr] then recs[addr] = nil end
@@ -453,5 +463,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - keys only, holds sustained, Fire Y ' .. tostring(FIRE_Y))
+log(VERSION .. ' loaded - holds sustained, micro jitter ' .. MICRO .. ' px, Fire Y ' .. tostring(FIRE_Y))
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
