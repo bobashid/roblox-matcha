@@ -1,38 +1,41 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v2.2
-  Features:   auto play - one toggle plus one Fire Y slider; lane columns learned from the
-              tiles, lane->key order learned from the game's own key labels when it can be
-              found, plus a one-button key-order test
-  Controls:   menu tab "Piano Auto" - one toggle, one slider, two diagnostic buttons
+  Version:    v2.3
+  Features:   auto play - one toggle plus one Fire Y slider; CLICKS the lane column so the
+              game itself resolves the lane (no key-order guess), keys as a fallback
+  Controls:   menu tab "Piano Auto" - one toggle, one slider, one output toggle
+  Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
 
-  Why v2.2 exists (lane still wrong after v2.1):
-    v2.1 learned the four lane X columns from the tiles, so the column is right. The
-    remaining unknown is which KEY the game maps to each column. The client builds that
-    map from the saved profile's key preset (Shared.Config.KeyPresets), which can be
-    D F J K, A S D F, 1 2 3 4 or the arrow keys - so hardcoding D F J K is a guess.
-    v2.2 therefore:
-      1. tries to read the on-screen key labels and derive the order automatically;
-      2. if that fails, uses D F J K but gives a "Test key order" button so the user can
-         press D,F,J,K in sequence, watch which column flashes, and tell us the order.
+  Why v2.3 exists (lane still wrong after v2.1/v2.2):
+    The four lane COLUMNS are correct (learned from tile X: 630 / 798 / 965 / 1133 and
+    confirmed live as 965,511 and 1133,31). So the remaining error can only be which
+    KEY the game maps to each column - that comes from the saved profile's key preset,
+    not from a constant, so hardcoding D F J K was a guess.
+    Instead of guessing, v2.3 clicks the lane column: Client.Input resolves a click with
+    Board.laneAt(position.X), i.e. THE GAME decides the lane from the X we click. There
+    is no key order to get wrong. Keys stay available as a fallback toggle.
 
-  Confirmed:  Client.Input maps KeyCode -> lane with v_u_8[KeyCode] built from the key
-              preset, so the key per lane is profile data, not a constant
-  Confirmed:  Client.Input also accepts a mouse click / touch, resolving the lane from
-              Board.laneAt(position.X) - the game's own X math
-  Confirmed:  tiles sit at four distinct X values (observed 630 / 798 / 965 / 1133)
+  Confirmed:  Client.Input maps a mouse click / touch to a lane via Board.laneAt(pos.X)
+  Confirmed:  Client.Input maps KeyCode -> lane from the profile's key preset
+  Confirmed:  tiles sit at four distinct X values (630 / 798 / 965 / 1133)
+  Confirmed:  a tile's X is its lane's left edge + ~5, so tile width = lane width
+  Confirmed:  the single-char TextLabels in PianoTiles are the judgement tally
+              (PERFECT/COOL/GOOD/MISS at x 641/803/965/1127), NOT key labels
   Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom
   Confirmed:  idle tiles park at y = 1104, just BELOW the board (bottom ~1076)
   Confirmed:  FIRE_Y = 950 lands hits; y >= 1034 was LATE
-  Confirmed:  keypress / keyrelease / mousemoveabs / mouse1press / mouse1release exist
+  Confirmed:  mousemoveabs / mouse1press / mouse1release / keypress all exist
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
-  UNVERIFIED: which key the game assigns to each column on this account
-  UNVERIFIED: sustaining the key while the tile persists is enough for holds
+  UNVERIFIED: an injected mouse click reaches UserInputService with its Position
+  UNVERIFIED: sustaining the press while the tile persists is enough for holds
+
+  SLIDER:  LOWER Fire Y = fires EARLIER   |   HIGHER Fire Y = fires LATER
+  HUD:     "lanes 630/798/965/1133" = learned columns | "last click lane 2 x881" = last act
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v2.2'
+local VERSION = 'v2.3'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -54,21 +57,21 @@ end
 local FIRE_Y = 950
 
 local CFG = {
-    ARM_GAP   = 100,
-    gapMs     = 30,
-    maxHold   = 3.0,
-    giveUp    = 140,
-    laneTol   = 8,
-    defaultKeys = { 0x44, 0x46, 0x4A, 0x4B },   -- D F J K, fallback only
+    ARM_GAP   = 100,     -- tile must be seen this far above FIRE_Y before it can fire
+    gapMs     = 30,      -- min ms between two presses in one lane
+    maxHold   = 3.0,     -- safety cap on one held lane, seconds
+    giveUp    = 140,     -- px past FIRE_Y before an unpressed tile is abandoned
+    laneTol   = 8,       -- px tolerance when deduplicating a lane X
+    clickYpct = 55,      -- click Y as % of viewport height (lane comes from X)
+    keys      = { 0x44, 0x46, 0x4A, 0x4B },   -- D F J K, fallback mode only
 }
 
 -- ---- state ----
 
+local useMouse = true
 local on       = true
 local recs     = {}
 local laneXs   = {}
-local keys     = { 0x44, 0x46, 0x4A, 0x4B }
-local orderAuto = false
 local chart    = nil
 local taps     = 0
 local holds    = 0
@@ -78,60 +81,15 @@ local laneAt   = { 0, 0, 0, 0 }
 local down     = {}
 local lastLane = 0
 local lastX    = 0
-local lastKey  = 0
+local lastAct  = '-'
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
 end
 
+-- injected input must be enabled once, or every keypress/click is dropped
 if type(setrobloxinput) == 'function' then
     pcall(setrobloxinput, true)
-end
-
--- ---- key order discovery ----
--- The game shows the four lane keys as single-character TextLabels somewhere in the
--- PianoTiles ScreenGui. If they can be read, sort them by X and use that order.
-
-local LETTERS = {}
-for c = 65, 90 do LETTERS[string.char(c)] = c end
-for c = 48, 57 do LETTERS[string.char(c)] = c end
-LETTERS[' '] = 0x20
-
-local function scanKeyLabels()
-    local sg = lp:FindFirstChild('PlayerGui')
-    sg = sg and sg:FindFirstChild('PianoTiles')
-    if not sg then return false end
-    local found = {}
-    local okD, list = pcall(function() return sg:GetDescendants() end)
-    if not okD or not list then return false end
-    for i = 1, #list do
-        local d = list[i]
-        local okC, cls = pcall(function() return d.ClassName end)
-        if okC and cls == 'TextLabel' then
-            local okT, txt = pcall(function() return d.Text end)
-            if okT and type(txt) == 'string' then
-                local up = string.upper(txt)
-                if #up == 1 and LETTERS[up] then
-                    local okP, p = pcall(function() return d.AbsolutePosition end)
-                    if okP and p and type(p.X) == 'number' then
-                        found[#found + 1] = { x = p.X, vk = LETTERS[up] }
-                    end
-                end
-            end
-        end
-    end
-    if #found ~= 4 then return false end
-    table.sort(found, function(a, b) return a.x < b.x end)
-    local out = {}
-    for i = 1, 4 do
-        out[i] = found[i].vk
-    end
-    keys = out
-    orderAuto = true
-    local names = {}
-    for i = 1, 4 do names[i] = string.char(out[i]) end
-    log('key order learned from labels: ' .. table.concat(names, ' '))
-    return true
 end
 
 -- ---- lane discovery ----
@@ -159,12 +117,61 @@ local function laneFromX(x)
     return nil
 end
 
--- ---- key output ----
+local function laneWidth()
+    if #laneXs < 4 then return 167 end
+    local w = (laneXs[4] - laneXs[1]) / 3
+    if w > 40 and w < 600 then return w end
+    return 167
+end
+
+-- ---- output helpers ----
+
+local function viewportH()
+    local ok, vp = pcall(function() return workspace.CurrentCamera.ViewportSize end)
+    if ok and vp and type(vp.Y) == 'number' and vp.Y > 0 then return vp.Y end
+    return 1080
+end
+
+local function mousePos()
+    local ok, m = pcall(function() return lp:GetMouse() end)
+    if not ok or not m then return nil, nil end
+    local okx, x = pcall(function() return m.X end)
+    local oky, y = pcall(function() return m.Y end)
+    if okx and oky and type(x) == 'number' and type(y) == 'number' then
+        return x, y
+    end
+    return nil, nil
+end
+
+-- Click the middle of the lane column. The game resolves the lane from this X
+-- with Board.laneAt, so the key mapping never enters the picture.
+local function clickLane(lane)
+    if type(mousemoveabs) ~= 'function' or type(mouse1press) ~= 'function' then
+        return false
+    end
+    local lx = laneXs[lane]
+    if not lx then return false end
+    local cx = math.floor(lx + laneWidth() * 0.5)
+    local cy = math.floor(viewportH() * (CFG.clickYpct / 100))
+    if not pcall(function() mousemoveabs(cx, cy) end) then return false end
+    if not pcall(function() mouse1press() end) then return false end
+    return true, cx
+end
 
 local function releaseLane(lane)
-    if not down[lane] then return end
+    local d = down[lane]
+    if not d then return end
     down[lane] = nil
-    pcall(keyrelease, keys[lane])
+    if d.mouse then
+        pcall(function() mouse1release() end)
+        if d.sx and d.sy then
+            task.delay(0.02, function()
+                pcall(function() mousemoveabs(d.sx, d.sy) end)
+            end)
+        end
+    else
+        pcall(keyrelease, d.vk)
+    end
 end
 
 local function releaseAll()
@@ -174,15 +181,33 @@ local function releaseAll()
 end
 
 local function press(lane, addr, now)
-    local vk = keys[lane]
-    if not vk or type(keypress) ~= 'function' then return false end
     if down[lane] then return false end
     if now - laneAt[lane] < CFG.gapMs / 1000 then return false end
+
+    if useMouse then
+        local sx, sy = mousePos()
+        local ok, cx = clickLane(lane)
+        if not ok then
+            lastAct = 'click failed'
+            return false
+        end
+        laneAt[lane] = now
+        down[lane] = { addr = addr, since = now, mouse = true, sx = sx, sy = sy }
+        taps = taps + 1
+        lastAct = 'click lane ' .. lane .. ' x' .. tostring(cx)
+        return true
+    end
+
+    local vk = CFG.keys[lane]
+    if not vk or type(keypress) ~= 'function' then return false end
+    if not pcall(keypress, vk) then
+        lastAct = 'keypress failed'
+        return false
+    end
     laneAt[lane] = now
-    local ok = pcall(keypress, vk)
-    if not ok then return false end
-    down[lane] = { addr = addr, since = now }
+    down[lane] = { addr = addr, since = now, vk = vk }
     taps = taps + 1
+    lastAct = 'key ' .. string.char(vk) .. ' lane ' .. lane
     return true
 end
 
@@ -227,7 +252,6 @@ local function step()
                 taps   = 0
                 holds  = 0
                 releaseAll()
-                if not orderAuto then scanKeyLabels() end
                 log('chart ' .. tostring(chart))
             end
             break
@@ -270,10 +294,9 @@ local function step()
                 local lane = laneFromX(it.x)
                 if lane then
                     if press(lane, it.addr, now) then
-                        r.done = true
+                        r.done   = true
                         lastLane = lane
                         lastX    = it.x
-                        lastKey  = keys[lane]
                     elseif it.y > FIRE_Y + CFG.giveUp then
                         r.done = true
                     end
@@ -313,19 +336,13 @@ pcall(function()
     hud.Visible = true
 end)
 
-local function keyNames()
-    local out = {}
-    for i = 1, 4 do out[i] = string.char(keys[i] or 63) end
-    return table.concat(out, ' ')
-end
-
 local function hudText()
     if not hud then return end
     local lanesTxt = #laneXs > 0 and table.concat(laneXs, '/') or 'learning'
-    local lastTxt = lastLane > 0 and (lastLane .. ' x' .. math.floor(lastX) .. ' ' .. string.char(lastKey or 63)) or '-'
-    hud.Text = string.format('%s | on %s | focus %s | taps %d | holds %d | fireY %d | lanes %s | keys %s%s | last %s | chart %s',
-        VERSION, tostring(on), tostring(focused), taps, holds, math.floor(FIRE_Y),
-        lanesTxt, keyNames(), orderAuto and ' (auto)' or ' (default)', lastTxt, tostring(chart))
+    hud.Text = string.format('%s | on %s | focus %s | %s | taps %d holds %d | fireY %d | lanes %s | last %s | chart %s',
+        VERSION, tostring(on), tostring(focused),
+        useMouse and 'CLICK' or 'KEYS', taps, holds, math.floor(FIRE_Y),
+        lanesTxt, lastAct, tostring(chart))
 end
 
 local okRender = pcall(function()
@@ -336,7 +353,7 @@ local okRender = pcall(function()
 end)
 if not okRender then log('RenderStepped connect failed') end
 
--- ---- menu: one toggle, one slider, two diagnostic buttons ----
+-- ---- menu ----
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local built  = false
@@ -402,13 +419,6 @@ local function mkSlider(sec, label, id, min, max, def, apply)
     return false
 end
 
-local function mkButton(sec, label, cb)
-    if pcall(function() sec:Button(label, cb) end) then return true end
-    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
-    log('button failed: ' .. label)
-    return false
-end
-
 if HAS_UI then
     local ok, err = pcall(function()
         UI.AddTab('Piano Auto', function(tab)
@@ -435,27 +445,10 @@ if HAS_UI then
                     log('fireY = ' .. tostring(FIRE_Y))
                 end)
 
-                mkButton(sec, 'Rescan key labels', function()
-                    orderAuto = false
-                    if scanKeyLabels() then
-                        log('ok - key order now ' .. keyNames())
-                    else
-                        log('no 4 single-letter labels found - keeping ' .. keyNames())
-                    end
-                end)
-
-                mkButton(sec, 'Test key order (D F J K)', function()
-                    log('pressing D, F, J, K one at a time - watch which column flashes')
-                    task.spawn(function()
-                        for i = 1, 4 do
-                            local vk = CFG.defaultKeys[i]
-                            pcall(keypress, vk)
-                            task.wait(0.25)
-                            pcall(keyrelease, vk)
-                            task.wait(0.45)
-                        end
-                        log('test done - tell me the left-to-right order you saw')
-                    end)
+                mkToggle(sec, 'Click lanes (off = keys D F J K)', 'pa_mouse', useMouse, function(v)
+                    releaseAll()
+                    useMouse = v
+                    log('output ' .. (v and 'click' or 'keys'))
                 end)
             end)
             if not okB then log('menu build error: ' .. tostring(errB)) end
@@ -487,5 +480,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - keys ' .. keyNames() .. ', Fire Y ' .. tostring(FIRE_Y))
+log(VERSION .. ' loaded - clicks lanes, Fire Y ' .. tostring(FIRE_Y))
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
