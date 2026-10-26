@@ -1,30 +1,32 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v2.12
-  Features:   auto play - ONE toggle only. Fire Y is a constant (625). Keys only.
-              Holds detected by a head+tail tile pair. Micro jitter, humanized taps.
+  Version:    v2.13
+  Features:   auto play - ONE toggle. Fire Y fixed at 625. Keys only. Every note is
+              held for a fixed duration so hold notes can register.
   Controls:   menu tab "Piano Auto" - one toggle. Nothing else.
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
 
-  Why v2.12:
-    1. HOLDS STILL DID NOT WORK. v2.11 detected a hold by tile lifetime, which fails
-       because the tile disappears at the press. A read-only probe of live tiles found
-       the real signal: EVERY tile has children Corner/Grad/Edge/Spine/Dot/Ring/Shine,
-       and all four Frames read Visible=false, so visibility is useless - but two tiles
-       were seen at the IDENTICAL position (idx=31 x=798 y=311 and idx=32 x=798 y=311).
-       Two notes sharing one screen position is a head and a tail: that is a hold.
-       v2.12 therefore calls a note a hold when another live tile in the SAME LANE sits
-       within HOLD_TOL px of it, and keeps the lane key down while that partner is alive.
-    2. FIRE Y IS NOW FIXED AT 625 (user: "make it permanent at 625 instead of slider").
-       The slider is gone; the menu is one toggle. 625 is the earliest Y that still
-       scores PERFECT, so firing there can never be late.
-    3. Jitter is POSITIVE ONLY (0..MICRO) so a note can never fire before 625.
+  Why v2.13 (third attempt at holds, with new information):
+    The user confirmed a hold note is ONE SINGLE LINE, not a head and a tail. That
+    kills v2.12's pair theory outright.
+    Combined with the two earlier failures it also proves where the tile goes:
+      - v2.10 required Y > FIRE_Y + 20 (tile keeps moving past the line) -> failed
+      - v2.11 required the tile to still exist 90 ms after the press      -> failed
+    Both fail only if THE TILE IS DESTROYED AT THE MOMENT IT IS PRESSED. So no
+    property of the tile can tell us how long a hold lasts: by the time we know we
+    pressed it, it is already gone.
+    The duration therefore has to be assumed, not measured. v2.13 gives EVERY note a
+    fixed hold of HOLD_ALL (plus a little jitter) instead of a 35-55 ms tap. A tap is
+    judged on key-down, so holding it longer is normally harmless; a hold needs the
+    key down for its body, which this now does. The press path force-releases the lane
+    first, so a long hold can never swallow the next note in the same lane.
 
-  Confirmed:  every Tile carries Corner/Grad/Edge/Spine/Dot/Ring/Shine children, all
-              Frames Visible=false - visibility is NOT a hold signal
-  Confirmed:  two tiles can occupy the same X and Y (idx=31 and idx=32 at 798,311):
-              a head+tail pair, i.e. a hold
+  Confirmed:  a hold note is ONE line, not two tiles (user statement) - the v2.12
+              head+tail pair theory is WRONG
+  Confirmed:  the tile is destroyed at the press: both Y-past-the-line (v2.10) and
+              tile-still-alive (v2.11) hold detection failed, and those are the only
+              two ways a surviving tile could have been observed
   Confirmed:  the perfect window opens around Y = 625 (user report)
   Confirmed:  keypress / keyrelease reach the game; mouse movement does not
   Confirmed:  tiles sit at four X values: 630 / 798 / 965 / 1133 (left to right)
@@ -34,13 +36,17 @@
   Confirmed:  no hit/press remote exists - scoring is local, input is the only route
   Confirmed:  a tile can report AbsolutePosition.X = 0 (rejected below)
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
-  UNVERIFIED: that the head+tail pair is what a hold looks like here
+  UNVERIFIED: that holding every note longer does not break tap scoring
 
-  HUD:  taps, holds, skipped, armed, lane + key of the last press, lanes, chart
+  HOLD_ALL is the one number to change if holds still fail:
+    0.50 s is a guess at a short hold. Try 0.30 if taps start mis-scoring, 0.90 if
+    long holds still break.
+
+  HUD:  taps, longHolds, skipped, armed, lane + key, lanes, chart
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v2.12'
+local VERSION = 'v2.13'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -49,20 +55,17 @@ local Players    = game:GetService('Players')
 local RunService = game:GetService('RunService')
 local lp         = Players.LocalPlayer
 
--- ---- constants (no menu controls for these) ----
+-- ---- constants ----
 
-local FIRE_Y     = 625                          -- fixed: earliest Y that scores PERFECT
-local MICRO      = 18                           -- px of jitter, positive only
-local KEYS       = { 0x44, 0x46, 0x4A, 0x4B }   -- D F J K, left to right
-local FALLBACK   = { 630, 798, 965, 1133 }
-local HOLD_TOL   = 26                           -- px: partner tile this close = a hold
-local HOLD_BASE  = 0.35                         -- s a hold is held before any extension
-local HOLD_STEP  = 0.05                         -- s pushed forward per frame while alive
-local MAX_HOLD   = 6.0                          -- s safety cap
-local TAP_MIN    = 35                           -- ms key-down range (humanized)
-local TAP_MAX    = 55
-local PAST       = 220
-local DOT_OFF    = 83
+local FIRE_Y    = 625                          -- fixed: earliest Y that scores PERFECT
+local MICRO     = 18                           -- px of jitter, positive only
+local KEYS      = { 0x44, 0x46, 0x4A, 0x4B }   -- D F J K, left to right
+local FALLBACK  = { 630, 798, 965, 1133 }
+local HOLD_ALL  = 0.50                         -- s every note is held (see header)
+local HOLD_JIT  = 60                           -- ms of extra hold, random per note
+local MAX_HOLD  = 6.0                          -- s absolute safety cap
+local PAST      = 220
+local DOT_OFF   = 83
 
 -- ---- state ----
 
@@ -75,7 +78,6 @@ local chart   = nil
 local taps, holdsN, skipped, armedN = 0, 0, 0, 0
 local focused = nil
 local lastLane, lastKey = 0, 0
-local liveNow = {}
 local dots    = {}
 local lineFire, lineBottom, lineLabel, hud
 
@@ -121,30 +123,25 @@ local function releaseAll()
 end
 
 -- Force a release first: InputBegan only fires on the key transition, so a key left
--- down would silently swallow every later note in that lane.
+-- down would swallow the next note in that lane. This is what makes a long hold safe.
 -- The field is `due`, never `until` - `until` is a reserved Lua keyword.
-local function pressLane(lane, now, addr, isHold)
+local function pressLane(lane, now)
     local vk = KEYS[lane]
     if not vk or type(keypress) ~= 'function' then return false end
-    if held[lane] then releaseLane(lane) end
+    releaseLane(lane)
     if not pcall(keypress, vk) then return false end
-    local dur = isHold and HOLD_BASE or (math.random(TAP_MIN, TAP_MAX) / 1000)
-    held[lane] = { due = now + dur, since = now, addr = addr, hold = isHold }
+    local dur = HOLD_ALL + math.random(0, HOLD_JIT) / 1000
+    held[lane] = { due = now + dur, since = now }
     taps = taps + 1
-    if isHold then holdsN = holdsN + 1 end
+    if dur >= 0.2 then holdsN = holdsN + 1 end
     lastLane, lastKey = lane, vk
     return true
 end
 
--- Deadline-driven release. A hold is extended while its partner tile is still alive,
--- which is the head+tail pair the probe found; no Y or Visible test is used.
 local function serviceKeys(now)
     for lane = 1, 4 do
         local h = held[lane]
         if h then
-            if h.hold and h.partner and liveNow[h.partner] then
-                h.due = math.min(h.due + HOLD_STEP, now + HOLD_STEP * 2)
-            end
             if now >= h.due or (now - h.since) > MAX_HOLD then
                 releaseLane(lane)
             end
@@ -234,7 +231,6 @@ local function step()
     local live, batch = {}, {}
     local di, armed = 0, 0
 
-    -- pass 1: read every tile, learn columns, arm, draw dots, collect positions
     for i = 1, #list do
         local t = list[i]
         if t.Name == 'Tile' then
@@ -244,9 +240,6 @@ local function step()
                 and type(p.X) == 'number' and type(p.Y) == 'number' then
                 live[addr] = true
                 noteLaneX(p.X)
-
-                local lane = laneOf(p.X)
-                batch[#batch + 1] = { addr = addr, x = p.X, y = p.Y, lane = lane }
 
                 local r = recs[addr]
                 if not r then
@@ -278,6 +271,8 @@ local function step()
                     end
                     d.Visible = true
                 end
+
+                batch[#batch + 1] = { addr = addr, x = p.X, y = p.Y, r = r }
             end
         end
     end
@@ -304,34 +299,22 @@ local function step()
         lineLabel.Visible = true
     end
 
-    -- pass 2: fire once per tile; detect a hold as a partner tile sharing the position
     if on and focused then
         for i = 1, #batch do
             local it = batch[i]
-            local r  = it.addr and recs[it.addr]
-            if r and r.armed and not r.done and it.lane then
+            local r  = it.r
+            if r.armed and not r.done then
                 local fy = FIRE_Y + r.jit
                 if it.y >= fy then
-                    local partner = nil
-                    for j = 1, #batch do
-                        local other = batch[j]
-                        if other.addr ~= it.addr and other.lane == it.lane
-                            and math.abs(other.y - it.y) <= HOLD_TOL then
-                            partner = other.addr
-                            break
-                        end
-                    end
+                    local lane = laneOf(it.x)
+                    if lane then pressLane(lane, now) end
                     r.done = true
-                    pressLane(it.lane, now, it.addr, partner ~= nil)
-                    if partner and held[it.lane] then held[it.lane].partner = partner end
                 end
-            elseif r and not r.done and it.y > FIRE_Y + PAST then
+            elseif not r.done and it.y > FIRE_Y + PAST then
                 r.done = true
             end
         end
     end
-
-    liveNow = live
 
     for addr in pairs(recs) do
         if not live[addr] then recs[addr] = nil end
@@ -342,9 +325,9 @@ local function hudText()
     if not hud then return end
     local lanesTxt = (#laneXs > 0) and table.concat(laneXs, '/') or 'default'
     local keyTxt   = (lastKey > 0) and string.char(lastKey) or '-'
-    hud.Text = string.format('%s | on %s | focus %s | taps %d | holds %d | skipped %d | armed %d | fireY %d | last lane %d key %s | lanes %s | chart %s',
+    hud.Text = string.format('%s | on %s | focus %s | taps %d | held %d | skipped %d | armed %d | fireY %d | hold %dms | last lane %d key %s | lanes %s | chart %s',
         VERSION, tostring(on), tostring(focused), taps, holdsN, skipped, armedN,
-        FIRE_Y, lastLane, keyTxt, lanesTxt, tostring(chart))
+        FIRE_Y, math.floor(HOLD_ALL * 1000), lastLane, keyTxt, lanesTxt, tostring(chart))
 end
 
 local okRender = pcall(function()
@@ -444,5 +427,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - one toggle, Fire Y fixed at ' .. FIRE_Y)
+log(VERSION .. ' loaded - one toggle, Fire Y ' .. FIRE_Y .. ', hold ' .. math.floor(HOLD_ALL * 1000) .. 'ms')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
