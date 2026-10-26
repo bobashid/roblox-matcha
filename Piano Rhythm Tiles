@@ -1,0 +1,358 @@
+--[[
+  Game:       Piano Rhythm Tiles
+  Place IDs:  101999883467300
+  Version:    v1.0
+  Features:   auto play - lane-key taps timed off the tile spawn clock, offset trim, hold support, HUD
+  Controls:   menu tab "Piano Auto" (toggle, sliders and buttons only)
+  Needs:      Matcha Pro; Roblox window focused (injected keys only reach a focused client)
+  Confirmed:  lanes at x 625/792/959/1126, width 167; tiles are Board.Tiles.Tile with
+              TileIndex / ChartVersion attributes and a readable .Address
+  Confirmed:  a tile's AbsolutePosition.Y never changes in this VM, so screen Y cannot drive
+              hit timing; timing uses the spawn clock instead
+  Confirmed:  Shared.Config: Lanes 4, ApproachTime 1.5, LeadIn 2.4, DefaultKeys D F J K
+  Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
+  UNVERIFIED: a tile is created exactly ApproachTime before its judged moment
+]]
+
+local NAME    = 'PianoAutoPlay'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players    = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local lp         = Players.LocalPlayer
+
+local running = true
+local conns   = {}
+
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
+
+-- ---- config ----
+
+local cfg = {
+    enabled    = true,
+    offsetMs   = 0,
+    approachMs = 1500,
+    holdMs     = 45,
+    laneX      = { 625, 792, 959, 1126 },
+    laneW      = 167,
+    keys       = { 0x44, 0x46, 0x4A, 0x4B },
+}
+
+-- ---- state ----
+
+local rec          = {}
+local chartVersion = nil
+local justReset    = true
+local presses      = 0
+local warnedFocus  = false
+local status       = 'waiting'
+
+local function log(m)
+    print('[' .. NAME .. '] ' .. tostring(m))
+end
+
+-- ---- board lookup ----
+
+local function tilesHolder()
+    local ok, holder = pcall(function()
+        local pg = lp:FindFirstChild('PlayerGui')
+        local sg = pg and pg:FindFirstChild('PianoTiles')
+        local b  = sg and sg:FindFirstChild('Board')
+        if not b then return nil end
+        return b:FindFirstChild('Tiles')
+    end)
+    if ok then return holder end
+    return nil
+end
+
+local function laneOf(x)
+    if type(x) ~= 'number' then return nil end
+    for i = 1, 4 do
+        if x >= cfg.laneX[i] - 10 and x < cfg.laneX[i] + cfg.laneW + 10 then
+            return i
+        end
+    end
+    return nil
+end
+
+-- ---- key output ----
+
+local function tap(lane)
+    local vk = cfg.keys[lane]
+    if not vk then return end
+    if type(keypress) ~= 'function' then
+        status = 'keypress missing'
+        return
+    end
+    local ok = pcall(function() keypress(vk) end)
+    if not ok then
+        status = 'keypress failed'
+        return
+    end
+    presses = presses + 1
+    task.delay(math.max(cfg.holdMs, 15) / 1000, function()
+        pcall(function() keyrelease(vk) end)
+    end)
+end
+
+local function checkFocus()
+    if warnedFocus then return end
+    if type(isrbxactive) ~= 'function' then return end
+    local ok, act = pcall(isrbxactive)
+    if ok and act == false then
+        warnedFocus = true
+        log('window not focused - injected keys will not reach the game')
+    end
+end
+
+-- ---- per-frame work ----
+
+local function step()
+    if not running then return end
+    local holder = tilesHolder()
+    if not holder then
+        status = 'no board'
+        return
+    end
+
+    local now  = os.clock()
+    local list = holder:GetChildren()
+    local seen = {}
+
+    for i = 1, #list do
+        local t = list[i]
+        if t.Name == 'Tile' then
+            local okA, addr = pcall(function() return t.Address end)
+            local okP, pos  = pcall(function() return t.AbsolutePosition end)
+            if okA and addr and okP and pos then
+                seen[addr] = true
+                local okV, cv = pcall(function() return t:GetAttribute('ChartVersion') end)
+                if okV and cv ~= chartVersion then
+                    chartVersion = cv
+                    rec = {}
+                    justReset = true
+                end
+                local r = rec[addr]
+                if not r then
+                    r = { spawn = now, skip = justReset, done = false }
+                    r.lane = laneOf(pos.X)
+                    rec[addr] = r
+                end
+                if not r.lane then r.lane = laneOf(pos.X) end
+                if cfg.enabled and not r.done and not r.skip and r.lane then
+                    local due = r.spawn + (cfg.approachMs + cfg.offsetMs) / 1000
+                    if now >= due then
+                        r.done = true
+                        checkFocus()
+                        tap(r.lane)
+                    end
+                end
+            end
+        end
+    end
+
+    for addr in pairs(rec) do
+        if not seen[addr] then rec[addr] = nil end
+    end
+    justReset = false
+
+    if cfg.enabled then
+        status = string.format('%d presses, chart %s', presses, tostring(chartVersion))
+    else
+        status = 'off'
+    end
+end
+
+-- ---- hud ----
+
+local hud = nil
+pcall(function()
+    hud = Drawing.new('Text')
+    hud.Size = 14
+    hud.Outline = true
+    hud.Color = Color3.fromRGB(235, 235, 245)
+    hud.Position = Vector2.new(12, 40)
+    hud.Visible = true
+    hud.Text = '[' .. NAME .. '] starting'
+end)
+
+local hudLast = ''
+local function drawHud()
+    if not hud then return end
+    local txt = '[' .. NAME .. '] ' .. status
+    if txt ~= hudLast then
+        hud.Text = txt
+        hudLast = txt
+    end
+    hud.Visible = true
+end
+
+-- ---- renderer ----
+
+local okRender = pcall(function()
+    track(RunService.RenderStepped:Connect(function()
+        pcall(step)
+        pcall(drawHud)
+    end))
+end)
+if not okRender then
+    log('RenderStepped connect failed')
+end
+
+-- ---- menu helpers ----
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built  = false
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    log('toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    log('slider failed: ' .. label)
+    return false
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    log('button failed: ' .. label)
+    return false
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Piano Auto', function(tab)
+            if built then return end
+            built = true
+            local okB, errB = pcall(function()
+                local sec = mkSection(tab, 'Auto Play')
+                if not sec then return end
+
+                mkToggle(sec, 'Auto Play', 'pa_on', cfg.enabled, function(v)
+                    cfg.enabled = v
+                    log('auto play ' .. (v and 'ON' or 'off'))
+                end)
+
+                mkSlider(sec, 'Offset ms (- = earlier)', 'pa_off', -300, 300, cfg.offsetMs, function(v)
+                    cfg.offsetMs = v
+                end)
+
+                mkSlider(sec, 'Approach ms', 'pa_app', 300, 3000, cfg.approachMs, function(v)
+                    cfg.approachMs = v
+                end)
+
+                mkSlider(sec, 'Hold ms', 'pa_hold', 20, 400, cfg.holdMs, function(v)
+                    cfg.holdMs = v
+                end)
+
+                mkButton(sec, 'Print status', function()
+                    log(string.format('presses=%d chart=%s offset=%d approach=%d hold=%d status=%s',
+                        presses, tostring(chartVersion), cfg.offsetMs, cfg.approachMs, cfg.holdMs, status))
+                end)
+
+                mkButton(sec, 'Reset timing', function()
+                    rec = {}
+                    chartVersion = nil
+                    justReset = true
+                    presses = 0
+                    log('timing reset')
+                end)
+
+                mkButton(sec, 'Stop script', function()
+                    if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+                end)
+            end)
+            if not okB then log('menu build error: ' .. tostring(errB)) end
+            log('tab widgets built')
+        end)
+    end)
+    if not ok then
+        HAS_UI = false
+        log('UI.AddTab failed: ' .. tostring(err))
+    end
+end
+
+-- ---- stop ----
+
+local function stop()
+    running = false
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    conns = {}
+    for i = 1, #cfg.keys do
+        pcall(function() keyrelease(cfg.keys[i]) end)
+    end
+    if hud then
+        pcall(function() hud:Remove() end)
+        hud = nil
+    end
+    if HAS_UI then
+        pcall(function() UI.RemoveTab('Piano Auto') end)
+    end
+    _G[NAME] = nil
+    log('stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+log(VERSION .. ' loaded - keys D F J K, offset ' .. tostring(cfg.offsetMs) .. ' ms')
+pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
