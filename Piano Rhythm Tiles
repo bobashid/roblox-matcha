@@ -1,28 +1,28 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v2.9
-  Features:   auto play - ONE toggle and ONE slider. Keys only. Hold notes are sustained
-              by keeping the lane key down while its tile persists past the line.
+  Version:    v2.10
+  Features:   auto play - ONE toggle and ONE slider. Keys only. Hold notes sustained.
   Controls:   menu tab "Piano Auto" - one toggle, one slider. Nothing else.
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
 
-  Why v2.9:
-    v2.7 worked for the opening bars and then degraded. Both causes are fixed here.
-      1. ARMING WINDOW. v2.7 armed a tile only if it was seen at Y < FIRE_Y - 120. In a
-         dense passage one dropped frame can carry a tile past that window, so the tile
-         was discarded silently. v2.9 arms any tile first seen above FIRE_Y.
-      2. KEY RELEASE. v2.7 released with task.delay(45 ms). A missed delayed release
-         leaves the key down, and Windows sends no new keydown for a held key, so
-         InputBegan never fires again in that lane. v2.9 releases on a per-frame
-         deadline and force-releases a lane immediately before each press.
+  v2.10 fixes the compile error in v2.9:
+    "Matcha:129: Expected identifier when parsing expression, got 'until'"
+    `until` is a Lua RESERVED KEYWORD, so it cannot be used as a bare table key.
+    v2.9 wrote  held[lane] = { until = ..., since = ... }  which never compiled,
+    so nothing ran at all. The field is now called `due`. Never name a table key
+    after a reserved word (until, end, for, do, then, else, in, not, and, or,
+    local, function, repeat, while, if, return, break, nil, true, false).
 
-  HOLD NOTES (user: "there are hold ones too"):
-    A hold tile keeps existing past the line while its body is consumed, so the lane key
-    is kept down and re-armed for as long as that tile is still live and still between
-    FIRE_Y + 20 and FIRE_Y + HOLD_TAIL. It is released TAP_MS after the tile disappears.
-    A tap tile does not persist past the line, so it still gets a plain tap. Four
-    independent keys let several lanes hold at once, which one mouse button never could.
+  Carried over from v2.9:
+    1. ARMING. Any tile first seen above FIRE_Y is armed, so a dense passage can no
+       longer drop notes that skip past a narrow window between frames.
+    2. RELEASE. Keys are released on a per-frame deadline with a forced release
+       immediately before each press, so a stuck key cannot swallow later notes.
+       No task.delay is used for releases.
+    3. HOLDS. A hold tile persists past the line, so its lane key is kept down while
+       the tile is live and between FIRE_Y + 20 and FIRE_Y + HOLD_TAIL, then
+       released TAP_MS after it disappears, capped at MAX_HOLD.
 
   Confirmed:  keypress / keyrelease reach the game (v1.7 landed hits; v2.6 HUD showed
               KEYS mode with taps climbing)
@@ -43,7 +43,7 @@
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v2.9'
+local VERSION = 'v2.10'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -121,19 +121,20 @@ end
 
 -- Force a release first: InputBegan only fires on the key transition, so a key left
 -- down would silently swallow every later note in that lane.
+-- NOTE: the field is `due`, not `until` - `until` is a reserved Lua keyword.
 local function pressLane(lane, now, addr)
     local vk = KEYS[lane]
     if not vk or type(keypress) ~= 'function' then return false end
     if held[lane] then releaseLane(lane) end
     if not pcall(keypress, vk) then return false end
-    held[lane] = { until = now + TAP_MS / 1000, since = now, addr = addr, hold = false }
+    held[lane] = { due = now + TAP_MS / 1000, since = now, addr = addr, hold = false }
     taps = taps + 1
     lastLane, lastKey = lane, vk
     return true
 end
 
--- Deadline-driven release, plus hold extension. A tile that is still live and has
--- travelled past the line is a hold in progress, so its key is re-armed each frame.
+-- Deadline-driven release, plus hold extension. A tile still live and past the line
+-- is a hold in progress, so its release deadline is pushed forward each frame.
 local function serviceKeys(now)
     for lane = 1, 4 do
         local h = held[lane]
@@ -141,10 +142,10 @@ local function serviceKeys(now)
             local y = lastPos[h.addr]
             if lastLive[h.addr] and type(y) == 'number'
                 and y > FIRE_Y + 20 and y < FIRE_Y + HOLD_TAIL then
-                h.until = now + TAP_MS / 1000
+                h.due = now + TAP_MS / 1000
                 if not h.hold then h.hold = true; holdsN = holdsN + 1 end
             end
-            if now >= h.until or (now - h.since) > MAX_HOLD then
+            if now >= h.due or (now - h.since) > MAX_HOLD then
                 releaseLane(lane)
             end
         end
