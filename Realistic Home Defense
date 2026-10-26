@@ -1,28 +1,30 @@
 --[[
   Game:       Realistic Home Defense
   Place IDs:  105527962898452
-  Version:    v4.1
-  Features:   no recoil, no spread, rapid fire, infinite ammo (client), weapon giver, GC diagnostics
+  Version:    v5.0
+  Features:   no recoil, no spread, rapid fire, infinite ammo (client), weapon giver
   Controls:   menu tab "Weapon Mods"; every control is a toggle, slider or button
   Needs:      Matcha Pro / Allow Unsafe LuaU (getgc, applygc)
   Confirmed:  ACS_Engine.ToolStorage holds the gun Tools (HK416, AR-15, MCX, RPG-7);
               ACS_Settings defines ShootRate (HK416 = 800 rounds per minute), MinSpread /
               MaxSpread, camRecoil, gunRecoil, Ammo / AmmoInGun / MaxStoredAmmo; an equipped
               gun carries a RepValues folder
-  Confirmed:  require(<ModuleScript>) fails in Matcha, so the settings table cannot be read
-              through require; getgc on the field names is the only route
-  Confirmed:  Player.CharacterAdded reads nil here - v4.0 died with
-              "Matcha:548: attempt to index nil with 'Connect'" on that hook, which killed
-              the tail of the chunk (no loaded print, no _G registration). v4.1 polls
-              lp.Character for respawns and runs the hook last, inside pcall.
-  UNVERIFIED: that a getgc entry's addr is the address of the table holding the key. The
-              script uses it to intersect keys so applygc only touches real settings tables;
-              if that is wrong it falls back to plain value-range filtering
-  UNVERIFIED: whether the server re-applies any of these values after the client writes them
+  Confirmed:  require(<ModuleScript>) fails in Matcha
+  Confirmed:  Player.CharacterAdded reads nil here (v4.0 died on it); v5.0 polls instead
+  Confirmed:  a getgc entry's addr is NOT the table holding the key. Measured: 35 camRecoil
+              entries -> 35 unique addrs, 17 ShootRate entries -> 17 unique addrs, and the two
+              sets share ZERO addresses even though the settings tables carry both keys. So
+              keys cannot be intersected by addr; v4.0/v4.1 anchored on nothing and are gone.
+              What is left is filtering by value shape, which is what this version does.
+  Confirmed:  scanning is expensive per key (getgc on 2 keys took ~13 s), so the periodic
+              auto-rescan in v4.0/v4.1 was the lag; v5.0 scans once, on the button only
+  UNVERIFIED: whether the server re-applies ShootRate / spread / recoil after client writes
+  UNVERIFIED: whether setting ShootRate on every plausible number entry actually changes the
+              gun's rate; numbers cannot corrupt structure, but they can land on the wrong table
 ]]
 
 local NAME    = 'RHD Weapon Mods'
-local VERSION = 'v4.1'
+local VERSION = 'v5.0'
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
 local Players = game:GetService('Players')
@@ -42,16 +44,15 @@ end
 
 -- ---- config -------------------------------------------------------------
 local CFG = {
-    noRecoil   = false,
-    noSpread   = false,
-    rapid      = false,
-    infAmmo    = false,
-    rpm        = 1500,
-    ammo       = 9999,
-    autoRescan = true,
+    noRecoil = false,
+    noSpread = false,
+    rapid    = false,
+    infAmmo  = false,
+    rpm      = 1500,
+    ammo     = 9999,
 }
 
-local STATS = { scans = 0, writes = 0, last = 'nothing scanned yet' }
+local STATS = { scans = 0, writes = 0, last = 'not scanned yet', scanning = false }
 
 -- ---- game helpers -------------------------------------------------------
 local function getTool()
@@ -93,13 +94,13 @@ local function refillRep(tool)
     end
 end
 
--- ---- GC: find the real settings tables, write only there --------------
--- getgc(key) returns one entry per table that carries that key: `value` is the value
--- stored under the key and `addr` identifies where it lives. An entry for camRecoil
--- whose value is a recoil table is therefore inside a genuine ACS settings table, so
--- its addr marks one. Every other key is then written only at those addrs. Writing to
--- every table that happens to have a key named ShootRate or MinSpread is what broke
--- the held gun in earlier versions.
+-- ---- GC: shape-filtered cache, scanned once ----------------------------
+-- getgc(key) returns one entry per place that key appears, with `value` = what is
+-- stored there and `addr` = that entry's own identity (NOT the table around it, which
+-- is why keys cannot be intersected). Filtering therefore has to be by value shape:
+-- recoil keys must hold a real recoil table, numeric keys must hold a plausible number.
+-- A table written into a slot that held a number is what broke the held gun before;
+-- numbers into number slots cannot corrupt structure.
 
 local ZERO_CAM = {
     camRecoilUp = { 0, 0 }, camRecoilTilt = { 0, 0 },
@@ -110,92 +111,105 @@ local ZERO_GUN = {
     gunRecoilLeft = { 0, 0 }, gunRecoilRight = { 0, 0 },
 }
 
-local anchorAddrs = {}
 local SLOTS = {}
 
 local function slot(key)
     local s = SLOTS[key]
     if not s then
-        s = { key = key, state = 'idle', entries = nil, orig = nil, next = 0 }
+        s = { key = key, state = 'idle', entries = nil, orig = nil }
         SLOTS[key] = s
     end
     return s
 end
 
-local function anchorPred(e)
-    if e.type ~= 'table' then return false end
-    if type(e.value) ~= 'table' then return false end
-    local v = e.value
-    return v.camRecoilUp ~= nil or v.gunRecoilUp ~= nil
+local CAM_FIELDS = { 'camRecoilUp', 'camRecoilTilt', 'camRecoilLeft', 'camRecoilRight' }
+local GUN_FIELDS = { 'gunRecoilUp', 'gunRecoilTilt', 'gunRecoilLeft', 'gunRecoilRight' }
+
+local function recPred(fields)
+    return function(e)
+        if e.type ~= 'table' then return false end
+        local v = e.value
+        if type(v) ~= 'table' then return false end
+        local n = 0
+        for i = 1, #fields do
+            if v[fields[i]] ~= nil then n = n + 1 end
+        end
+        return n >= 2
+    end
 end
 
 local function numPred(lo, hi)
-    return function(e, raw)
+    return function(e)
         if e.type ~= 'number' then return false end
-        if type(e.value) ~= 'number' then return false end
-        if e.value < lo or e.value > hi then return false end
-        if not raw and next(anchorAddrs) ~= nil and anchorAddrs[e.addr] ~= true then
-            return false
-        end
-        return true
+        local v = e.value
+        if type(v) ~= 'number' then return false end
+        return v >= lo and v <= hi
     end
 end
 
-local function collect(res, key, pred, raw)
-    local kept = {}
-    for i = 1, #res do
-        local e = res[i]
-        if e.key == key then
-            local okp, keep = pcall(pred, e, raw)
-            if okp and keep then kept[#kept + 1] = e end
-        end
-    end
-    return kept
-end
+local SCAN = {
+    { key = 'camRecoil',  pred = recPred(CAM_FIELDS) },
+    { key = 'gunRecoil',  pred = recPred(GUN_FIELDS) },
+    { key = 'MinSpread',  pred = numPred(0.01, 60) },
+    { key = 'MaxSpread',  pred = numPred(1, 500) },
+    { key = 'ShootRate',  pred = numPred(60, 3000) },
+    { key = 'AmmoInGun',  pred = numPred(1, 500) },
+}
 
-local function scanKey(key, pred, force)
+local function scanOne(key, pred)
     local s = slot(key)
-    if not HAS_GC then return end
-    if s.state == 'scan' then return end
-    if s.state == 'ready' and not force then return end
-    s.state = 'scan'
+    local t0 = os.clock()
+    local ok, res = pcall(function() return getgc(key) end)
+    local total = 0
+    local kept = {}
+    if ok and type(res) == 'table' then
+        total = #res
+        for i = 1, #res do
+            local e = res[i]
+            if e.key == key then
+                local okp, keep = pcall(pred, e)
+                if okp and keep then kept[#kept + 1] = e end
+            end
+        end
+    end
+    if #kept > 0 then
+        s.entries = kept
+        local o = {}
+        for i = 1, #kept do o[i] = kept[i].value end
+        s.orig = o
+        s.state = 'ready'
+    else
+        s.entries = nil
+        s.orig = nil
+        s.state = 'empty'
+    end
+    print(string.format('[%s] %s: kept %d of %d (%.1fs)',
+        NAME, key, #kept, total, os.clock() - t0))
+    return #kept
+end
+
+local function scanAll()
+    if not HAS_GC then
+        warn('[' .. NAME .. '] getgc/applygc missing - cannot scan')
+        return
+    end
+    if STATS.scanning then
+        print('[' .. NAME .. '] already scanning')
+        return
+    end
+    STATS.scanning = true
     task.spawn(function()
-        local t0 = os.clock()
-        local ok, res = pcall(function() return getgc(key) end)
+        print('[' .. NAME .. '] scanning all keys, about 15s, do not spam this')
         local total = 0
-        local kept = {}
-        if ok and type(res) == 'table' then
-            total = #res
-            kept = collect(res, key, pred, false)
-            if #kept == 0 then
-                kept = collect(res, key, pred, true)
-            end
+        for i = 1, #SCAN do
+            total = total + scanOne(SCAN[i].key, SCAN[i].pred)
+            task.wait(0.3)
         end
-        if #kept > 0 then
-            s.entries = kept
-            if s.orig == nil then
-                local o = {}
-                for i = 1, #kept do o[i] = kept[i].value end
-                s.orig = o
-            end
-            s.state = 'ready'
-        else
-            s.entries = nil
-            s.state = 'idle'
-        end
-        if key == 'camRecoil' then
-            anchorAddrs = {}
-            if s.state == 'ready' then
-                for i = 1, #s.entries do
-                    anchorAddrs[s.entries[i].addr] = true
-                end
-            end
-        end
-        s.next = os.clock() + 8
+        STATS.scanning = false
         STATS.scans = STATS.scans + 1
-        STATS.last = key .. ': kept ' .. tostring(#kept) .. ' of ' .. tostring(total)
-            .. ' in ' .. string.format('%.1fs', os.clock() - t0)
+        STATS.last = 'scan finished, ' .. tostring(total) .. ' entries kept'
         print('[' .. NAME .. '] ' .. STATS.last)
+        pcall(notify, 'Scan done: ' .. tostring(total) .. ' entries', NAME, 4)
     end)
 end
 
@@ -232,65 +246,36 @@ local function anyOn()
     return CFG.noRecoil or CFG.noSpread or CFG.rapid or CFG.infAmmo
 end
 
--- ---- apply loop --------------------------------------------------------
+local function readyCount()
+    local n = 0
+    for i = 1, #ALL_KEYS do
+        if slot(ALL_KEYS[i]).state == 'ready' then n = n + 1 end
+    end
+    return n
+end
+
+-- ---- apply loop (never scans, only writes) -----------------------------
 task.spawn(function()
     while running do
-        if HAS_GC and anyOn() then
-            local a = slot('camRecoil')
-            if a.state ~= 'ready' then
-                if os.clock() >= a.next then scanKey('camRecoil', anchorPred) end
-            elseif CFG.autoRescan and os.clock() >= a.next then
-                scanKey('camRecoil', anchorPred, true)
+        if HAS_GC and anyOn() and readyCount() > 0 then
+            if CFG.noRecoil then
+                applyKey('camRecoil', ZERO_CAM)
+                applyKey('gunRecoil', ZERO_GUN)
             end
-
-            if a.state == 'ready' then
-                if CFG.noRecoil then
-                    applyKey('camRecoil', ZERO_CAM)
-                    local gr = slot('gunRecoil')
-                    if gr.state ~= 'ready' then
-                        if os.clock() >= gr.next then scanKey('gunRecoil', anchorPred) end
-                    else
-                        applyKey('gunRecoil', ZERO_GUN)
-                    end
-                end
-
-                if CFG.noSpread then
-                    local ms = slot('MinSpread')
-                    if ms.state ~= 'ready' then
-                        if os.clock() >= ms.next then scanKey('MinSpread', numPred(0.0001, 60)) end
-                    else
-                        applyKey('MinSpread', 0)
-                    end
-                    local xs = slot('MaxSpread')
-                    if xs.state ~= 'ready' then
-                        if os.clock() >= xs.next then scanKey('MaxSpread', numPred(1, 500)) end
-                    else
-                        applyKey('MaxSpread', 0)
-                    end
-                end
-
-                if CFG.rapid then
-                    local sr = slot('ShootRate')
-                    if sr.state ~= 'ready' then
-                        if os.clock() >= sr.next then scanKey('ShootRate', numPred(60, 3000)) end
-                    else
-                        applyKey('ShootRate', CFG.rpm)
-                    end
-                end
-
-                if CFG.infAmmo then
-                    local am = slot('AmmoInGun')
-                    if am.state ~= 'ready' then
-                        if os.clock() >= am.next then scanKey('AmmoInGun', numPred(1, 500)) end
-                    else
-                        applyKey('AmmoInGun', CFG.ammo)
-                    end
-                    local t = getTool()
-                    if t then refillRep(t) end
-                end
+            if CFG.noSpread then
+                applyKey('MinSpread', 0)
+                applyKey('MaxSpread', 0)
+            end
+            if CFG.rapid then
+                applyKey('ShootRate', CFG.rpm)
+            end
+            if CFG.infAmmo then
+                applyKey('AmmoInGun', CFG.ammo)
+                local t = getTool()
+                if t then refillRep(t) end
             end
         end
-        task.wait(1)
+        task.wait(0.5)
     end
 end)
 
@@ -409,17 +394,11 @@ local function registerToggle(key, id)
     TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = id }
 end
 
-local function countAddrs()
-    local n = 0
-    for k in pairs(anchorAddrs) do n = n + 1 end
-    return n
-end
-
 local function reportStatus()
     print('[' .. NAME .. '] --- status ---')
-    print('[' .. NAME .. '] scans ' .. tostring(STATS.scans) .. ', writes ' .. tostring(STATS.writes))
+    print('[' .. NAME .. '] scans ' .. tostring(STATS.scans) .. ', writes ' .. tostring(STATS.writes)
+        .. ', scanning ' .. tostring(STATS.scanning))
     print('[' .. NAME .. '] last: ' .. STATS.last)
-    print('[' .. NAME .. '] anchor addrs ' .. tostring(countAddrs()))
     for i = 1, #ALL_KEYS do
         local s = slot(ALL_KEYS[i])
         print('[' .. NAME .. '] ' .. ALL_KEYS[i] .. ' = ' .. tostring(s.state)
@@ -433,22 +412,13 @@ local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
-        local sec = mkSection(tab, 'Step 1 - Detect')
+        local sec = mkSection(tab, 'Step 1 - Scan')
         if sec then
-            mkButton(sec, 'Scan settings tables', function()
-                print('[' .. NAME .. '] scanning, 10-20s')
-                anchorAddrs = {}
-                scanKey('camRecoil', anchorPred, true)
-            end)
+            mkButton(sec, 'Scan once (about 15s)', function() scanAll() end)
             mkButton(sec, 'Status (read the console)', function() reportStatus() end)
             mkButton(sec, 'Restore original values', function() restoreAll() end)
-            mkToggle(sec, 'Auto rescan (every 8s)', 'rhd_rescan', true, function(v)
-                CFG.autoRescan = v
-                print('[' .. NAME .. '] auto rescan = ' .. tostring(v))
-            end)
-            registerToggle('autoRescan', 'rhd_rescan')
-            mkText(sec, 'Scan first, then flip mods in Step 2.')
-            mkText(sec, 'Only keys found inside a real settings table get written.')
+            mkText(sec, 'One scan per session. Nothing is scanned automatically.')
+            mkText(sec, 'The old version rescanned every 8s - that was the lag.')
         end
 
         local sec2 = mkSection(tab, 'Step 2 - Mods')
@@ -482,8 +452,8 @@ local function buildTab(tab)
             end)
             registerToggle('infAmmo', 'rhd_ammo')
 
-            mkText(sec2, 'Stock HK416 fire rate is 800 RPM, so 1500 is faster.')
-            mkText(sec2, 'If a toggle does nothing, press Status and check entries.')
+            mkText(sec2, 'Stock HK416 is 800 RPM, so 1500 is faster.')
+            mkText(sec2, 'Recoil writes only touch entries that hold a real recoil table.')
         end
 
         local sec3 = mkSection(tab, 'Step 3 - Weapons')
@@ -562,32 +532,19 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-pcall(notify, NAME .. ' ' .. VERSION, 'scan in Step 1, then mods', 4)
-print('[' .. NAME .. '] loaded ' .. VERSION .. ' - nothing scanned yet')
+pcall(notify, NAME .. ' ' .. VERSION, 'press Scan once, then mods', 4)
+print('[' .. NAME .. '] loaded ' .. VERSION .. ' - nothing scanned, nothing written')
 
--- ---- respawn watch ------------------------------------------------------
--- Player.CharacterAdded is nil in this build (v4.0 died on it), so a hook is only
--- installed if it exists; polling lp.Character works either way.
+-- ---- respawn watch (poll; CharacterAdded is nil here) -------------------
 local lastChar = lp.Character
-
-local function onNewChar()
-    print('[' .. NAME .. '] new character - clearing caches')
-    anchorAddrs = {}
-    SLOTS = {}
-    STATS.last = 'cleared on respawn'
-end
 
 if lp.CharacterAdded ~= nil then
     local ok = pcall(function()
-        track(lp.CharacterAdded:Connect(onNewChar))
+        track(lp.CharacterAdded:Connect(function()
+            print('[' .. NAME .. '] respawn detected')
+        end))
     end)
-    if ok then
-        print('[' .. NAME .. '] CharacterAdded hook installed')
-    else
-        print('[' .. NAME .. '] CharacterAdded hook failed - polling instead')
-    end
-else
-    print('[' .. NAME .. '] CharacterAdded is nil - polling for respawn')
+    if ok then print('[' .. NAME .. '] CharacterAdded hook installed') end
 end
 
 task.spawn(function()
@@ -595,7 +552,7 @@ task.spawn(function()
         local ok, c = pcall(function() return lp.Character end)
         if ok and c ~= lastChar then
             lastChar = c
-            onNewChar()
+            print('[' .. NAME .. '] new character - settings cache kept, press Scan if a mod stops')
         end
         task.wait(1)
     end
