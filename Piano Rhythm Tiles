@@ -1,48 +1,40 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v2.6
-  Features:   auto play - one toggle, Fire Y slider, CLICK X OFFSET slider, relative mouse
-              move, fire line + per-note dots
-  Controls:   menu tab "Piano Auto" - one toggle, two sliders, two toggles
+  Version:    v2.7
+  Features:   auto play - ONE toggle and ONE slider. Presses lane keys at the Fire Y line.
+              Mouse output removed entirely (it never worked in this game).
+  Controls:   menu tab "Piano Auto" - one toggle, one slider. Nothing else.
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
 
-  Why v2.6 (click still lands in the wrong column):
-    Three versions produced correct timing with the wrong column, including v2.4 which
-    clicked at the tile's own X and verified the cursor with lp:GetMouse(). That means
-    the lane arithmetic is NOT the fault - the click is being delivered to a different X
-    than the one we aimed at (a coordinate-space difference between mousemoveabs,
-    lp:GetMouse() and the Position the game reads).
-    v2.6 keeps the relative move and adds the one control that fixes this by eye:
-    a CLICK X OFFSET slider. The HUD prints the tile X and the click X it used, so you
-    can dial the offset until the click column matches the note column, then tell me the
-    number and I bake it in.
+  Why v2.7 (user HUD: "KEYS | lanes 0/630/798/965 | cur 1919,1079"):
+    1. A tile reported X = 0, so lane 1 was learned at 0. Lane width became
+       (965-0)/3 = 321 instead of 167 and every target was wrong. Tile X is now
+       only accepted inside 560..1400, so a parked or hidden tile cannot pollute
+       the ladder.
+    2. The cursor read back as 1919,1079 - the bottom-right corner of a 1920x1080
+       screen - and never moved. Mouse movement does not work in this game, so
+       every click fired into the corner. Mouse output is therefore GONE; v2.7
+       presses keys only, which is the route that landed hits in v1.7.
+    3. The menu is now exactly one toggle and one slider, as requested.
 
-  Remotes are TELEMETRY ONLY - confirmed from the user's dump:
-    Request:InvokeServer("telemetry", {event = "play_requested"})
-    Request:InvokeServer("telemetry", {event = "offer", key = "practiceMode"})
-    Request:InvokeServer("telemetry", {event = "frames", taps = 0, long = 0, ...})
-    plus clientErrors and songVote from the decompile. There is NO hit/press/release
-    remote, so hits are scored locally in Client.Engine. Input simulation is the only
-    route, and holds cannot be sent remotely.
-
-  Confirmed:  Client.Input resolves a click with Board.laneAt(input.Position.X), X only
-  Confirmed:  tiles sit at four distinct X values (630 / 798 / 965 / 1133); tile X is the
-              lane's left edge + ~5, so tile X + half a lane = the lane centre
+  Confirmed:  keypress / keyrelease reach the game (v1.7 landed hits with keys)
+  Confirmed:  tiles sit at four X values: 630 / 798 / 965 / 1133 (left to right)
+  Confirmed:  Shared.Config DefaultKeys = D F J K, left to right
   Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom
-  Confirmed:  board is x 625..1292 (667 wide), height ~1076, y=1104 is BELOW the board
-  Confirmed:  FIRE_Y = 950 lands hits; y >= 1034 was LATE; timing is settled
-  Confirmed:  the single-char TextLabels in PianoTiles are the judgement tally, not keys
-  Confirmed:  mousemoveabs / mousemoverel / mouse1press / mouse1release all exist
+  Confirmed:  board is x 625..1292, bottom edge y ~ 1076; y=1104 is the park spot
+  Confirmed:  FIRE_Y 950 landed hits; y >= 1034 was LATE; timing is settled
+  Confirmed:  no hit/press remote exists - scoring is local, input is the only route
+  Confirmed:  mousemoveabs / mousemoverel do not move the cursor in this game
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
-  UNVERIFIED: the X offset between our click and the game's input.Position
+  UNVERIFIED: the exact FIRE_Y you settle on
 
-  SLIDERS: LOWER Fire Y = fires EARLIER | HIGHER Fire Y = fires LATER
-           Click X offset shifts every click right (+) or left (-) in pixels
+  SLIDER:  LOWER Fire Y = fires EARLIER   |   HIGHER Fire Y = fires LATER
+  HUD:     taps, fireY, the lane+key of the last press, lanes, chart
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v2.6'
+local VERSION = 'v2.7'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -51,125 +43,52 @@ local Players    = game:GetService('Players')
 local RunService = game:GetService('RunService')
 local lp         = Players.LocalPlayer
 
-local running = true
-local conns   = {}
-
-local function track(c)
-    conns[#conns + 1] = c
-    return c
-end
-
 -- ---- config ----
 
-local FIRE_Y      = 950
-local CLICK_X_OFF = 0      -- live value, the offset slider writes this
-
-local CFG = {
-    ARM_GAP   = 100,
-    giveUp    = 160,
-    laneTol   = 8,
-    tapMs     = 35,
-    clickYpct = 55,
-    fallbackW = 167,
-    boardBottom = 1076,
-    keys      = { 0x44, 0x46, 0x4A, 0x4B },
-}
+local FIRE_Y = 950                       -- the slider writes this
+local LANE_FALLBACK = { 630, 798, 965, 1133 }
+local KEYS          = { 0x44, 0x46, 0x4A, 0x4B }   -- D F J K, left to right
+local LANE_MIN, LANE_MAX = 560, 1400     -- reject impossible tile X values
+local TAP_MS   = 45
+local ARM_GAP  = 120                     -- tile must be seen this far above FIRE_Y
+local GIVE_UP  = 180                     -- px past FIRE_Y before a tile is abandoned
+local DOT_OFF  = 83                      -- half a lane, for the dot on each note
 
 -- ---- state ----
 
-local on         = true
-local recs       = {}
-local laneXs     = {}
-local chart      = nil
-local taps       = 0
-local fired      = {}
-local focused    = nil
-local lastAct    = '-'
-local lastCursor = '-'
-local lastTileX  = 0
-local lastClickX = 0
-local mouseBusy  = false
-local clickFails = 0
-local useKeys    = false
-local useAbs     = false
-local mirrored   = false
-local dotPool    = {}
+local running = true
+local conns   = {}
+local on      = true
+local recs    = {}
+local fired   = {}
+local laneXs  = {}
+local chart   = nil
+local taps    = 0
+local focused = nil
+local lastLane, lastKey = 0, 0
+local dotPool = {}
 local lineFire, lineBottom, lineLabel
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
 end
 
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
+
 if type(setrobloxinput) == 'function' then
     pcall(setrobloxinput, true)
 end
 
--- ---- helpers ----
-
-local function viewportH()
-    local ok, vp = pcall(function() return workspace.CurrentCamera.ViewportSize end)
-    if ok and vp and type(vp.Y) == 'number' and vp.Y > 0 then return vp.Y end
-    return 1080
-end
-
-local function mousePos()
-    local ok, m = pcall(function() return lp:GetMouse() end)
-    if not ok or not m then return nil, nil end
-    local okx, x = pcall(function() return m.X end)
-    local oky, y = pcall(function() return m.Y end)
-    if okx and oky and type(x) == 'number' and type(y) == 'number' then
-        return x, y
-    end
-    return nil, nil
-end
-
--- Relative movement: a DELTA is identical in every coordinate space, so window
--- offset, title bar and DPI scaling cannot skew it. Chunked because the OS clamps
--- large relative moves.
-local function moveRel(tx, ty)
-    if type(mousemoverel) ~= 'function' then return false, 'no mousemoverel' end
-    for _ = 1, 12 do
-        local cx, cy = mousePos()
-        if not cx or not cy then
-            pcall(function() mousemoverel(0, 0) end)
-            return false, 'no cursor readback'
-        end
-        local dx, dy = tx - cx, ty - cy
-        if math.abs(dx) <= 3 and math.abs(dy) <= 3 then return true end
-        local sx = math.max(-200, math.min(200, math.floor(dx + 0.5)))
-        local sy = math.max(-200, math.min(200, math.floor(dy + 0.5)))
-        if sx == 0 and sy == 0 then return true end
-        pcall(function() mousemoverel(sx, sy) end)
-    end
-    local fx, fy = mousePos()
-    if not fx then return false, 'gave up' end
-    return (math.abs(tx - fx) <= 8 and math.abs(ty - fy) <= 8),
-           string.format('cursor %d,%d want %d,%d', fx, fy, tx, ty)
-end
-
-local function moveAbs(tx, ty)
-    if type(mousemoveabs) ~= 'function' then return false, 'no mousemoveabs' end
-    for _ = 1, 3 do
-        pcall(function() mousemoveabs(tx, ty) end)
-        local cx, cy = mousePos()
-        if not cx or not cy then return true end
-        if math.abs(tx - cx) <= 2 and math.abs(ty - cy) <= 2 then return true end
-    end
-    local fx, fy = mousePos()
-    if not fx then return true end
-    return (math.abs(tx - fx) <= 6 and math.abs(ty - fy) <= 6),
-           string.format('cursor %d,%d want %d,%d', fx, fy, tx, ty)
-end
-
-local function moveTo(tx, ty)
-    if useAbs then return moveAbs(tx, ty) end
-    return moveRel(tx, ty)
-end
+-- ---- lanes ----
 
 local function noteLaneX(x)
+    if type(x) ~= 'number' or x < LANE_MIN or x > LANE_MAX then return end
     local rx = math.floor(x + 0.5)
     for i = 1, #laneXs do
-        if math.abs(laneXs[i] - rx) <= CFG.laneTol then return end
+        if math.abs(laneXs[i] - rx) <= 8 then return end
     end
     if #laneXs >= 4 then return end
     laneXs[#laneXs + 1] = rx
@@ -179,111 +98,31 @@ local function noteLaneX(x)
     end
 end
 
-local function laneWidth()
-    if #laneXs < 2 then return CFG.fallbackW end
-    local w = (laneXs[#laneXs] - laneXs[1]) / (#laneXs - 1)
-    if w > 40 and w < 600 then return w end
-    return CFG.fallbackW
+local function laneOf(x)
+    local cols = (#laneXs == 4) and laneXs or LANE_FALLBACK
+    local best, bestD = nil, math.huge
+    for i = 1, 4 do
+        local d = math.abs(cols[i] - x)
+        if d < bestD then best, bestD = i, d end
+    end
+    if bestD <= 120 then return best end
+    return nil
 end
 
-local function setupDrawings()
-    pcall(function()
-        lineFire = Drawing.new('Line')
-        lineFire.Color = Color3.fromRGB(255, 220, 60)
-        lineFire.Thickness = 2
-        lineFire.Visible = false
+-- ---- key output ----
 
-        lineBottom = Drawing.new('Line')
-        lineBottom.Color = Color3.fromRGB(200, 200, 210)
-        lineBottom.Thickness = 1
-        lineBottom.Transparency = 0.55
-        lineBottom.Visible = false
-
-        lineLabel = Drawing.new('Text')
-        lineLabel.Size = 12
-        lineLabel.Outline = true
-        lineLabel.Color = Color3.fromRGB(255, 220, 60)
-        lineLabel.Visible = false
-
-        for i = 1, 40 do
-            local d = Drawing.new('Circle')
-            d.Radius = 4
-            d.NumSides = 12
-            d.Filled = true
-            d.Thickness = 1
-            d.Color = Color3.fromRGB(120, 220, 255)
-            d.Visible = false
-            dotPool[i] = d
-        end
-    end)
-end
-
-setupDrawings()
-
-local function releaseMouse()
-    if not mouseBusy then return end
-    mouseBusy = false
-    pcall(function() mouse1release() end)
-end
-
--- ---- one lane press ----
-
-local function pressAt(tileX, addr, now)
-    local w = laneWidth()
-    local col = 0
-    for i = 1, #laneXs do
-        if math.abs(laneXs[i] - tileX) < 20 then col = i end
-    end
-    if mirrored and col > 0 then col = 5 - col end
-    local baseX
-    if col > 0 then
-        baseX = laneXs[col] + w * 0.5
-    else
-        baseX = tileX + w * 0.5
-    end
-    local tx = math.floor(baseX + CLICK_X_OFF)
-    local ty = math.floor(viewportH() * (CFG.clickYpct / 100))
-    lastTileX  = math.floor(tileX)
-    lastClickX = tx
-
-    if not useKeys then
-        if mouseBusy then return false end
-        local ok, why = moveTo(tx, ty)
-        local cx, cy = mousePos()
-        lastCursor = cx and string.format('cur %d,%d', cx, cy) or 'cur ?'
-        if ok then
-            if pcall(function() mouse1press() end) then
-                mouseBusy = true
-                taps = taps + 1
-                clickFails = 0
-                lastAct = string.format('click %d,%d', tx, ty)
-                task.delay(CFG.tapMs / 1000, releaseMouse)
-                return true
-            end
-            why = 'mouse1press failed'
-        end
-        clickFails = clickFails + 1
-        lastAct = 'move fail ' .. tostring(why)
-        if clickFails >= 6 then
-            useKeys = true
-            log('cursor would not move after 6 tries - switched to keys')
-        end
-        return false
-    end
-
-    local lane, best = 1, math.huge
-    for i = 1, #laneXs do
-        local d = math.abs(laneXs[i] - tileX)
-        if d < best then best, lane = d, i end
-    end
-    if mirrored then lane = 5 - lane end
-    local vk = CFG.keys[lane]
+local function tapLane(lane)
+    local vk = KEYS[lane]
     if not vk or type(keypress) ~= 'function' then return false end
     if not pcall(keypress, vk) then return false end
     taps = taps + 1
-    lastAct = 'key ' .. string.char(vk) .. ' lane ' .. lane
-    task.delay(CFG.tapMs / 1000, function() pcall(keyrelease, vk) end)
+    lastLane, lastKey = lane, vk
+    task.delay(TAP_MS / 1000, function() pcall(keyrelease, vk) end)
     return true
+end
+
+local function releaseAll()
+    for i = 1, 4 do pcall(keyrelease, KEYS[i]) end
 end
 
 local function tiles()
@@ -293,6 +132,38 @@ local function tiles()
     if not bd then return nil end
     return bd:FindFirstChild('Tiles')
 end
+
+-- ---- overlays ----
+
+pcall(function()
+    lineFire = Drawing.new('Line')
+    lineFire.Color = Color3.fromRGB(255, 220, 60)
+    lineFire.Thickness = 2
+    lineFire.Visible = false
+
+    lineBottom = Drawing.new('Line')
+    lineBottom.Color = Color3.fromRGB(200, 200, 210)
+    lineBottom.Thickness = 1
+    lineBottom.Transparency = 0.55
+    lineBottom.Visible = false
+
+    lineLabel = Drawing.new('Text')
+    lineLabel.Size = 12
+    lineLabel.Outline = true
+    lineLabel.Color = Color3.fromRGB(255, 220, 60)
+    lineLabel.Visible = false
+
+    for i = 1, 40 do
+        local d = Drawing.new('Circle')
+        d.Radius = 4
+        d.NumSides = 12
+        d.Filled = true
+        d.Thickness = 1
+        d.Color = Color3.fromRGB(120, 220, 255)
+        d.Visible = false
+        dotPool[i] = d
+    end
+end)
 
 -- ---- per frame ----
 
@@ -309,25 +180,21 @@ local function step()
         focused = true
     end
 
-    if not on or not focused then
-        releaseMouse()
-    end
-
     local now  = os.clock()
     local list = holder:GetChildren()
-    local armY = FIRE_Y - CFG.ARM_GAP
+    local armY = FIRE_Y - ARM_GAP
 
+    -- new song -> forget everything, including the learned columns
     for i = 1, #list do
         if list[i].Name == 'Tile' then
             local okC, cv = pcall(function() return list[i]:GetAttribute('ChartVersion') end)
             if okC and cv ~= nil and cv ~= chart then
-                chart      = cv
-                recs       = {}
-                fired      = {}
-                laneXs     = {}
-                taps       = 0
-                clickFails = 0
-                releaseMouse()
+                chart  = cv
+                recs   = {}
+                fired  = {}
+                laneXs = {}
+                taps   = 0
+                releaseAll()
                 log('chart ' .. tostring(chart))
             end
             break
@@ -358,7 +225,7 @@ local function step()
                 dotIx = dotIx + 1
                 local d = dotPool[dotIx]
                 if d then
-                    d.Position = Vector2.new(pos.X + laneWidth() * 0.5, pos.Y)
+                    d.Position = Vector2.new(pos.X + DOT_OFF, pos.Y)
                     if fired[addr] then
                         d.Color = Color3.fromRGB(150, 150, 160)
                         d.Transparency = 0.6
@@ -386,16 +253,14 @@ local function step()
     end
 
     if lineFire then
-        local x1, x2 = 619, 1298
-        if #laneXs >= 2 then
-            x1 = laneXs[1] - 6
-            x2 = laneXs[#laneXs] + laneWidth() + 6
-        end
+        local cols = (#laneXs == 4) and laneXs or LANE_FALLBACK
+        local x1 = cols[1] - 10
+        local x2 = cols[4] + 170
         lineFire.From = Vector2.new(x1, FIRE_Y)
         lineFire.To   = Vector2.new(x2, FIRE_Y)
         lineFire.Visible = true
-        lineBottom.From = Vector2.new(x1, CFG.boardBottom)
-        lineBottom.To   = Vector2.new(x2, CFG.boardBottom)
+        lineBottom.From = Vector2.new(x1, 1076)
+        lineBottom.To   = Vector2.new(x2, 1076)
         lineBottom.Visible = true
         lineLabel.Text = string.format('FIRE %d', math.floor(FIRE_Y))
         lineLabel.Position = Vector2.new(x1 + 4, FIRE_Y - 16)
@@ -406,10 +271,13 @@ local function step()
         local it = batch[i]
         local r  = it.r
         if not fired[it.addr] then
-            if it.y > FIRE_Y + CFG.giveUp then
+            if it.y > FIRE_Y + GIVE_UP then
                 fired[it.addr] = true
-            elseif on and focused and it.y >= FIRE_Y and r.armed then
-                if pressAt(it.x, it.addr, now) then
+            elseif on and focused and r.armed and it.y >= FIRE_Y then
+                local lane = laneOf(it.x)
+                if lane then
+                    if tapLane(lane) then fired[it.addr] = true end
+                else
                     fired[it.addr] = true
                 end
             end
@@ -424,7 +292,14 @@ local function step()
     end
 end
 
--- ---- readout ----
+local function hudText()
+    if not hud then return end
+    local lanesTxt = #laneXs > 0 and table.concat(laneXs, '/') or 'default'
+    local keyTxt   = lastKey > 0 and string.char(lastKey) or '-'
+    hud.Text = string.format('%s | on %s | focus %s | taps %d | fireY %d | last lane %d key %s | lanes %s | chart %s',
+        VERSION, tostring(on), tostring(focused), taps, math.floor(FIRE_Y),
+        lastLane, keyTxt, lanesTxt, tostring(chart))
+end
 
 local hud
 pcall(function()
@@ -436,17 +311,6 @@ pcall(function()
     hud.Visible = true
 end)
 
-local function hudText()
-    if not hud then return end
-    local lanesTxt = #laneXs > 0 and table.concat(laneXs, '/') or 'learning'
-    hud.Text = string.format('%s | %s%s | focus %s | taps %d | fireY %d | off %+d | lanes %s | tile x%d -> click x%d | %s | chart %s',
-        VERSION,
-        useKeys and 'KEYS' or (useAbs and 'ABS' or 'REL'),
-        mirrored and ' MIRROR' or '',
-        tostring(focused), taps, math.floor(FIRE_Y), math.floor(CLICK_X_OFF),
-        lanesTxt, lastTileX, lastClickX, lastCursor, tostring(chart))
-end
-
 local okRender = pcall(function()
     track(RunService.RenderStepped:Connect(function()
         pcall(step)
@@ -455,7 +319,7 @@ local okRender = pcall(function()
 end)
 if not okRender then log('RenderStepped connect failed') end
 
--- ---- menu ----
+-- ---- menu: exactly one toggle + one slider ----
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local built  = false
@@ -537,7 +401,7 @@ if HAS_UI then
                             pcall(setrobloxinput, true)
                         end
                     else
-                        releaseMouse()
+                        releaseAll()
                     end
                     log('auto play ' .. (v and 'ON' or 'OFF'))
                 end)
@@ -545,21 +409,6 @@ if HAS_UI then
                 mkSlider(sec, 'Fire Y (lower = earlier)', 'pa_firey', 500, 1100, math.floor(FIRE_Y), function(v)
                     FIRE_Y = math.floor(v)
                     log('fireY = ' .. tostring(FIRE_Y))
-                end)
-
-                mkSlider(sec, 'Click X offset px (+ = right)', 'pa_xoff', -400, 400, math.floor(CLICK_X_OFF), function(v)
-                    CLICK_X_OFF = math.floor(v)
-                    log('click x offset = ' .. tostring(CLICK_X_OFF))
-                end)
-
-                mkToggle(sec, 'Absolute mouse move (off = relative)', 'pa_abs', useAbs, function(v)
-                    useAbs = v
-                    log('mouse move ' .. (v and 'ABSOLUTE' or 'RELATIVE'))
-                end)
-
-                mkToggle(sec, 'Mirror lanes (1 <-> 4)', 'pa_mirror', mirrored, function(v)
-                    mirrored = v
-                    log('mirror ' .. (v and 'ON' or 'OFF'))
                 end)
             end)
             if not okB then log('menu build error: ' .. tostring(errB)) end
@@ -580,7 +429,7 @@ local function stop()
         pcall(function() conns[i]:Disconnect() end)
     end
     conns = {}
-    releaseMouse()
+    releaseAll()
     for i = 1, #dotPool do
         pcall(function() dotPool[i]:Remove() end)
     end
@@ -598,5 +447,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - Fire Y ' .. tostring(FIRE_Y) .. ', click offset ' .. tostring(CLICK_X_OFF))
+log(VERSION .. ' loaded - keys only, Fire Y ' .. tostring(FIRE_Y))
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
