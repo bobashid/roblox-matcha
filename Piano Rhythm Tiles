@@ -1,32 +1,31 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v1.9
-  Features:   auto play - one toggle plus one Fire Y slider; taps on the Y line and holds
-              the lane while that tile is still on screen
+  Version:    v2.0
+  Features:   auto play - one toggle plus one Fire Y slider; taps on the Y line, holds the
+              lane while that tile persists, LANE MATH FIXED (was off by one to the left)
   Controls:   menu tab "Piano Auto" - one toggle, one slider
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
-  Confirmed:  lanes x 625/792/959/1126, width 167; tiles are Board.Tiles.Tile with
-              TileIndex / ChartVersion and a readable .Address
-  Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom of the screen
+
+  Confirmed:  lanes at x 625 / 792 / 959 / 1127, width 167, SepEnd 1292
+  Confirmed:  a tile's AbsolutePosition.X is its lane's left edge + ~6
+              (observed tile X values: 630, 798, 965, 1133)
+  Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom
   Confirmed:  a live chart is a 100px ladder: idx 3 y=991 ... idx 12 y=91
-  Confirmed:  idle tiles park at y = 1104, just BELOW the board
-  Confirmed:  Board at (625,0), lanes end 1292 -> width 667; BoardAspect 0.62
-              -> board height ~1076, so y=1104 is outside the board (park spot)
-  Confirmed:  FIRE_Y = 950 lands hits; y >= 1034 was LATE; v1.8 landed two clicks
+  Confirmed:  idle tiles park at y = 1104, just BELOW the board (bottom ~1076)
+  Confirmed:  FIRE_Y = 950 lands hits; y >= 1034 was LATE
+  Confirmed:  timing is now correct, but the wrong key was pressed (user report)
+  Confirmed:  cause: laneOf used overlapping ranges, so 798 -> lane 1, 965 -> lane 2,
+              1133 -> lane 3 - every tile one lane to the left. Fixed below.
   Confirmed:  keypress / keyrelease / isrbxactive / setrobloxinput all exist
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
   UNVERIFIED: sustaining the key while the tile persists is enough for hold notes
 
-  THE SLIDER:
-    LOWER Fire Y  -> fires EARLIER
-    HIGHER Fire Y -> fires LATER
-  Everything else is fixed. Arming point follows the slider automatically
-  (a tile is armed once it has been seen 100 px above the Fire Y value).
+  SLIDER:  LOWER Fire Y = fires EARLIER   |   HIGHER Fire Y = fires LATER
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v1.9'
+local VERSION = 'v2.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -51,22 +50,23 @@ local CFG = {
     ARM_GAP = 100,     -- a tile must be seen this far above FIRE_Y before it can fire
     gapMs   = 30,      -- min ms between two presses in the same lane
     maxHold = 3.0,     -- safety cap on one held lane, seconds
-    laneX   = { 625, 792, 959, 1126 },
-    laneW   = 167,
-    keys    = { 0x44, 0x46, 0x4A, 0x4B },   -- D F J K
+    laneX   = { 625, 792, 959, 1127 },   -- lane LEFT edges, ascending
+    keys    = { 0x44, 0x46, 0x4A, 0x4B }, -- D F J K, left to right
 }
 
 -- ---- state ----
 
-local on      = true
-local recs    = {}
-local chart   = nil
-local taps    = 0
-local holds   = 0
-local focused = nil
-local lowY    = 0
-local laneAt  = { 0, 0, 0, 0 }
-local down    = {}      -- lane -> { addr = tile address, since = clock }
+local on       = true
+local recs     = {}
+local chart    = nil
+local taps     = 0
+local holds    = 0
+local focused  = nil
+local lowY     = 0
+local laneAt   = { 0, 0, 0, 0 }
+local down     = {}      -- lane -> { addr = tile address, since = clock }
+local lastLane = 0
+local lastX    = 0
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
@@ -77,14 +77,15 @@ if type(setrobloxinput) == 'function' then
     pcall(setrobloxinput, true)
 end
 
+-- FIXED: take the HIGHEST lane whose left edge is at or below x.
+-- The old version tested a wide range per lane, lanes overlapped, and the loop
+-- returned the lower lane for every tile (798 -> 1, 965 -> 2, 1133 -> 3).
 local function laneOf(x)
     if type(x) ~= 'number' then return nil end
-    for i = 1, 4 do
-        if x >= CFG.laneX[i] - 12 and x < CFG.laneX[i] + CFG.laneW + 12 then
-            return i
-        end
+    for i = 4, 1, -1 do
+        if x >= CFG.laneX[i] - 12 then return i end
     end
-    return nil
+    return 1
 end
 
 -- ---- key output ----
@@ -143,7 +144,6 @@ local function step()
     local list = holder:GetChildren()
     local armY = FIRE_Y - CFG.ARM_GAP
 
-    -- new song -> forget every tracked tile and every held key
     for i = 1, #list do
         if list[i].Name == 'Tile' then
             local okC, cv = pcall(function() return list[i]:GetAttribute('ChartVersion') end)
@@ -183,6 +183,8 @@ local function step()
                 if on and focused and r.armed and not r.done and r.lane
                     and pos.Y >= FIRE_Y then
                     r.done = true
+                    lastLane = r.lane
+                    lastX    = pos.X
                     press(r.lane, addr, now)
                 end
             end
@@ -223,9 +225,9 @@ end)
 
 local function hudText()
     if not hud then return end
-    hud.Text = string.format('%s | on %s | focus %s | taps %d | holds %d | fireY %d | low y %d | chart %s',
+    hud.Text = string.format('%s | on %s | focus %s | taps %d | holds %d | fireY %d | lane %d @ x %d | chart %s',
         VERSION, tostring(on), tostring(focused), taps, holds, math.floor(FIRE_Y),
-        math.floor(lowY), tostring(chart))
+        lastLane, math.floor(lastX), tostring(chart))
 end
 
 local okRender = pcall(function()
@@ -357,5 +359,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - toggle + Fire Y slider, starting at ' .. tostring(FIRE_Y))
+log(VERSION .. ' loaded - lane math fixed, Fire Y ' .. tostring(FIRE_Y))
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
