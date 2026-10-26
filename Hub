@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v2.4: Piano Rhythm Tiles pinned by place id (auto play).
 -- v2.3: Ride A Dino removed (scrapped).
 -- v2.2: Ride A Dino - Always Gain Stamina mounts via the dino prompt.
 -- v2.1: Ride A Dino - Always Gain Stamina (anchor + hold still).
@@ -21,7 +22,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v2.3'
+local VERSION = 'v2.4'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -44,6 +45,7 @@ local PLACES = {
     [103363457515322] = 'Chop A Forest',
     [109440485612336] = 'What If Disasters',
     [105527962898452] = 'Realistic Home Defense',
+    [101999883467300] = 'Piano Rhythm Tiles',
 }
 
 -- file name + the names/aliases this place might show up as.
@@ -57,6 +59,7 @@ local SCRIPTS = {
     { file = 'Dogs',                    keys = { 'dogs' } },
     { file = 'Feed A Mosquito',         keys = { 'feedamosquito', 'mosquito' } },
     { file = 'Hike For Eggs',           keys = { 'hikeforeggs' } },
+    { file = 'Piano Rhythm Tiles',      keys = { 'pianorhythmtiles', 'pianotiles' } },
     { file = 'PRISON LIFE TRIGGERBOT',  keys = { 'prisonlifetriggerbot', 'triggerbot' } },
     { file = 'Prison Life HvH',         keys = { 'prisonlifehvh', 'hvh' } },
     { file = 'Realistic Home Defense',  keys = { 'realistichomedefense', 'homedefense' } },
