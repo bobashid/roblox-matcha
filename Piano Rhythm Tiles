@@ -1,43 +1,48 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v2.5
-  Features:   auto play - one toggle + one Fire Y slider; moves the cursor RELATIVELY so the
-              click lands in the tile's own column, verifies arrival before pressing, draws
-              the fire line and a dot on every note
-  Controls:   menu tab "Piano Auto" - one toggle, one slider, two move-mode toggles
+  Version:    v2.6
+  Features:   auto play - one toggle, Fire Y slider, CLICK X OFFSET slider, relative mouse
+              move, fire line + per-note dots
+  Controls:   menu tab "Piano Auto" - one toggle, two sliders, two toggles
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
 
-  Why v2.5 (click still lands in the wrong column):
-    v2.4 clicked at the tile's own X and verified the cursor with lp:GetMouse(). It still
-    landed in the wrong column. That leaves ONE assumption: that mousemoveabs, the value
-    returned by lp:GetMouse(), and the Position the game sees in input.Position all share
-    a coordinate space. If they do not, the verification passes (GetMouse agrees with
-    itself) while the game receives a different X - exactly the symptom.
-    v2.5 therefore moves with mousemoverel, i.e. by DELTAS. A delta is the same number in
-    every space, so relative movement cannot be offset by a title bar, a window position
-    or a DPI scale. Absolute movement stays available as a toggle for comparison.
+  Why v2.6 (click still lands in the wrong column):
+    Three versions produced correct timing with the wrong column, including v2.4 which
+    clicked at the tile's own X and verified the cursor with lp:GetMouse(). That means
+    the lane arithmetic is NOT the fault - the click is being delivered to a different X
+    than the one we aimed at (a coordinate-space difference between mousemoveabs,
+    lp:GetMouse() and the Position the game reads).
+    v2.6 keeps the relative move and adds the one control that fixes this by eye:
+    a CLICK X OFFSET slider. The HUD prints the tile X and the click X it used, so you
+    can dial the offset until the click column matches the note column, then tell me the
+    number and I bake it in.
 
-  Also available: a Mirror toggle, for the case where the game maps lane 1 to the RIGHT
-  column (Engine.setUpscroll / line mode can flip the board).
+  Remotes are TELEMETRY ONLY - confirmed from the user's dump:
+    Request:InvokeServer("telemetry", {event = "play_requested"})
+    Request:InvokeServer("telemetry", {event = "offer", key = "practiceMode"})
+    Request:InvokeServer("telemetry", {event = "frames", taps = 0, long = 0, ...})
+    plus clientErrors and songVote from the decompile. There is NO hit/press/release
+    remote, so hits are scored locally in Client.Engine. Input simulation is the only
+    route, and holds cannot be sent remotely.
 
   Confirmed:  Client.Input resolves a click with Board.laneAt(input.Position.X), X only
   Confirmed:  tiles sit at four distinct X values (630 / 798 / 965 / 1133); tile X is the
               lane's left edge + ~5, so tile X + half a lane = the lane centre
   Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom
   Confirmed:  board is x 625..1292 (667 wide), height ~1076, y=1104 is BELOW the board
-  Confirmed:  FIRE_Y = 950 lands hits; y >= 1034 was LATE; timing now confirmed right
+  Confirmed:  FIRE_Y = 950 lands hits; y >= 1034 was LATE; timing is settled
   Confirmed:  the single-char TextLabels in PianoTiles are the judgement tally, not keys
   Confirmed:  mousemoveabs / mousemoverel / mouse1press / mouse1release all exist
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
-  UNVERIFIED: which coordinate space mousemoveabs and input.Position actually use
+  UNVERIFIED: the X offset between our click and the game's input.Position
 
-  SLIDER:  LOWER Fire Y = fires EARLIER   |   HIGHER Fire Y = fires LATER
-  HUD:     mode REL/ABS | last click x,y | cursor readback after the move
+  SLIDERS: LOWER Fire Y = fires EARLIER | HIGHER Fire Y = fires LATER
+           Click X offset shifts every click right (+) or left (-) in pixels
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v2.5'
+local VERSION = 'v2.6'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -56,7 +61,8 @@ end
 
 -- ---- config ----
 
-local FIRE_Y = 950
+local FIRE_Y      = 950
+local CLICK_X_OFF = 0      -- live value, the offset slider writes this
 
 local CFG = {
     ARM_GAP   = 100,
@@ -71,21 +77,23 @@ local CFG = {
 
 -- ---- state ----
 
-local on        = true
-local recs      = {}
-local laneXs    = {}
-local chart     = nil
-local taps      = 0
-local fired     = {}
-local focused   = nil
-local lastAct   = '-'
+local on         = true
+local recs       = {}
+local laneXs     = {}
+local chart      = nil
+local taps       = 0
+local fired      = {}
+local focused    = nil
+local lastAct    = '-'
 local lastCursor = '-'
-local mouseBusy = false
+local lastTileX  = 0
+local lastClickX = 0
+local mouseBusy  = false
 local clickFails = 0
-local useKeys   = false
-local useAbs    = false      -- false = relative movement (default)
-local mirrored  = false
-local dotPool   = {}
+local useKeys    = false
+local useAbs     = false
+local mirrored   = false
+local dotPool    = {}
 local lineFire, lineBottom, lineLabel
 
 local function log(m)
@@ -115,9 +123,9 @@ local function mousePos()
     return nil, nil
 end
 
--- Relative movement: a DELTA is the same number in every coordinate space, so this
--- cannot be thrown off by window position, title bar or DPI scaling. Chunked because
--- the OS clamps large relative moves.
+-- Relative movement: a DELTA is identical in every coordinate space, so window
+-- offset, title bar and DPI scaling cannot skew it. Chunked because the OS clamps
+-- large relative moves.
 local function moveRel(tx, ty)
     if type(mousemoverel) ~= 'function' then return false, 'no mousemoverel' end
     for _ = 1, 12 do
@@ -227,13 +235,16 @@ local function pressAt(tileX, addr, now)
         if math.abs(laneXs[i] - tileX) < 20 then col = i end
     end
     if mirrored and col > 0 then col = 5 - col end
-    local tx
+    local baseX
     if col > 0 then
-        tx = math.floor(laneXs[col] + w * 0.5)
+        baseX = laneXs[col] + w * 0.5
     else
-        tx = math.floor(tileX + w * 0.5)
+        baseX = tileX + w * 0.5
     end
+    local tx = math.floor(baseX + CLICK_X_OFF)
     local ty = math.floor(viewportH() * (CFG.clickYpct / 100))
+    lastTileX  = math.floor(tileX)
+    lastClickX = tx
 
     if not useKeys then
         if mouseBusy then return false end
@@ -253,9 +264,9 @@ local function pressAt(tileX, addr, now)
         end
         clickFails = clickFails + 1
         lastAct = 'move fail ' .. tostring(why)
-        if clickFails >= 4 then
+        if clickFails >= 6 then
             useKeys = true
-            log('cursor would not move after 4 tries - switched to keys')
+            log('cursor would not move after 6 tries - switched to keys')
         end
         return false
     end
@@ -310,11 +321,11 @@ local function step()
         if list[i].Name == 'Tile' then
             local okC, cv = pcall(function() return list[i]:GetAttribute('ChartVersion') end)
             if okC and cv ~= nil and cv ~= chart then
-                chart    = cv
-                recs     = {}
-                fired    = {}
-                laneXs   = {}
-                taps     = 0
+                chart      = cv
+                recs       = {}
+                fired      = {}
+                laneXs     = {}
+                taps       = 0
                 clickFails = 0
                 releaseMouse()
                 log('chart ' .. tostring(chart))
@@ -323,9 +334,9 @@ local function step()
         end
     end
 
-    local live   = {}
-    local batch  = {}
-    local dotIx  = 0
+    local live  = {}
+    local batch = {}
+    local dotIx = 0
 
     for i = 1, #list do
         local t = list[i]
@@ -428,13 +439,12 @@ end)
 local function hudText()
     if not hud then return end
     local lanesTxt = #laneXs > 0 and table.concat(laneXs, '/') or 'learning'
-    hud.Text = string.format('%s | %s%s%s | focus %s | %s | taps %d | fireY %d | lanes %s | last %s | %s | chart %s',
+    hud.Text = string.format('%s | %s%s | focus %s | taps %d | fireY %d | off %+d | lanes %s | tile x%d -> click x%d | %s | chart %s',
         VERSION,
         useKeys and 'KEYS' or (useAbs and 'ABS' or 'REL'),
         mirrored and ' MIRROR' or '',
-        '',
-        tostring(focused), tostring(on),
-        taps, math.floor(FIRE_Y), lanesTxt, lastAct, lastCursor, tostring(chart))
+        tostring(focused), taps, math.floor(FIRE_Y), math.floor(CLICK_X_OFF),
+        lanesTxt, lastTileX, lastClickX, lastCursor, tostring(chart))
 end
 
 local okRender = pcall(function()
@@ -529,12 +539,17 @@ if HAS_UI then
                     else
                         releaseMouse()
                     end
-                    log('auto play ' .. (v and 'ON' or 'off'))
+                    log('auto play ' .. (v and 'ON' or 'OFF'))
                 end)
 
                 mkSlider(sec, 'Fire Y (lower = earlier)', 'pa_firey', 500, 1100, math.floor(FIRE_Y), function(v)
                     FIRE_Y = math.floor(v)
                     log('fireY = ' .. tostring(FIRE_Y))
+                end)
+
+                mkSlider(sec, 'Click X offset px (+ = right)', 'pa_xoff', -400, 400, math.floor(CLICK_X_OFF), function(v)
+                    CLICK_X_OFF = math.floor(v)
+                    log('click x offset = ' .. tostring(CLICK_X_OFF))
                 end)
 
                 mkToggle(sec, 'Absolute mouse move (off = relative)', 'pa_abs', useAbs, function(v)
@@ -544,7 +559,7 @@ if HAS_UI then
 
                 mkToggle(sec, 'Mirror lanes (1 <-> 4)', 'pa_mirror', mirrored, function(v)
                     mirrored = v
-                    log('mirror ' .. (v and 'ON' or 'off'))
+                    log('mirror ' .. (v and 'ON' or 'OFF'))
                 end)
             end)
             if not okB then log('menu build error: ' .. tostring(errB)) end
@@ -583,5 +598,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - relative mouse move, Fire Y ' .. tostring(FIRE_Y))
+log(VERSION .. ' loaded - Fire Y ' .. tostring(FIRE_Y) .. ', click offset ' .. tostring(CLICK_X_OFF))
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
