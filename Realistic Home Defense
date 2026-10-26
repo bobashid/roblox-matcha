@@ -1,7 +1,7 @@
 --[[
   Game:       Realistic Home Defense
   Place IDs:  105527962898452
-  Version:    v4.0
+  Version:    v4.1
   Features:   no recoil, no spread, rapid fire, infinite ammo (client), weapon giver, GC diagnostics
   Controls:   menu tab "Weapon Mods"; every control is a toggle, slider or button
   Needs:      Matcha Pro / Allow Unsafe LuaU (getgc, applygc)
@@ -11,6 +11,10 @@
               gun carries a RepValues folder
   Confirmed:  require(<ModuleScript>) fails in Matcha, so the settings table cannot be read
               through require; getgc on the field names is the only route
+  Confirmed:  Player.CharacterAdded reads nil here - v4.0 died with
+              "Matcha:548: attempt to index nil with 'Connect'" on that hook, which killed
+              the tail of the chunk (no loaded print, no _G registration). v4.1 polls
+              lp.Character for respawns and runs the hook last, inside pcall.
   UNVERIFIED: that a getgc entry's addr is the address of the table holding the key. The
               script uses it to intersect keys so applygc only touches real settings tables;
               if that is wrong it falls back to plain value-range filtering
@@ -18,7 +22,7 @@
 ]]
 
 local NAME    = 'RHD Weapon Mods'
-local VERSION = 'v4.0'
+local VERSION = 'v4.1'
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
 local Players = game:GetService('Players')
@@ -405,15 +409,17 @@ local function registerToggle(key, id)
     TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = id }
 end
 
+local function countAddrs()
+    local n = 0
+    for k in pairs(anchorAddrs) do n = n + 1 end
+    return n
+end
+
 local function reportStatus()
     print('[' .. NAME .. '] --- status ---')
     print('[' .. NAME .. '] scans ' .. tostring(STATS.scans) .. ', writes ' .. tostring(STATS.writes))
     print('[' .. NAME .. '] last: ' .. STATS.last)
-    print('[' .. NAME .. '] anchor addrs ' .. tostring((function()
-        local n = 0
-        for k in pairs(anchorAddrs) do n = n + 1 end
-        return n
-    end)()))
+    print('[' .. NAME .. '] anchor addrs ' .. tostring(countAddrs()))
     for i = 1, #ALL_KEYS do
         local s = slot(ALL_KEYS[i])
         print('[' .. NAME .. '] ' .. ALL_KEYS[i] .. ' = ' .. tostring(s.state)
@@ -543,19 +549,7 @@ if HAS_UI then
     end)
 end
 
--- ---- respawn -----------------------------------------------------------
-local ch = lp.Character
-track(lp.CharacterAdded:Connect(function()
-    print('[' .. NAME .. '] respawn - clearing caches')
-    anchorAddrs = {}
-    SLOTS = {}
-    STATS.last = 'cleared on respawn'
-end))
-
--- ---- go ----------------------------------------------------------------
-pcall(notify, NAME .. ' ' .. VERSION, 'scan in Step 1, then mods', 4)
-print('[' .. NAME .. '] loaded ' .. VERSION .. ' - nothing scanned yet')
-
+-- ---- stop + register (before anything optional) -------------------------
 local function stop()
     running = false
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
@@ -568,3 +562,41 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
+pcall(notify, NAME .. ' ' .. VERSION, 'scan in Step 1, then mods', 4)
+print('[' .. NAME .. '] loaded ' .. VERSION .. ' - nothing scanned yet')
+
+-- ---- respawn watch ------------------------------------------------------
+-- Player.CharacterAdded is nil in this build (v4.0 died on it), so a hook is only
+-- installed if it exists; polling lp.Character works either way.
+local lastChar = lp.Character
+
+local function onNewChar()
+    print('[' .. NAME .. '] new character - clearing caches')
+    anchorAddrs = {}
+    SLOTS = {}
+    STATS.last = 'cleared on respawn'
+end
+
+if lp.CharacterAdded ~= nil then
+    local ok = pcall(function()
+        track(lp.CharacterAdded:Connect(onNewChar))
+    end)
+    if ok then
+        print('[' .. NAME .. '] CharacterAdded hook installed')
+    else
+        print('[' .. NAME .. '] CharacterAdded hook failed - polling instead')
+    end
+else
+    print('[' .. NAME .. '] CharacterAdded is nil - polling for respawn')
+end
+
+task.spawn(function()
+    while running do
+        local ok, c = pcall(function() return lp.Character end)
+        if ok and c ~= lastChar then
+            lastChar = c
+            onNewChar()
+        end
+        task.wait(1)
+    end
+end)
