@@ -1,52 +1,55 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v2.13
-  Features:   auto play - ONE toggle. Fire Y fixed at 625. Keys only. Every note is
-              held for a fixed duration so hold notes can register.
+  Version:    v2.14
+  Features:   auto play - ONE toggle. Fire Y fixed at 625. Keys only. Every note is held
+              for 2.0 s (the game's hold range is 0.6-2.4 s) so holds can complete.
   Controls:   menu tab "Piano Auto" - one toggle. Nothing else.
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
 
-  Why v2.13 (third attempt at holds, with new information):
-    The user confirmed a hold note is ONE SINGLE LINE, not a head and a tail. That
-    kills v2.12's pair theory outright.
-    Combined with the two earlier failures it also proves where the tile goes:
-      - v2.10 required Y > FIRE_Y + 20 (tile keeps moving past the line) -> failed
-      - v2.11 required the tile to still exist 90 ms after the press      -> failed
-    Both fail only if THE TILE IS DESTROYED AT THE MOMENT IT IS PRESSED. So no
-    property of the tile can tell us how long a hold lasts: by the time we know we
-    pressed it, it is already gone.
-    The duration therefore has to be assumed, not measured. v2.13 gives EVERY note a
-    fixed hold of HOLD_ALL (plus a little jitter) instead of a 35-55 ms tap. A tap is
-    judged on key-down, so holding it longer is normally harmless; a hold needs the
-    key down for its body, which this now does. The press path force-releases the lane
-    first, so a long hold can never swallow the next note in the same lane.
+  Why v2.14 - MY BUG, found by reading the game's own Config:
+    v2.13 held every note for HOLD_ALL = 0.50 s. But Shared.Config says:
+        HoldMinLen = 0.6      (shortest hold in the game)
+        HoldMaxLen = 2.4      (longest hold)
+        HoldTickRate = 8      (hold scored 8x per second)
+        HoldKeepFrac = 0.82
+    0.50 s is BELOW HoldMinLen, so a hold could never be completed - the key was
+    released before the shortest possible hold ended. That is why "still not holding"
+    happened on v2.13 despite the press path being correct.
+    v2.14 holds for HOLD_ALL = 2.0 s, inside the game's range and near the top of it, so
+    every hold length (0.6-2.4 s) is covered for the vast majority of its body.
 
-  Confirmed:  a hold note is ONE line, not two tiles (user statement) - the v2.12
-              head+tail pair theory is WRONG
+  Why holding every note is still safe:
+    The press path force-releases the lane immediately before each press, so a long hold
+    can never swallow the next note in the same lane (SameLaneMinDt = 0.17 s). A tap is
+    judged on key-down, so holding it longer does not lose the hit.
+
+  Confirmed:  Shared.Config HoldMinLen = 0.6, HoldMaxLen = 2.4, HoldTickRate = 8,
+              HoldKeepFrac = 0.82, SameLaneMinDt = 0.17  (matcha_decompile of Config)
+  Confirmed:  a hold note is ONE line, not two tiles (user statement)
   Confirmed:  the tile is destroyed at the press: both Y-past-the-line (v2.10) and
-              tile-still-alive (v2.11) hold detection failed, and those are the only
-              two ways a surviving tile could have been observed
+              tile-still-alive (v2.11) hold detection failed, so no tile property can
+              measure a hold's length - the duration must be assumed
   Confirmed:  the perfect window opens around Y = 625 (user report)
   Confirmed:  keypress / keyrelease reach the game; mouse movement does not
   Confirmed:  tiles sit at four X values: 630 / 798 / 965 / 1133 (left to right)
-  Confirmed:  Shared.Config DefaultKeys = D F J K, left to right
   Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom
   Confirmed:  board is x 625..1292, bottom edge y ~ 1076; y = 1104 is the park spot
   Confirmed:  no hit/press remote exists - scoring is local, input is the only route
   Confirmed:  a tile can report AbsolutePosition.X = 0 (rejected below)
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
-  UNVERIFIED: that holding every note longer does not break tap scoring
+  UNVERIFIED: that holding 2.0 s does not cost anything on plain taps
 
-  HOLD_ALL is the one number to change if holds still fail:
-    0.50 s is a guess at a short hold. Try 0.30 if taps start mis-scoring, 0.90 if
-    long holds still break.
+  HOLD_ALL is the one number to change:
+    holds still break  -> raise toward 2.4 (the game maximum)
+    taps mis-score or  -> lower toward 1.0
+    notes get skipped
 
-  HUD:  taps, longHolds, skipped, armed, lane + key, lanes, chart
+  HUD:  taps, held, skipped, armed, fireY, hold ms, lane + key, lanes, chart
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v2.13'
+local VERSION = 'v2.14'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -61,9 +64,9 @@ local FIRE_Y    = 625                          -- fixed: earliest Y that scores 
 local MICRO     = 18                           -- px of jitter, positive only
 local KEYS      = { 0x44, 0x46, 0x4A, 0x4B }   -- D F J K, left to right
 local FALLBACK  = { 630, 798, 965, 1133 }
-local HOLD_ALL  = 0.50                         -- s every note is held (see header)
-local HOLD_JIT  = 60                           -- ms of extra hold, random per note
-local MAX_HOLD  = 6.0                          -- s absolute safety cap
+local HOLD_ALL  = 2.0                          -- s; game holds are 0.6-2.4 s (see header)
+local HOLD_JIT  = 80                           -- ms of extra hold, random per note
+local MAX_HOLD  = 3.0                          -- s absolute safety cap
 local PAST      = 220
 local DOT_OFF   = 83
 
@@ -123,7 +126,8 @@ local function releaseAll()
 end
 
 -- Force a release first: InputBegan only fires on the key transition, so a key left
--- down would swallow the next note in that lane. This is what makes a long hold safe.
+-- down would swallow the next note in that lane. This is what makes a long hold safe
+-- even though SameLaneMinDt is only 0.17 s.
 -- The field is `due`, never `until` - `until` is a reserved Lua keyword.
 local function pressLane(lane, now)
     local vk = KEYS[lane]
@@ -133,7 +137,7 @@ local function pressLane(lane, now)
     local dur = HOLD_ALL + math.random(0, HOLD_JIT) / 1000
     held[lane] = { due = now + dur, since = now }
     taps = taps + 1
-    if dur >= 0.2 then holdsN = holdsN + 1 end
+    holdsN = holdsN + 1
     lastLane, lastKey = lane, vk
     return true
 end
