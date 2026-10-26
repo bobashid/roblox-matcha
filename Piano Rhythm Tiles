@@ -1,27 +1,26 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v1.7
-  Features:   auto play - ONE toggle; taps the lane when a tile crosses a single Y line
+  Version:    v1.8
+  Features:   auto play - ONE toggle; taps on a single Y line (proven at 950) and HOLDS
+              the lane while that tile is still on screen, so long notes survive
   Controls:   menu tab "Piano Auto" - one toggle, nothing else
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
   Confirmed:  lanes x 625/792/959/1126, width 167; tiles are Board.Tiles.Tile with
               TileIndex / ChartVersion and a readable .Address
-  Confirmed:  Client.Input picks a click's lane with Board.laneAt(position.X) - X only
   Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom of the screen
   Confirmed:  a live chart is a 100px ladder: idx 3 y=991 ... idx 12 y=91
   Confirmed:  idle tiles park at y = 1104, just BELOW the board, and vanish there
-  Confirmed:  Board sits at (625,0) and the lanes end at 1292 -> board width 667
-  Confirmed:  Shared.Config.BoardAspect = 0.62 -> board height ~1076, so the board
-              occupies y 0..1076 and y=1104 is outside it (clipped away)
+  Confirmed:  Board at (625,0), lanes end 1292 -> width 667; BoardAspect 0.62
+              -> board height ~1076, so y=1104 is outside the board (park spot)
+  Confirmed:  FIRE_Y = 950 LANDS HITS (user: "its now working"); y >= 1034 was LATE
   Confirmed:  keypress / keyrelease / isrbxactive / setrobloxinput all exist
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
-  Confirmed:  a build firing at y >= 1034 scored exactly one hit, and it was LATE
-  UNVERIFIED: the exact judged Y - FIRE_Y below is the one number to trim
+  UNVERIFIED: sustaining the key while the tile persists is enough for hold notes
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v1.7'
+local VERSION = 'v1.8'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -39,19 +38,17 @@ local function track(c)
 end
 
 -- ---- config ----
--- Tiles fall DOWNWARD, so a LOWER FIRE_Y fires EARLIER and a HIGHER one fires LATER.
--- A build firing at y >= 1034 was LATE, so start below it.
---   still late  -> lower FIRE_Y  (950 -> 900 -> 860)
---   too early   -> raise FIRE_Y  (950 -> 1000)
+-- Tiles fall DOWNWARD, so a LOWER FIRE_Y fires EARLIER, a HIGHER one fires LATER.
+-- 950 is the proven-working value. 1034 was late. Trim in ~30 steps only if needed.
 
 local CFG = {
-    FIRE_Y = 950,
-    SEEN_Y = 850,      -- a tile must be seen above this before it is armed
-    tapMs  = 40,
-    gapMs  = 30,
-    laneX  = { 625, 792, 959, 1126 },
-    laneW  = 167,
-    keys   = { 0x44, 0x46, 0x4A, 0x4B },   -- D F J K
+    FIRE_Y  = 950,
+    SEEN_Y  = 850,      -- tile must be seen above this before it can fire
+    gapMs   = 30,       -- min ms between two presses in the same lane
+    maxHold = 3.0,      -- safety cap on one held lane, seconds
+    laneX   = { 625, 792, 959, 1126 },
+    laneW   = 167,
+    keys    = { 0x44, 0x46, 0x4A, 0x4B },   -- D F J K
 }
 
 -- ---- state ----
@@ -60,9 +57,11 @@ local on      = true
 local recs    = {}
 local chart   = nil
 local taps    = 0
+local holds   = 0
 local focused = nil
-local laneAt  = { 0, 0, 0, 0 }
 local lowY    = 0
+local laneAt  = { 0, 0, 0, 0 }
+local down    = {}      -- lane -> { addr = tile address, since = clock }
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
@@ -83,17 +82,30 @@ local function laneOf(x)
     return nil
 end
 
-local function tap(lane, now)
-    local vk = CFG.keys[lane]
-    if not vk then return end
+-- ---- key output ----
+
+local function releaseLane(lane)
+    local d = down[lane]
+    if not d then return end
+    down[lane] = nil
+    pcall(keyrelease, CFG.keys[lane])
+end
+
+local function releaseAll()
+    for lane = 1, 4 do
+        releaseLane(lane)
+    end
+end
+
+local function press(lane, addr, now)
+    if down[lane] then return end
     if now - laneAt[lane] < CFG.gapMs / 1000 then return end
+    local vk = CFG.keys[lane]
+    if not vk or type(keypress) ~= 'function' then return end
     laneAt[lane] = now
-    if type(keypress) ~= 'function' then return end
     pcall(keypress, vk)
+    down[lane] = { addr = addr, since = now }
     taps = taps + 1
-    task.delay(CFG.tapMs / 1000, function()
-        pcall(keyrelease, vk)
-    end)
 end
 
 local function tiles()
@@ -119,10 +131,15 @@ local function step()
         focused = true
     end
 
+    -- never hold a key into an unfocused window or with the toggle off
+    if not on or not focused then
+        releaseAll()
+    end
+
     local now  = os.clock()
     local list = holder:GetChildren()
 
-    -- new song -> forget every tracked tile
+    -- new song -> forget every tracked tile and every held key
     for i = 1, #list do
         if list[i].Name == 'Tile' then
             local okC, cv = pcall(function() return list[i]:GetAttribute('ChartVersion') end)
@@ -130,6 +147,8 @@ local function step()
                 chart = cv
                 recs  = {}
                 taps  = 0
+                holds = 0
+                releaseAll()
                 log('chart ' .. tostring(chart))
             end
             break
@@ -160,13 +179,27 @@ local function step()
                 if on and focused and r.armed and not r.done and r.lane
                     and pos.Y >= CFG.FIRE_Y then
                     r.done = true
-                    tap(r.lane, now)
+                    press(r.lane, addr, now)
                 end
             end
         end
     end
 
     lowY = lowest
+
+    -- release a lane once the tile that pressed it is gone, or the cap is hit.
+    -- A tap tile disappears almost at once; a hold tile stays, so the key stays down.
+    for lane = 1, 4 do
+        local d = down[lane]
+        if d then
+            local gone = not live[d.addr]
+            local dur  = now - d.since
+            if gone or dur > CFG.maxHold then
+                if dur > 0.12 then holds = holds + 1 end
+                releaseLane(lane)
+            end
+        end
+    end
 
     for addr in pairs(recs) do
         if not live[addr] then recs[addr] = nil end
@@ -187,8 +220,8 @@ end)
 
 local function hudText()
     if not hud then return end
-    hud.Text = string.format('%s | on %s | focus %s | taps %d | fireY %d | low y %d | chart %s',
-        VERSION, tostring(on), tostring(focused), taps, CFG.FIRE_Y,
+    hud.Text = string.format('%s | on %s | focus %s | taps %d | holds %d | fireY %d | low y %d | chart %s',
+        VERSION, tostring(on), tostring(focused), taps, holds, CFG.FIRE_Y,
         math.floor(lowY), tostring(chart))
 end
 
@@ -251,8 +284,12 @@ if HAS_UI then
                 if not sec then return end
                 mkToggle(sec, 'Auto Play', 'pa_on', on, function(v)
                     on = v
-                    if v and type(setrobloxinput) == 'function' then
-                        pcall(setrobloxinput, true)
+                    if v then
+                        if type(setrobloxinput) == 'function' then
+                            pcall(setrobloxinput, true)
+                        end
+                    else
+                        releaseAll()
                     end
                     log('auto play ' .. (v and 'ON' or 'off'))
                 end)
@@ -275,9 +312,7 @@ local function stop()
         pcall(function() conns[i]:Disconnect() end)
     end
     conns = {}
-    for i = 1, #CFG.keys do
-        pcall(function() keyrelease(CFG.keys[i]) end)
-    end
+    releaseAll()
     if hud then
         pcall(function() hud:Remove() end)
         hud = nil
@@ -288,5 +323,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - one toggle, fire at y >= ' .. tostring(CFG.FIRE_Y))
+log(VERSION .. ' loaded - one toggle, fire at y >= ' .. tostring(CFG.FIRE_Y) .. ', holds sustained')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
