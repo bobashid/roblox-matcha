@@ -1,26 +1,32 @@
 --[[
   Game:       Piano Rhythm Tiles
   Place IDs:  101999883467300
-  Version:    v1.8
-  Features:   auto play - ONE toggle; taps on a single Y line (proven at 950) and HOLDS
-              the lane while that tile is still on screen, so long notes survive
-  Controls:   menu tab "Piano Auto" - one toggle, nothing else
+  Version:    v1.9
+  Features:   auto play - one toggle plus one Fire Y slider; taps on the Y line and holds
+              the lane while that tile is still on screen
+  Controls:   menu tab "Piano Auto" - one toggle, one slider
   Needs:      Matcha Pro; Roblox window focused (injected input is dropped otherwise)
   Confirmed:  lanes x 625/792/959/1126, width 167; tiles are Board.Tiles.Tile with
               TileIndex / ChartVersion and a readable .Address
   Confirmed:  tiles fall DOWNWARD - Y increases toward the bottom of the screen
   Confirmed:  a live chart is a 100px ladder: idx 3 y=991 ... idx 12 y=91
-  Confirmed:  idle tiles park at y = 1104, just BELOW the board, and vanish there
+  Confirmed:  idle tiles park at y = 1104, just BELOW the board
   Confirmed:  Board at (625,0), lanes end 1292 -> width 667; BoardAspect 0.62
               -> board height ~1076, so y=1104 is outside the board (park spot)
-  Confirmed:  FIRE_Y = 950 LANDS HITS (user: "its now working"); y >= 1034 was LATE
+  Confirmed:  FIRE_Y = 950 lands hits; y >= 1034 was LATE; v1.8 landed two clicks
   Confirmed:  keypress / keyrelease / isrbxactive / setrobloxinput all exist
   Confirmed:  RunService.PreRender is nil in this build; RenderStepped works
   UNVERIFIED: sustaining the key while the tile persists is enough for hold notes
+
+  THE SLIDER:
+    LOWER Fire Y  -> fires EARLIER
+    HIGHER Fire Y -> fires LATER
+  Everything else is fixed. Arming point follows the slider automatically
+  (a tile is armed once it has been seen 100 px above the Fire Y value).
 ]]
 
 local NAME    = 'PianoAutoPlay'
-local VERSION = 'v1.8'
+local VERSION = 'v1.9'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -38,14 +44,13 @@ local function track(c)
 end
 
 -- ---- config ----
--- Tiles fall DOWNWARD, so a LOWER FIRE_Y fires EARLIER, a HIGHER one fires LATER.
--- 950 is the proven-working value. 1034 was late. Trim in ~30 steps only if needed.
+
+local FIRE_Y = 950     -- live value, the slider writes this
 
 local CFG = {
-    FIRE_Y  = 950,
-    SEEN_Y  = 850,      -- tile must be seen above this before it can fire
-    gapMs   = 30,       -- min ms between two presses in the same lane
-    maxHold = 3.0,      -- safety cap on one held lane, seconds
+    ARM_GAP = 100,     -- a tile must be seen this far above FIRE_Y before it can fire
+    gapMs   = 30,      -- min ms between two presses in the same lane
+    maxHold = 3.0,     -- safety cap on one held lane, seconds
     laneX   = { 625, 792, 959, 1126 },
     laneW   = 167,
     keys    = { 0x44, 0x46, 0x4A, 0x4B },   -- D F J K
@@ -85,8 +90,7 @@ end
 -- ---- key output ----
 
 local function releaseLane(lane)
-    local d = down[lane]
-    if not d then return end
+    if not down[lane] then return end
     down[lane] = nil
     pcall(keyrelease, CFG.keys[lane])
 end
@@ -131,13 +135,13 @@ local function step()
         focused = true
     end
 
-    -- never hold a key into an unfocused window or with the toggle off
     if not on or not focused then
         releaseAll()
     end
 
     local now  = os.clock()
     local list = holder:GetChildren()
+    local armY = FIRE_Y - CFG.ARM_GAP
 
     -- new song -> forget every tracked tile and every held key
     for i = 1, #list do
@@ -168,16 +172,16 @@ local function step()
 
                 local r = recs[addr]
                 if not r then
-                    r = { lane = laneOf(pos.X), armed = pos.Y < CFG.SEEN_Y, done = false }
+                    r = { lane = laneOf(pos.X), armed = pos.Y < armY, done = false }
                     recs[addr] = r
                 end
-                if not r.armed and pos.Y < CFG.SEEN_Y then r.armed = true end
+                if not r.armed and pos.Y < armY then r.armed = true end
                 if not r.lane then r.lane = laneOf(pos.X) end
 
                 if pos.Y > lowest then lowest = pos.Y end
 
                 if on and focused and r.armed and not r.done and r.lane
-                    and pos.Y >= CFG.FIRE_Y then
+                    and pos.Y >= FIRE_Y then
                     r.done = true
                     press(r.lane, addr, now)
                 end
@@ -187,8 +191,7 @@ local function step()
 
     lowY = lowest
 
-    -- release a lane once the tile that pressed it is gone, or the cap is hit.
-    -- A tap tile disappears almost at once; a hold tile stays, so the key stays down.
+    -- release a lane once the tile that pressed it is gone, or the cap is hit
     for lane = 1, 4 do
         local d = down[lane]
         if d then
@@ -221,7 +224,7 @@ end)
 local function hudText()
     if not hud then return end
     hud.Text = string.format('%s | on %s | focus %s | taps %d | holds %d | fireY %d | low y %d | chart %s',
-        VERSION, tostring(on), tostring(focused), taps, holds, CFG.FIRE_Y,
+        VERSION, tostring(on), tostring(focused), taps, holds, math.floor(FIRE_Y),
         math.floor(lowY), tostring(chart))
 end
 
@@ -233,7 +236,7 @@ local okRender = pcall(function()
 end)
 if not okRender then log('RenderStepped connect failed') end
 
--- ---- menu: exactly one toggle ----
+-- ---- menu: one toggle + one slider ----
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local built  = false
@@ -242,6 +245,14 @@ local function firstBool(...)
     for i = 1, select('#', ...) do
         local v = select(i, ...)
         if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
     end
     return nil
 end
@@ -274,6 +285,23 @@ local function mkToggle(sec, label, id, def, apply)
     return false
 end
 
+local function mkSlider(sec, label, id, min, max, def, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(id, label, min, max, def, cb) end,
+        function() sec:SliderInt(label, id, min, max, def, cb) end,
+        function() sec:SliderInt(label, min, max, def, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    log('slider failed: ' .. label)
+    return false
+end
+
 if HAS_UI then
     local ok, err = pcall(function()
         UI.AddTab('Piano Auto', function(tab)
@@ -282,6 +310,7 @@ if HAS_UI then
             local okB, errB = pcall(function()
                 local sec = mkSection(tab, 'Auto Play')
                 if not sec then return end
+
                 mkToggle(sec, 'Auto Play', 'pa_on', on, function(v)
                     on = v
                     if v then
@@ -292,6 +321,11 @@ if HAS_UI then
                         releaseAll()
                     end
                     log('auto play ' .. (v and 'ON' or 'off'))
+                end)
+
+                mkSlider(sec, 'Fire Y (lower = earlier)', 'pa_firey', 500, 1100, math.floor(FIRE_Y), function(v)
+                    FIRE_Y = math.floor(v)
+                    log('fireY = ' .. tostring(FIRE_Y))
                 end)
             end)
             if not okB then log('menu build error: ' .. tostring(errB)) end
@@ -323,5 +357,5 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - one toggle, fire at y >= ' .. tostring(CFG.FIRE_Y) .. ', holds sustained')
+log(VERSION .. ' loaded - toggle + Fire Y slider, starting at ' .. tostring(FIRE_Y))
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Piano Auto', 3) end)
