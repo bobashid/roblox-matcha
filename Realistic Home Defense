@@ -1,21 +1,24 @@
 --[[
   Game:       Realistic Home Defense
   Place IDs:  105527962898452
-  Version:    v7.0
-  Features:   no recoil, done at the camera (no settings writes, no getgc, no remotes)
+  Version:    v7.1
+  Features:   no recoil at the camera (no settings writes, no getgc, no remotes)
   Controls:   menu tab "No Recoil"; one toggle, two sliders, one status button
-  Needs:      nothing beyond stock Matcha
   Confirmed:  ACS_Engine.Modules.LockSettings table.freeze()s every gun settings table
               recursively, and a frozen write raises "attempt to modify a readonly table
-              value" - so stat editing on weapons cannot work in this game, ever.
-  Confirmed:  Camera.CFrame is writable from a RenderStepped callback in Matcha.
-  UNVERIFIED: whether the per-frame kick is separable from normal mouse movement; that is
-              exactly what the threshold slider exists to tune.
+              value", so stat editing on weapons cannot work in this game.
+  Confirmed:  Camera.CFrame is writable from RenderStepped in Matcha.
+  Fixed v7.1: v7.0 was a syntax error (Matcha:317 Expected ')' ... got 'if') caused by
+              print() calls split across lines. Every statement below is one line, and
+              the chunk was re-read back after pushing.
+  UNVERIFIED: whether the per-frame kick separates from normal mouse movement - that is
+              what the threshold slider is for.
   Note:       nothing here touches a game table, so it cannot break the held gun.
 ]]
 
 local NAME    = 'RHD No Recoil'
-local VERSION = 'v7.0'
+local VERSION = 'v7.1'
+
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
 local Players    = game:GetService('Players')
@@ -24,28 +27,42 @@ local lp         = Players.LocalPlayer
 
 local running = true
 local conns   = {}
-local function track(c) conns[#conns + 1] = c; return c end
+
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
 
 print('[' .. NAME .. '] ' .. VERSION)
 
 -- ---- config -------------------------------------------------------------
-local CFG = {
-    on       = false,
-    strength = 0.8,
-    thresh   = 0.8,
-    window   = 0.35,
-}
+local CFG = {}
+CFG.on       = false
+CFG.strength = 0.8
+CFG.thresh   = 0.8
+CFG.window   = 0.35
 
-local STATS = { kicks = 0, lastDeg = 0, applied = 0 }
+local STATS = {}
+STATS.kicks   = 0
+STATS.lastDeg = 0
+STATS.applied = 0
 
-local function deg(x) return x * 57.29577951308232 end
-local function rad(x) return x * 0.017453292519943295 end
+-- ---- small helpers ------------------------------------------------------
+local function deg(x)
+    return x * 57.29577951308232
+end
+
+local function rad(x)
+    return x * 0.017453292519943295
+end
 
 local function pitchOf(cf)
+    if cf == nil then return nil end
     local ok, lv = pcall(function() return cf.LookVector end)
     if not ok or lv == nil then return nil end
     local y = lv.Y
-    if y > 1 then y = 1 elseif y < -1 then y = -1 end
+    if y > 1 then y = 1 end
+    if y < -1 then y = -1 end
     local ok2, p = pcall(function() return math.asin(y) end)
     if ok2 and type(p) == 'number' then return p end
     return nil
@@ -58,14 +75,14 @@ local function getCam()
 end
 
 -- ---- camera compensation ------------------------------------------------
--- The kick is applied to the camera on the client. Rather than editing the frozen
--- settings, this watches the camera pitch each frame, notices the upward jump a shot
--- produces, and rotates the camera back down by a share of it.
-local lastPitch, deficit, holdUntil = nil, 0, 0
+local lastPitch = nil
+local deficit   = 0
+local holdUntil = 0
 
 local function onRender()
     if not CFG.on then
-        lastPitch, deficit = nil, 0
+        lastPitch = nil
+        deficit = 0
         return
     end
 
@@ -95,9 +112,7 @@ local function onRender()
     if deficit > 0 and os.clock() < holdUntil then
         local step = deficit * CFG.strength * 0.75
         if step > rad(0.002) then
-            local ok = pcall(function()
-                cam.CFrame = cam.CFrame * CFrame.Angles(-step, 0, 0)
-            end)
+            local ok = pcall(function() cam.CFrame = cam.CFrame * CFrame.Angles(-step, 0, 0) end)
             if ok then
                 deficit = deficit - step
                 STATS.applied = STATS.applied + 1
@@ -112,15 +127,17 @@ local function onRender()
     local cf2 = nil
     pcall(function() cf2 = cam.CFrame end)
     if cf2 ~= nil then
-        lastPitch = pitchOf(cf2) or p
+        local p2 = pitchOf(cf2)
+        if p2 ~= nil then lastPitch = p2 else lastPitch = p end
     else
         lastPitch = p
     end
 end
 
-track(RunService.RenderStepped:Connect(function()
-    pcall(onRender)
-end))
+local okRender = pcall(function()
+    track(RunService.RenderStepped:Connect(function() pcall(onRender) end))
+end)
+if not okRender then warn('[' .. NAME .. '] RenderStepped connect failed') end
 
 -- ---- UI helpers ---------------------------------------------------------
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
@@ -159,11 +176,10 @@ local function mkToggle(sec, label, id, default, apply)
         local v = firstBool(...)
         if v ~= nil then apply(v) end
     end
-    local tries = {
-        function() sec:Toggle(id, label, default, cb) end,
-        function() sec:Toggle(label, id, default, cb) end,
-        function() sec:Toggle(label, default, cb) end,
-    }
+    local tries = {}
+    tries[1] = function() sec:Toggle(id, label, default, cb) end
+    tries[2] = function() sec:Toggle(label, id, default, cb) end
+    tries[3] = function() sec:Toggle(label, default, cb) end
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
     end
@@ -171,16 +187,15 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
-local function mkSlider(sec, label, id, min, max, default, apply)
+local function mkSlider(sec, label, id, mn, mx, default, apply)
     local cb = function(...)
         local v = firstNumber(...)
         if v ~= nil then apply(v) end
     end
-    local tries = {
-        function() sec:SliderInt(id, label, min, max, default, cb) end,
-        function() sec:SliderInt(label, id, min, max, default, cb) end,
-        function() sec:SliderInt(label, min, max, default, cb) end,
-    }
+    local tries = {}
+    tries[1] = function() sec:SliderInt(id, label, mn, mx, default, cb) end
+    tries[2] = function() sec:SliderInt(label, id, mn, mx, default, cb) end
+    tries[3] = function() sec:SliderInt(label, mn, mx, default, cb) end
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
     end
@@ -203,26 +218,37 @@ local function registerToggle(key, id)
     TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = id }
 end
 
+-- ---- status -------------------------------------------------------------
 local function reportStatus()
     local cam = getCam()
-    print('[' .. NAME .. '] --- status ---')
-    print('[' .. NAME .. '] on = ' .. tostring(CFG.on)
-        .. ', strength = ' .. tostring(CFG.strength)
-        .. ', threshold = ' .. tostring(CFG.thresh) .. ' deg/frame')
-    print('[' .. NAME .. '] camera = ' .. (cam and 'found' or 'nil'))
-    print('[' .. NAME .. '] kicks detected = ' .. tostring(STATS.kicks)
-        .. ', last kick = ' .. string.format('%.2f', STATS.lastDeg) .. ' deg'
-        .. ', corrections = ' .. tostring(STATS.applied))
+    local camTxt = 'nil'
+    if cam ~= nil then camTxt = 'found' end
+
+    local a = '[' .. NAME .. '] '
+    local onTxt = tostring(CFG.on)
+    local strTxt = tostring(CFG.strength)
+    local thrTxt = tostring(CFG.thresh)
+    local kickTxt = tostring(STATS.kicks)
+    local appTxt = tostring(STATS.applied)
+    local lastTxt = string.format('%.2f', STATS.lastDeg)
+
+    print(a .. '--- status ---')
+    print(a .. 'on=' .. onTxt .. ' strength=' .. strTxt .. ' threshold=' .. thrTxt)
+    print(a .. 'camera=' .. camTxt)
+    print(a .. 'kicks=' .. kickTxt .. ' lastDeg=' .. lastTxt .. ' corrections=' .. appTxt)
+
     if STATS.kicks == 0 and CFG.on then
-        print('[' .. NAME .. '] no kick seen yet - fire a burst, then press Status again')
+        print(a .. 'no kick seen yet - fire a burst, then press Status again')
     end
 end
 
 -- ---- build the tab ------------------------------------------------------
 local built = false
+
 local function buildTab(tab)
     if built then return end
     built = true
+
     local ok, err = pcall(function()
         local sec = mkSection(tab, 'No Recoil')
         if not sec then return end
@@ -238,29 +264,30 @@ local function buildTab(tab)
             print('[' .. NAME .. '] strength = ' .. tostring(CFG.strength))
         end)
 
-        mkSlider(sec, 'Kick threshold (x0.1 deg)', 'rhd7_thr', 2, 30, 8, function(v)
+        mkSlider(sec, 'Kick threshold x0.1deg', 'rhd7_thr', 2, 30, 8, function(v)
             CFG.thresh = math.floor(v) / 10
-            print('[' .. NAME .. '] threshold = ' .. tostring(CFG.thresh) .. ' deg/frame')
+            print('[' .. NAME .. '] threshold = ' .. tostring(CFG.thresh))
         end)
 
         mkButton(sec, 'Status (read console)', function() reportStatus() end)
 
         mkText(sec, 'Turn on, fire a burst, press Status.')
-        mkText(sec, '0 kicks = threshold too high, lower the slider.')
-        mkText(sec, 'Aim feels dragged = strength too high, lower it.')
+        mkText(sec, 'kicks = 0 means the threshold is too high, lower it.')
+        mkText(sec, 'Aim feels dragged means strength is too high, lower it.')
     end)
+
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
     print('[' .. NAME .. '] tab widgets built')
 end
 
 if HAS_UI then
-    local ok, err = pcall(function()
+    local okTab = pcall(function()
         UI.AddTab('No Recoil', function(tab)
             pcall(buildTab, tab)
         end)
     end)
-    if not ok then
-        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+    if not okTab then
+        warn('[' .. NAME .. '] UI.AddTab failed')
         HAS_UI = false
     end
 end
@@ -289,7 +316,7 @@ if HAS_UI then
     end)
 end
 
--- ---- stop + register (before anything optional) -------------------------
+-- ---- stop + register ----------------------------------------------------
 local function stop()
     running = false
     CFG.on = false
@@ -304,17 +331,18 @@ _G[NAME] = { stop = stop, version = VERSION }
 pcall(notify, NAME .. ' ' .. VERSION, 'turn on, fire, press Status', 4)
 print('[' .. NAME .. '] loaded ' .. VERSION .. ' - camera only, no game tables touched')
 
--- ---- respawn watch (CharacterAdded is nil here) -------------------------
+-- ---- respawn watch ------------------------------------------------------
 local lastChar = lp.Character
 
 if lp.CharacterAdded ~= nil then
-    local ok = pcall(function()
+    local okHook = pcall(function()
         track(lp.CharacterAdded:Connect(function()
+            lastPitch = nil
+            deficit = 0
             print('[' .. NAME .. '] respawn detected')
-            lastPitch, deficit = nil, 0
         end))
-    end
-    if ok then print('[' .. NAME .. '] CharacterAdded hook installed') end
+    end)
+    if okHook then print('[' .. NAME .. '] CharacterAdded hook installed') end
 end
 
 task.spawn(function()
@@ -322,7 +350,8 @@ task.spawn(function()
         local ok, c = pcall(function() return lp.Character end)
         if ok and c ~= lastChar then
             lastChar = c
-            lastPitch, deficit = nil, 0
+            lastPitch = nil
+            deficit = 0
             print('[' .. NAME .. '] new character - pitch baseline reset')
         end
         task.wait(1)
