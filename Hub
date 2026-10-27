@@ -7,7 +7,8 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
--- v2.5: CQB Hell pinned by place id (weapon / NPC / heal / ammo ESP).
+-- v2.6: CQB Hell note - weapon mods only (ESP removed).
+-- v2.5: CQB Hell pinned by place id.
 -- v2.4: Piano Rhythm Tiles pinned by place id (auto play).
 -- v2.3: Ride A Dino removed (scrapped).
 -- v2.2: Ride A Dino - Always Gain Stamina mounts via the dino prompt.
@@ -23,7 +24,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v2.5'
+local VERSION = 'v2.6'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
