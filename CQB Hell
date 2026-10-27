@@ -1,44 +1,44 @@
--- CQB Hell (place 98689921952741) - Weapon / NPC / Heal / Ammo ESP - Matcha LuauVM
+-- CQB Hell (place 98689921952741) - Weapon mods + ESP - Matcha LuauVM
 --
--- One Matcha menu tab: four ESP toggles + range / transparency sliders.
+-- One Matcha menu tab: ESP toggles + range/transparency, plus a Weapon section.
 -- No Instance.new, no hooks, no getgc, no input simulation.
 --
 -- Confirmed in game (probes 2026-10-27):
---   NPCs live under a folder named 'People', but that folder MOVES. It is not always
---     a direct workspace child: probe saw 'PEOPLE_NOW false' while these existed:
---       Surroundings>People>MosinGP>Mosin
---       Surroundings>People>Tec9GP>Tec9
---       People>Model>Tec93GP>Tec9
---     So search by ANCESTRY for any instance named 'People', never by a fixed path.
---   NPC Humanoid health is 5000000000/5000000000 - the game's "invincible" sentinel,
---     so a normal health bar is meaningless. HP text is hidden above 1e6.
---   Statues (Surroundings>Lobby>Model>Statue) also have a Humanoid at 5e9 and must be
---     excluded, or the ESP boxes scenery.
---   player characters are DIRECT workspace children, ~20 per server, 100/100 each
+--   Weapon settings are real NumberValue instances, not GC tables:
+--     <gun>.Settings.<Weapon>.Firerate      (probe values 0.1, 0.15, 0.2, 0.4, 1)
+--     <gun>.Settings.<Weapon>.ReloadDelay   (probe value 0.2)
+--     seen on EnemyShotgun_Corpse, Tec9_Corpse, PKM_Corpse under Workspace
+--   so Rapid Fire / Faster Reload can be written straight into the NumberValue.
+--   NPCs live under a folder named 'People' that MOVES - found by ancestry, not path.
+--   NPC Humanoid health is 5000000000/5000000000, the "invincible" sentinel.
+--   Statues (Surroundings>Lobby>Model>Statue) share that sentinel - excluded.
+--   player characters are DIRECT workspace children named after the player
 --   NPC models are named after the gun they carry: AKM, Tec9, PM, RPK, Slam, Deagle,
 --     Mosin, MP5, PKM, Draco, EnemyShotgun, Db, Brian the Hero. Names repeat.
---   corpses are <Name>_Corpse with Humanoid.Health == 0
 --   equipped weapons are Tool children of a character
 --   ammo pickups are Parts named '10 Ammo' at workspace root, 5 Decals + ProximityPrompt
 --   'Ammo Dispencer' / 'Medkit Dispencer' / 'Grenade Dispencer' are static wall props
---   heal pickups clone from ReplicatedStorage.Heal.HealModels (7 MeshParts w/ prompts):
---     Bandage, Medkit, Big Medkit, Regen Stim, Health Stim, Combat Stim, Coffee
+--   heal pickups clone from ReplicatedStorage.Heal.HealModels (7 MeshParts w/ prompts)
 -- UNVERIFIED:
---   a dropped heal / dropped weapon keeping its name at workspace root
+--   the ammo field name inside a gun (no gun was equipped while probing). Inf Ammo
+--     writes any NumberValue under the gun whose name contains 'ammo' and not 'max',
+--     and also refills the Local_CurrentAmmo / Ammo attributes on the Tool.
+--   whether the server accepts client-side Firerate/ReloadDelay writes (ACS may
+--     recompute on its own tick). If shots do not speed up, that is why.
 --
--- v1.5: NPCs are found by walking ANCESTORS for an instance named 'People', so the
---       folder can live at workspace root, under Surroundings, or anywhere the map
---       shuffles it to. v1.4 looked only at workspace.People and drew nothing when the
---       map moved it (probe: PEOPLE_NOW false). Statues under Lobby are excluded.
+-- v2.0: Weapon section - Inf Ammo, Faster Reload + slider, Rapid Fire + slider.
+--       Values are found by walking the LOCAL character for Firerate / ReloadDelay
+--       NumberValues, so it targets your gun and not a corpse on the floor.
 
 local NAME    = 'CQBHellESP'
-local VERSION = 'v1.5'
+local VERSION = 'v2.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 print('[' .. NAME .. '] ' .. VERSION)
 
+local Players = game:GetService('Players')
 local running = true
 
 local cfg = {
@@ -49,6 +49,12 @@ local cfg = {
     ammoESP    = true,
     maxDist    = 400,
     trans      = 0.25,
+
+    infAmmo    = false,
+    fastReload = false,
+    rapidFire  = false,
+    reloadVal  = 0,
+    fireVal    = 0,
 }
 
 local HEAL_NAMES = {
@@ -104,8 +110,6 @@ local function isPlayerModel(m)
     return false
 end
 
--- Walk up looking for an ancestor with this exact name. The People folder moves
--- between rounds, so its parent chain is not fixed.
 local function ancestryHas(m, target)
     local cur = m.Parent
     local depth = 0
@@ -134,6 +138,17 @@ local function humanoidOf(m)
     return h
 end
 
+local function myCharacter()
+    local myName = nil
+    pcall(function() myName = Players.LocalPlayer.Name end)
+    if myName == nil then return nil end
+    local ch = nil
+    pcall(function() ch = workspace:FindFirstChild(myName) end)
+    return ch
+end
+
+-- ---- collectors ----
+
 local npcs, items, weapons = {}, {}, {}
 
 local function collectNPCs()
@@ -161,7 +176,6 @@ local function collectNPCs()
         end
     end
 
-    -- Drop wrappers whose inner body is also a candidate (draw the body, not the wrapper).
     for i = 1, #cands do
         local m = cands[i]
         local nested = false
@@ -239,6 +253,85 @@ local function collectItems()
         end
     end
     return out
+end
+
+-- ---- weapon values (the gun's own settings) ----
+
+-- Firerate and ReloadDelay are NumberValues under <gun>.Settings.<Weapon>.
+-- Walk the LOCAL character only, so a corpse on the floor is never touched.
+local fireVals, reloadVals, ammoVals, myTools = {}, {}, {}, {}
+
+local function collectWeaponValues()
+    local fires, reloads, ammos, tools = {}, {}, {}, {}
+    local ch = myCharacter()
+    if ch == nil then return fires, reloads, ammos, tools end
+    local ok, d = pcall(function() return ch:GetDescendants() end)
+    if not ok then return fires, reloads, ammos, tools end
+    for i = 1, #d do
+        local v = d[i]
+        if v.ClassName == 'Tool' then
+            tools[#tools + 1] = v
+        elseif v.ClassName == 'NumberValue' then
+            local low = string.lower(v.Name)
+            if low == 'firerate' then
+                fires[#fires + 1] = v
+            elseif low == 'reloaddelay' then
+                reloads[#reloads + 1] = v
+            elseif string.find(low, 'ammo', 1, true) ~= nil
+                and string.find(low, 'max', 1, true) == nil then
+                ammos[#ammos + 1] = v
+            end
+        end
+    end
+    return fires, reloads, ammos, tools
+end
+
+local function refillAmmo()
+    local ch = myCharacter()
+    if ch == nil then return end
+    local ok, d = pcall(function() return ch:GetDescendants() end)
+    if not ok then return end
+    for i = 1, #d do
+        local v = d[i]
+        if v.ClassName == 'Tool' then
+            local okMx, mx = pcall(function() return v:GetAttribute('MaxAmmo') end)
+            if okMx and type(mx) == 'number' then
+                pcall(function() v:SetAttribute('Local_CurrentAmmo', mx) end)
+                pcall(function() v:SetAttribute('Ammo', mx) end)
+            end
+            local okA, a = pcall(function() return v:GetAttribute('Ammo') end)
+            local okB, b = pcall(function() return v:GetAttribute('Local_CurrentAmmo') end)
+            if okA and type(a) == 'number' and okB and type(b) == 'number' and a > b then
+                pcall(function() v:SetAttribute('Local_CurrentAmmo', a) end)
+            end
+        end
+    end
+end
+
+local function applyWeapon()
+    if cfg.rapidFire then
+        for i = 1, #fireVals do
+            pcall(function() fireVals[i].Value = cfg.fireVal end)
+        end
+    end
+    if cfg.fastReload then
+        for i = 1, #reloadVals do
+            pcall(function() reloadVals[i].Value = cfg.reloadVal end)
+        end
+    end
+    if cfg.infAmmo then
+        for i = 1, #ammoVals do
+            pcall(function()
+                local mx = ammoVals[i]:FindFirstChild('Max' .. ammoVals[i].Name)
+                if mx ~= nil and type(mx.Value) == 'number' then
+                    ammoVals[i].Value = mx.Value
+                else
+                    ammoVals[i].Value = 9999
+                end
+            end)
+        end
+        refillAmmo()
+    end
 end
 
 -- ---- drawing ----
@@ -523,6 +616,15 @@ local function buildTab(tab)
     if built then return end
     built = true
     local ok, err = pcall(function()
+        local w = mkSection(tab, 'Weapon')
+        if w ~= nil then
+            mkToggle(w, 'Inf Ammo', 'cqb_infammo', false, function(v) cfg.infAmmo = v end)
+            mkToggle(w, 'Faster Reload', 'cqb_fastreload', false, function(v) cfg.fastReload = v end)
+            mkSlider(w, 'Reload Delay', 'cqb_reloadval', 0, 100, 0, function(v) cfg.reloadVal = v / 100 end)
+            mkToggle(w, 'Rapid Fire', 'cqb_rapid', false, function(v) cfg.rapidFire = v end)
+            mkSlider(w, 'Fire Rate', 'cqb_fireval', 0, 100, 0, function(v) cfg.fireVal = v / 100 end)
+        end
+
         local s = mkSection(tab, 'ESP')
         if s ~= nil then
             mkToggle(s, 'NPC ESP', 'cqb_npc', true, function(v) cfg.npcESP = v end)
@@ -575,6 +677,20 @@ task.spawn(function()
         local ok, r = pcall(collectItems)
         if ok then items = r end
         task.wait(0.5)
+    end
+end)
+
+-- weapon values are re-read on their own loop, so re-equipping is picked up
+task.spawn(function()
+    while running do
+        local okF, f, rl, am, tl = pcall(collectWeaponValues)
+        if okF then
+            fireVals, reloadVals, ammoVals, myTools = f, rl, am, tl
+        end
+        if cfg.infAmmo or cfg.fastReload or cfg.rapidFire then
+            pcall(applyWeapon)
+        end
+        task.wait(0.2)
     end
 end)
 
