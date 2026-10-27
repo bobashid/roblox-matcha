@@ -1,0 +1,538 @@
+-- CQB Hell (place 98689921952741) - Weapon / NPC / Heal / Ammo ESP - Matcha LuauVM
+--
+-- One Matcha menu tab: four ESP toggles + range / transparency sliders.
+-- No Instance.new, no hooks, no getgc, no input simulation.
+--
+-- Confirmed in game (probes 2026-10-27):
+--   NPCs are root Models with a Humanoid: Tec9, AKM, EnemyShotgun, Draco, Mosin, MP5
+--   corpses are <Name>_Corpse with Humanoid.Health == 0 (10+ on the floor at once)
+--   player characters are workspace Models with a Humanoid (O_CsF, FakeAimbotON)
+--   equipped weapons are Tool children of a character (O_CsF.Musket, FakeAimbotON.Eagle.50)
+--   ammo pickups are Parts named '10 Ammo' at workspace root, 5 Decals + ProximityPrompt
+--   'Ammo Dispencer' is a Model with a ClickDetector on .Button
+--   heal pickups are cloned from ReplicatedStorage.Heal.HealModels, 7 MeshParts w/ prompts:
+--     Bandage, Medkit, Big Medkit, Regen Stim, Health Stim, Combat Stim, Coffee
+-- UNVERIFIED:
+--   a dropped heal keeps its HealModels name at workspace root (no heal on the floor while probing)
+--   a dropped weapon keeps the gun name at workspace root (only equipped Tools were seen)
+
+local NAME    = 'CQBHellESP'
+local VERSION = 'v1.1'
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players = game:GetService('Players')
+local lp = Players.LocalPlayer
+local running = true
+
+local cfg = {
+    npcESP     = true,
+    showCorpse = false,
+    wesp       = true,
+    healESP    = true,
+    ammoESP    = true,
+    maxDist    = 400,
+    trans      = 0.25,
+}
+
+local HEAL_NAMES = {
+    ['Medkit'] = true, ['Big Medkit'] = true, ['Bandage'] = true,
+    ['Regen Stim'] = true, ['Health Stim'] = true, ['Combat Stim'] = true,
+    ['Coffee'] = true,
+}
+
+local POOL_NPC  = 40
+local POOL_ITEM = 30
+
+-- ---- helpers ----
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+-- Part, Model and MeshPart all have to resolve to one world position.
+local function worldPos(inst)
+    local ok, p = pcall(function() return inst.Position end)
+    if ok and typeof(p) == 'Vector3' then return p end
+    local ok2, p2 = pcall(function() return inst:GetPivot().Position end)
+    if ok2 and typeof(p2) == 'Vector3' then return p2 end
+    local ok3, bp = pcall(function() return inst:FindFirstChildWhichIsA('BasePart', true) end)
+    if ok3 and bp ~= nil then
+        local ok4, p4 = pcall(function() return bp.Position end)
+        if ok4 and typeof(p4) == 'Vector3' then return p4 end
+    end
+    return nil
+end
+
+-- ---- drawing pools ----
+
+-- corner order below MUST match this table: 1..4 = back face, 5..8 = front face
+local EDGES = {
+    {1,2},{3,4},{5,6},{7,8},
+    {1,3},{2,4},{5,7},{6,8},
+    {1,5},{2,6},{3,7},{4,8},
+}
+
+local function mkBox()
+    local e = { lines = {}, txt = Drawing.new('Text') }
+    for i = 1, 12 do
+        local l = Drawing.new('Line')
+        l.Thickness = 1
+        l.Transparency = 1
+        l.Visible = false
+        e.lines[i] = l
+    end
+    e.txt.Size = 14
+    e.txt.Center = true
+    e.txt.Outline = true
+    e.txt.Visible = false
+    return e
+end
+
+local function mkBar()
+    local bg = Drawing.new('Square')
+    bg.Filled = true
+    bg.Thickness = 1
+    bg.Visible = false
+    local fg = Drawing.new('Square')
+    fg.Filled = true
+    fg.Thickness = 1
+    fg.Visible = false
+    return { bg = bg, fg = fg }
+end
+
+local npcPool, itemPool = {}, {}
+for i = 1, POOL_NPC do npcPool[i] = { box = mkBox(), bar = mkBar() } end
+for i = 1, POOL_ITEM do itemPool[i] = { box = mkBox() } end
+
+local function hideBox(e)
+    for k = 1, 12 do e.lines[k].Visible = false end
+    e.txt.Visible = false
+end
+
+local function hideBar(b)
+    b.bg.Visible = false
+    b.fg.Visible = false
+end
+
+local function clearAll()
+    for i = 1, POOL_NPC do
+        hideBox(npcPool[i].box)
+        hideBar(npcPool[i].bar)
+    end
+    for i = 1, POOL_ITEM do
+        hideBox(itemPool[i].box)
+    end
+end
+
+-- ---- collectors ----
+
+local function isPlayerChar(inst)
+    local ok, plrs = pcall(function() return Players:GetPlayers() end)
+    if not ok then return false end
+    for i = 1, #plrs do
+        local ch = nil
+        pcall(function() ch = plrs[i].Character end)
+        if ch ~= nil and ch == inst then return true end
+    end
+    return false
+end
+
+local npcs, items, weapons = {}, {}, {}
+
+local function collectNPCs()
+    local out = {}
+    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    if not ok then return out end
+    for i = 1, #kids do
+        local m = kids[i]
+        if m.ClassName == 'Model' and not isPlayerChar(m) then
+            local h = nil
+            pcall(function() h = m:FindFirstChildOfClass('Humanoid') end)
+            if h ~= nil then
+                local hp = nil
+                local mx = nil
+                pcall(function() hp = h.Health end)
+                pcall(function() mx = h.MaxHealth end)
+                local pos = worldPos(m)
+                if pos ~= nil then
+                    out[#out + 1] = {
+                        inst = m,
+                        pos = pos,
+                        hp = tonumber(hp) or 0,
+                        mx = tonumber(mx) or 100,
+                        corpse = string.find(string.lower(m.Name), 'corpse', 1, true) ~= nil,
+                    }
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function collectWeapons()
+    local out = {}
+    local ok, d = pcall(function() return workspace:GetDescendants() end)
+    if not ok then return out end
+    for i = 1, #d do
+        local v = d[i]
+        if v.ClassName == 'Tool' then
+            local pos = worldPos(v)
+            if pos ~= nil then
+                out[#out + 1] = { inst = v, pos = pos, label = 'Weapon: ' .. tostring(v.Name) }
+            end
+        end
+    end
+    return out
+end
+
+local function collectItems()
+    local out = {}
+    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    if not ok then return out end
+    for i = 1, #kids do
+        local c = kids[i]
+        local n = c.Name
+        local isAmmo = string.find(string.lower(n), 'ammo', 1, true) ~= nil
+        local isHeal = HEAL_NAMES[n] == true
+        if isAmmo or isHeal then
+            local pos = worldPos(c)
+            if pos ~= nil then
+                out[#out + 1] = {
+                    inst = c,
+                    pos = pos,
+                    kind = isHeal and 'heal' or 'ammo',
+                    label = n,
+                }
+            end
+        end
+    end
+    return out
+end
+
+-- ---- drawing ----
+
+local function boxCorners(c, hx, hy, hz)
+    local x, y, z = c.X, c.Y, c.Z
+    return {
+        Vector3.new(x - hx, y - hy, z - hz),
+        Vector3.new(x + hx, y - hy, z - hz),
+        Vector3.new(x - hx, y + hy, z - hz),
+        Vector3.new(x + hx, y + hy, z - hz),
+        Vector3.new(x - hx, y - hy, z + hz),
+        Vector3.new(x + hx, y - hy, z + hz),
+        Vector3.new(x - hx, y + hy, z + hz),
+        Vector3.new(x + hx, y + hy, z + hz),
+    }
+end
+
+local function drawBox(e, center, hx, hy, hz, color, label, trans)
+    local cs = boxCorners(center, hx, hy, hz)
+    local pts = {}
+    for i = 1, 8 do
+        local sp, on = WorldToScreen(cs[i])
+        if not on then
+            hideBox(e)
+            return false
+        end
+        pts[i] = sp
+    end
+    for i = 1, 12 do
+        local ed = EDGES[i]
+        local a = pts[ed[1]]
+        local b = pts[ed[2]]
+        local l = e.lines[i]
+        l.From = a
+        l.To = b
+        l.Color = color
+        l.Transparency = trans
+        l.Visible = true
+    end
+    local mid, on2 = WorldToScreen(center)
+    if on2 then
+        e.txt.Text = label
+        e.txt.Position = Vector2.new(mid.X, mid.Y - 26)
+        e.txt.Color = color
+        e.txt.Transparency = trans
+        e.txt.Visible = true
+    else
+        e.txt.Visible = false
+    end
+    return true
+end
+
+local function drawBar(b, center, frac, color)
+    local top, on1 = WorldToScreen(Vector3.new(center.X, center.Y + 2.4, center.Z))
+    local bot, on2 = WorldToScreen(Vector3.new(center.X, center.Y - 2.4, center.Z))
+    if not on1 or not on2 then
+        hideBar(b)
+        return
+    end
+    local h = math.abs(bot.Y - top.Y)
+    if h < 6 then h = 6 end
+    local w = 4
+    local x = top.X - w - 4
+    local y = math.min(top.Y, bot.Y)
+    b.bg.Position = Vector2.new(x, y)
+    b.bg.Size = Vector2.new(w, h)
+    b.bg.Color = Color3.new(0, 0, 0)
+    b.bg.Transparency = 0.4
+    b.bg.Visible = true
+    local fh = h * math.clamp(frac, 0, 1)
+    b.fg.Position = Vector2.new(x, y + (h - fh))
+    b.fg.Size = Vector2.new(w, fh)
+    b.fg.Color = color
+    b.fg.Transparency = 0.15
+    b.fg.Visible = true
+end
+
+-- ---- render ----
+
+local function render()
+    local cam = workspace.CurrentCamera
+    if cam == nil then return end
+    local eye = cam.CFrame.Position
+    local maxD = cfg.maxDist
+
+    if cfg.npcESP then
+        local cand = {}
+        for i = 1, #npcs do
+            local n = npcs[i]
+            if cfg.showCorpse or not n.corpse then
+                local d = (n.pos - eye).Magnitude
+                if d <= maxD then cand[#cand + 1] = { n = n, d = d } end
+            end
+        end
+        table.sort(cand, function(a, b) return a.d < b.d end)
+        local cap = math.min(#cand, POOL_NPC)
+        for i = 1, cap do
+            local slot = npcPool[i]
+            local n = cand[i].n
+            local frac = 0
+            if n.mx > 0 then frac = n.hp / n.mx end
+            local col = Color3.new(1, 0.2, 0.2)
+            if frac > 0.5 then
+                col = Color3.new(0.2, 1, 0.3)
+            elseif frac > 0.25 then
+                col = Color3.new(1, 0.85, 0.2)
+            end
+            local label = n.inst.Name .. '  ' .. tostring(math.floor(n.hp)) .. '/' .. tostring(math.floor(n.mx)) .. '  ' .. tostring(math.floor(cand[i].d)) .. 'm'
+            local drew = drawBox(slot.box, n.pos, 1.6, 2.6, 1.6, col, label, cfg.trans)
+            if drew then
+                drawBar(slot.bar, n.pos, frac, col)
+            else
+                hideBar(slot.bar)
+            end
+        end
+        for i = cap + 1, POOL_NPC do
+            hideBox(npcPool[i].box)
+            hideBar(npcPool[i].bar)
+        end
+    else
+        for i = 1, POOL_NPC do
+            hideBox(npcPool[i].box)
+            hideBar(npcPool[i].bar)
+        end
+    end
+
+    local cand = {}
+    if cfg.wesp then
+        for i = 1, #weapons do
+            local w = weapons[i]
+            local d = (w.pos - eye).Magnitude
+            if d <= maxD then
+                cand[#cand + 1] = { pos = w.pos, d = d, label = w.label, col = Color3.new(0.4, 0.8, 1) }
+            end
+        end
+    end
+    for i = 1, #items do
+        local it = items[i]
+        local on = false
+        if it.kind == 'heal' and cfg.healESP then on = true end
+        if it.kind == 'ammo' and cfg.ammoESP then on = true end
+        if on then
+            local d = (it.pos - eye).Magnitude
+            if d <= maxD then
+                local col = Color3.new(1, 0.8, 0.2)
+                if it.kind == 'heal' then col = Color3.new(0.3, 1, 0.6) end
+                cand[#cand + 1] = { pos = it.pos, d = d, label = it.label, col = col }
+            end
+        end
+    end
+    table.sort(cand, function(a, b) return a.d < b.d end)
+    local cap = math.min(#cand, POOL_ITEM)
+    for i = 1, cap do
+        local slot = itemPool[i]
+        local c = cand[i]
+        local label = c.label .. '  ' .. tostring(math.floor(c.d)) .. 'm'
+        drawBox(slot.box, c.pos, 0.7, 0.7, 0.7, c.col, label, cfg.trans)
+    end
+    for i = cap + 1, POOL_ITEM do hideBox(itemPool[i].box) end
+end
+
+-- ---- menu ----
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built = false
+local conns = {}
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    warn('[' .. NAME .. '] section ' .. name .. ' failed')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local s = mkSection(tab, 'ESP')
+        if s ~= nil then
+            mkToggle(s, 'NPC ESP', 'cqb_npc', true, function(v) cfg.npcESP = v end)
+            mkToggle(s, 'Corpses', 'cqb_corp', false, function(v) cfg.showCorpse = v end)
+            mkToggle(s, 'Weapon ESP', 'cqb_wep', true, function(v) cfg.wesp = v end)
+            mkToggle(s, 'Heal ESP', 'cqb_heal', true, function(v) cfg.healESP = v end)
+            mkToggle(s, 'Ammo ESP', 'cqb_ammo', true, function(v) cfg.ammoESP = v end)
+            mkSlider(s, 'Max Distance', 'cqb_dist', 50, 1500, 400, function(v) cfg.maxDist = v end)
+            mkSlider(s, 'Transparency', 'cqb_tr', 0, 90, 25, function(v) cfg.trans = v / 100 end)
+        end
+    end)
+    if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
+    print('[' .. NAME .. '] tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('CQB Hell', function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn('[' .. NAME .. '] no UI table - menu unavailable')
+end
+
+-- ---- loops ----
+
+task.spawn(function()
+    while running do
+        npcs = collectNPCs()
+        task.wait(0.4)
+    end
+end)
+
+task.spawn(function()
+    while running do
+        weapons = collectWeapons()
+        task.wait(0.9)
+    end
+end)
+
+task.spawn(function()
+    while running do
+        items = collectItems()
+        task.wait(0.5)
+    end
+end)
+
+task.spawn(function()
+    while running do
+        local cam = workspace.CurrentCamera
+        if cam ~= nil then
+            local ok = pcall(function()
+                local c = cam.RenderStepped:Connect(function()
+                    if not running then return end
+                    pcall(render)
+                end)
+                conns[#conns + 1] = c
+            end)
+            if ok then break end
+        end
+        task.wait(1)
+    end
+end)
+
+-- ---- stop ----
+
+local function stop()
+    running = false
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    clearAll()
+    for i = 1, POOL_NPC do
+        local e = npcPool[i]
+        for k = 1, 12 do pcall(function() e.box.lines[k]:Remove() end) end
+        pcall(function() e.box.txt:Remove() end)
+        pcall(function() e.bar.bg:Remove() end)
+        pcall(function() e.bar.fg:Remove() end)
+    end
+    for i = 1, POOL_ITEM do
+        local e = itemPool[i]
+        for k = 1, 12 do pcall(function() e.box.lines[k]:Remove() end) end
+        pcall(function() e.box.txt:Remove() end)
+    end
+    if HAS_UI then pcall(function() UI.RemoveTab('CQB Hell') end) end
+    _G[NAME] = nil
+    print('[' .. NAME .. '] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI))
