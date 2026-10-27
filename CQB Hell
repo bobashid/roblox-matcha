@@ -4,24 +4,30 @@
 -- No Instance.new, no hooks, no getgc, no input simulation.
 --
 -- Confirmed in game (probes 2026-10-27):
---   NPCs are root Models with a Humanoid: Tec9, AKM, EnemyShotgun, Draco, Mosin, MP5, PKM
+--   NPC models are named after the gun they carry: RPK, PM, Slam, Deagle, AKM, Tec9,
+--     Mosin, MP5, PKM, Draco, EnemyShotgun. Several share one name at the same time.
+--   player characters carry NameTag + FPV_DynamicCam children and NO Settings folder
+--   NPC models carry a Settings folder and have NO NameTag / FPV_DynamicCam
+--     (probe: RPK/Slam/Deagle/PM = 'tagx fpx setY', players = 'tagY fpvY setx')
+--   some NPCs are parented to a Room model, not to workspace root
 --   corpses are <Name>_Corpse with Humanoid.Health == 0 (30 on the floor at once mid-match)
---   player characters are workspace Models named exactly like the player (O_CsF, FakeAimbotON)
 --   equipped weapons are Tool children of a character (O_CsF.Musket, FakeAimbotON.Eagle.50)
 --   ammo pickups are Parts named '10 Ammo' at workspace root, 5 Decals + ProximityPrompt
---   'Ammo Dispencer' is a static wall prop (Model, ClickDetector) and is NOT a pickup
+--   'Ammo Dispencer' / 'Medkit Dispencer' / 'Grenade Dispencer' are static wall props
 --   heal pickups are cloned from ReplicatedStorage.Heal.HealModels, 7 MeshParts w/ prompts:
 --     Bandage, Medkit, Big Medkit, Regen Stim, Health Stim, Combat Stim, Coffee
 -- UNVERIFIED:
 --   a dropped heal keeps its HealModels name at workspace root (none on the floor while probing)
 --   a dropped weapon keeps the gun name at workspace root (only equipped Tools were seen)
 --
--- v1.2: player characters are excluded by NAME. lp.Character reads nil in this build
---       (probe: 'CHK lpChar=true:nil'), so comparing Player.Character == inst never matches
---       and v1.1 drew a box on yourself and on the enemy player. Ammo Dispencer excluded.
+-- v1.3: players are told apart by MARKER (NameTag / FPV_DynamicCam), never by name.
+--       NPCs are named after guns (AKM, PM, Slam...), so any name list can hide a real
+--       NPC when a player name or display name collides - that is the reported bug.
+--       NPCs are also collected from workspace:GetDescendants(), not just root children,
+--       because some NPCs are parented to a Room model.
 
 local NAME    = 'CQBHellESP'
-local VERSION = 'v1.2'
+local VERSION = 'v1.3'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -29,7 +35,6 @@ end
 print('[' .. NAME .. '] ' .. VERSION)
 
 local Players = game:GetService('Players')
-local lp = Players.LocalPlayer
 local running = true
 
 local cfg = {
@@ -69,6 +74,12 @@ local function firstNumber(...)
     return nil
 end
 
+local function hasChild(inst, childName)
+    local ok, c = pcall(function() return inst:FindFirstChild(childName) end)
+    if ok and c ~= nil then return true end
+    return false
+end
+
 -- Part, Model and MeshPart all have to resolve to one world position.
 local function worldPos(inst)
     local ok, p = pcall(function() return inst.Position end)
@@ -83,34 +94,23 @@ local function worldPos(inst)
     return nil
 end
 
--- Player characters are named exactly like the player here, and lp.Character is nil
--- in this build, so the name set is the only filter that actually works.
-local function playerNames()
-    local set = {}
-    local ok, plrs = pcall(function() return Players:GetPlayers() end)
-    if ok then
-        for i = 1, #plrs do
-            local n = nil
-            pcall(function() n = plrs[i].Name end)
-            if n ~= nil then set[n] = true end
-            local dn = nil
-            pcall(function() dn = plrs[i].DisplayName end)
-            if dn ~= nil and dn ~= '' then set[dn] = true end
-        end
-    end
-    return set
+-- A player character carries NameTag + FPV_DynamicCam and no Settings folder.
+-- An NPC carries a Settings folder and neither marker. Name is never consulted:
+-- NPC names are gun names, so a name list hides real NPCs.
+local function isPlayerModel(m)
+    if hasChild(m, 'NameTag') or hasChild(m, 'FPV_DynamicCam') then return true end
+    return false
 end
 
 local npcs, items, weapons = {}, {}, {}
 
 local function collectNPCs()
     local out = {}
-    local names = playerNames()
-    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    local ok, d = pcall(function() return workspace:GetDescendants() end)
     if not ok then return out end
-    for i = 1, #kids do
-        local m = kids[i]
-        if m.ClassName == 'Model' and not names[m.Name] then
+    for i = 1, #d do
+        local m = d[i]
+        if m.ClassName == 'Model' and not isPlayerModel(m) then
             local h = nil
             pcall(function() h = m:FindFirstChildOfClass('Humanoid') end)
             if h ~= nil then
@@ -118,13 +118,16 @@ local function collectNPCs()
                 local mx = nil
                 pcall(function() hp = h.Health end)
                 pcall(function() mx = h.MaxHealth end)
+                hp = tonumber(hp) or 0
+                mx = tonumber(mx) or 100
+                -- skip NPCs nested inside another NPC already in the list
                 local pos = worldPos(m)
-                if pos ~= nil then
+                if pos ~= nil and mx >= 20 then
                     out[#out + 1] = {
                         inst = m,
                         pos = pos,
-                        hp = tonumber(hp) or 0,
-                        mx = tonumber(mx) or 100,
+                        hp = hp,
+                        mx = mx,
                         corpse = string.find(string.lower(m.Name), 'corpse', 1, true) ~= nil,
                     }
                 end
@@ -150,6 +153,12 @@ local function collectWeapons()
     return out
 end
 
+local function isProp(nm)
+    local low = string.lower(nm)
+    if string.find(low, 'dispenc', 1, true) then return true end
+    return false
+end
+
 local function collectItems()
     local out = {}
     local ok, kids = pcall(function() return workspace:GetChildren() end)
@@ -157,20 +166,19 @@ local function collectItems()
     for i = 1, #kids do
         local c = kids[i]
         local n = c.Name
-        local low = string.lower(n)
-        -- 'Ammo Dispencer' is a wall prop, not a pickup
-        local isDisp = string.find(low, 'dispenc', 1, true) ~= nil
-        local isAmmo = (not isDisp) and string.find(low, 'ammo', 1, true) ~= nil
-        local isHeal = HEAL_NAMES[n] == true
-        if isAmmo or isHeal then
-            local pos = worldPos(c)
-            if pos ~= nil then
-                out[#out + 1] = {
-                    inst = c,
-                    pos = pos,
-                    kind = isHeal and 'heal' or 'ammo',
-                    label = n,
-                }
+        if not isProp(n) then
+            local isAmmo = string.find(string.lower(n), 'ammo', 1, true) ~= nil
+            local isHeal = HEAL_NAMES[n] == true
+            if isAmmo or isHeal then
+                local pos = worldPos(c)
+                if pos ~= nil then
+                    out[#out + 1] = {
+                        inst = c,
+                        pos = pos,
+                        kind = isHeal and 'heal' or 'ammo',
+                        label = n,
+                    }
+                end
             end
         end
     end
@@ -486,7 +494,7 @@ end
 task.spawn(function()
     while running do
         npcs = collectNPCs()
-        task.wait(0.4)
+        task.wait(0.45)
     end
 end)
 
