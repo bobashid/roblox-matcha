@@ -1,0 +1,272 @@
+-- Merge Block Arena Weapons: zero the gear cooldown
+-- Matcha LuauVM | place 76024476718474 | universe 10767663125 | by mPhase
+-- VERSION v1.0
+-- Writes the equipped/backpack gear's own CooldownEndsAt (and optionally
+-- CooldownDuration) attributes to zero continuously. No teleport, no CFrame,
+-- no remote argument guessing.
+-- Attributes confirmed on live tools: CooldownDuration, CooldownEndsAt, GearId,
+-- Rarity, Stars, LaunchFrom, LaunchAt, Dropped, ExpiresAt.
+
+local NAME = 'Merge Block Arena Weapons'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local lp = Players.LocalPlayer
+
+local running = true
+local built = false
+local TOGGLES = {}
+local conn = nil
+local lastWrite = 0
+
+local CFG = {
+    enabled = true,
+    zeroDuration = true,
+    intervalMs = 0,
+}
+
+local STAT = { writes = 0, tools = 0, last = 'idle' }
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+
+local function log(msg)
+    print('[' .. NAME .. '] ' .. tostring(msg))
+end
+
+local function eachTool(fn)
+    local seen = {}
+    local bp = lp:FindFirstChild("Backpack")
+    if bp then
+        for _, t in ipairs(bp:GetChildren()) do
+            if t.ClassName == "Tool" then
+                seen[t] = true
+                pcall(fn, t, 'bag')
+            end
+        end
+    end
+    local ch = lp.Character
+    if ch then
+        for _, t in ipairs(ch:GetChildren()) do
+            if t.ClassName == "Tool" and not seen[t] then
+                pcall(fn, t, 'held')
+            end
+        end
+    end
+end
+
+local function clearOne(tool)
+    local changed = 0
+    pcall(function()
+        if tool:GetAttribute("CooldownEndsAt") ~= nil then
+            tool:SetAttribute("CooldownEndsAt", 0)
+            changed = changed + 1
+        end
+    end)
+    if CFG.zeroDuration then
+        pcall(function()
+            if tool:GetAttribute("CooldownDuration") ~= nil then
+                tool:SetAttribute("CooldownDuration", 0)
+                changed = changed + 1
+            end
+        end)
+    end
+    return changed
+end
+
+local function tickClear()
+    local n, w = 0, 0
+    eachTool(function(tool)
+        n = n + 1
+        w = w + clearOne(tool)
+    end)
+    STAT.tools = n
+    STAT.writes = STAT.writes + w
+    if n > 0 then
+        STAT.last = 'cleared ' .. tostring(w) .. ' attr on ' .. tostring(n) .. ' tools'
+    end
+end
+
+local function startConn()
+    if conn ~= nil then return end
+    conn = RunService.RenderStepped:Connect(function()
+        if not running or not CFG.enabled then return end
+        if CFG.intervalMs > 0 then
+            local now = os.clock() * 1000
+            if now - lastWrite < CFG.intervalMs then return end
+            lastWrite = now
+        end
+        pcall(tickClear)
+    end)
+end
+
+local function stopConn()
+    if conn ~= nil then
+        pcall(function() conn:Disconnect() end)
+        conn = nil
+    end
+end
+
+local function report()
+    local rows = {}
+    eachTool(function(tool, where)
+        local d = tool:GetAttribute("CooldownDuration")
+        local e = tool:GetAttribute("CooldownEndsAt")
+        local g = tool:GetAttribute("GearId")
+        local r = tool:GetAttribute("Rarity")
+        rows[#rows + 1] = where .. ':' .. tostring(tool.Name) .. ' gear=' .. tostring(g) .. ' rar=' .. tostring(r) .. ' dur=' .. tostring(d) .. ' ends=' .. tostring(e)
+    end)
+    log('gear ' .. tostring(#rows) .. ' :: ' .. table.concat(rows, ' | '))
+    log('writes ' .. tostring(STAT.writes) .. ' | ' .. tostring(STAT.last))
+end
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    warn('[' .. NAME .. '] section ' .. name .. ' failed')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then
+            TOGGLES[#TOGGLES + 1] = { key = id, id = id, name = label }
+            return true
+        end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. label)
+    return false
+end
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'Gear Cooldown')
+        if sec == nil then return end
+        mkToggle(sec, 'No Cooldown', 'noCooldown', true, function(on)
+            CFG.enabled = on
+            if on then startConn() else stopConn() end
+        end)
+        mkToggle(sec, 'Also zero CooldownDuration', 'zeroDuration', true, function(on)
+            CFG.zeroDuration = on
+        end)
+        mkSlider(sec, 'Write interval (ms)', 'intervalMs', 0, 500, 0, function(v)
+            CFG.intervalMs = math.floor(v)
+        end)
+        mkButton(sec, 'List gear + cooldowns', function() report() end)
+    end)
+    if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
+    log('tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('No Cooldown', function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn('[' .. NAME .. '] no UI - use _G config')
+end
+
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t = TOGGLES[i]
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == 'boolean' then
+                if CFG[t.key] ~= v1 then
+                    CFG[t.key] = v1
+                    if t.key == 'noCooldown' then
+                        if v1 then startConn() else stopConn() end
+                    end
+                end
+            end
+        end
+        task.wait(0.15)
+    end
+end)
+
+local function stop()
+    running = false
+    CFG.enabled = false
+    stopConn()
+    if HAS_UI and type(UI.RemoveTab) == 'function' then
+        pcall(function() UI.RemoveTab('No Cooldown') end)
+    end
+    _G[NAME] = nil
+    log('stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION, config = CFG, stats = STAT }
+
+startConn()
+task.defer(function()
+    pcall(tickClear)
+    report()
+end)
+log(VERSION .. ' ready')
