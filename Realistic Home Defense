@@ -1,26 +1,23 @@
 --[[
   Game:       Realistic Home Defense
   Place IDs:  105527962898452
-  Version:    v8.0
-  Features:   infinite ammo (writes the equipped tool's RepValues and fires the Refil remote),
-              plus RepValues diagnostics so the result is verifiable in the console
-  Controls:   menu tab "Ammo"; one toggle, one slider, one toggle, three buttons
-  Needs:      the RepValues writes need nothing; firing Refil needs hybrid mode
-  Confirmed:  ACS_Engine.Modules.LockSettings recursively table.freeze()s every gun settings
-              table, so ShootRate / camRecoil / MinSpread have no writable copy. That is why
-              fire rate is NOT in this version - there is nothing a script can set.
-  Confirmed:  ReplicatedStorage.ACS_Engine.Events.Refil is a RemoteEvent, not a frozen table,
-              so the freeze cannot block it.
-  Confirmed:  an equipped gun carries a RepValues folder with a BoolValue Chambered. Its
-              NumberValue children are Instances, and Instance property writes are a different
-              mechanism from table writes, so the freeze does not apply to them.
-  UNVERIFIED: whether writing the ammo numbers keeps the gun firing (the server may re-assert
-              ammo), and whether Refil:FireServer() needs arguments. The console prints every
-              value before and after, so the answer is visible rather than guessed.
+  Version:    v8.1
+  Features:   infinite ammo - keeps Mag / StoredAmmo topped up and Chambered true, plus Refil
+  Controls:   menu tab "Ammo"; one toggle, two sliders, one toggle, three buttons
+  Needs:      hybrid mode for the Refil remote
+  Confirmed:  DDM4 V7's RepValues contains exactly IntValue Mag (30), IntValue StoredAmmo (120),
+              BoolValue Chambered (true). Verified by an in-game probe, 2026-10-27.
+  Confirmed:  ACS_Engine.Events.Refil is a RemoteEvent.
+  Confirmed:  v8.0 wrote to those values (its ammo/mag name filter matches Mag and StoredAmmo)
+              but its loop ran once per second, which a ~800 rpm gun outruns instantly.
+  Confirmed:  ShootRate / camRecoil / MinSpread live only in the LockSettings-frozen table,
+              so fire rate is NOT in this version - there is no writable copy.
+  UNVERIFIED: whether the server re-asserts Mag after each shot. If it does, this cannot hold
+              and the only remaining route is firing the Atirar remote ourselves.
 ]]
 
 local NAME    = 'RHD Ammo'
-local VERSION = 'v8.0'
+local VERSION = 'v8.1'
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
 local Players = game:GetService('Players')
@@ -36,14 +33,18 @@ print('[' .. NAME .. '] ' .. VERSION)
 -- ---- config -------------------------------------------------------------
 local CFG = {}
 CFG.infAmmo   = false
-CFG.ammoValue = 9999
+CFG.magValue  = 999
+CFG.storeValue = 9999
 CFG.useRefil  = true
+CFG.writeGap  = 0.05
 
 local STATS = {}
-STATS.writes  = 0
-STATS.refils  = 0
-STATS.refilOk = 0
-STATS.lastErr = 'none'
+STATS.writes   = 0
+STATS.refils   = 0
+STATS.refilOk  = 0
+STATS.lastErr  = 'none'
+STATS.lastTool = 'none'
+STATS.firstRun = false
 
 -- ---- game lookups -------------------------------------------------------
 local function getTool()
@@ -72,15 +73,12 @@ local function getRefil()
     return ev:FindFirstChild('Refil')
 end
 
-local function isAmmoName(n)
-    local s = string.lower(tostring(n))
-    if string.find(s, 'ammo', 1, true) then return true end
-    if string.find(s, 'mag', 1, true) then return true end
-    if string.find(s, 'clip', 1, true) then return true end
-    return false
+local function readVal(c)
+    local ok, v = pcall(function() return c.Value end)
+    if ok then return v end
+    return nil
 end
 
--- ---- RepValues ----------------------------------------------------------
 local function dumpRep()
     local t = getTool()
     if t == nil then
@@ -97,59 +95,97 @@ local function dumpRep()
     print('[' .. NAME .. '] RepValues children = ' .. tostring(#kids))
     for i = 1, #kids do
         local c = kids[i]
-        local ok, v = pcall(function() return c.Value end)
-        local vs = 'nil'
-        if ok and v ~= nil then vs = tostring(v) end
-        print('[' .. NAME .. '] ' .. c.ClassName .. ' ' .. c.Name .. ' = ' .. vs)
+        print('[' .. NAME .. '] ' .. c.ClassName .. ' ' .. c.Name .. ' = ' .. tostring(readVal(c)))
     end
 end
 
-local function refillRep()
+-- ---- the write ----------------------------------------------------------
+-- Names confirmed in game on DDM4 V7: Mag (IntValue), StoredAmmo (IntValue),
+-- Chambered (BoolValue). Only write when the value actually differs, so the
+-- Changed event is not spammed every tick.
+local function applyAmmo()
     local t = getTool()
     if t == nil then return 0 end
+    if t.Name ~= STATS.lastTool then
+        STATS.lastTool = t.Name
+        STATS.firstRun = false
+    end
     local rep = t:FindFirstChild('RepValues')
     if rep == nil then return 0 end
     local n = 0
     local kids = rep:GetChildren()
     for i = 1, #kids do
         local c = kids[i]
-        if c.ClassName == 'NumberValue' or c.ClassName == 'IntValue' then
-            if isAmmoName(c.Name) then
-                local ok = pcall(function() c.Value = CFG.ammoValue end)
+        local cn = c.ClassName
+        local nm = c.Name
+        if cn == 'IntValue' or cn == 'NumberValue' then
+            local target = nil
+            if nm == 'Mag' or nm == 'AmmoInGun' or nm == 'Clip' then
+                target = CFG.magValue
+            elseif nm == 'StoredAmmo' or nm == 'MaxStoredAmmo' or nm == 'Ammo' then
+                target = CFG.storeValue
+            end
+            if target ~= nil then
+                local cur = readVal(c)
+                if cur ~= target then
+                    local ok = pcall(function() c.Value = target end)
+                    if ok then
+                        n = n + 1
+                        if not STATS.firstRun then
+                            print('[' .. NAME .. '] ' .. nm .. ' ' .. tostring(cur) .. ' -> ' .. tostring(target))
+                        end
+                    end
+                end
+            end
+        elseif cn == 'BoolValue' and nm == 'Chambered' then
+            local cur = readVal(c)
+            if cur ~= true then
+                local ok = pcall(function() c.Value = true end)
                 if ok then n = n + 1 end
             end
         end
+    end
+    if n > 0 and not STATS.firstRun then
+        STATS.firstRun = true
+        print('[' .. NAME .. '] first write on ' .. t.Name .. ' complete')
     end
     STATS.writes = STATS.writes + n
     return n
 end
 
--- ---- Refil remote -------------------------------------------------------
 local function fireRefil()
     local r = getRefil()
     if r == nil then
         STATS.lastErr = 'Refil not found'
         return false
     end
-    local ok = pcall(function() r:FireServer() end)
+    local ok, err = pcall(function() r:FireServer() end)
     STATS.refils = STATS.refils + 1
     if ok then
         STATS.refilOk = STATS.refilOk + 1
     else
-        STATS.lastErr = 'Refil FireServer errored'
+        STATS.lastErr = tostring(err)
     end
     return ok
 end
 
--- ---- apply loop ---------------------------------------------------------
+-- ---- fast write loop ----------------------------------------------------
+-- 0.05 s is 20 writes a second; an 800 rpm gun fires ~13 times a second, so this
+-- can keep up where v8.0's 1 s loop could not.
 task.spawn(function()
     while running do
         if CFG.infAmmo then
-            local n = refillRep()
-            if CFG.useRefil then fireRefil() end
-            if n > 0 and STATS.writes % 20 == n then
-                print('[' .. NAME .. '] wrote ' .. tostring(n) .. ' ammo values')
-            end
+            pcall(applyAmmo)
+        end
+        task.wait(CFG.writeGap)
+    end
+end)
+
+-- ---- refil loop ---------------------------------------------------------
+task.spawn(function()
+    while running do
+        if CFG.infAmmo and CFG.useRefil then
+            pcall(fireRefil)
         end
         task.wait(1)
     end
@@ -163,15 +199,23 @@ local function reportStatus()
     if t ~= nil then tn = t.Name end
     local hasRefil = 'no'
     if getRefil() ~= nil then hasRefil = 'yes' end
+    local magNow = 'n/a'
+    local storeNow = 'n/a'
+    if t ~= nil then
+        local rep = t:FindFirstChild('RepValues')
+        if rep ~= nil then
+            local m = rep:FindFirstChild('Mag')
+            local s = rep:FindFirstChild('StoredAmmo')
+            if m ~= nil then magNow = tostring(readVal(m)) end
+            if s ~= nil then storeNow = tostring(readVal(s)) end
+        end
+    end
     print(a .. '--- status ---')
-    print(a .. 'infAmmo=' .. tostring(CFG.infAmmo) .. ' value=' .. tostring(CFG.ammoValue))
-    print(a .. 'useRefil=' .. tostring(CFG.useRefil) .. ' refilFound=' .. hasRefil)
-    print(a .. 'tool=' .. tn)
+    print(a .. 'infAmmo=' .. tostring(CFG.infAmmo) .. ' gap=' .. tostring(CFG.writeGap))
+    print(a .. 'magTarget=' .. tostring(CFG.magValue) .. ' storeTarget=' .. tostring(CFG.storeValue))
+    print(a .. 'tool=' .. tn .. ' magNow=' .. magNow .. ' storeNow=' .. storeNow)
     print(a .. 'writes=' .. tostring(STATS.writes) .. ' refils=' .. tostring(STATS.refils))
     print(a .. 'refilOk=' .. tostring(STATS.refilOk) .. ' lastErr=' .. STATS.lastErr)
-    if STATS.writes == 0 and CFG.infAmmo then
-        print(a .. 'writes=0 means no ammo-number child was found - press Dump RepValues')
-    end
 end
 
 -- ---- UI helpers ---------------------------------------------------------
@@ -266,17 +310,20 @@ local function buildTab(tab)
 
         mkToggle(sec, 'Infinite Ammo', 'rhd8_ammo', false, function(v)
             CFG.infAmmo = v
+            STATS.firstRun = false
             print('[' .. NAME .. '] Infinite Ammo = ' .. tostring(v))
-            if v then
-                dumpRep()
-                refillRep()
-            end
+            if v then pcall(applyAmmo) end
         end)
         registerToggle('infAmmo', 'rhd8_ammo')
 
-        mkSlider(sec, 'Ammo value', 'rhd8_val', 100, 99999, 9999, function(v)
-            CFG.ammoValue = math.floor(v)
-            print('[' .. NAME .. '] ammo value = ' .. tostring(CFG.ammoValue))
+        mkSlider(sec, 'Mag target', 'rhd8_mag', 30, 9999, 999, function(v)
+            CFG.magValue = math.floor(v)
+            print('[' .. NAME .. '] Mag = ' .. tostring(CFG.magValue))
+        end)
+
+        mkSlider(sec, 'Stored ammo target', 'rhd8_store', 100, 99999, 9999, function(v)
+            CFG.storeValue = math.floor(v)
+            print('[' .. NAME .. '] StoredAmmo = ' .. tostring(CFG.storeValue))
         end)
 
         mkToggle(sec, 'Also fire Refil remote', 'rhd8_refil', true, function(v)
@@ -286,12 +333,11 @@ local function buildTab(tab)
         registerToggle('useRefil', 'rhd8_refil')
 
         mkButton(sec, 'Dump RepValues (read console)', function() dumpRep() end)
-        mkButton(sec, 'Test Refil once', function() fireRefil() end)
+        mkButton(sec, 'Write once now', function() applyAmmo() end)
         mkButton(sec, 'Status (read console)', function() reportStatus() end)
 
-        mkText(sec, 'Equip a gun first, then Dump RepValues.')
-        mkText(sec, 'writes=0 means no ammo number was found.')
-        mkText(sec, 'Refil is a remote; the server may reject it.')
+        mkText(sec, 'Writes 20x per second while on.')
+        mkText(sec, 'Fire rate is not here - ShootRate is frozen.')
     end)
 
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
@@ -346,8 +392,8 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-pcall(notify, NAME .. ' ' .. VERSION, 'equip a gun, dump RepValues first', 4)
-print('[' .. NAME .. '] loaded ' .. VERSION .. ' - no table writes, no game tables touched')
+pcall(notify, NAME .. ' ' .. VERSION, 'equip a gun, flip Infinite Ammo', 4)
+print('[' .. NAME .. '] loaded ' .. VERSION .. ' - writes at 20 per second')
 
 -- ---- respawn watch ------------------------------------------------------
 local lastChar = lp.Character
@@ -355,6 +401,7 @@ local lastChar = lp.Character
 if lp.CharacterAdded ~= nil then
     local okHook = pcall(function()
         track(lp.CharacterAdded:Connect(function()
+            STATS.firstRun = false
             print('[' .. NAME .. '] respawn detected')
         end))
     end)
@@ -366,7 +413,8 @@ task.spawn(function()
         local ok, c = pcall(function() return lp.Character end)
         if ok and c ~= lastChar then
             lastChar = c
-            print('[' .. NAME .. '] new character - re-dump RepValues')
+            STATS.firstRun = false
+            print('[' .. NAME .. '] new character - re-applying')
         end
         task.wait(1)
     end
