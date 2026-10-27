@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v2.7: Merge Block Arena pinned by place id.
 -- v2.6: CQB Hell note - weapon mods only (ESP removed).
 -- v2.5: CQB Hell pinned by place id.
 -- v2.4: Piano Rhythm Tiles pinned by place id (auto play).
@@ -24,7 +25,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v2.6'
+local VERSION = 'v2.7'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -49,6 +50,7 @@ local PLACES = {
     [105527962898452] = 'Realistic Home Defense',
     [101999883467300] = 'Piano Rhythm Tiles',
     [98689921952741]  = 'CQB Hell',
+    [76024476718474]  = 'Merge Block Arena',
 }
 
 -- file name + the names/aliases this place might show up as.
@@ -63,6 +65,7 @@ local SCRIPTS = {
     { file = 'Dogs',                    keys = { 'dogs' } },
     { file = 'Feed A Mosquito',         keys = { 'feedamosquito', 'mosquito' } },
     { file = 'Hike For Eggs',           keys = { 'hikeforeggs' } },
+    { file = 'Merge Block Arena',       keys = { 'mergeblockarena', 'mergeblock' } },
     { file = 'Piano Rhythm Tiles',      keys = { 'pianorhythmtiles', 'pianotiles' } },
     { file = 'PRISON LIFE TRIGGERBOT',  keys = { 'prisonlifetriggerbot', 'triggerbot' } },
     { file = 'Prison Life HvH',         keys = { 'prisonlifehvh', 'hvh' } },
