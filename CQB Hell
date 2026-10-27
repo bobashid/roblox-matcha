@@ -4,20 +4,24 @@
 -- No Instance.new, no hooks, no getgc, no input simulation.
 --
 -- Confirmed in game (probes 2026-10-27):
---   NPCs are root Models with a Humanoid: Tec9, AKM, EnemyShotgun, Draco, Mosin, MP5
---   corpses are <Name>_Corpse with Humanoid.Health == 0 (10+ on the floor at once)
---   player characters are workspace Models with a Humanoid (O_CsF, FakeAimbotON)
+--   NPCs are root Models with a Humanoid: Tec9, AKM, EnemyShotgun, Draco, Mosin, MP5, PKM
+--   corpses are <Name>_Corpse with Humanoid.Health == 0 (30 on the floor at once mid-match)
+--   player characters are workspace Models named exactly like the player (O_CsF, FakeAimbotON)
 --   equipped weapons are Tool children of a character (O_CsF.Musket, FakeAimbotON.Eagle.50)
 --   ammo pickups are Parts named '10 Ammo' at workspace root, 5 Decals + ProximityPrompt
---   'Ammo Dispencer' is a Model with a ClickDetector on .Button
+--   'Ammo Dispencer' is a static wall prop (Model, ClickDetector) and is NOT a pickup
 --   heal pickups are cloned from ReplicatedStorage.Heal.HealModels, 7 MeshParts w/ prompts:
 --     Bandage, Medkit, Big Medkit, Regen Stim, Health Stim, Combat Stim, Coffee
 -- UNVERIFIED:
---   a dropped heal keeps its HealModels name at workspace root (no heal on the floor while probing)
+--   a dropped heal keeps its HealModels name at workspace root (none on the floor while probing)
 --   a dropped weapon keeps the gun name at workspace root (only equipped Tools were seen)
+--
+-- v1.2: player characters are excluded by NAME. lp.Character reads nil in this build
+--       (probe: 'CHK lpChar=true:nil'), so comparing Player.Character == inst never matches
+--       and v1.1 drew a box on yourself and on the enemy player. Ammo Dispencer excluded.
 
 local NAME    = 'CQBHellESP'
-local VERSION = 'v1.1'
+local VERSION = 'v1.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -79,7 +83,101 @@ local function worldPos(inst)
     return nil
 end
 
--- ---- drawing pools ----
+-- Player characters are named exactly like the player here, and lp.Character is nil
+-- in this build, so the name set is the only filter that actually works.
+local function playerNames()
+    local set = {}
+    local ok, plrs = pcall(function() return Players:GetPlayers() end)
+    if ok then
+        for i = 1, #plrs do
+            local n = nil
+            pcall(function() n = plrs[i].Name end)
+            if n ~= nil then set[n] = true end
+            local dn = nil
+            pcall(function() dn = plrs[i].DisplayName end)
+            if dn ~= nil and dn ~= '' then set[dn] = true end
+        end
+    end
+    return set
+end
+
+local npcs, items, weapons = {}, {}, {}
+
+local function collectNPCs()
+    local out = {}
+    local names = playerNames()
+    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    if not ok then return out end
+    for i = 1, #kids do
+        local m = kids[i]
+        if m.ClassName == 'Model' and not names[m.Name] then
+            local h = nil
+            pcall(function() h = m:FindFirstChildOfClass('Humanoid') end)
+            if h ~= nil then
+                local hp = nil
+                local mx = nil
+                pcall(function() hp = h.Health end)
+                pcall(function() mx = h.MaxHealth end)
+                local pos = worldPos(m)
+                if pos ~= nil then
+                    out[#out + 1] = {
+                        inst = m,
+                        pos = pos,
+                        hp = tonumber(hp) or 0,
+                        mx = tonumber(mx) or 100,
+                        corpse = string.find(string.lower(m.Name), 'corpse', 1, true) ~= nil,
+                    }
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function collectWeapons()
+    local out = {}
+    local ok, d = pcall(function() return workspace:GetDescendants() end)
+    if not ok then return out end
+    for i = 1, #d do
+        local v = d[i]
+        if v.ClassName == 'Tool' then
+            local pos = worldPos(v)
+            if pos ~= nil then
+                out[#out + 1] = { inst = v, pos = pos, label = 'Weapon: ' .. tostring(v.Name) }
+            end
+        end
+    end
+    return out
+end
+
+local function collectItems()
+    local out = {}
+    local ok, kids = pcall(function() return workspace:GetChildren() end)
+    if not ok then return out end
+    for i = 1, #kids do
+        local c = kids[i]
+        local n = c.Name
+        local low = string.lower(n)
+        -- 'Ammo Dispencer' is a wall prop, not a pickup
+        local isDisp = string.find(low, 'dispenc', 1, true) ~= nil
+        local isAmmo = (not isDisp) and string.find(low, 'ammo', 1, true) ~= nil
+        local isHeal = HEAL_NAMES[n] == true
+        if isAmmo or isHeal then
+            local pos = worldPos(c)
+            if pos ~= nil then
+                out[#out + 1] = {
+                    inst = c,
+                    pos = pos,
+                    kind = isHeal and 'heal' or 'ammo',
+                    label = n,
+                }
+            end
+        end
+    end
+    return out
+end
+
+-- ---- drawing ----
 
 -- corner order below MUST match this table: 1..4 = back face, 5..8 = front face
 local EDGES = {
@@ -139,93 +237,6 @@ local function clearAll()
         hideBox(itemPool[i].box)
     end
 end
-
--- ---- collectors ----
-
-local function isPlayerChar(inst)
-    local ok, plrs = pcall(function() return Players:GetPlayers() end)
-    if not ok then return false end
-    for i = 1, #plrs do
-        local ch = nil
-        pcall(function() ch = plrs[i].Character end)
-        if ch ~= nil and ch == inst then return true end
-    end
-    return false
-end
-
-local npcs, items, weapons = {}, {}, {}
-
-local function collectNPCs()
-    local out = {}
-    local ok, kids = pcall(function() return workspace:GetChildren() end)
-    if not ok then return out end
-    for i = 1, #kids do
-        local m = kids[i]
-        if m.ClassName == 'Model' and not isPlayerChar(m) then
-            local h = nil
-            pcall(function() h = m:FindFirstChildOfClass('Humanoid') end)
-            if h ~= nil then
-                local hp = nil
-                local mx = nil
-                pcall(function() hp = h.Health end)
-                pcall(function() mx = h.MaxHealth end)
-                local pos = worldPos(m)
-                if pos ~= nil then
-                    out[#out + 1] = {
-                        inst = m,
-                        pos = pos,
-                        hp = tonumber(hp) or 0,
-                        mx = tonumber(mx) or 100,
-                        corpse = string.find(string.lower(m.Name), 'corpse', 1, true) ~= nil,
-                    }
-                end
-            end
-        end
-    end
-    return out
-end
-
-local function collectWeapons()
-    local out = {}
-    local ok, d = pcall(function() return workspace:GetDescendants() end)
-    if not ok then return out end
-    for i = 1, #d do
-        local v = d[i]
-        if v.ClassName == 'Tool' then
-            local pos = worldPos(v)
-            if pos ~= nil then
-                out[#out + 1] = { inst = v, pos = pos, label = 'Weapon: ' .. tostring(v.Name) }
-            end
-        end
-    end
-    return out
-end
-
-local function collectItems()
-    local out = {}
-    local ok, kids = pcall(function() return workspace:GetChildren() end)
-    if not ok then return out end
-    for i = 1, #kids do
-        local c = kids[i]
-        local n = c.Name
-        local isAmmo = string.find(string.lower(n), 'ammo', 1, true) ~= nil
-        local isHeal = HEAL_NAMES[n] == true
-        if isAmmo or isHeal then
-            local pos = worldPos(c)
-            if pos ~= nil then
-                out[#out + 1] = {
-                    inst = c,
-                    pos = pos,
-                    kind = isHeal and 'heal' or 'ammo',
-                    label = n,
-                }
-            end
-        end
-    end
-    return out
-end
-
--- ---- drawing ----
 
 local function boxCorners(c, hx, hy, hz)
     local x, y, z = c.X, c.Y, c.Z
