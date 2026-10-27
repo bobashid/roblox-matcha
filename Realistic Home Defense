@@ -1,143 +1,178 @@
 --[[
   Game:       Realistic Home Defense
   Place IDs:  105527962898452
-  Version:    v7.1
-  Features:   no recoil at the camera (no settings writes, no getgc, no remotes)
-  Controls:   menu tab "No Recoil"; one toggle, two sliders, one status button
-  Confirmed:  ACS_Engine.Modules.LockSettings table.freeze()s every gun settings table
-              recursively, and a frozen write raises "attempt to modify a readonly table
-              value", so stat editing on weapons cannot work in this game.
-  Confirmed:  Camera.CFrame is writable from RenderStepped in Matcha.
-  Fixed v7.1: v7.0 was a syntax error (Matcha:317 Expected ')' ... got 'if') caused by
-              print() calls split across lines. Every statement below is one line, and
-              the chunk was re-read back after pushing.
-  UNVERIFIED: whether the per-frame kick separates from normal mouse movement - that is
-              what the threshold slider is for.
-  Note:       nothing here touches a game table, so it cannot break the held gun.
+  Version:    v8.0
+  Features:   infinite ammo (writes the equipped tool's RepValues and fires the Refil remote),
+              plus RepValues diagnostics so the result is verifiable in the console
+  Controls:   menu tab "Ammo"; one toggle, one slider, one toggle, three buttons
+  Needs:      the RepValues writes need nothing; firing Refil needs hybrid mode
+  Confirmed:  ACS_Engine.Modules.LockSettings recursively table.freeze()s every gun settings
+              table, so ShootRate / camRecoil / MinSpread have no writable copy. That is why
+              fire rate is NOT in this version - there is nothing a script can set.
+  Confirmed:  ReplicatedStorage.ACS_Engine.Events.Refil is a RemoteEvent, not a frozen table,
+              so the freeze cannot block it.
+  Confirmed:  an equipped gun carries a RepValues folder with a BoolValue Chambered. Its
+              NumberValue children are Instances, and Instance property writes are a different
+              mechanism from table writes, so the freeze does not apply to them.
+  UNVERIFIED: whether writing the ammo numbers keeps the gun firing (the server may re-assert
+              ammo), and whether Refil:FireServer() needs arguments. The console prints every
+              value before and after, so the answer is visible rather than guessed.
 ]]
 
-local NAME    = 'RHD No Recoil'
-local VERSION = 'v7.1'
-
+local NAME    = 'RHD Ammo'
+local VERSION = 'v8.0'
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
-local Players    = game:GetService('Players')
-local RunService = game:GetService('RunService')
-local lp         = Players.LocalPlayer
+local Players = game:GetService('Players')
+local RS      = game:GetService('ReplicatedStorage')
+local lp      = Players.LocalPlayer
 
 local running = true
-local conns   = {}
-
-local function track(c)
-    conns[#conns + 1] = c
-    return c
-end
+local conns = {}
+local function track(c) conns[#conns + 1] = c; return c end
 
 print('[' .. NAME .. '] ' .. VERSION)
 
 -- ---- config -------------------------------------------------------------
 local CFG = {}
-CFG.on       = false
-CFG.strength = 0.8
-CFG.thresh   = 0.8
-CFG.window   = 0.35
+CFG.infAmmo   = false
+CFG.ammoValue = 9999
+CFG.useRefil  = true
 
 local STATS = {}
-STATS.kicks   = 0
-STATS.lastDeg = 0
-STATS.applied = 0
+STATS.writes  = 0
+STATS.refils  = 0
+STATS.refilOk = 0
+STATS.lastErr = 'none'
 
--- ---- small helpers ------------------------------------------------------
-local function deg(x)
-    return x * 57.29577951308232
-end
-
-local function rad(x)
-    return x * 0.017453292519943295
-end
-
-local function pitchOf(cf)
-    if cf == nil then return nil end
-    local ok, lv = pcall(function() return cf.LookVector end)
-    if not ok or lv == nil then return nil end
-    local y = lv.Y
-    if y > 1 then y = 1 end
-    if y < -1 then y = -1 end
-    local ok2, p = pcall(function() return math.asin(y) end)
-    if ok2 and type(p) == 'number' then return p end
-    return nil
-end
-
-local function getCam()
-    local ok, c = pcall(function() return workspace.CurrentCamera end)
-    if ok and c ~= nil then return c end
-    return nil
-end
-
--- ---- camera compensation ------------------------------------------------
-local lastPitch = nil
-local deficit   = 0
-local holdUntil = 0
-
-local function onRender()
-    if not CFG.on then
-        lastPitch = nil
-        deficit = 0
-        return
-    end
-
-    local cam = getCam()
-    if cam == nil then
-        lastPitch = nil
-        return
-    end
-
-    local cf = nil
-    pcall(function() cf = cam.CFrame end)
-    if cf == nil then return end
-
-    local p = pitchOf(cf)
-    if p == nil then return end
-
-    if lastPitch ~= nil then
-        local d = p - lastPitch
-        if d > rad(CFG.thresh) then
-            deficit = deficit + d
-            holdUntil = os.clock() + CFG.window
-            STATS.kicks = STATS.kicks + 1
-            STATS.lastDeg = deg(d)
+-- ---- game lookups -------------------------------------------------------
+local function getTool()
+    local ch = lp.Character
+    if ch then
+        local kids = ch:GetChildren()
+        for i = 1, #kids do
+            if kids[i].ClassName == 'Tool' then return kids[i] end
         end
     end
+    local bp = lp:FindFirstChild('Backpack')
+    if bp then
+        local bk = bp:GetChildren()
+        for i = 1, #bk do
+            if bk[i].ClassName == 'Tool' then return bk[i] end
+        end
+    end
+    return nil
+end
 
-    if deficit > 0 and os.clock() < holdUntil then
-        local step = deficit * CFG.strength * 0.75
-        if step > rad(0.002) then
-            local ok = pcall(function() cam.CFrame = cam.CFrame * CFrame.Angles(-step, 0, 0) end)
-            if ok then
-                deficit = deficit - step
-                STATS.applied = STATS.applied + 1
+local function getRefil()
+    local eng = RS:FindFirstChild('ACS_Engine')
+    if not eng then return nil end
+    local ev = eng:FindFirstChild('Events')
+    if not ev then return nil end
+    return ev:FindFirstChild('Refil')
+end
+
+local function isAmmoName(n)
+    local s = string.lower(tostring(n))
+    if string.find(s, 'ammo', 1, true) then return true end
+    if string.find(s, 'mag', 1, true) then return true end
+    if string.find(s, 'clip', 1, true) then return true end
+    return false
+end
+
+-- ---- RepValues ----------------------------------------------------------
+local function dumpRep()
+    local t = getTool()
+    if t == nil then
+        print('[' .. NAME .. '] no tool equipped - equip a gun first')
+        return
+    end
+    print('[' .. NAME .. '] tool = ' .. t.Name)
+    local rep = t:FindFirstChild('RepValues')
+    if rep == nil then
+        print('[' .. NAME .. '] RepValues missing on this tool')
+        return
+    end
+    local kids = rep:GetChildren()
+    print('[' .. NAME .. '] RepValues children = ' .. tostring(#kids))
+    for i = 1, #kids do
+        local c = kids[i]
+        local ok, v = pcall(function() return c.Value end)
+        local vs = 'nil'
+        if ok and v ~= nil then vs = tostring(v) end
+        print('[' .. NAME .. '] ' .. c.ClassName .. ' ' .. c.Name .. ' = ' .. vs)
+    end
+end
+
+local function refillRep()
+    local t = getTool()
+    if t == nil then return 0 end
+    local rep = t:FindFirstChild('RepValues')
+    if rep == nil then return 0 end
+    local n = 0
+    local kids = rep:GetChildren()
+    for i = 1, #kids do
+        local c = kids[i]
+        if c.ClassName == 'NumberValue' or c.ClassName == 'IntValue' then
+            if isAmmoName(c.Name) then
+                local ok = pcall(function() c.Value = CFG.ammoValue end)
+                if ok then n = n + 1 end
             end
-        else
-            deficit = 0
         end
-    else
-        deficit = 0
     end
-
-    local cf2 = nil
-    pcall(function() cf2 = cam.CFrame end)
-    if cf2 ~= nil then
-        local p2 = pitchOf(cf2)
-        if p2 ~= nil then lastPitch = p2 else lastPitch = p end
-    else
-        lastPitch = p
-    end
+    STATS.writes = STATS.writes + n
+    return n
 end
 
-local okRender = pcall(function()
-    track(RunService.RenderStepped:Connect(function() pcall(onRender) end))
+-- ---- Refil remote -------------------------------------------------------
+local function fireRefil()
+    local r = getRefil()
+    if r == nil then
+        STATS.lastErr = 'Refil not found'
+        return false
+    end
+    local ok = pcall(function() r:FireServer() end)
+    STATS.refils = STATS.refils + 1
+    if ok then
+        STATS.refilOk = STATS.refilOk + 1
+    else
+        STATS.lastErr = 'Refil FireServer errored'
+    end
+    return ok
+end
+
+-- ---- apply loop ---------------------------------------------------------
+task.spawn(function()
+    while running do
+        if CFG.infAmmo then
+            local n = refillRep()
+            if CFG.useRefil then fireRefil() end
+            if n > 0 and STATS.writes % 20 == n then
+                print('[' .. NAME .. '] wrote ' .. tostring(n) .. ' ammo values')
+            end
+        end
+        task.wait(1)
+    end
 end)
-if not okRender then warn('[' .. NAME .. '] RenderStepped connect failed') end
+
+-- ---- status -------------------------------------------------------------
+local function reportStatus()
+    local a = '[' .. NAME .. '] '
+    local t = getTool()
+    local tn = 'none'
+    if t ~= nil then tn = t.Name end
+    local hasRefil = 'no'
+    if getRefil() ~= nil then hasRefil = 'yes' end
+    print(a .. '--- status ---')
+    print(a .. 'infAmmo=' .. tostring(CFG.infAmmo) .. ' value=' .. tostring(CFG.ammoValue))
+    print(a .. 'useRefil=' .. tostring(CFG.useRefil) .. ' refilFound=' .. hasRefil)
+    print(a .. 'tool=' .. tn)
+    print(a .. 'writes=' .. tostring(STATS.writes) .. ' refils=' .. tostring(STATS.refils))
+    print(a .. 'refilOk=' .. tostring(STATS.refilOk) .. ' lastErr=' .. STATS.lastErr)
+    if STATS.writes == 0 and CFG.infAmmo then
+        print(a .. 'writes=0 means no ammo-number child was found - press Dump RepValues')
+    end
+end
 
 -- ---- UI helpers ---------------------------------------------------------
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
@@ -218,30 +253,6 @@ local function registerToggle(key, id)
     TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = id }
 end
 
--- ---- status -------------------------------------------------------------
-local function reportStatus()
-    local cam = getCam()
-    local camTxt = 'nil'
-    if cam ~= nil then camTxt = 'found' end
-
-    local a = '[' .. NAME .. '] '
-    local onTxt = tostring(CFG.on)
-    local strTxt = tostring(CFG.strength)
-    local thrTxt = tostring(CFG.thresh)
-    local kickTxt = tostring(STATS.kicks)
-    local appTxt = tostring(STATS.applied)
-    local lastTxt = string.format('%.2f', STATS.lastDeg)
-
-    print(a .. '--- status ---')
-    print(a .. 'on=' .. onTxt .. ' strength=' .. strTxt .. ' threshold=' .. thrTxt)
-    print(a .. 'camera=' .. camTxt)
-    print(a .. 'kicks=' .. kickTxt .. ' lastDeg=' .. lastTxt .. ' corrections=' .. appTxt)
-
-    if STATS.kicks == 0 and CFG.on then
-        print(a .. 'no kick seen yet - fire a burst, then press Status again')
-    end
-end
-
 -- ---- build the tab ------------------------------------------------------
 local built = false
 
@@ -250,30 +261,37 @@ local function buildTab(tab)
     built = true
 
     local ok, err = pcall(function()
-        local sec = mkSection(tab, 'No Recoil')
+        local sec = mkSection(tab, 'Ammo')
         if not sec then return end
 
-        mkToggle(sec, 'No Recoil', 'rhd7_on', false, function(v)
-            CFG.on = v
-            print('[' .. NAME .. '] No Recoil = ' .. tostring(v))
+        mkToggle(sec, 'Infinite Ammo', 'rhd8_ammo', false, function(v)
+            CFG.infAmmo = v
+            print('[' .. NAME .. '] Infinite Ammo = ' .. tostring(v))
+            if v then
+                dumpRep()
+                refillRep()
+            end
         end)
-        registerToggle('on', 'rhd7_on')
+        registerToggle('infAmmo', 'rhd8_ammo')
 
-        mkSlider(sec, 'Strength %', 'rhd7_str', 0, 100, 80, function(v)
-            CFG.strength = math.floor(v) / 100
-            print('[' .. NAME .. '] strength = ' .. tostring(CFG.strength))
+        mkSlider(sec, 'Ammo value', 'rhd8_val', 100, 99999, 9999, function(v)
+            CFG.ammoValue = math.floor(v)
+            print('[' .. NAME .. '] ammo value = ' .. tostring(CFG.ammoValue))
         end)
 
-        mkSlider(sec, 'Kick threshold x0.1deg', 'rhd7_thr', 2, 30, 8, function(v)
-            CFG.thresh = math.floor(v) / 10
-            print('[' .. NAME .. '] threshold = ' .. tostring(CFG.thresh))
+        mkToggle(sec, 'Also fire Refil remote', 'rhd8_refil', true, function(v)
+            CFG.useRefil = v
+            print('[' .. NAME .. '] use Refil = ' .. tostring(v))
         end)
+        registerToggle('useRefil', 'rhd8_refil')
 
+        mkButton(sec, 'Dump RepValues (read console)', function() dumpRep() end)
+        mkButton(sec, 'Test Refil once', function() fireRefil() end)
         mkButton(sec, 'Status (read console)', function() reportStatus() end)
 
-        mkText(sec, 'Turn on, fire a burst, press Status.')
-        mkText(sec, 'kicks = 0 means the threshold is too high, lower it.')
-        mkText(sec, 'Aim feels dragged means strength is too high, lower it.')
+        mkText(sec, 'Equip a gun first, then Dump RepValues.')
+        mkText(sec, 'writes=0 means no ammo number was found.')
+        mkText(sec, 'Refil is a remote; the server may reject it.')
     end)
 
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
@@ -282,7 +300,7 @@ end
 
 if HAS_UI then
     local okTab = pcall(function()
-        UI.AddTab('No Recoil', function(tab)
+        UI.AddTab('Ammo', function(tab)
             pcall(buildTab, tab)
         end)
     end)
@@ -319,17 +337,17 @@ end
 -- ---- stop + register ----------------------------------------------------
 local function stop()
     running = false
-    CFG.on = false
+    CFG.infAmmo = false
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
-    if HAS_UI then pcall(function() UI.RemoveTab('No Recoil') end) end
+    if HAS_UI then pcall(function() UI.RemoveTab('Ammo') end) end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-pcall(notify, NAME .. ' ' .. VERSION, 'turn on, fire, press Status', 4)
-print('[' .. NAME .. '] loaded ' .. VERSION .. ' - camera only, no game tables touched')
+pcall(notify, NAME .. ' ' .. VERSION, 'equip a gun, dump RepValues first', 4)
+print('[' .. NAME .. '] loaded ' .. VERSION .. ' - no table writes, no game tables touched')
 
 -- ---- respawn watch ------------------------------------------------------
 local lastChar = lp.Character
@@ -337,8 +355,6 @@ local lastChar = lp.Character
 if lp.CharacterAdded ~= nil then
     local okHook = pcall(function()
         track(lp.CharacterAdded:Connect(function()
-            lastPitch = nil
-            deficit = 0
             print('[' .. NAME .. '] respawn detected')
         end))
     end)
@@ -350,9 +366,7 @@ task.spawn(function()
         local ok, c = pcall(function() return lp.Character end)
         if ok and c ~= lastChar then
             lastChar = c
-            lastPitch = nil
-            deficit = 0
-            print('[' .. NAME .. '] new character - pitch baseline reset')
+            print('[' .. NAME .. '] new character - re-dump RepValues')
         end
         task.wait(1)
     end
