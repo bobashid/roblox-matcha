@@ -1,32 +1,26 @@
 --[[
   Game:       Realistic Home Defense
   Place IDs:  105527962898452
-  Version:    v6.0
-  Features:   no recoil only (the four camRecoil {min,max} pairs zeroed)
-  Controls:   menu tab "No Recoil"; one toggle, three buttons, nothing else
-  Needs:      Matcha Pro / Allow Unsafe LuaU (getgc, applygc)
-  Confirmed:  ACS_Engine.ToolStorage holds the gun Tools (HK416, AR-15, MCX, RPG-7) and
-              ACS_Settings defines camRecoil = { camRecoilUp/Tilt/Left/Right = {min,max} }
-  Confirmed:  require(<ModuleScript>) fails in Matcha, so the settings table cannot be read
-  Confirmed:  Player.CharacterAdded is nil here; v4.0 died on that hook, so this polls
-  Confirmed:  measured earlier this session: getgc('camRecoil') returned 35 entries and only
-              2 of them were tables (9 functions, 20 unknown, 4 strings). So the real recoil
-              data is a very small number of entries - which is exactly why this version
-              targets the four inner pairs instead of replacing the whole camRecoil table.
-              Replacing the table is what changed its shape; writing {0,0} into a slot that
-              already holds {min,max} cannot change the shape at all.
-  UNVERIFIED: whether zeroing those pairs removes the camera kick, and whether the gun must be
-              re-equipped first because the settings may be copied at equip time
-  UNVERIFIED: whether applygc accepts a filtered subset of the getgc cache (this build has
-              never been shown to fail at it, but it has never been proven either)
+  Version:    v7.0
+  Features:   no recoil, done at the camera (no settings writes, no getgc, no remotes)
+  Controls:   menu tab "No Recoil"; one toggle, two sliders, one status button
+  Needs:      nothing beyond stock Matcha
+  Confirmed:  ACS_Engine.Modules.LockSettings table.freeze()s every gun settings table
+              recursively, and a frozen write raises "attempt to modify a readonly table
+              value" - so stat editing on weapons cannot work in this game, ever.
+  Confirmed:  Camera.CFrame is writable from a RenderStepped callback in Matcha.
+  UNVERIFIED: whether the per-frame kick is separable from normal mouse movement; that is
+              exactly what the threshold slider exists to tune.
+  Note:       nothing here touches a game table, so it cannot break the held gun.
 ]]
 
 local NAME    = 'RHD No Recoil'
-local VERSION = 'v6.0'
+local VERSION = 'v7.0'
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
-local Players = game:GetService('Players')
-local lp      = Players.LocalPlayer
+local Players    = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local lp         = Players.LocalPlayer
 
 local running = true
 local conns   = {}
@@ -34,146 +28,99 @@ local function track(c) conns[#conns + 1] = c; return c end
 
 print('[' .. NAME .. '] ' .. VERSION)
 
-local HAS_GC = type(getgc) == 'function' and type(applygc) == 'function'
-if not HAS_GC then
-    warn('[' .. NAME .. '] getgc/applygc missing - turn on Allow Unsafe LuaU')
-end
-
 -- ---- config -------------------------------------------------------------
 local CFG = {
-    noRecoil = false,
-    reapply  = 1.0,
+    on       = false,
+    strength = 0.8,
+    thresh   = 0.8,
+    window   = 0.35,
 }
 
--- each of these holds a two-number {min,max} table inside camRecoil
-local RECOIL_KEYS = { 'camRecoilUp', 'camRecoilTilt', 'camRecoilLeft', 'camRecoilRight' }
+local STATS = { kicks = 0, lastDeg = 0, applied = 0 }
 
-local SLOTS    = {}
-local scanning = false
+local function deg(x) return x * 57.29577951308232 end
+local function rad(x) return x * 0.017453292519943295 end
 
--- ---- scan + apply -------------------------------------------------------
-local function slot(key)
-    local s = SLOTS[key]
-    if not s then
-        s = { key = key, entries = nil, orig = nil, state = 'idle' }
-        SLOTS[key] = s
-    end
-    return s
+local function pitchOf(cf)
+    local ok, lv = pcall(function() return cf.LookVector end)
+    if not ok or lv == nil then return nil end
+    local y = lv.Y
+    if y > 1 then y = 1 elseif y < -1 then y = -1 end
+    local ok2, p = pcall(function() return math.asin(y) end)
+    if ok2 and type(p) == 'number' then return p end
+    return nil
 end
 
-local function pairPred(e)
-    if e.type ~= 'table' then return false end
-    local v = e.value
-    if type(v) ~= 'table' then return false end
-    if type(v[1]) ~= 'number' then return false end
-    if type(v[2]) ~= 'number' then return false end
-    return true
+local function getCam()
+    local ok, c = pcall(function() return workspace.CurrentCamera end)
+    if ok and c ~= nil then return c end
+    return nil
 end
 
-local function scanKey(key)
-    local s = slot(key)
-    local t0 = os.clock()
-    local ok, res = pcall(function() return getgc(key) end)
-    local total = 0
-    local kept, origs = {}, {}
-    if ok and type(res) == 'table' then
-        total = #res
-        for i = 1, #res do
-            local e = res[i]
-            if e.key == key and pairPred(e) then
-                kept[#kept + 1] = e
-                origs[#origs + 1] = { e.value[1], e.value[2] }
-            end
-        end
-    end
-    s.entries, s.orig = kept, origs
-    s.state = (#kept > 0) and 'ready' or 'empty'
-    print(string.format('[%s] %s: kept %d of %d (%.1fs)',
-        NAME, key, #kept, total, os.clock() - t0))
-    return #kept
-end
+-- ---- camera compensation ------------------------------------------------
+-- The kick is applied to the camera on the client. Rather than editing the frozen
+-- settings, this watches the camera pitch each frame, notices the upward jump a shot
+-- produces, and rotates the camera back down by a share of it.
+local lastPitch, deficit, holdUntil = nil, 0, 0
 
-local function anyReady()
-    for i = 1, #RECOIL_KEYS do
-        if slot(RECOIL_KEYS[i]).state == 'ready' then return true end
-    end
-    return false
-end
-
-local function scanAll()
-    if not HAS_GC then
-        warn('[' .. NAME .. '] cannot scan without getgc')
+local function onRender()
+    if not CFG.on then
+        lastPitch, deficit = nil, 0
         return
     end
-    if scanning then
-        print('[' .. NAME .. '] already scanning')
+
+    local cam = getCam()
+    if cam == nil then
+        lastPitch = nil
         return
     end
-    scanning = true
-    task.spawn(function()
-        print('[' .. NAME .. '] scanning 4 keys, about 20s, please wait')
-        local total = 0
-        for i = 1, #RECOIL_KEYS do
-            total = total + scanKey(RECOIL_KEYS[i])
-            task.wait(0.3)
-        end
-        scanning = false
-        print('[' .. NAME .. '] scan done: ' .. tostring(total) .. ' entries kept')
-        pcall(notify, 'Scan done: ' .. tostring(total) .. ' entries', NAME, 4)
-    end)
-end
 
-local function applyAll()
-    local n = 0
-    for i = 1, #RECOIL_KEYS do
-        local s = slot(RECOIL_KEYS[i])
-        if s.state == 'ready' and s.entries then
-            local ok, c = pcall(applygc, s.entries, s.key, { 0, 0 })
-            if ok and type(c) == 'number' then n = n + c end
+    local cf = nil
+    pcall(function() cf = cam.CFrame end)
+    if cf == nil then return end
+
+    local p = pitchOf(cf)
+    if p == nil then return end
+
+    if lastPitch ~= nil then
+        local d = p - lastPitch
+        if d > rad(CFG.thresh) then
+            deficit = deficit + d
+            holdUntil = os.clock() + CFG.window
+            STATS.kicks = STATS.kicks + 1
+            STATS.lastDeg = deg(d)
         end
     end
-    return n
-end
 
-local function restoreAll()
-    local n = 0
-    for i = 1, #RECOIL_KEYS do
-        local s = slot(RECOIL_KEYS[i])
-        if s.state == 'ready' and s.entries and s.orig then
-            for j = 1, #s.entries do
-                local ok, c = pcall(applygc, { s.entries[j] }, s.key, s.orig[j])
-                if ok and type(c) == 'number' then n = n + c end
+    if deficit > 0 and os.clock() < holdUntil then
+        local step = deficit * CFG.strength * 0.75
+        if step > rad(0.002) then
+            local ok = pcall(function()
+                cam.CFrame = cam.CFrame * CFrame.Angles(-step, 0, 0)
+            end)
+            if ok then
+                deficit = deficit - step
+                STATS.applied = STATS.applied + 1
             end
+        else
+            deficit = 0
         end
+    else
+        deficit = 0
     end
-    print('[' .. NAME .. '] restored ' .. tostring(n) .. ' values')
-    return n
+
+    local cf2 = nil
+    pcall(function() cf2 = cam.CFrame end)
+    if cf2 ~= nil then
+        lastPitch = pitchOf(cf2) or p
+    else
+        lastPitch = p
+    end
 end
 
-local function reportStatus()
-    print('[' .. NAME .. '] --- status ---')
-    print('[' .. NAME .. '] noRecoil = ' .. tostring(CFG.noRecoil)
-        .. ', scanning = ' .. tostring(scanning))
-    for i = 1, #RECOIL_KEYS do
-        local s = slot(RECOIL_KEYS[i])
-        print('[' .. NAME .. '] ' .. RECOIL_KEYS[i] .. ' = ' .. tostring(s.state)
-            .. ', entries ' .. tostring(s.entries and #s.entries or 0))
-    end
-end
-
--- ---- apply loop (writes only, never scans) ------------------------------
-task.spawn(function()
-    local last = 0
-    while running do
-        if CFG.noRecoil and HAS_GC and anyReady() then
-            if os.clock() - last >= CFG.reapply then
-                last = os.clock()
-                applyAll()
-            end
-        end
-        task.wait(0.2)
-    end
-end)
+track(RunService.RenderStepped:Connect(function()
+    pcall(onRender)
+end))
 
 -- ---- UI helpers ---------------------------------------------------------
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
@@ -183,6 +130,14 @@ local function firstBool(...)
     for i = 1, select('#', ...) do
         local v = select(i, ...)
         if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
     end
     return nil
 end
@@ -216,6 +171,23 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
 local function mkButton(sec, label, cb)
     if pcall(function() sec:Button(label, cb) end) then return true end
     if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
@@ -231,6 +203,21 @@ local function registerToggle(key, id)
     TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = id }
 end
 
+local function reportStatus()
+    local cam = getCam()
+    print('[' .. NAME .. '] --- status ---')
+    print('[' .. NAME .. '] on = ' .. tostring(CFG.on)
+        .. ', strength = ' .. tostring(CFG.strength)
+        .. ', threshold = ' .. tostring(CFG.thresh) .. ' deg/frame')
+    print('[' .. NAME .. '] camera = ' .. (cam and 'found' or 'nil'))
+    print('[' .. NAME .. '] kicks detected = ' .. tostring(STATS.kicks)
+        .. ', last kick = ' .. string.format('%.2f', STATS.lastDeg) .. ' deg'
+        .. ', corrections = ' .. tostring(STATS.applied))
+    if STATS.kicks == 0 and CFG.on then
+        print('[' .. NAME .. '] no kick seen yet - fire a burst, then press Status again')
+    end
+end
+
 -- ---- build the tab ------------------------------------------------------
 local built = false
 local function buildTab(tab)
@@ -240,24 +227,27 @@ local function buildTab(tab)
         local sec = mkSection(tab, 'No Recoil')
         if not sec then return end
 
-        mkButton(sec, 'Test scan (read console)', function() scanAll() end)
-        mkButton(sec, 'Status (read console)', function() reportStatus() end)
-        mkButton(sec, 'Restore original values', function() restoreAll() end)
-
-        mkToggle(sec, 'No Recoil', 'rhd6_norecoil', false, function(v)
-            if v == CFG.noRecoil then return end
-            CFG.noRecoil = v
+        mkToggle(sec, 'No Recoil', 'rhd7_on', false, function(v)
+            CFG.on = v
             print('[' .. NAME .. '] No Recoil = ' .. tostring(v))
-            if v then
-                if not anyReady() and not scanning then scanAll() end
-            else
-                restoreAll()
-            end
         end)
-        registerToggle('noRecoil', 'rhd6_norecoil')
+        registerToggle('on', 'rhd7_on')
 
-        mkText(sec, 'Scan once, then flip No Recoil. Re-equip the gun if nothing changes.')
-        mkText(sec, 'Only the four camRecoil {min,max} pairs are written; nothing else.')
+        mkSlider(sec, 'Strength %', 'rhd7_str', 0, 100, 80, function(v)
+            CFG.strength = math.floor(v) / 100
+            print('[' .. NAME .. '] strength = ' .. tostring(CFG.strength))
+        end)
+
+        mkSlider(sec, 'Kick threshold (x0.1 deg)', 'rhd7_thr', 2, 30, 8, function(v)
+            CFG.thresh = math.floor(v) / 10
+            print('[' .. NAME .. '] threshold = ' .. tostring(CFG.thresh) .. ' deg/frame')
+        end)
+
+        mkButton(sec, 'Status (read console)', function() reportStatus() end)
+
+        mkText(sec, 'Turn on, fire a burst, press Status.')
+        mkText(sec, '0 kicks = threshold too high, lower the slider.')
+        mkText(sec, 'Aim feels dragged = strength too high, lower it.')
     end)
     if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
     print('[' .. NAME .. '] tab widgets built')
@@ -292,13 +282,6 @@ if HAS_UI then
                 if val ~= nil and CFG[t.key] ~= val then
                     CFG[t.key] = val
                     print('[' .. NAME .. '] ' .. t.key .. ' = ' .. tostring(val))
-                    if t.key == 'noRecoil' then
-                        if val then
-                            if not anyReady() and not scanning then scanAll() end
-                        else
-                            restoreAll()
-                        end
-                    end
                 end
             end
             task.wait(0.15)
@@ -309,17 +292,17 @@ end
 -- ---- stop + register (before anything optional) -------------------------
 local function stop()
     running = false
+    CFG.on = false
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
-    restoreAll()
     if HAS_UI then pcall(function() UI.RemoveTab('No Recoil') end) end
     _G[NAME] = nil
     print('[' .. NAME .. '] stopped')
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-pcall(notify, NAME .. ' ' .. VERSION, 'scan once, then flip No Recoil', 4)
-print('[' .. NAME .. '] loaded ' .. VERSION .. ' - nothing scanned, nothing written')
+pcall(notify, NAME .. ' ' .. VERSION, 'turn on, fire, press Status', 4)
+print('[' .. NAME .. '] loaded ' .. VERSION .. ' - camera only, no game tables touched')
 
 -- ---- respawn watch (CharacterAdded is nil here) -------------------------
 local lastChar = lp.Character
@@ -328,8 +311,9 @@ if lp.CharacterAdded ~= nil then
     local ok = pcall(function()
         track(lp.CharacterAdded:Connect(function()
             print('[' .. NAME .. '] respawn detected')
+            lastPitch, deficit = nil, 0
         end))
-    end)
+    end
     if ok then print('[' .. NAME .. '] CharacterAdded hook installed') end
 end
 
@@ -338,9 +322,8 @@ task.spawn(function()
         local ok, c = pcall(function() return lp.Character end)
         if ok and c ~= lastChar then
             lastChar = c
-            SLOTS = {}
-            print('[' .. NAME .. '] new character - cache cleared')
-            if CFG.noRecoil then scanAll() end
+            lastPitch, deficit = nil, 0
+            print('[' .. NAME .. '] new character - pitch baseline reset')
         end
         task.wait(1)
     end
