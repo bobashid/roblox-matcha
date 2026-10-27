@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v2.8: Merge Block Arena Weapons added to SCRIPTS (manual load only).
 -- v2.7: Merge Block Arena pinned by place id.
 -- v2.6: CQB Hell note - weapon mods only (ESP removed).
 -- v2.5: CQB Hell pinned by place id.
@@ -25,7 +26,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v2.7'
+local VERSION = 'v2.8'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -56,22 +57,23 @@ local PLACES = {
 -- file name + the names/aliases this place might show up as.
 -- keys are normalised: lowercase, letters and digits only.
 local SCRIPTS = {
-    { file = '+1 Upgrade Per Kill',     keys = { '1upgradeperkill', 'upgradeperkill' } },
-    { file = 'Build And Kill Zombies',  keys = { 'buildandkillzombies', 'killzombies' } },
-    { file = 'Chop A Forest',           keys = { 'chopaforest', 'chopforest' } },
-    { file = 'Clean Everything',        keys = { 'cleaneverything' } },
-    { file = 'Command An Army',         keys = { 'commandanarmy' } },
-    { file = 'CQB Hell',                keys = { 'cqbhell', 'cqb' } },
-    { file = 'Dogs',                    keys = { 'dogs' } },
-    { file = 'Feed A Mosquito',         keys = { 'feedamosquito', 'mosquito' } },
-    { file = 'Hike For Eggs',           keys = { 'hikeforeggs' } },
-    { file = 'Merge Block Arena',       keys = { 'mergeblockarena', 'mergeblock' } },
-    { file = 'Piano Rhythm Tiles',      keys = { 'pianorhythmtiles', 'pianotiles' } },
-    { file = 'PRISON LIFE TRIGGERBOT',  keys = { 'prisonlifetriggerbot', 'triggerbot' } },
-    { file = 'Prison Life HvH',         keys = { 'prisonlifehvh', 'hvh' } },
-    { file = 'Realistic Home Defense',  keys = { 'realistichomedefense', 'homedefense' } },
-    { file = 'Tower Incremental',       keys = { 'towerincremental' } },
-    { file = 'What If Disasters',       keys = { 'whatifdisasters', 'disasters' } },
+    { file = '+1 Upgrade Per Kill',          keys = { '1upgradeperkill', 'upgradeperkill' } },
+    { file = 'Build And Kill Zombies',       keys = { 'buildandkillzombies', 'killzombies' } },
+    { file = 'Chop A Forest',                keys = { 'chopaforest', 'chopforest' } },
+    { file = 'Clean Everything',             keys = { 'cleaneverything' } },
+    { file = 'Command An Army',              keys = { 'commandanarmy' } },
+    { file = 'CQB Hell',                     keys = { 'cqbhell', 'cqb' } },
+    { file = 'Dogs',                         keys = { 'dogs' } },
+    { file = 'Feed A Mosquito',              keys = { 'feedamosquito', 'mosquito' } },
+    { file = 'Hike For Eggs',                keys = { 'hikeforeggs' } },
+    { file = 'Merge Block Arena',            keys = { 'mergeblockarena', 'mergeblock' } },
+    { file = 'Merge Block Arena Weapons',    keys = { 'mergeblockarenaweapons', 'mergeweapons' } },
+    { file = 'Piano Rhythm Tiles',           keys = { 'pianorhythmtiles', 'pianotiles' } },
+    { file = 'PRISON LIFE TRIGGERBOT',       keys = { 'prisonlifetriggerbot', 'triggerbot' } },
+    { file = 'Prison Life HvH',              keys = { 'prisonlifehvh', 'hvh' } },
+    { file = 'Realistic Home Defense',       keys = { 'realistichomedefense', 'homedefense' } },
+    { file = 'Tower Incremental',            keys = { 'towerincremental' } },
+    { file = 'What If Disasters',            keys = { 'whatifdisasters', 'disasters' } },
 }
 
 local function norm(s)
