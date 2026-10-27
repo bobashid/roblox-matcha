@@ -1,0 +1,355 @@
+-- Merge Block Arena: silent auto merge (no teleport, no character movement)
+-- Matcha LuauVM | place 76024476718474 | universe 10767663125 | by mPhase
+-- VERSION v1.0
+-- Merges equal-tier blocks on your own plot by firing the game's own remote.
+-- Nothing here touches the character, camera or position: no CFrame, no teleport,
+-- no root-part resize, no TweenService.
+
+local NAME = 'Merge Block Arena'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local lp = Players.LocalPlayer
+
+local running = true
+local built = false
+local TOGGLES = {}
+local getterWorks = {}
+local loopThread = nil
+
+local CFG = {
+    autoMerge = false,
+    dryRun = true,
+    minTier = 1,
+    delay = 0.20,
+}
+
+local STAT = { pairs = 0, merges = 0, last = 'idle', variant = nil, busy = false }
+
+local Events = RS:FindFirstChild("Events")
+
+local function remote(name)
+    if not Events then return nil end
+    local o = Events:FindFirstChild(name)
+    if o ~= nil and (o.ClassName == 'RemoteEvent' or o.ClassName == 'RemoteFunction') then
+        return o
+    end
+    return nil
+end
+
+local FRAG = remote('FragmentRequest')
+
+local function log(msg)
+    print('[' .. NAME .. '] ' .. tostring(msg))
+end
+
+local function getPlot()
+    local pp = workspace:FindFirstChild("PlayerPlots")
+    if not pp then return nil end
+    local uid = tostring(lp.UserId)
+    local fallback = nil
+    for _, p in ipairs(pp:GetChildren()) do
+        if string.find(tostring(p.Name), uid, 1, true) then return p end
+        if fallback == nil and p:FindFirstChild("Merge_1") ~= nil then fallback = p end
+    end
+    return fallback
+end
+
+local function tierOf(model)
+    local n = string.match(tostring(model.Name), '^Merge_(%d+)$')
+    if n then return tonumber(n) end
+    local at = model:GetAttribute("Tier")
+    if type(at) == 'number' then return at end
+    return nil
+end
+
+local function collect(plot)
+    local out = {}
+    if not plot then return out end
+    for _, k in ipairs(plot:GetChildren()) do
+        if k:IsA("Model") then
+            local t = tierOf(k)
+            if t ~= nil and t >= CFG.minTier then
+                out[#out + 1] = { model = k, tier = t }
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.tier ~= b.tier then return a.tier < b.tier end
+        return tostring(a.model.Name) < tostring(b.model.Name)
+    end)
+    return out
+end
+
+local function signature(plot)
+    if not plot then return '' end
+    local parts = {}
+    for _, k in ipairs(plot:GetChildren()) do
+        parts[#parts + 1] = tostring(k.Name)
+    end
+    table.sort(parts)
+    return table.concat(parts, '|')
+end
+
+local function findPair(list)
+    local i = 1
+    while i < #list do
+        if list[i].tier == list[i + 1].tier then
+            return list[i], list[i + 1], list[i].tier
+        end
+        i = i + 1
+    end
+    return nil, nil, nil
+end
+
+local function attempt(a, b, variant)
+    if FRAG == nil then return false end
+    return (pcall(function()
+        if variant == 1 then
+            FRAG:FireServer(a.model)
+        elseif variant == 2 then
+            FRAG:FireServer(a.model, b.model)
+        elseif variant == 3 then
+            FRAG:FireServer(a.model.Name, b.model.Name)
+        elseif variant == 4 then
+            FRAG:FireServer(a.model:GetPivot().Position, b.model:GetPivot().Position)
+        end
+    end))
+end
+
+local function mergeOnce(plot, a, b)
+    local before = signature(plot)
+    local order = { 1, 2, 3, 4 }
+    if STAT.variant ~= nil then order = { STAT.variant } end
+    for _, v in ipairs(order) do
+        attempt(a, b, v)
+        task.wait(0.30)
+        if signature(plot) ~= before then
+            if STAT.variant ~= v then
+                STAT.variant = v
+                log('merge variant ' .. tostring(v) .. ' works')
+            end
+            return true
+        end
+    end
+    log('no merge variant changed the plot - send me this line')
+    return false
+end
+
+local function loopStep()
+    local plot = getPlot()
+    if not plot then
+        STAT.last = 'no plot'
+        return
+    end
+    local list = collect(plot)
+    local a, b, tier = findPair(list)
+    if not a then
+        STAT.last = 'no pair (blocks ' .. tostring(#list) .. ')'
+        return
+    end
+    STAT.pairs = STAT.pairs + 1
+    if CFG.dryRun then
+        STAT.last = 'would merge tier ' .. tostring(tier)
+        log('dry run: tier ' .. tostring(tier) .. ' ' .. tostring(a.model.Name) .. ' + ' .. tostring(b.model.Name))
+        return
+    end
+    STAT.busy = true
+    local ok = mergeOnce(plot, a, b)
+    STAT.busy = false
+    if ok then
+        STAT.merges = STAT.merges + 1
+        STAT.last = 'merged tier ' .. tostring(tier)
+    else
+        STAT.last = 'merge failed'
+    end
+end
+
+local function startLoop()
+    if loopThread ~= nil then return end
+    loopThread = task.spawn(function()
+        while running and CFG.autoMerge do
+            local ok, err = pcall(loopStep)
+            if not ok then log('loop error ' .. tostring(err)) end
+            task.wait(CFG.delay)
+        end
+        loopThread = nil
+        STAT.busy = false
+    end)
+end
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    warn('[' .. NAME .. '] section ' .. name .. ' failed')
+    return nil
+end
+
+local function mkToggle(sec, label, id, default, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then
+            TOGGLES[#TOGGLES + 1] = { key = id, id = id, name = label }
+            return true
+        end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, min, max, default, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+        function() sec:SliderInt(label, min, max, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. label)
+    return false
+end
+
+local function report()
+    local plot = getPlot()
+    local list = collect(plot)
+    local counts = {}
+    for _, e in ipairs(list) do
+        counts[e.tier] = (counts[e.tier] or 0) + 1
+    end
+    local rows = {}
+    local tiers = {}
+    for t in pairs(counts) do tiers[#tiers + 1] = t end
+    table.sort(tiers)
+    for _, t in ipairs(tiers) do
+        rows[#rows + 1] = 't' .. tostring(t) .. 'x' .. tostring(counts[t])
+    end
+    log('plot ' .. tostring(plot and plot.Name) .. ' blocks ' .. tostring(#list) .. ' | ' .. table.concat(rows, ' '))
+    log('remote FragmentRequest ' .. tostring(FRAG ~= nil) .. ' | variant ' .. tostring(STAT.variant) .. ' | merges ' .. tostring(STAT.merges))
+end
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'Auto Merge')
+        if sec == nil then return end
+        mkToggle(sec, 'Auto Merge', 'autoMerge', false, function(on)
+            CFG.autoMerge = on
+            if on then startLoop() end
+        end)
+        mkToggle(sec, 'Dry Run (no actions)', 'dryRun', true, function(on)
+            CFG.dryRun = on
+        end)
+        mkSlider(sec, 'Min tier', 'minTier', 1, 10, 1, function(v)
+            CFG.minTier = math.floor(v)
+        end)
+        mkSlider(sec, 'Delay (ms)', 'delayMs', 50, 1000, 200, function(v)
+            CFG.delay = v / 1000
+        end)
+        mkButton(sec, 'Scan plot', function() report() end)
+    end)
+    if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
+    log('tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Merge Block Arena', function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn('[' .. NAME .. '] no UI - toggles via _G config')
+end
+
+task.spawn(function()
+    while running do
+        for i = 1, #TOGGLES do
+            local t = TOGGLES[i]
+            local val = nil
+            local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+            if ok1 and type(v1) == 'boolean' then
+                val = v1
+            else
+                local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                if ok2 and type(v2) == 'boolean' then val = v2 end
+            end
+            if val ~= nil then
+                getterWorks[t.key] = true
+                if CFG[t.key] ~= val then
+                    CFG[t.key] = val
+                    if t.key == 'autoMerge' and val then startLoop() end
+                end
+            end
+        end
+        task.wait(0.15)
+    end
+end)
+
+local function stop()
+    running = false
+    CFG.autoMerge = false
+    if HAS_UI and type(UI.RemoveTab) == 'function' then
+        pcall(function() UI.RemoveTab('Merge Block Arena') end)
+    end
+    _G[NAME] = nil
+    log('stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION, config = CFG, stats = STAT }
+
+local p0 = getPlot()
+log(VERSION .. ' ready | plot ' .. tostring(p0 and p0.Name) .. ' | FragReq ' .. tostring(FRAG ~= nil))
