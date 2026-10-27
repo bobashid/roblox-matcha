@@ -4,37 +4,35 @@
 -- No Instance.new, no hooks, no getgc, no input simulation.
 --
 -- Confirmed in game (probes 2026-10-27):
---   NPC models are named after the gun they carry: RPK, PM, Slam, Deagle, AKM, Tec9,
---     Mosin, MP5, PKM, Draco, EnemyShotgun. Several share one name at the same time.
---   player characters carry NameTag + FPV_DynamicCam children and NO Settings folder
---   NPC models carry a Settings folder and have NO NameTag / FPV_DynamicCam
---     (probe: RPK/Slam/Deagle/PM = 'tagx fpx setY', players = 'tagY fpvY setx')
---   some NPCs are parented to a Room model, not to workspace root
---   corpses are <Name>_Corpse with Humanoid.Health == 0 (30 on the floor at once mid-match)
---   equipped weapons are Tool children of a character (O_CsF.Musket, FakeAimbotON.Eagle.50)
+--   NPCs live under workspace.People, WRAPPED: People.<Name>GP.<Name>
+--     the GP wrapper has no Humanoid, the inner model does
+--   NPC Humanoid health is 5000000000/5000000000 - the game's "invincible" sentinel,
+--     so a normal health bar is meaningless. HP text is hidden above 1e6.
+--   NPC models are named after the gun they carry: AKM, Tec9, PM, RPK, Slam, Deagle,
+--     Mosin, MP5, PKM, Draco, EnemyShotgun, Db, Brian the Hero. Names repeat.
+--   player characters are direct workspace children and carry NameTag + FPV_DynamicCam
+--   corpses are <Name>_Corpse with Humanoid.Health == 0
+--   equipped weapons are Tool children of a character
 --   ammo pickups are Parts named '10 Ammo' at workspace root, 5 Decals + ProximityPrompt
 --   'Ammo Dispencer' / 'Medkit Dispencer' / 'Grenade Dispencer' are static wall props
---   heal pickups are cloned from ReplicatedStorage.Heal.HealModels, 7 MeshParts w/ prompts:
+--   heal pickups clone from ReplicatedStorage.Heal.HealModels (7 MeshParts w/ prompts):
 --     Bandage, Medkit, Big Medkit, Regen Stim, Health Stim, Combat Stim, Coffee
 -- UNVERIFIED:
---   a dropped heal keeps its HealModels name at workspace root (none on the floor while probing)
---   a dropped weapon keeps the gun name at workspace root (only equipped Tools were seen)
+--   a dropped heal / dropped weapon keeping its name at workspace root
 --
--- v1.3: players are told apart by MARKER (NameTag / FPV_DynamicCam), never by name.
---       NPCs are named after guns (AKM, PM, Slam...), so any name list can hide a real
---       NPC when a player name or display name collides - that is the reported bug.
---       NPCs are also collected from workspace:GetDescendants(), not just root children,
---       because some NPCs are parented to a Room model.
+-- v1.4: NPC source is workspace.People (the game's own container), not a name list.
+--       Reads the Humanoid from the inner model of each <Name>GP wrapper.
+--       HP is only displayed when MaxHealth is sane (< 1e6); the 5e9 sentinel is hidden.
+--       Falls back to root models with a Humanoid if People is missing.
 
 local NAME    = 'CQBHellESP'
-local VERSION = 'v1.3'
+local VERSION = 'v1.4'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 print('[' .. NAME .. '] ' .. VERSION)
 
-local Players = game:GetService('Players')
 local running = true
 
 local cfg = {
@@ -80,7 +78,6 @@ local function hasChild(inst, childName)
     return false
 end
 
--- Part, Model and MeshPart all have to resolve to one world position.
 local function worldPos(inst)
     local ok, p = pcall(function() return inst.Position end)
     if ok and typeof(p) == 'Vector3' then return p end
@@ -94,46 +91,84 @@ local function worldPos(inst)
     return nil
 end
 
--- A player character carries NameTag + FPV_DynamicCam and no Settings folder.
--- An NPC carries a Settings folder and neither marker. Name is never consulted:
--- NPC names are gun names, so a name list hides real NPCs.
 local function isPlayerModel(m)
     if hasChild(m, 'NameTag') or hasChild(m, 'FPV_DynamicCam') then return true end
     return false
+end
+
+-- Resolve one NPC candidate into {inst, hp, mx}. Handles the <Name>GP wrapper:
+-- if the model has no Humanoid, look one level down for the real body.
+local function asNpc(m)
+    if m.ClassName ~= 'Model' then return nil end
+    if isPlayerModel(m) then return nil end
+    local body = m
+    local h = nil
+    pcall(function() h = m:FindFirstChildOfClass('Humanoid') end)
+    if h == nil then
+        local ok, kids = pcall(function() return m:GetChildren() end)
+        if ok then
+            for i = 1, #kids do
+                local c = kids[i]
+                if c.ClassName == 'Model' then
+                    local ch = nil
+                    pcall(function() ch = c:FindFirstChildOfClass('Humanoid') end)
+                    if ch ~= nil then body = c; h = ch; break end
+                end
+            end
+        end
+    end
+    if h == nil then return nil end
+    local hp, mx = 0, 100
+    pcall(function() hp = tonumber(h.Health) or 0 end)
+    pcall(function() mx = tonumber(h.MaxHealth) or 100 end)
+    local pos = worldPos(body)
+    if pos == nil then return nil end
+    return {
+        inst = body,
+        root = m,
+        pos = pos,
+        hp = hp,
+        mx = mx,
+        corpse = string.find(string.lower(m.Name), 'corpse', 1, true) ~= nil,
+    }
 end
 
 local npcs, items, weapons = {}, {}, {}
 
 local function collectNPCs()
     local out = {}
-    local ok, d = pcall(function() return workspace:GetDescendants() end)
-    if not ok then return out end
-    for i = 1, #d do
-        local m = d[i]
-        if m.ClassName == 'Model' and not isPlayerModel(m) then
-            local h = nil
-            pcall(function() h = m:FindFirstChildOfClass('Humanoid') end)
-            if h ~= nil then
-                local hp = nil
-                local mx = nil
-                pcall(function() hp = h.Health end)
-                pcall(function() mx = h.MaxHealth end)
-                hp = tonumber(hp) or 0
-                mx = tonumber(mx) or 100
-                -- skip NPCs nested inside another NPC already in the list
-                local pos = worldPos(m)
-                if pos ~= nil and mx >= 20 then
-                    out[#out + 1] = {
-                        inst = m,
-                        pos = pos,
-                        hp = hp,
-                        mx = mx,
-                        corpse = string.find(string.lower(m.Name), 'corpse', 1, true) ~= nil,
-                    }
+    local seen = {}
+    local added = 0
+
+    local people = nil
+    pcall(function() people = workspace:FindFirstChild('People') end)
+
+    if people ~= nil then
+        local ok, kids = pcall(function() return people:GetChildren() end)
+        if ok then
+            for i = 1, #kids do
+                local e = asNpc(kids[i])
+                if e ~= nil and not seen[e.inst] then
+                    seen[e.inst] = true
+                    out[#out + 1] = e
+                    added = added + 1
                 end
             end
         end
     end
+
+    -- fallback / corpses sitting outside People
+    local ok2, rootKids = pcall(function() return workspace:GetChildren() end)
+    if ok2 then
+        for i = 1, #rootKids do
+            local e = asNpc(rootKids[i])
+            if e ~= nil and not seen[e.inst] then
+                seen[e.inst] = true
+                out[#out + 1] = e
+            end
+        end
+    end
+
     return out
 end
 
@@ -187,7 +222,6 @@ end
 
 -- ---- drawing ----
 
--- corner order below MUST match this table: 1..4 = back face, 5..8 = front face
 local EDGES = {
     {1,2},{3,4},{5,6},{7,8},
     {1,3},{2,4},{5,7},{6,8},
@@ -342,17 +376,26 @@ local function render()
         for i = 1, cap do
             local slot = npcPool[i]
             local n = cand[i].n
+            local sane = n.mx < 1000000
             local frac = 0
-            if n.mx > 0 then frac = n.hp / n.mx end
+            if sane and n.mx > 0 then frac = n.hp / n.mx end
             local col = Color3.new(1, 0.2, 0.2)
-            if frac > 0.5 then
-                col = Color3.new(0.2, 1, 0.3)
-            elseif frac > 0.25 then
-                col = Color3.new(1, 0.85, 0.2)
+            if sane then
+                if frac > 0.5 then
+                    col = Color3.new(0.2, 1, 0.3)
+                elseif frac > 0.25 then
+                    col = Color3.new(1, 0.85, 0.2)
+                end
+            else
+                col = Color3.new(0.85, 0.4, 1)
             end
-            local label = n.inst.Name .. '  ' .. tostring(math.floor(n.hp)) .. '/' .. tostring(math.floor(n.mx)) .. '  ' .. tostring(math.floor(cand[i].d)) .. 'm'
+            local label = n.inst.Name
+            if sane then
+                label = label .. '  ' .. tostring(math.floor(n.hp)) .. '/' .. tostring(math.floor(n.mx))
+            end
+            label = label .. '  ' .. tostring(math.floor(cand[i].d)) .. 'm'
             local drew = drawBox(slot.box, n.pos, 1.6, 2.6, 1.6, col, label, cfg.trans)
-            if drew then
+            if drew and sane then
                 drawBar(slot.bar, n.pos, frac, col)
             else
                 hideBar(slot.bar)
@@ -493,21 +536,24 @@ end
 
 task.spawn(function()
     while running do
-        npcs = collectNPCs()
-        task.wait(0.45)
+        local ok, r = pcall(collectNPCs)
+        if ok then npcs = r end
+        task.wait(0.35)
     end
 end)
 
 task.spawn(function()
     while running do
-        weapons = collectWeapons()
+        local ok, r = pcall(collectWeapons)
+        if ok then weapons = r end
         task.wait(0.9)
     end
 end)
 
 task.spawn(function()
     while running do
-        items = collectItems()
+        local ok, r = pcall(collectItems)
+        if ok then items = r end
         task.wait(0.5)
     end
 end)
@@ -554,4 +600,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI))
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded, menu=' .. tostring(HAS_UI) .. ', npc=' .. tostring(#npcs))
