@@ -1,22 +1,20 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 3.7.0
--- DIAGNOSIS: only the tip jar works. Tips is the ONLY action that fires a single remote with
--- no interaction step. Every other action in the captured traffic fires TWO calls:
+-- Version: 3.7.1
+-- DIAGNOSIS (user: "nothing except auto tip jar works"): tips is the ONLY action that fires
+-- ONE remote. Every other action fires TWO calls, in this order:
 --   1) Events.Restaurant.Interactions.Interacted:FireServer(tycoon, promptTable)
 --   2) Events.Restaurant.TaskCompleted:FireServer(taskTable)
--- v3.6.x sent only (2), which is why seat/bill/serve silently did nothing.
--- v3.7.0 sends the Interactions call first, shaped exactly like the captured bill payload:
---   { Id, ActionText, WorldPosition, GamepadKeyCode, TemporaryPart, KeyboardKeyCode, Range,
---     IsCustomerPrompt, Key, Model, Part, Prompt, InteractionType, HoldDuration }
--- CONFIRMED: the Interactions call for CollectBill (user capture).
--- GUESSED: the Key/InteractionType strings for SendToTable and Serve, and the prompt Id.
---          If seat/serve still fail, those strings are the reason - capture them.
+-- v3.6.x sent only (2) -> silent no-op for seat / bill / serve.
+-- v3.7.x sends (1) then (2). CONFIRMED for bills (user capture).
+-- UNVERIFIED: the Key strings for SendToTable / Serve, the prompt Id, and whether the server
+--   range-checks the interaction. v3.7.1 therefore refuses to fire at targets farther than
+--   Range studs from the character (the capture showed Range = 7.2).
 -- Upgrades untouched. No teleports, no Drawing, no Dialog firing.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '3.7.0'
+local VERSION = '3.7.1'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -38,6 +36,7 @@ local CONFIG = {
     SeatGap   = 2.0,
     TipsEvery = 4.0,
     BillEvery = 2.0,
+    Range     = 7.2,
 }
 
 local running = true
@@ -45,7 +44,7 @@ local toggles = {}
 local tServe, tSeat, tTips, tBill = 0, 0, 0, 0
 local held = nil
 local guestIdx, tableIdx = 1, 1
-local stat = { grabs = 0, serves = 0, seats = 0, tips = 0, bills = 0 }
+local stat = { grabs = 0, serves = 0, seats = 0, tips = 0, bills = 0, skipped = 0 }
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -84,7 +83,16 @@ local function findTycoon()
     return nil
 end
 
--- first BasePart under a model, for Part / TemporaryPart / WorldPosition
+local function rootPos()
+    local ok, c = pcall(function() return lp.Character end)
+    if not ok or not c then return nil end
+    local r = c:FindFirstChild('HumanoidRootPart')
+    if not r then return nil end
+    local ok2, p = pcall(function() return r.Position end)
+    if ok2 and typeof(p) == 'Vector3' then return p end
+    return nil
+end
+
 local function aPart(model)
     if not model then return nil end
     local ok, p = pcall(function() return model.PrimaryPart end)
@@ -94,7 +102,17 @@ local function aPart(model)
     return nil
 end
 
--- the Interactions call that must precede TaskCompleted (captured shape)
+-- distance gate: the captured payload carried Range = 7.2, so the server may validate it
+local function inRange(model)
+    local origin = rootPos()
+    if not origin then return true end
+    local part = aPart(model)
+    if not part then return true end
+    local ok, p = pcall(function() return part.Position end)
+    if not ok or typeof(p) ~= 'Vector3' then return true end
+    return (origin - p).Magnitude <= CONFIG.Range
+end
+
 local function interact(ty, model, key, promptId)
     local it = ev('Restaurant', 'Interactions')
     if not it or not ty or not model then return false end
@@ -111,7 +129,7 @@ local function interact(ty, model, key, promptId)
         GamepadKeyCode = Enum.KeyCode.Thumbstick1,
         TemporaryPart = part,
         KeyboardKeyCode = Enum.KeyCode.E,
-        Range = 7.2,
+        Range = CONFIG.Range,
         IsCustomerPrompt = true,
         Key = key,
         Model = model,
@@ -193,7 +211,7 @@ end
 local function seat(ty, guest, table)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not guest or not table then return false end
-    -- Interactions first, exactly like the captured traffic; then the task
+    if not inRange(table) then stat.skipped = stat.skipped + 1 return false end
     interact(ty, table, 'SendToTable', 1)
     task.wait(0.05)
     local payload = {
@@ -210,6 +228,7 @@ end
 local function serve(ty, guest, customerId, foodModel)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not guest or not foodModel then return false end
+    if not inRange(foodModel) then stat.skipped = stat.skipped + 1 return false end
     interact(ty, foodModel, 'Serve', 1)
     task.wait(0.05)
     local payload = {
@@ -249,7 +268,7 @@ end
 local function takeBill(ty, model)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not model then return false end
-    -- This is the captured pair: Interactions first, then TaskCompleted
+    if not inRange(model) then stat.skipped = stat.skipped + 1 return false end
     interact(ty, model, 'CollectBill', 142)
     task.wait(0.05)
     local payload = { Tycoon = ty, Name = 'CollectBill', FurnitureModel = model }
@@ -302,6 +321,7 @@ local function report()
     local g = ty and guestList(ty)
     local tl = ty and tableList(ty)
     local b = ty and billTargets(ty)
+    local origin = rootPos()
     local line = 'counter=' .. tostring(f and #f or -1) ..
                  ' held=' .. tostring(held and held.Name or 'nil') ..
                  ' guests=' .. tostring(g and #g or -1) ..
@@ -311,9 +331,10 @@ local function report()
                  ' seats=' .. tostring(stat.seats) ..
                  ' tips=' .. tostring(stat.tips) ..
                  ' bills=' .. tostring(stat.bills) ..
-                 ' billsLeft=' .. tostring(b and #b or -1)
+                 ' skippedOutOfRange=' .. tostring(stat.skipped) ..
+                 ' dist=' .. tostring(origin and (#b > 0 and math.floor((origin - (aPart(b[1]) and aPart(b[1]).Position or origin)).Magnitude) or 0) or -1)
     print('[RT3] ' .. line)
-    pcall(function() notify('RT3', line, 5) end)
+    pcall(function() notify('RT3', line, 6) end)
 end
 
 if UI then
@@ -332,6 +353,7 @@ if UI then
             reg('rt3_serve', 'Auto Serve To Guest', 'Serve')
 
             local tune = tab:Section('Tuning', 'Right')
+            safeSlider(tune, 'rt3_range', 'Interaction Range', 4, 20, 7, function(v) CONFIG.Range = v end)
             safeSlider(tune, 'rt3_seatgap', 'Seat Gap x10', 5, 120, 20, function(v) CONFIG.SeatGap = v / 10 end)
             safeButton(tune, 'Test Bill', function()
                 local ty = findTycoon()
