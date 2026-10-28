@@ -1,14 +1,15 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 3.2.0
--- Scope: auto pickup dishes, auto seat, auto collect tips, auto collect bill.
--- Payloads for tips and bill are USER-CAPTURED with Remote Spy (2026-10-27), not guessed.
+-- Version: 3.3.0
+-- Scope: auto pickup dishes, auto collect tips, auto collect bills.
+-- Auto Seat (firing SeatPrompt) REMOVED - the user meant accepting a guest's arrival
+-- prompt, not firing seats. That payload is not captured yet, so nothing guesses at it.
+-- Payloads for tips and bill are USER-CAPTURED with Remote Spy (2026-10-27).
 -- Upgrades untouched. No teleports, no Drawing, no Dialog firing.
--- Still not attempted: taking a customer's order - no captured payload for it yet.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '3.2.0'
+local VERSION = '3.3.0'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -21,18 +22,16 @@ local lp      = Players.LocalPlayer
 
 local CONFIG = {
     Dish = true,
-    Seat = true,
     Tips = true,
     Bill = true,
     Cycle     = 0.4,
-    SeatEvery = 2.0,
     TipsEvery = 4.0,
     BillEvery = 2.0,
 }
 
 local running = true
 local toggles = {}
-local tSeat, tTips, tBill = 0, 0, 0
+local tTips, tBill = 0, 0
 local stat = { grabs = 0, tips = 0, bills = 0 }
 
 local function nowT()
@@ -70,33 +69,6 @@ local function findTycoon()
         end
     end
     return nil
-end
-
-local function myPrompts(ty, want)
-    local out = {}
-    if not ty then return out end
-    local ok, desc = pcall(function() return ty:GetDescendants() end)
-    if not ok or not desc then return out end
-    for i = 1, #desc do
-        local d = desc[i]
-        if d.ClassName == 'ProximityPrompt' and d.Name == want then
-            out[#out + 1] = d
-        end
-    end
-    return out
-end
-
-local function seatFree(prompt)
-    local att = prompt.Parent
-    local base = att and att.Parent
-    if not base then return false end
-    local ok, seat = pcall(function() return base:FindFirstChildOfClass('Seat') end)
-    if ok and seat then
-        local occ
-        pcall(function() occ = seat.Occupant end)
-        if occ then return false end
-    end
-    return true
 end
 
 local function foodList(ty)
@@ -212,15 +184,12 @@ if UI then
             local main = tab:Section('Automation', 'Left')
             safeToggle(main, 'rt3_dish', 'Auto Pickup Dishes', CONFIG.Dish, function(v) CONFIG.Dish = v end)
             reg('rt3_dish', 'Auto Pickup Dishes', 'Dish')
-            safeToggle(main, 'rt3_seat', 'Auto Seat', CONFIG.Seat, function(v) CONFIG.Seat = v end)
-            reg('rt3_seat', 'Auto Seat', 'Seat')
             safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
             reg('rt3_tips', 'Auto Collect Tips', 'Tips')
             safeToggle(main, 'rt3_bill', 'Auto Collect Bills', CONFIG.Bill, function(v) CONFIG.Bill = v end)
             reg('rt3_bill', 'Auto Collect Bills', 'Bill')
 
             local tune = tab:Section('Tuning', 'Right')
-            safeSlider(tune, 'rt3_seatevery', 'Seat Every x10', 5, 60, 20, function(v) CONFIG.SeatEvery = v / 10 end)
             safeSlider(tune, 'rt3_tipsevery', 'Tips Every x10', 10, 120, 40, function(v) CONFIG.TipsEvery = v / 10 end)
             safeButton(tune, 'Collect Tips Now', function() local ty = findTycoon() takeTips(ty) end)
             safeButton(tune, 'Collect Bill Now', function()
@@ -271,18 +240,6 @@ task.spawn(function()
 
         if CONFIG.Tips and ty and (t - tTips) >= CONFIG.TipsEvery then
             if takeTips(ty) then tTips = t end
-        end
-
-        if CONFIG.Seat and ty and (t - tSeat) >= CONFIG.SeatEvery then
-            local seats = myPrompts(ty, 'SeatPrompt')
-            for i = 1, #seats do
-                local p = seats[i]
-                if seatFree(p) then
-                    pcall(fireproximityprompt, p)
-                    tSeat = t
-                    break
-                end
-            end
         end
 
         task.wait(CONFIG.Cycle)
