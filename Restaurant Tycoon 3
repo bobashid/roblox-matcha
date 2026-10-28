@@ -1,5 +1,5 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 2.0.0
+-- Version: 2.0.1
 -- Silent automation of the game's own entry points:
 --   * grab food    -> Events.Restaurant.GrabFood:InvokeServer(foodModel)
 --   * serve        -> fires the customer's own Dialog ProximityPrompt, so the game
@@ -9,11 +9,13 @@
 -- Money drops need nothing: the game auto-collects inside 7+SizeModifier studs.
 -- Upgrades are deliberately NOT touched.
 -- No teleports, no Drawing, no notifications.
+-- v2.0.1: Dialog prompts are filtered to real characters (a model with a Humanoid),
+--         because only 1 of the 4 Dialog prompts in the place sits on an NPC.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '2.0.0'
+local VERSION = '2.0.1'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -34,10 +36,10 @@ local CONFIG = {
     ServeEach = 2,
     GrowEvery = 6,
     ShopEvery = 40,
+    NeedHumanoid = true,
 }
 
 local running   = true
-local conns     = {}
 local toggles   = {}
 local cd        = {}
 local held      = 0
@@ -50,10 +52,6 @@ end
 
 local function stop()
     running = false
-    for i = 1, #conns do
-        pcall(function() conns[i]:Disconnect() end)
-    end
-    conns = {}
     _G[NAME] = nil
     print('[Restaurant Tycoon 3] stopped')
 end
@@ -84,18 +82,6 @@ local function findTycoon()
     return nil
 end
 
-local function rootPos()
-    local c
-    pcall(function() c = lp.Character end)
-    if not c then return nil end
-    local r = c:FindFirstChild('HumanoidRootPart')
-    if not r then return nil end
-    local p
-    pcall(function() p = r.Position end)
-    if typeof(p) == 'Vector3' then return p end
-    return nil
-end
-
 local function foodList(ty)
     local out = {}
     if not ty then return out end
@@ -122,6 +108,19 @@ end
 local function tryCancel()
     local c = ev('Restaurant', 'CancelGrabRequested')
     if c then pcall(function() c:FireServer() end) end
+end
+
+-- walk up from a prompt to the character model it hangs off, if there is one
+local function onCharacter(p)
+    local node = p
+    for i = 1, 4 do
+        local ok, par = pcall(function() return node.Parent end)
+        if not ok or not par then return false end
+        node = par
+        local ok2, hum = pcall(function() return node:FindFirstChildOfClass('Humanoid') end)
+        if ok2 and hum then return true end
+    end
+    return false
 end
 
 local function promptReady(p, gap)
@@ -202,6 +201,8 @@ if UI then
             reg('rt3_shop', 'Auto Ingredient Shop', 'Shop')
 
             local tune = tab:Section('Tuning', 'Right')
+            safeToggle(tune, 'rt3_hum', 'Customers Only (Humanoid)', CONFIG.NeedHumanoid, function(v) CONFIG.NeedHumanoid = v end)
+            reg('rt3_hum', 'Customers Only (Humanoid)', 'NeedHumanoid')
             safeSlider(tune, 'rt3_held', 'Max Held', 1, 4, CONFIG.MaxHeld, function(v) CONFIG.MaxHeld = v end)
             safeSlider(tune, 'rt3_serve_each', 'Serve Prompts / Cycle', 1, 6, CONFIG.ServeEach, function(v) CONFIG.ServeEach = v end)
             safeSlider(tune, 'rt3_grow_every', 'Grow Every (cycles)', 2, 40, CONFIG.GrowEvery, function(v) CONFIG.GrowEvery = v end)
@@ -246,9 +247,6 @@ task.spawn(function()
         end
 
         if CONFIG.Serve then
-            if #growList == 0 and (cycles % 10) == 0 then
-                growList = promptsNamed('GrowAllPrompt')
-            end
             local served = 0
             local ok, desc = pcall(function() return workspace:GetDescendants() end)
             if ok and desc then
@@ -256,7 +254,9 @@ task.spawn(function()
                     if served >= CONFIG.ServeEach then break end
                     local d = desc[i]
                     if d.ClassName == 'ProximityPrompt' and d.Name == 'Dialog' then
-                        if promptReady(d, 2.0) then
+                        local usable = true
+                        if CONFIG.NeedHumanoid then usable = onCharacter(d) end
+                        if usable and promptReady(d, 2.0) then
                             if firePrompt(d) then
                                 served = served + 1
                                 if held > 0 then held = held - 1 end
