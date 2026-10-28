@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v2.9: Restaurant Tycoon 3 added to SCRIPTS (name match; place id not known yet).
 -- v2.8: Merge Block Arena Weapons added to SCRIPTS (manual load only).
 -- v2.7: Merge Block Arena pinned by place id.
 -- v2.6: CQB Hell note - weapon mods only (ESP removed).
@@ -26,7 +27,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v2.8'
+local VERSION = 'v2.9'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -72,6 +73,7 @@ local SCRIPTS = {
     { file = 'PRISON LIFE TRIGGERBOT',       keys = { 'prisonlifetriggerbot', 'triggerbot' } },
     { file = 'Prison Life HvH',              keys = { 'prisonlifehvh', 'hvh' } },
     { file = 'Realistic Home Defense',       keys = { 'realistichomedefense', 'homedefense' } },
+    { file = 'Restaurant Tycoon 3',          keys = { 'restauranttycoon3', 'restauranttycoon' } },
     { file = 'Tower Incremental',            keys = { 'towerincremental' } },
     { file = 'What If Disasters',            keys = { 'whatifdisasters', 'disasters' } },
 }
