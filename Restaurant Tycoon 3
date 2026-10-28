@@ -1,30 +1,29 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 5.0.0 -- AUTO SERVE ONLY (user request 2026-10-27)
+-- Version: 5.1.0 -- AUTO SERVE ONLY
 --
--- User report driving this build:
---   "i am picking the food up into my hand but not giving it to them also it bugs me so i
---    cant give it to them myself, also i only want auto serve toggle for now"
+-- Why v5.0.0 picked up nothing (from the user's log, 2026-10-27):
+--   guests=0 on every Report, grabs=0, passes climbing.
+--   servePass() checked guests FIRST and returned before ever calling GrabFood, so the
+--   grab was never attempted. "Nothing picked up" was that ordering, not a broken grab.
 --
--- So this build does exactly one thing, and does it in one motion:
---   1. cancel any stuck grab on load (CancelGrabRequested) so your hands are clean
---   2. find a dish on the counter, GrabFood:InvokeServer(dish)
---   3. immediately TaskCompleted{Name='Serve', FoodModel=dish, CustomerId, GroupId}
---      for each guest currently in ClientCustomers - the game only accepts the dish that
---      guest ordered, so trying each guest is the matching step, not a guess at the ids.
+-- v5.1.0 fixes the order and keeps hands clean:
+--   1. grab one dish (GrabFood:InvokeServer)
+--   2. try Serve on every guest found by any known source
+--   3. if no serve was accepted, CancelGrabRequested so the dish does NOT stay stuck in hand
+--      (the user's complaint: "it bugs me so i cant give it to them myself")
 --
--- Customer ids come from Tycoon.ClientCustomers: group FOLDER NAME = GroupId,
--- child MODEL NAME = CustomerId. Names are opaque strings - never validated with tonumber().
---
--- Known limit, observed in a live dump: dishes on the counter carry NO CustomerId/GroupId
--- (only EatMethod, Taken, Part:Head, UnionOperation:TestNewPlate, Model:Contents). So the
--- target can only come from the live guest list, never from the dish.
+-- Guest sources tried, in order, and logged with counts so the log names the live one:
+--   a) Tycoon.ClientCustomers   -> folder name = GroupId, child model name = CustomerId
+--   b) Tycoon descendants       -> any Model with a Humanoid that is not the local character
+--   c) workspace.EatingFoods    -> children models
+-- Names are opaque strings - never validated with tonumber().
 --
 -- Upgrades excluded. No Instance.new. ClassName tests only (IsA always true in Matcha).
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '5.0.0'
+local VERSION = '5.1.0'
 print('[Restaurant Tycoon 3] v' .. VERSION .. ' (auto serve only)')
 
 if _G[NAME] and _G[NAME].stop then
@@ -38,15 +37,15 @@ local unpackFn = table.unpack or unpack
 
 local CONFIG = {
     Serve = true,
-    Gap   = 0.15,     -- loop tick
-    ServeGap = 0.20,  -- min time between two serve attempts
-    MaxGuests = 6,    -- try at most this many guests per dish
-    MaxDishes = 2,    -- try at most this many dishes per pass
+    Gap   = 0.18,
+    ServeGap = 0.25,
+    MaxGuests = 8,
 }
 
 local running = true
-local stat = { grabs = 0, served = 0, passes = 0 }
+local stat = { grabs = 0, serves = 0, passes = 0, cancels = 0 }
 local lastServe = 0
+local lastSrc = ''
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -64,7 +63,6 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
--- varargs must be packed: `...` inside the pcall closure is a parse error
 local function packArgs(...)
     return { n = select('#', ...), ... }
 end
@@ -115,20 +113,6 @@ local function findTycoon()
     return nil
 end
 
--- guests currently inside: group folder name = GroupId, model name = CustomerId
-local function guestList(ty)
-    local out = {}
-    if not ty then return out end
-    local cc = ty:FindFirstChild('ClientCustomers')
-    if not cc then return out end
-    for _, g in ipairs(cc:GetChildren()) do
-        for _, c in ipairs(g:GetChildren()) do
-            out[#out + 1] = { groupId = g.Name, customerId = c.Name }
-        end
-    end
-    return out
-end
-
 local function dishList(ty)
     local out = {}
     if not ty then return out end
@@ -144,14 +128,77 @@ end
 
 local function cancelGrab()
     local c = remote('Restaurant', 'CancelGrabRequested')
-    if c then pcall(function() c:FireServer() end) end
+    if c then
+        local ok = fire(c)
+        if ok then stat.cancels = stat.cancels + 1 end
+    end
 end
 
--- grab one dish then offer it to each guest; the game accepts only the matching order
-local function servePass(ty)
-    local guests = guestList(ty)
-    if #guests == 0 then return false, 'no guests present' end
+-- all guest sources, each returning { groupId, customerId }
+local function guestSources(ty)
+    local sources = {}
 
+    -- a) ClientCustomers
+    local a = {}
+    local cc = ty and ty:FindFirstChild('ClientCustomers')
+    if cc then
+        for _, g in ipairs(cc:GetChildren()) do
+            for _, c in ipairs(g:GetChildren()) do
+                a[#a + 1] = { groupId = g.Name, customerId = c.Name }
+            end
+        end
+    end
+    sources[#sources + 1] = { tag = 'ClientCustomers', list = a }
+
+    -- b) tycoon descendants with a Humanoid (skip our own character)
+    local b = {}
+    local myChar
+    pcall(function() myChar = lp.Character end)
+    if ty then
+        local ok, desc = pcall(function() return ty:GetDescendants() end)
+        if ok and desc then
+            for _, d in ipairs(desc) do
+                if d.ClassName == 'Model' and d ~= myChar and not (myChar and d:IsDescendantOf(myChar)) then
+                    local h
+                    pcall(function() h = d:FindFirstChildOfClass('Humanoid') end)
+                    if h then
+                        local grp = d.Parent
+                        b[#b + 1] = { groupId = grp and grp.Name or '', customerId = d.Name }
+                    end
+                end
+            end
+        end
+    end
+    sources[#sources + 1] = { tag = 'tycoonHumanoids', list = b }
+
+    -- c) workspace.EatingFoods children
+    local c = {}
+    local ef = workspace:FindFirstChild('EatingFoods')
+    if ef then
+        for _, m in ipairs(ef:GetChildren()) do
+            c[#c + 1] = { groupId = '', customerId = m.Name }
+        end
+    end
+    sources[#sources + 1] = { tag = 'EatingFoods', list = c }
+
+    return sources
+end
+
+local function bestGuestList(ty)
+    local sources = guestSources(ty)
+    local best, bestTag = {}, 'none'
+    local parts = {}
+    for _, s in ipairs(sources) do
+        parts[#parts + 1] = s.tag .. '=' .. #s.list
+        if #s.list > #best then
+            best, bestTag = s.list, s.tag
+        end
+    end
+    return best, bestTag, table.concat(parts, ' ')
+end
+
+-- grab one dish, offer it to each guest, clean hands if nothing accepted
+local function servePass(ty)
     local dishes = dishList(ty)
     if #dishes == 0 then return false, 'no dishes on counter' end
 
@@ -159,64 +206,67 @@ local function servePass(ty)
     local tc = remote('Restaurant', 'TaskCompleted')
     if not gf or not tc then return false, 'remote missing' end
 
-    local servedAny = false
-    local tried = 0
+    local guests, srcTag, srcCounts = bestGuestList(ty)
+    lastSrc = srcCounts
 
-    for d = 1, math.min(#dishes, CONFIG.MaxDishes) do
-        local dish = dishes[d]
-        if dish and dish.Parent then
-            local gok = invoke(gf, dish)
-            if gok then
-                stat.grabs = stat.grabs + 1
-                for k = 1, math.min(#guests, CONFIG.MaxGuests) do
-                    local t = nowT()
-                    if (t - lastServe) >= CONFIG.ServeGap then
-                        lastServe = t
-                        local g = guests[k]
-                        local ok = fire(tc, {
-                            Name = 'Serve',
-                            Tycoon = ty,
-                            FoodModel = dish,
-                            CustomerId = g.customerId,
-                            GroupId = g.groupId,
-                        })
-                        tried = tried + 1
-                        if ok then
-                            servedAny = true
-                            stat.served = stat.served + 1
-                            note('serve attempt dish=' .. dish.Name .. ' guest=' .. g.groupId .. ':' .. g.customerId)
-                        end
-                    end
-                end
-                if servedAny then break end
-            end
+    local dish = dishes[1]
+    if not dish or not dish.Parent then return false, 'dish vanished' end
+
+    local gok, gres = invoke(gf, dish)
+    if not gok then return false, 'grab call errored' end
+    if gres == false then return false, 'grab refused by server (dish not grabbable now)' end
+    stat.grabs = stat.grabs + 1
+
+    if #guests == 0 then
+        cancelGrab()
+        return false, 'grabbed ' .. dish.Name .. ' then released: no guests (' .. srcCounts .. ')'
+    end
+
+    local tried, accepted = 0, 0
+    for k = 1, math.min(#guests, CONFIG.MaxGuests) do
+        local t = nowT()
+        if (t - lastServe) >= CONFIG.ServeGap then
+            lastServe = t
+            local g = guests[k]
+            local ok = fire(tc, {
+                Name = 'Serve',
+                Tycoon = ty,
+                FoodModel = dish,
+                CustomerId = g.customerId,
+                GroupId = g.groupId,
+            })
+            tried = tried + 1
+            if ok then accepted = accepted + 1 end
         end
     end
 
-    if not servedAny then
-        return false, 'grabbed but no serve fired (tried ' .. tried .. ', guests=' .. #guests .. ', dishes=' .. #dishes .. ')'
+    stat.serves = stat.serves + accepted
+
+    if accepted == 0 then
+        cancelGrab()
+        return false, 'served 0/' .. tried .. ' via ' .. srcTag .. ' (' .. srcCounts .. ')'
     end
-    return true, 'served (tried ' .. tried .. ' guests)'
+    return true, 'fired ' .. accepted .. '/' .. tried .. ' via ' .. srcTag
 end
 
 local function report()
     local ty = findTycoon()
-    local guests = guestList(ty)
     local dishes = dishList(ty)
+    local guests, srcTag, srcCounts = bestGuestList(ty)
     note('--- REPORT v' .. VERSION .. ' ---')
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
-    note('guests=' .. #guests .. ' dishes=' .. #dishes)
+    note('dishes=' .. #dishes .. '  guests=' .. #guests .. ' via ' .. srcTag)
+    note('sources ' .. srcCounts)
     for i, g in ipairs(guests) do
-        if i <= 6 then note('  guest ' .. g.groupId .. ':' .. g.customerId) end
+        if i <= 6 then note('  guest group=' .. tostring(g.groupId) .. ' id=' .. tostring(g.customerId)) end
     end
     for i, d in ipairs(dishes) do
         if i <= 4 then note('  dish ' .. d.Name) end
     end
-    note('grabs=' .. stat.grabs .. ' serves=' .. stat.served .. ' passes=' .. stat.passes)
+    note('grabs=' .. stat.grabs .. ' serves=' .. stat.serves .. ' passes=' .. stat.passes .. ' cancels=' .. stat.cancels)
     note('--- end ---')
 end
 
--- menu: one toggle, as asked
 local function safeToggle(sec, id, label, default, cb)
     for _, v in ipairs({
         function() sec:Toggle(id, label, default, cb) end,
@@ -253,7 +303,6 @@ if UI then
     end)
 end
 
--- clear any stuck grab left by an earlier version before the loop starts
 cancelGrab()
 note('cleared grab state')
 
@@ -282,14 +331,14 @@ task.spawn(function()
                 local ok, why = servePass(ty)
                 if not ok then
                     local t = nowT()
-                    if why ~= lastMsg or (t - lastMsgT) > 8 then
+                    if why ~= lastMsg or (t - lastMsgT) > 10 then
                         note('idle: ' .. tostring(why))
                         lastMsg, lastMsgT = why, t
                     end
                 end
             else
                 local t = nowT()
-                if (t - lastMsgT) > 8 then
+                if (t - lastMsgT) > 10 then
                     note('idle: tycoon not found')
                     lastMsgT = t
                 end
@@ -299,5 +348,5 @@ task.spawn(function()
     end
 end)
 
-note('loaded. Auto Serve is ON. Your hands are clean - it grabs and serves in one motion.')
+note('loaded. Grabs first, serves to any guest found, releases the dish if none accepts.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
