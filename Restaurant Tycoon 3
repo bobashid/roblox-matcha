@@ -1,0 +1,264 @@
+-- Restaurant Tycoon 3 - Matcha LuauVM
+-- Version: 1.0.0
+-- Auto collect dishes + auto collect money.
+-- "Silent" = fires the game's own ProximityPrompt / ClickDetector instead of
+-- clicking, so nothing flashes on screen and no prompt UI opens.
+-- No teleports, no notifications, no property writes.
+-- Loader:
+-- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
+
+local NAME    = 'RestaurantTycoon3'
+local VERSION = '1.0.0'
+print('[Restaurant Tycoon 3] v' .. VERSION)
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+
+local Players = game:GetService('Players')
+local lp = Players.LocalPlayer
+
+local CONFIG = {
+    Dishes   = true,
+    Money    = true,
+    OnlyMine = false,
+    Range    = 0,
+    Delay    = 25,
+}
+
+local running = true
+local conns = {}
+local lastFired = {}
+local toggles = {}
+
+local DISH_KEYS  = { 'dish', 'dirty', 'plate', 'tray', 'wash', 'trash', 'clean', 'food' }
+local MONEY_KEYS = { 'money', 'cash', 'tip', 'register', 'collect', 'profit', 'coin', 'dollar', 'earn' }
+
+local function nowT()
+    if type(tick) == 'function' then return tick() end
+    return os.clock()
+end
+
+local function stop()
+    running = false
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    conns = {}
+    _G[NAME] = nil
+    print('[Restaurant Tycoon 3] stopped')
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+
+local function matches(name, keys)
+    local n = string.lower(tostring(name or ''))
+    if n == '' then return false end
+    for i = 1, #keys do
+        if string.find(n, keys[i], 1, true) then return true end
+    end
+    return false
+end
+
+local function parentName(inst)
+    local ok, n = pcall(function()
+        local p = inst.Parent
+        return p and p.Name or ''
+    end)
+    if ok and n then return n end
+    return ''
+end
+
+local function isDish(inst)
+    return matches(inst.Name, DISH_KEYS) or matches(parentName(inst), DISH_KEYS)
+end
+
+local function isMoney(inst)
+    return matches(inst.Name, MONEY_KEYS) or matches(parentName(inst), MONEY_KEYS)
+end
+
+local function mine(inst)
+    if not CONFIG.OnlyMine then return true end
+    local p = inst
+    for i = 1, 8 do
+        local ok, nxt = pcall(function() return p.Parent end)
+        if not ok or not nxt then return false end
+        p = nxt
+        local ok2, owner = pcall(function() return p:GetAttribute('Owner') end)
+        if ok2 and owner ~= nil then
+            return tostring(owner) == tostring(lp.UserId) or tostring(owner) == tostring(lp.Name)
+        end
+    end
+    return true
+end
+
+local function charPos()
+    local ok, c = pcall(function() return lp.Character end)
+    if not ok or not c then return nil end
+    local r = c:FindFirstChild('HumanoidRootPart')
+    if not r then return nil end
+    local ok2, p = pcall(function() return r.Position end)
+    if ok2 and typeof(p) == 'Vector3' then return p end
+    return nil
+end
+
+local function posOf(inst)
+    local ok, p = pcall(function() return inst.Parent end)
+    if not ok or not p then return nil end
+    local ok2, v = pcall(function() return p.Position end)
+    if ok2 and typeof(v) == 'Vector3' then return v end
+    local ok3, pp = pcall(function() return p.PrimaryPart end)
+    if ok3 and pp then
+        local ok4, v2 = pcall(function() return pp.Position end)
+        if ok4 and typeof(v2) == 'Vector3' then return v2 end
+    end
+    local hrp = p:FindFirstChild('HumanoidRootPart')
+    if hrp then
+        local ok5, v3 = pcall(function() return hrp.Position end)
+        if ok5 and typeof(v3) == 'Vector3' then return v3 end
+    end
+    return nil
+end
+
+local function scan()
+    local out = {}
+    local ok, desc = pcall(function() return workspace:GetDescendants() end)
+    if not ok or not desc then return out end
+    for i = 1, #desc do
+        local d = desc[i]
+        local cn = d.ClassName
+        if cn == 'ProximityPrompt' or cn == 'ClickDetector' then
+            local dish  = isDish(d)
+            local money = isMoney(d)
+            if (dish and CONFIG.Dishes) or (money and CONFIG.Money) then
+                out[#out + 1] = d
+            end
+        end
+    end
+    return out
+end
+
+local function fire(inst)
+    local cn = inst.ClassName
+    if cn == 'ProximityPrompt' then
+        return pcall(fireproximityprompt, inst)
+    end
+    if cn == 'ClickDetector' then
+        return pcall(fireclickdetector, inst)
+    end
+    return false
+end
+
+local function safeToggle(sec, id, label, default, cb)
+    local variants = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #variants do
+        if pcall(variants[i]) then return true end
+    end
+    return false
+end
+
+local function safeSlider(sec, id, label, min, max, default, cb)
+    local variants = {
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
+    }
+    for i = 1, #variants do
+        if pcall(variants[i]) then return true end
+    end
+    return false
+end
+
+local function safeButton(sec, label, cb)
+    local variants = {
+        function() sec:Button(label, cb) end,
+        function() sec:Button(label, label, cb) end,
+    }
+    for i = 1, #variants do
+        if pcall(variants[i]) then return true end
+    end
+    return false
+end
+
+local function reg(id, label, key)
+    toggles[#toggles + 1] = { id = id, name = label, key = key }
+end
+
+if UI then
+    pcall(function()
+        UI.AddTab('Restaurant Tycoon 3', function(tab)
+            local main = tab:Section('Collect', 'Left')
+            safeToggle(main, 'rt3_dishes', 'Auto Collect Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
+            reg('rt3_dishes', 'Auto Collect Dishes', 'Dishes')
+            safeToggle(main, 'rt3_money', 'Auto Collect Money', CONFIG.Money, function(v) CONFIG.Money = v end)
+            reg('rt3_money', 'Auto Collect Money', 'Money')
+            safeToggle(main, 'rt3_mine', 'Only My Plot', CONFIG.OnlyMine, function(v) CONFIG.OnlyMine = v end)
+            reg('rt3_mine', 'Only My Plot', 'OnlyMine')
+            safeSlider(main, 'rt3_delay', 'Scan Delay x100', 5, 100, CONFIG.Delay, function(v) CONFIG.Delay = v end)
+            safeSlider(main, 'rt3_range', 'Max Range (0 = any)', 0, 200, CONFIG.Range, function(v) CONFIG.Range = v end)
+            safeButton(main, 'Rescan Now', function()
+                lastFired = {}
+                pcall(function() notify('Restaurant Tycoon 3', 'rescanning', 2) end)
+            end)
+            safeButton(main, 'Stop', function() stop() end)
+        end)
+    end)
+end
+
+task.spawn(function()
+    while running do
+        for i = 1, #toggles do
+            local t = toggles[i]
+            local ok, v = pcall(function() return UI.GetValue(t.id) end)
+            if not ok or type(v) ~= 'boolean' then
+                ok, v = pcall(function() return UI.GetValue(t.name) end)
+            end
+            if ok and type(v) == 'boolean' then
+                CONFIG[t.key] = v
+            end
+        end
+        task.wait(0.15)
+    end
+end)
+
+task.spawn(function()
+    local list = {}
+    local lastScan = 0
+    while running do
+        local t = nowT()
+        if #list == 0 or (t - lastScan) > 2 then
+            lastScan = t
+            list = scan()
+        end
+        local origin = charPos()
+        for i = 1, #list do
+            local inst = list[i]
+            if inst and inst.Parent then
+                local dish  = isDish(inst)
+                local money = isMoney(inst)
+                local wanted = (dish and CONFIG.Dishes) or (money and CONFIG.Money)
+                if wanted and mine(inst) then
+                    local last = lastFired[inst] or 0
+                    if (t - last) >= 1.0 then
+                        local inRange = true
+                        if CONFIG.Range > 0 and origin then
+                            local p = posOf(inst)
+                            if p then inRange = (origin - p).Magnitude <= CONFIG.Range end
+                        end
+                        if inRange then
+                            lastFired[inst] = t
+                            fire(inst)
+                        end
+                    end
+                end
+            end
+        end
+        task.wait(CONFIG.Delay / 100)
+    end
+end)
+
+pcall(function() notify('Restaurant Tycoon 3', 'v' .. VERSION .. ' loaded', 3) end)
+print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
