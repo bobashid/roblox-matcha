@@ -1,18 +1,19 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 3.6.0
--- Scope: pickup dishes, serve the held dish, SEAT guests, tips, bills.
+-- Version: 3.6.1
+-- Scope: SEAT guests, pickup dishes, serve the held dish, tips, bills.
 -- SEAT payload is USER-CAPTURED (2026-10-27):
 --   TaskCompleted:FireServer({FurnitureModel = Items.Surface.T1, GroupId = "19",
 --                             Tycoon = tycoon, Name = "SendToTable"})
 --   GroupId is a STRING there, so this build sends the raw folder name, not a number.
--- The same payload does the bill with Name = "CollectBill" and no GroupId.
--- Tips and bill payloads are USER-CAPTURED. 'Serve' as a Name is memory-confirmed via getgc.
+--   In game the flow is: click the guest's prompt, then click an empty table.
+-- Tips / bill / seat payloads are USER-CAPTURED. 'Serve' as a Name is getgc-confirmed.
 -- Upgrades untouched. No teleports, no Drawing, no Dialog firing.
+-- v3.6.1: fixed a malformed local in the Seat Once Now button (was findTycon and nil or ...).
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '3.6.0'
+local VERSION = '3.6.1'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -109,8 +110,8 @@ local function guestList(ty)
     local cc = ty:FindFirstChild('ClientCustomers')
     if not cc then return out end
     for _, g in ipairs(cc:GetChildren()) do
-        local kids = g:GetChildren()
-        if #kids > 0 then
+        local ok, kids = pcall(function() return g:GetChildren() end)
+        if ok and kids and #kids > 0 then
             local any = false
             for _, c in ipairs(kids) do
                 if tonumber(c.Name) then any = true end
@@ -132,7 +133,7 @@ local function customersOf(guest)
     return out
 end
 
--- a Surface model counts as a free table when it has no Bill child and no plate/food child
+-- a Surface model is a free table when it holds no Bill and no plate
 local function tableList(ty)
     local out = {}
     if not ty then return out end
@@ -157,9 +158,9 @@ end
 
 local function seatsBusy(ty)
     local n = 0
-    if not ty then return 0 end
+    if not ty then return n end
     local ok, desc = pcall(function() return ty:GetDescendants() end)
-    if not ok or not desc then return 0 end
+    if not ok or not desc then return n end
     for i = 1, #desc do
         if desc[i].ClassName == 'Seat' then
             local occ
@@ -185,7 +186,7 @@ local function seat(ty, guest, table)
     return ok
 end
 
--- Name='Serve' is memory-confirmed; GroupId/CustomerId sent as strings like the seat capture
+-- Name='Serve' is getgc-confirmed; ids sent as strings like the seat capture
 local function serve(ty, guest, customerId, foodModel)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not guest or not foodModel then return false end
@@ -274,12 +275,12 @@ local function report()
     local ty = findTycoon()
     local f = ty and foodList(ty)
     local g = ty and guestList(ty)
-    local t = ty and tableList(ty)
+    local tl = ty and tableList(ty)
     local b = ty and billTargets(ty)
     local line = 'counter=' .. tostring(f and #f or -1) ..
                  ' held=' .. tostring(held and held.Name or 'nil') ..
                  ' guests=' .. tostring(g and #g or -1) ..
-                 ' freeTables=' .. tostring(t and #t or -1) ..
+                 ' freeTables=' .. tostring(tl and #tl or -1) ..
                  ' seatsTaken=' .. tostring(seatsBusy(ty)) ..
                  ' grabs=' .. tostring(stat.grabs) ..
                  ' serves=' .. tostring(stat.serves) ..
@@ -310,10 +311,10 @@ if UI then
             safeSlider(tune, 'rt3_seatgap', 'Seat Gap x10', 5, 120, 20, function(v) CONFIG.SeatGap = v / 10 end)
             safeSlider(tune, 'rt3_servegap', 'Serve Gap x10', 5, 60, 8, function(v) CONFIG.ServeGap = v / 10 end)
             safeButton(tune, 'Seat Once Now', function()
-                local ty = findTycon and nil or findTycoon()
+                local ty = findTycoon()
                 local g = ty and guestList(ty)
-                local t = ty and tableList(ty)
-                if ty and g and g[1] and t and t[1] then seat(ty, g[1], t[1]) end
+                local tl = ty and tableList(ty)
+                if ty and g and g[1] and tl and tl[1] then seat(ty, g[1], tl[1]) end
             end)
             safeButton(tune, 'Serve Held Now', function()
                 local ty = findTycoon()
