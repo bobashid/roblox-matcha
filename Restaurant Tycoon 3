@@ -1,20 +1,19 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 3.0.0
--- Scope: auto seat, auto take order, auto pickup dishes.
--- Dialog firing is GONE - it was poking WaveyDavey and other non-customer NPCs.
--- Upgrades are deliberately NOT touched.
--- No teleports, no Drawing.
+-- Version: 3.1.0
+-- Scope: auto pickup dishes (proven) + auto seat (best effort).
+-- No Dialog firing anywhere - that was opening WaveyDavey's dialogue.
+-- Upgrades untouched. No teleports, no Drawing.
 --
--- Honest limits (probed, see brain note):
---   * the tip jar  Items.Furniture.K32.Jar  and the table bill  Items.Surface.T19.Bill
---     have NO ProximityPrompt, NO ClickDetector and NO TouchTransmitter. They cannot be
---     picked up by fire* and their remote is not yet identified, so this build does not
---     attempt them. Shipping a guess there is what broke v1 and v2.
+-- Not attempted, because the game gives nothing to fire at (probed 2026-10-27):
+--   * tip jar   Items.Furniture.K32.Jar  -> MeshPart + BillboardGui only
+--   * table bill Items.Surface.T19.Bill  -> Model + 4 Parts only
+--   * taking orders -> 0 Dialog prompts inside the plot
+-- Those are UI/remote driven and their entry points are not identified yet.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '3.0.0'
+local VERSION = '3.1.0'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -26,17 +25,16 @@ local RS      = game:GetService('ReplicatedStorage')
 local lp      = Players.LocalPlayer
 
 local CONFIG = {
-    Seat  = true,
-    Order = true,
     Dish  = true,
+    Seat  = true,
     Cycle = 0.4,
-    SeatGap  = 1.5,
-    OrderGap = 1.0,
+    SeatEvery = 2.0,
 }
 
 local running = true
 local toggles = {}
-local cd      = {}
+local lastSeat = 0
+local grabs = 0
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -75,20 +73,6 @@ local function findTycoon()
     return nil
 end
 
-local function promptReady(p, gap)
-    local t = nowT()
-    local last = cd[p]
-    if last and (t - last) < gap then return false end
-    cd[p] = t
-    return true
-end
-
-local function firePrompt(p)
-    if not p then return false end
-    return (pcall(fireproximityprompt, p))
-end
-
--- prompts inside my own plot only, so other players' restaurants are never touched
 local function myPrompts(ty, want)
     local out = {}
     if not ty then return out end
@@ -103,7 +87,6 @@ local function myPrompts(ty, want)
     return out
 end
 
--- a seat is free when nothing is welded/sat on its Base
 local function seatFree(prompt)
     local att = prompt.Parent
     local base = att and att.Parent
@@ -136,8 +119,7 @@ local function tryGrab(model)
     if not gf or not model then return false end
     local ok, res = pcall(function() return gf:InvokeServer(model) end)
     if not ok then return false end
-    if res == true or type(res) == 'table' then return true end
-    return false
+    return (res == true or type(res) == 'table')
 end
 
 local function safeToggle(sec, id, label, default, cb)
@@ -145,6 +127,17 @@ local function safeToggle(sec, id, label, default, cb)
         function() sec:Toggle(id, label, default, cb) end,
         function() sec:Toggle(label, id, default, cb) end,
         function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #variants do
+        if pcall(variants[i]) then return true end
+    end
+    return false
+end
+
+local function safeSlider(sec, id, label, min, max, default, cb)
+    local variants = {
+        function() sec:SliderInt(id, label, min, max, default, cb) end,
+        function() sec:SliderInt(label, id, min, max, default, cb) end,
     }
     for i = 1, #variants do
         if pcall(variants[i]) then return true end
@@ -171,12 +164,19 @@ if UI then
     pcall(function()
         UI.AddTab('Restaurant Tycoon 3', function(tab)
             local main = tab:Section('Restaurant', 'Left')
-            safeToggle(main, 'rt3_seat', 'Auto Seat', CONFIG.Seat, function(v) CONFIG.Seat = v end)
-            reg('rt3_seat', 'Auto Seat', 'Seat')
-            safeToggle(main, 'rt3_order', 'Auto Take Order', CONFIG.Order, function(v) CONFIG.Order = v end)
-            reg('rt3_order', 'Auto Take Order', 'Order')
             safeToggle(main, 'rt3_dish', 'Auto Pickup Dishes', CONFIG.Dish, function(v) CONFIG.Dish = v end)
             reg('rt3_dish', 'Auto Pickup Dishes', 'Dish')
+            safeToggle(main, 'rt3_seat', 'Auto Seat', CONFIG.Seat, function(v) CONFIG.Seat = v end)
+            reg('rt3_seat', 'Auto Seat', 'Seat')
+            safeSlider(main, 'rt3_seatevery', 'Seat Every x10', 5, 60, 20, function(v) CONFIG.SeatEvery = v / 10 end)
+            safeButton(main, 'Report', function()
+                local ty = findTycoon()
+                local f = ty and foodList(ty)
+                pcall(function()
+                    notify('RT3', 'food=' .. tostring(f and #f or -1) .. ' grabs=' .. tostring(grabs), 4)
+                end)
+                print('[RT3] food=' .. tostring(f and #f or -1) .. ' grabs=' .. tostring(grabs))
+            end)
             safeButton(main, 'Stop', function() stop() end)
         end)
     end)
@@ -202,28 +202,26 @@ task.spawn(function()
     while running do
         local ty = findTycoon()
 
-        if CONFIG.Seat and ty then
-            local seats = myPrompts(ty, 'SeatPrompt')
-            for i = 1, #seats do
-                local p = seats[i]
-                if seatFree(p) and promptReady(p, CONFIG.SeatGap) then
-                    firePrompt(p)
-                end
+        if CONFIG.Dish and ty then
+            local list = foodList(ty)
+            if #list > 0 then
+                if tryGrab(list[1]) then grabs = grabs + 1 end
             end
         end
 
-        if CONFIG.Dish and ty then
-            local list = foodList(ty)
-            if #list > 0 then tryGrab(list[1]) end
-        end
-
-        -- order: the game's own prompt that appears on a seated customer.
-        -- Only prompts inside my plot, never a world NPC like WaveyDavey.
-        if CONFIG.Order and ty then
-            local dialogs = myPrompts(ty, 'Dialog')
-            for i = 1, #dialogs do
-                local p = dialogs[i]
-                if promptReady(p, CONFIG.OrderGap) then firePrompt(p) end
+        -- one seat per interval at most, so 8 free seats cannot be spammed
+        if CONFIG.Seat and ty then
+            local t = nowT()
+            if (t - lastSeat) >= CONFIG.SeatEvery then
+                local seats = myPrompts(ty, 'SeatPrompt')
+                for i = 1, #seats do
+                    local p = seats[i]
+                    if seatFree(p) then
+                        pcall(fireproximityprompt, p)
+                        lastSeat = t
+                        break
+                    end
+                end
             end
         end
 
