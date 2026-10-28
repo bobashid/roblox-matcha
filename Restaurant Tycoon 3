@@ -1,24 +1,22 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 4.0.1
--- v4.0.1 FIX: `Matcha:81: Cannot use '...' outside of a vararg function`. The fire() and
--- invoke() wrappers used `...` inside a nested closure, which is a parse error in Lua and
--- aborted the whole chunk at load. Args are now packed into a table and unpacked inside.
---
--- Ported from the working reference script the user supplied (2026-10-27).
--- Three earlier assumptions were wrong, corrected here:
---   1. NO Interactions.Interacted call is needed - TaskCompleted alone drives every task.
---   2. Dirty dishes are TaskCompleted Name='CollectDishes' on an Items.Surface child holding
---      a `Trash` child. NOT GrabFood on Objects.Food.
---   3. Serve reads CustomerId + GroupId from the FOOD MODEL itself, falling back to the
---      CustomerSpeechUI list. The food model carries its target.
--- Upgrades deliberately EXCLUDED (user instruction).
--- Matcha notes: no Instance.new; IsA() always true so class tests use ClassName.
+-- Version: 4.1.0 (DIAGNOSTIC)
+-- User: "this might just be all looks nothing seems to work".
+-- v4.1.0 stops pretending. Every action now:
+--   * records fire OK / fire FAILED separately from "remote missing"
+--   * records whether the object it acted on still existed next tick
+--   * Report prints a full state dump, including which class each remote resolved to
+-- The auto-fire loop is DISABLED BY DEFAULT (AutoRun = false) so nothing spams while
+-- you read the Report. Use the *Once buttons - each prints what it did.
+-- Confirmed by probe this turn: TaskCompleted resolves to UnreliableRemoteEvent (index 8),
+-- the tycoon IS found, Events.Restaurant exists. So the wiring is right and the silence is
+-- elsewhere - this build finds out where.
+-- Upgrades excluded. No Instance.new. ClassName tests only (IsA is always true in Matcha).
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '4.0.1'
-print('[Restaurant Tycoon 3] v' .. VERSION)
+local VERSION = '4.1.0'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (diagnostic)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -27,33 +25,32 @@ end
 local Players = game:GetService('Players')
 local RS      = game:GetService('ReplicatedStorage')
 local lp      = Players.LocalPlayer
-
 local unpackFn = table.unpack or unpack
 
-local EV = RS:FindFirstChild('Events')
-local function ev(folder, name)
-    if not EV then return nil end
-    local f = folder and EV:FindFirstChild(folder) or EV
-    if not f then return nil end
-    return f:FindFirstChild(name)
-end
-
 local CONFIG = {
+    AutoRun = false,          -- master: off until you have read Report once
     Cook = true, InstantCook = false, Seat = true, TakeOrder = true,
     GiveFood = true, Dishes = true, Bills = true, Tips = true,
     DriveThru = false, CalmRude = false, DropMoney = false,
-    Cycle = 0.25, DropReturn = true,
+    Cycle = 0.35,
 }
 
 local running = true
 local toggles = {}
-local stat = { cook = 0, seat = 0, order = 0, serve = 0, dishes = 0, bills = 0, tips = 0, rude = 0 }
-local idxOrder, idxSeat, idxTable = 1, 1, 1
 local last = {}
+local log = {}      -- rolling action log, newest last
+local stat = {}
+local idxOrder, idxSeat, idxTable = 1, 1, 1
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
     return os.clock()
+end
+
+local function note(s)
+    log[#log + 1] = s
+    if #log > 40 then table.remove(log, 1) end
+    print('[RT3] ' .. s)
 end
 
 local function stop()
@@ -63,6 +60,10 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
+local function bump(k)
+    stat[k] = (stat[k] or 0) + 1
+end
+
 local function ready(key, gap)
     local t = nowT()
     local l = last[key]
@@ -71,23 +72,50 @@ local function ready(key, gap)
     return true
 end
 
--- pack varargs so the pcall closure does not need `...` (that was the parse error)
 local function packArgs(...)
     return { n = select('#', ...), ... }
 end
 
+-- returns ok, err  -- ok is pcall success (no Lua error), NOT server acceptance
 local function fire(remote, ...)
-    if not remote then return false end
+    if not remote then return false, 'remote missing' end
     local a = packArgs(...)
-    return (pcall(function() remote:FireServer(unpackFn(a, 1, a.n)) end))
+    local ok, err = pcall(function() remote:FireServer(unpackFn(a, 1, a.n)) end)
+    return ok, err
 end
 
 local function invoke(remote, ...)
-    if not remote then return false, nil end
+    if not remote then return false, 'remote missing', nil end
     local a = packArgs(...)
     local ok, x, y = pcall(function() return remote:InvokeServer(unpackFn(a, 1, a.n)) end)
     if ok then return true, x, y end
-    return false, nil
+    return false, x, y
+end
+
+local EV = RS:FindFirstChild('Events')
+local function folder(name)
+    if not EV then return nil end
+    if not name then return EV end
+    return EV:FindFirstChild(name)
+end
+
+-- prefer a fireable class; UnreplicatedEvent cannot be fired from the client
+local function remote(folderName, remoteName)
+    local f = folder(folderName)
+    if not f then return nil, 'folder ' .. tostring(folderName) .. ' missing' end
+    local first, fireable = nil, nil
+    for _, c in ipairs(f:GetChildren()) do
+        if c.Name == remoteName then
+            if not first then first = c end
+            local cn = c.ClassName
+            if cn == 'RemoteEvent' or cn == 'UnreliableRemoteEvent' or cn == 'RemoteFunction' then
+                if not fireable then fireable = c end
+            end
+        end
+    end
+    if fireable then return fireable, 'ok(' .. fireable.ClassName .. ')' end
+    if first then return first, 'WARN(' .. first.ClassName .. ')' end
+    return nil, 'remote ' .. tostring(remoteName) .. ' missing'
 end
 
 local function isValueClass(inst)
@@ -98,31 +126,12 @@ end
 local function findTycoon()
     local ty = workspace:FindFirstChild('Tycoons')
     if not ty then return nil end
-    local kids = ty:GetChildren()
-    for i = 1, #kids do
-        local p = kids[i]
-        local ch = p:GetChildren()
-        for j = 1, #ch do
-            local c = ch[j]
-            if c.ClassName == 'ObjectValue' and (c.Name == 'Owner' or c.Name == 'Player') then
+    for _, p in ipairs(ty:GetChildren()) do
+        for _, c in ipairs(p:GetChildren()) do
+            if c.ClassName == 'ObjectValue' then
                 local v
                 pcall(function() v = c.Value end)
                 if v == lp then return p end
-            end
-        end
-    end
-    for i = 1, #kids do
-        local p = kids[i]
-        local ch = p:GetChildren()
-        for j = 1, #ch do
-            local sub = ch[j]:GetChildren()
-            for k = 1, #sub do
-                local c = sub[k]
-                if c.ClassName == 'ObjectValue' then
-                    local v
-                    pcall(function() v = c.Value end)
-                    if v == lp then return p end
-                end
             end
         end
     end
@@ -135,16 +144,13 @@ local function surfaceList(ty)
     local items = ty:FindFirstChild('Items')
     local surface = items and items:FindFirstChild('Surface')
     if not surface then return out end
-    local ch = surface:GetChildren()
-    for i = 1, #ch do out[#out + 1] = ch[i] end
+    for _, c in ipairs(surface:GetChildren()) do out[#out + 1] = c end
     return out
 end
 
 local function surfacesWith(ty, childName)
     local out = {}
-    local list = surfaceList(ty)
-    for i = 1, #list do
-        local m = list[i]
+    for _, m in ipairs(surfaceList(ty)) do
         local has = false
         pcall(function() has = (m:FindFirstChild(childName) ~= nil) end)
         if has then out[#out + 1] = m end
@@ -156,8 +162,8 @@ local function seatsOf(model)
     local out = {}
     local ok, desc = pcall(function() return model:GetDescendants() end)
     if not ok or not desc then return out end
-    for i = 1, #desc do
-        if desc[i].ClassName == 'Seat' then out[#out + 1] = desc[i] end
+    for _, d in ipairs(desc) do
+        if d.ClassName == 'Seat' then out[#out + 1] = d end
     end
     return out
 end
@@ -166,16 +172,14 @@ local function tableFree(m)
     if not m or not m.Parent then return false end
     if m:FindFirstChild('Bill') then return false end
     if m:FindFirstChild('Trash') then return false end
-    local atts = { 'Occupied', 'IsOccupied', 'InUse', 'Taken' }
-    for i = 1, #atts do
+    for _, att in ipairs({ 'Occupied', 'IsOccupied', 'InUse', 'Taken' }) do
         local v
-        pcall(function() v = m:GetAttribute(atts[i]) end)
+        pcall(function() v = m:GetAttribute(att) end)
         if v then return false end
     end
-    local seats = seatsOf(m)
-    for i = 1, #seats do
+    for _, s in ipairs(seatsOf(m)) do
         local occ
-        pcall(function() occ = seats[i].Occupant end)
+        pcall(function() occ = s.Occupant end)
         if occ then return false end
     end
     return true
@@ -207,16 +211,13 @@ local function speechList()
     local pg
     pcall(function() pg = lp:FindFirstChild('PlayerGui') end)
     if not pg then return out end
-    local kids = pg:GetChildren()
-    for i = 1, #kids do
-        local gui = kids[i]
+    for _, gui in ipairs(pg:GetChildren()) do
         if gui.Name == 'CustomerSpeechUI' then
             local adornee
             pcall(function() adornee = gui.Adornee end)
             if adornee then
-                local node = adornee
-                local model = nil
-                for d = 1, 6 do
+                local node, model = adornee, nil
+                for _ = 1, 6 do
                     local ok, p = pcall(function() return node.Parent end)
                     if not ok or not p then break end
                     node = p
@@ -231,7 +232,6 @@ local function speechList()
                         customerId = model.Name,
                         groupId = grp.Name,
                         waitingTable = string.find(string.lower(text or ''), 'table for', 1, true) ~= nil,
-                        key = grp.Name .. ':' .. model.Name,
                     }
                 end
             end
@@ -246,174 +246,149 @@ local function pick(list, idx)
     return list[idx], idx + 1
 end
 
-local function seat(ty, entry, table)
-    local tc = ev('Restaurant', 'TaskCompleted')
-    if not tc or not ty or not entry or not table then return false end
-    return fire(tc, { FurnitureModel = table, Tycoon = ty, Name = 'SendToTable', GroupId = entry.groupId })
-end
+-- ===== actions, each returns ok, detail =====
 
-local function takeOrder(ty, entry)
-    local tc = ev('Restaurant', 'TaskCompleted')
-    local ca = ev('Restaurant', 'CustomerActionReplicated')
-    if not tc or not ty or not entry then return false end
-    local ok = fire(tc, { GroupId = entry.groupId, Tycoon = ty, Name = 'TakeOrder', CustomerId = entry.customerId })
-    if ca then pcall(function() ca:FireServer(ty, 'SetCustomerState', entry.customerId, entry.groupId, 'WaitingForDish') end) end
-    if ok then stat.order = stat.order + 1 end
-    return ok
-end
-
-local function serveFood(ty, food, customerId, groupId)
-    local tc = ev('Restaurant', 'TaskCompleted')
-    if not tc or not ty or not food then return false end
-    local ok = fire(tc, { Name = 'Serve', Tycoon = ty, FoodModel = food, CustomerId = customerId, GroupId = groupId })
-    if ok then stat.serve = stat.serve + 1 end
-    return ok
-end
-
-local function grabFood(food)
-    local gf = ev('Restaurant', 'GrabFood')
-    return invoke(gf, food)
-end
-
-local function collect(ty, childName, taskName)
+local function doCollect(ty, childName, taskName, tag)
     local list = surfacesWith(ty, childName)
-    if #list == 0 then return 0 end
-    local tc = ev('Restaurant', 'TaskCompleted')
-    local n = 0
-    for i = 1, math.min(#list, 12) do
-        if fire(tc, { Tycoon = ty, Name = taskName, FurnitureModel = list[i] }) then n = n + 1 end
+    if #list == 0 then return false, 'no ' .. childName .. ' surfaces' end
+    local tc, why = remote('Restaurant', 'TaskCompleted')
+    if not tc then return false, why end
+    local n, fails = 0, 0
+    for i = 1, math.min(#list, 8) do
+        local ok, err = fire(tc, { Tycoon = ty, Name = taskName, FurnitureModel = list[i] })
+        if ok then n = n + 1 else fails = fails + 1 end
+        if not ok then note(tag .. ' fire error: ' .. tostring(err)) end
     end
-    return n
+    bump(tag)
+    return n > 0, ('fired ' .. n .. '/' .. #list .. ' fails=' .. fails .. ' (' .. why .. ')')
 end
 
-local function cook()
-    local ci = ev('Cook', 'CookInputRequested')
-    if not ci then return false end
-    return fire(ci, 'Interact', workspace, 'Oven')
+local function doTips(ty)
+    local tips, why = remote('Restaurant', 'TipsCollected')
+    if not tips then return false, why end
+    local ok, err = fire(tips, ty)
+    if ok then bump('tips') end
+    return ok, tostring(why) .. (ok and ' fired' or (' error ' .. tostring(err)))
 end
 
-local function cookPrompts()
-    local temp = workspace:FindFirstChild('Temp')
-    if not temp then return end
-    local ok, desc = pcall(function() return temp:GetDescendants() end)
-    if not ok or not desc then return end
-    local n = 0
-    for i = 1, #desc do
-        local d = desc[i]
-        if d.ClassName == 'ProximityPrompt' then
-            local act
-            pcall(function() act = d.ActionText end)
-            if act == 'Cook' then
-                pcall(fireproximityprompt, d)
-                n = n + 1
-                if n >= 6 then break end
-            end
-        end
+local function doCook()
+    local ci, why = remote('Cook', 'CookInputRequested')
+    if not ci then return false, why end
+    local ok, err = fire(ci, 'Interact', workspace, 'Oven')
+    if ok then bump('cook') end
+    return ok, tostring(why) .. (ok and ' fired' or (' error ' .. tostring(err)))
+end
+
+local function doSeat(ty)
+    local sp = speechList()
+    if #sp == 0 then return false, 'no speech UI' end
+    local entry
+    entry, idxSeat = pick(sp, idxSeat)
+    if not entry or not entry.waitingTable then return false, 'no guest waiting for a table' end
+    local tables = surfaceList(ty)
+    local m
+    m, idxTable = pick(tables, idxTable)
+    if not m then return false, 'no tables' end
+    if not tableFree(m) then return false, 'table ' .. m.Name .. ' busy' end
+    local tc, why = remote('Restaurant', 'TaskCompleted')
+    if not tc then return false, why end
+    local ok, err = fire(tc, { FurnitureModel = m, Tycoon = ty, Name = 'SendToTable', GroupId = entry.groupId })
+    if ok then bump('seat') end
+    return ok, 'group ' .. entry.groupId .. ' -> ' .. m.Name .. ' ' .. tostring(why) .. (ok and '' or (' error ' .. tostring(err)))
+end
+
+local function doOrder(ty)
+    local sp = speechList()
+    if #sp == 0 then return false, 'no speech UI' end
+    local entry
+    entry, idxOrder = pick(sp, idxOrder)
+    if not entry or entry.waitingTable then return false, 'no guest waiting to order' end
+    local tc, why = remote('Restaurant', 'TaskCompleted')
+    if not tc then return false, why end
+    local ok, err = fire(tc, { GroupId = entry.groupId, Tycoon = ty, Name = 'TakeOrder', CustomerId = entry.customerId })
+    local ca = remote('Restaurant', 'CustomerActionReplicated')
+    if ca then
+        pcall(function() ca:FireServer(ty, 'SetCustomerState', entry.customerId, entry.groupId, 'WaitingForDish') end)
     end
+    if ok then bump('order') end
+    return ok, entry.groupId .. ':' .. entry.customerId .. ' ' .. tostring(why) .. (ok and '' or (' error ' .. tostring(err)))
 end
 
-local function calmRude(ty, entry)
-    local g = ev('Restaurant', 'GetRudeCustomerDialog')
-    local dc = ev('Dialog', 'DialogCompleted')
-    if not g or not ty or not entry then return false end
-    local ok, res = invoke(g, ty, entry.customerId, entry.groupId)
-    if not ok then return false end
-    local worth = false
-    if type(res) == 'string' then
-        local low = string.lower(res)
-        worth = low ~= '' and not string.find(low, 'already', 1, true) and not string.find(low, 'not rude', 1, true)
-    else
-        worth = res ~= nil
-    end
-    if not worth then return false end
-    pcall(function() g:InvokeServer(ty, entry.customerId, entry.groupId, 'We really appreciate you bringing this to our attention.') end)
-    if dc then fire(dc) end
-    stat.rude = stat.rude + 1
-    return true
-end
-
-local function carsOf(ty)
-    local out = {}
-    if not ty then return out end
-    local cc = ty:FindFirstChild('ClientCars')
-    if not cc then return out end
-    local kids = cc:GetChildren()
-    for i = 1, #kids do
-        if tonumber(kids[i].Name) then out[#out + 1] = kids[i].Name end
-    end
-    table.sort(out, function(a, b) return tonumber(a) < tonumber(b) end)
-    return out
-end
-
-local function driveThru(ty)
+local function doServe(ty)
     local food = foodFolder(ty)
-    if not food then return end
+    if not food then return false, 'no Objects.Food' end
     local kids = food:GetChildren()
-    if #kids == 0 then return end
-    local cars = carsOf(ty)
-    if #cars == 0 then return end
-    local tc = ev('Restaurant', 'TaskCompleted')
+    if #kids == 0 then return false, 'no dishes on counter' end
     local f = kids[1]
-    grabFood(f)
-    local carId = attrOrChild(f, 'CarId') or cars[1]
-    fire(tc, { Name = 'Serve', Tycoon = ty, FoodModel = f, CarId = carId })
-    fire(tc, { Name = 'CollectDriveThruBill', Tycoon = ty, CarId = carId })
+    local gf, gwhy = remote('Restaurant', 'GrabFood')
+    local gok, gres = invoke(gf, f)
+    if not gok then return false, 'grab failed ' .. gwhy end
+    local cid = attrOrChild(f, 'CustomerId')
+    local gid = attrOrChild(f, 'GroupId')
+    if not cid then
+        local sp = speechList()
+        local e = sp[1]
+        if e then cid, gid = e.customerId, e.groupId end
+    end
+    if not cid then return false, 'dish has no CustomerId and no speech UI to fall back to' end
+    local tc, why = remote('Restaurant', 'TaskCompleted')
+    if not tc then return false, why end
+    local ok, err = fire(tc, { Name = 'Serve', Tycoon = ty, FoodModel = f, CustomerId = cid, GroupId = gid })
+    if ok then bump('serve') end
+    return ok, 'dish ' .. f.Name .. ' -> ' .. tostring(gid) .. ':' .. tostring(cid) .. ' (grab=' .. tostring(gres) .. ')' .. (ok and '' or (' error ' .. tostring(err)))
 end
 
-local function dropMoney()
-    local df = workspace:FindFirstChild('DropFolder')
-    if not df then return end
-    local ch = df:GetChildren()
-    if #ch == 0 then return end
-    local c
-    pcall(function() c = lp.Character end)
-    if not c then return end
-    local hrp = c:FindFirstChild('HumanoidRootPart')
-    if not hrp then return end
-    local home
-    pcall(function() home = hrp.CFrame end)
-    for i = 1, math.min(#ch, 8) do
-        local d = ch[i]
-        local pos
-        pcall(function() pos = d.Position end)
-        if pos then
-            pcall(function() hrp.CFrame = CFrame.new(pos) end)
-            task.wait(0.08)
-        end
+-- ===== report =====
+
+local function report()
+    local ty = findTycoon()
+    local food = ty and foodFolder(ty)
+    local sp = speechList()
+    note('--- REPORT v' .. VERSION .. ' ---')
+    note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
+    note('surfaces=' .. #surfaceList(ty) .. ' bills=' .. #surfacesWith(ty, 'Bill') .. ' trash=' .. #surfacesWith(ty, 'Trash'))
+    note('dishes=' .. tostring(food and #food:GetChildren() or -1) .. ' speech=' .. #sp)
+    local waitingTable, waitingOrder = 0, 0
+    for _, e in ipairs(sp) do
+        if e.waitingTable then waitingTable = waitingTable + 1 else waitingOrder = waitingOrder + 1 end
     end
-    if home and CONFIG.DropReturn then pcall(function() hrp.CFrame = home end) end
+    note('speechSeat=' .. waitingTable .. ' speechOrder=' .. waitingOrder)
+    for _, pair in ipairs({
+        { 'Restaurant', 'TaskCompleted' }, { 'Restaurant', 'GrabFood' },
+        { 'Restaurant', 'TipsCollected' }, { 'Restaurant', 'CustomerActionReplicated' },
+        { 'Cook', 'CookInputRequested' },
+    }) do
+        local r, why = remote(pair[1], pair[2])
+        note('remote ' .. pair[1] .. '.' .. pair[2] .. ' = ' .. tostring(r and r.ClassName or 'MISSING') .. ' [' .. tostring(why) .. ']')
+    end
+    local keys = {}
+    for k in pairs(stat) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local parts = {}
+    for _, k in ipairs(keys) do parts[#parts + 1] = k .. '=' .. tostring(stat[k]) end
+    note('counters ' .. table.concat(parts, ' '))
+    note('--- end ---')
 end
+
+-- ===== menu =====
 
 local function safeToggle(sec, id, label, default, cb)
-    local variants = {
+    for _, v in ipairs({
         function() sec:Toggle(id, label, default, cb) end,
         function() sec:Toggle(label, id, default, cb) end,
         function() sec:Toggle(label, default, cb) end,
-    }
-    for i = 1, #variants do
-        if pcall(variants[i]) then return true end
-    end
-    return false
-end
-
-local function safeSlider(sec, id, label, min, max, default, cb)
-    local variants = {
-        function() sec:SliderInt(id, label, min, max, default, cb) end,
-        function() sec:SliderInt(label, id, min, max, default, cb) end,
-    }
-    for i = 1, #variants do
-        if pcall(variants[i]) then return true end
+    }) do
+        if pcall(v) then return true end
     end
     return false
 end
 
 local function safeButton(sec, label, cb)
-    local variants = {
+    for _, v in ipairs({
         function() sec:Button(label, cb) end,
         function() sec:Button(label, label, cb) end,
-    }
-    for i = 1, #variants do
-        if pcall(variants[i]) then return true end
+    }) do
+        if pcall(v) then return true end
     end
     return false
 end
@@ -422,104 +397,55 @@ local function reg(id, label, key)
     toggles[#toggles + 1] = { id = id, name = label, key = key }
 end
 
-local function report()
+local function runOnce(tag, fn)
     local ty = findTycoon()
-    local food = ty and foodFolder(ty)
-    local sp = speechList()
-    local line = 'tycoon=' .. tostring(ty ~= nil) ..
-        ' food=' .. tostring(food and #food:GetChildren() or -1) ..
-        ' bills=' .. tostring(ty and #surfacesWith(ty, 'Bill') or -1) ..
-        ' trash=' .. tostring(ty and #surfacesWith(ty, 'Trash') or -1) ..
-        ' speech=' .. tostring(#sp) ..
-        ' cook=' .. tostring(stat.cook) ..
-        ' seat=' .. tostring(stat.seat) ..
-        ' order=' .. tostring(stat.order) ..
-        ' serve=' .. tostring(stat.serve) ..
-        ' dishes=' .. tostring(stat.dishes) ..
-        ' billsDone=' .. tostring(stat.bills) ..
-        ' tips=' .. tostring(stat.tips)
-    print('[RT3] ' .. line)
-    pcall(function() notify('RT3', line, 6) end)
-end
-
-local function teleport(where)
-    local t = ev('Teleports', 'TeleportRequestedClient')
-    if not t then return false end
-    pcall(function() t:Fire(where) end)
-    pcall(function() t:FireServer(where) end)
-    return true
+    if not ty then note(tag .. ': tycoon NOT FOUND - everything depends on this') return end
+    local ok, detail = fn(ty)
+    note(tag .. ': ' .. (ok and 'OK ' or 'FAIL ') .. tostring(detail))
 end
 
 if UI then
     pcall(function()
         UI.AddTab('Restaurant Tycoon 3', function(tab)
-            local auto = tab:Section('Automation', 'Left')
+            local diag = tab:Section('Diagnostics', 'Left')
+            safeButton(diag, 'Report', function() report() end)
+            safeButton(diag, 'Test Cook', function()
+                local ok, d = doCook()
+                note('Cook: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
+            end)
+            safeButton(diag, 'Test Tips', function() runOnce('Tips', doTips) end)
+            safeButton(diag, 'Test Dishes', function() runOnce('Dishes', function(ty) return doCollect(ty, 'Trash', 'CollectDishes', 'dishes') end) end)
+            safeButton(diag, 'Test Bills', function() runOnce('Bills', function(ty) return doCollect(ty, 'Bill', 'CollectBill', 'bills') end) end)
+            safeButton(diag, 'Test Seat', function() runOnce('Seat', doSeat) end)
+            safeButton(diag, 'Test Order', function() runOnce('Order', doOrder) end)
+            safeButton(diag, 'Test Serve', function() runOnce('Serve', doServe) end)
+
+            local auto = tab:Section('Automation', 'Right')
+            safeToggle(auto, 'rt3_autorun', 'MASTER Auto Run', CONFIG.AutoRun, function(v) CONFIG.AutoRun = v end)
+            reg('rt3_autorun', 'MASTER Auto Run', 'AutoRun')
             safeToggle(auto, 'rt3_cook', 'Auto Cook', CONFIG.Cook, function(v) CONFIG.Cook = v end)
             reg('rt3_cook', 'Auto Cook', 'Cook')
-            safeToggle(auto, 'rt3_inst', 'Instant Cook Only', CONFIG.InstantCook, function(v) CONFIG.InstantCook = v end)
-            reg('rt3_inst', 'Instant Cook Only', 'InstantCook')
-            safeToggle(auto, 'rt3_seat', 'Auto Seat Guests', CONFIG.Seat, function(v) CONFIG.Seat = v end)
-            reg('rt3_seat', 'Auto Seat Guests', 'Seat')
+            safeToggle(auto, 'rt3_seat', 'Auto Seat', CONFIG.Seat, function(v) CONFIG.Seat = v end)
+            reg('rt3_seat', 'Auto Seat', 'Seat')
             safeToggle(auto, 'rt3_order', 'Auto Take Orders', CONFIG.TakeOrder, function(v) CONFIG.TakeOrder = v end)
             reg('rt3_order', 'Auto Take Orders', 'TakeOrder')
             safeToggle(auto, 'rt3_food', 'Auto Give Food', CONFIG.GiveFood, function(v) CONFIG.GiveFood = v end)
             reg('rt3_food', 'Auto Give Food', 'GiveFood')
-            safeToggle(auto, 'rt3_dishes', 'Auto Pickup Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
-            reg('rt3_dishes', 'Auto Pickup Dishes', 'Dishes')
-            safeToggle(auto, 'rt3_bills', 'Auto Collect Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
-            reg('rt3_bills', 'Auto Collect Bills', 'Bills')
-            safeToggle(auto, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
-            reg('rt3_tips', 'Auto Collect Tips', 'Tips')
-            safeToggle(auto, 'rt3_drive', 'Auto Drive Thru', CONFIG.DriveThru, function(v) CONFIG.DriveThru = v end)
-            reg('rt3_drive', 'Auto Drive Thru', 'DriveThru')
-            safeToggle(auto, 'rt3_rude', 'Auto Calm Rude', CONFIG.CalmRude, function(v) CONFIG.CalmRude = v end)
-            reg('rt3_rude', 'Auto Calm Rude', 'CalmRude')
-            safeToggle(auto, 'rt3_drop', 'Auto Collect Drops', CONFIG.DropMoney, function(v) CONFIG.DropMoney = v end)
-            reg('rt3_drop', 'Auto Collect Drops', 'DropMoney')
-
-            local shop = tab:Section('Restaurant', 'Right')
-            safeButton(shop, 'Open Restaurant', function() fire(ev('Restaurant', 'RestaurantStatusUpdated'), findTycoon(), 'Open') end)
-            safeButton(shop, 'Close Restaurant', function() fire(ev('Restaurant', 'RestaurantStatusUpdated'), findTycoon(), 'Closed') end)
-            safeButton(shop, 'Kick All Customers', function() fire(ev('Restaurant', 'RestaurantStatusUpdated'), findTycoon(), 'Empty') end)
-            safeButton(shop, 'Claim Daily Reward', function() fire(ev('DailyRewards', 'DailyRewardClaimed')) end)
-            safeButton(shop, 'Claim Objectives', function() fire(ev('Rewards', 'RewardRequested'), 'Obejctives') end)
-            safeButton(shop, 'Redeem Codes', function()
-                local cs = ev('Shop', 'CodeSubmitted')
-                fire(cs, 'dineanddash')
-                task.wait(0.3)
-                fire(cs, 'UltrawEats')
-            end)
-
-            local tp = tab:Section('Teleports', 'Right')
-            safeButton(tp, 'To My Tycoon', function() teleport('Tycoon') end)
-            safeButton(tp, 'To Plaza', function() teleport('Plaza') end)
-            safeButton(tp, 'To EKEA', function() teleport('EKEA') end)
-            safeButton(tp, 'To Campsite', function() teleport('Campsite') end)
-            safeButton(tp, 'To Farm', function() teleport('Farm') end)
-
-            local tune = tab:Section('Tuning', 'Left')
-            safeSlider(tune, 'rt3_cycle', 'Cycle x100', 5, 100, 25, function(v) CONFIG.Cycle = v / 100 end)
-            safeButton(tune, 'Cook Once', function() cook() cookPrompts() end)
-            safeButton(tune, 'Dishes Once', function()
-                local ty = findTycoon()
-                local n = collect(ty, 'Trash', 'CollectDishes')
-                stat.dishes = stat.dishes + n
-            end)
-            safeButton(tune, 'Bills Once', function()
-                local ty = findTycoon()
-                local n = collect(ty, 'Bill', 'CollectBill')
-                stat.bills = stat.bills + n
-            end)
-            safeButton(tune, 'Report', function() report() end)
-            safeButton(tune, 'Stop', function() stop() end)
+            safeToggle(auto, 'rt3_dishes', 'Auto Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
+            reg('rt3_dishes', 'Auto Dishes', 'Dishes')
+            safeToggle(auto, 'rt3_bills', 'Auto Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
+            reg('rt3_bills', 'Auto Bills', 'Bills')
+            safeToggle(auto, 'rt3_tips', 'Auto Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
+            reg('rt3_tips', 'Auto Tips', 'Tips')
+            safeButton(auto, 'Stop', function() stop() end)
         end)
     end)
 end
 
+-- toggle poller
 task.spawn(function()
     while running do
-        for i = 1, #toggles do
-            local t = toggles[i]
+        for _, t in ipairs(toggles) do
             local ok, v = pcall(function() return UI.GetValue(t.id) end)
             if not ok or type(v) ~= 'boolean' then
                 ok, v = pcall(function() return UI.GetValue(t.name) end)
@@ -530,81 +456,26 @@ task.spawn(function()
     end
 end)
 
+-- auto loop: silent until AutoRun is true
 task.spawn(function()
     while running do
-        local ty = findTycoon()
-
-        if ty and (CONFIG.Cook or CONFIG.InstantCook) then
-            if CONFIG.InstantCook then
-                if ready('cook', 0.06) then cook() stat.cook = stat.cook + 1 end
-            elseif CONFIG.Cook and ready('cook', 0.25) then
-                cook()
-                stat.cook = stat.cook + 1
-                if ready('cookp', 0.5) then cookPrompts() end
+        if CONFIG.AutoRun then
+            local ty = findTycoon()
+            if ty then
+                if (CONFIG.Cook or CONFIG.InstantCook) and ready('cook', 0.3) then doCook() end
+                if CONFIG.Dishes and ready('dishes', 0.3) then doCollect(ty, 'Trash', 'CollectDishes', 'dishes') end
+                if CONFIG.Bills and ready('bills', 0.3) then doCollect(ty, 'Bill', 'CollectBill', 'bills') end
+                if CONFIG.Tips and ready('tips', 0.6) then doTips(ty) end
+                if CONFIG.Seat and ready('seat', 0.4) then doSeat(ty) end
+                if CONFIG.TakeOrder and ready('order', 0.3) then doOrder(ty) end
+                if CONFIG.GiveFood and ready('serve', 0.4) then doServe(ty) end
+            else
+                if ready('noty', 5) then note('tycoon not found - retrying') end
             end
         end
-
-        if ty and (CONFIG.Seat or CONFIG.TakeOrder or CONFIG.GiveFood or CONFIG.CalmRude) then
-            local sp = speechList()
-            if #sp > 0 then
-                if CONFIG.TakeOrder and ready('order', 0.08) then
-                    local e
-                    e, idxOrder = pick(sp, idxOrder)
-                    if e and not e.waitingTable then takeOrder(ty, e) end
-                end
-                if CONFIG.Seat and ready('seat', 0.3) then
-                    local e
-                    e, idxSeat = pick(sp, idxSeat)
-                    if e and e.waitingTable then
-                        local tables = surfaceList(ty)
-                        local m
-                        m, idxTable = pick(tables, idxTable)
-                        if m and tableFree(m) then
-                            if seat(ty, e, m) then stat.seat = stat.seat + 1 end
-                        end
-                    end
-                end
-                if CONFIG.GiveFood and ready('serve', 0.15) then
-                    local food = foodFolder(ty)
-                    local kids = food and food:GetChildren() or {}
-                    local f = kids[1]
-                    if f and f.Parent then
-                        grabFood(f)
-                        local cid = attrOrChild(f, 'CustomerId')
-                        local gid = attrOrChild(f, 'GroupId')
-                        if not cid then
-                            local e
-                            e, idxOrder = pick(sp, idxOrder)
-                            if e then cid, gid = e.customerId, e.groupId end
-                        end
-                        if cid and gid then serveFood(ty, f, cid, gid) end
-                    end
-                end
-                if CONFIG.CalmRude and ready('rude', 0.4) then
-                    local e
-                    e, idxSeat = pick(sp, idxSeat)
-                    if e then calmRude(ty, e) end
-                end
-            end
-        end
-
-        if ty and CONFIG.Dishes and ready('dishes', 0.3) then
-            stat.dishes = stat.dishes + collect(ty, 'Trash', 'CollectDishes')
-        end
-
-        if ty and CONFIG.Bills and ready('bills', 0.3) then
-            stat.bills = stat.bills + collect(ty, 'Bill', 'CollectBill')
-        end
-
-        if ty and CONFIG.Tips and ready('tips', 0.5) then
-            if fire(ev('Restaurant', 'TipsCollected'), ty) then stat.tips = stat.tips + 1 end
-        end
-
-        if ty and CONFIG.DriveThru and ready('drive', 0.4) then driveThru(ty) end
-        if CONFIG.DropMoney and ready('drop', 4) then dropMoney() end
-
         task.wait(CONFIG.Cycle)
     end
 end)
 
+note('loaded. AutoRun is OFF. Press Report, then the Test buttons.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
