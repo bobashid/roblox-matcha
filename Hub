@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v3.0: Restaurant Tycoon 3 pinned by place id 119048529960596 (game.Name is 'Ugc').
 -- v2.9: Restaurant Tycoon 3 added to SCRIPTS (name match; place id not known yet).
 -- v2.8: Merge Block Arena Weapons added to SCRIPTS (manual load only).
 -- v2.7: Merge Block Arena pinned by place id.
@@ -15,9 +16,6 @@
 -- v2.4: Piano Rhythm Tiles pinned by place id (auto play).
 -- v2.3: Ride A Dino removed (scrapped).
 -- v2.2: Ride A Dino - Always Gain Stamina mounts via the dino prompt.
--- v2.1: Ride A Dino - Always Gain Stamina (anchor + hold still).
--- v2.0: Ride A Dino - Auto Gain Energy is a hold-still toggle.
--- v1.9: Ride A Dino rebuilt - one toggle (auto gain energy).
 -- v1.8: Ride A Dino pinned by place id.
 -- v1.7: Realistic Home Defense pinned by place id.
 -- v1.6: What If Disasters pinned by place id.
@@ -27,7 +25,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v2.9'
+local VERSION = 'v3.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -53,6 +51,7 @@ local PLACES = {
     [101999883467300] = 'Piano Rhythm Tiles',
     [98689921952741]  = 'CQB Hell',
     [76024476718474]  = 'Merge Block Arena',
+    [119048529960596] = 'Restaurant Tycoon 3',
 }
 
 -- file name + the names/aliases this place might show up as.
