@@ -1,21 +1,19 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 4.1.1
--- v4.1.1 FIX (probed this turn): PlayerGui.CustomerSpeechUI.Adornee reads **nil** in this VM,
---   so the old speechList() could never identify a customer - every Seat/Order call sent
---   nothing. Customers are now read from Workspace.Tycoons.Tycoon.ClientCustomers, where the
---   group FOLDER NAME is GroupId and the child MODEL NAME is CustomerId (proven live:
---   Folder "14" -> Model "1", Model "2").
--- Also confirmed live: Surface=10 tables, bills=0, trash=0, food=0 when idle - so empty
--- collect loops are expected until customers actually sit and eat.
--- TaskCompleted is a plain RemoteEvent (index 3, only one) - the UnreplicatedEvent scare was
--- a garbled read, not real.
--- AutoRun defaults OFF. Use Report + the Test buttons; each prints OK/FAIL and why.
+-- Version: 4.1.2
+-- v4.1.2 FIX (probed live this turn): ClientCustomers IS populated (4 groups, 2 models each),
+--   but customerList() dropped every entry because it required tonumber(name) on BOTH the
+--   group folder and the child model. The names are opaque strings - pass them through as-is,
+--   never validate them numerically. That single filter is why Seat/Order/Serve always said
+--   "no customers in ClientCustomers" while the folder was full.
+-- Also: Serve falls back to the dish's own ids, then to the customer list; with the list fixed
+--   that fallback finally has something to fall back to.
+-- AutoRun defaults OFF. Report + Test buttons each print OK/FAIL and why.
 -- Upgrades excluded. No Instance.new. ClassName tests only (IsA is always true in Matcha).
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '4.1.1'
+local VERSION = '4.1.2'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -89,7 +87,6 @@ end
 
 local EV = RS:FindFirstChild('Events')
 
--- prefer a fireable class over UnreplicatedEvent
 local function remote(folderName, remoteName)
     if not EV then return nil, 'Events missing' end
     local f = folderName and EV:FindFirstChild(folderName) or EV
@@ -129,19 +126,15 @@ local function findTycoon()
     return nil
 end
 
--- PRIMARY customer source: ClientCustomers folder names are GroupId, model names CustomerId
+-- FIXED: names are opaque strings. Never require tonumber().
 local function customerList(ty)
     local out = {}
     if not ty then return out end
     local cc = ty:FindFirstChild('ClientCustomers')
     if not cc then return out end
     for _, g in ipairs(cc:GetChildren()) do
-        if tonumber(g.Name) then
-            for _, c in ipairs(g:GetChildren()) do
-                if tonumber(c.Name) then
-                    out[#out + 1] = { groupId = g.Name, customerId = c.Name, model = c }
-                end
-            end
+        for _, c in ipairs(g:GetChildren()) do
+            out[#out + 1] = { groupId = g.Name, customerId = c.Name, model = c }
         end
     end
     return out
@@ -220,8 +213,6 @@ local function pick(list, idx)
     if idx > #list then idx = 1 end
     return list[idx], idx + 1
 end
-
--- ===== actions =====
 
 local function doCollect(ty, childName, taskName, tag)
     local list = surfacesWith(ty, childName)
@@ -315,8 +306,6 @@ local function doServe(ty)
     return ok, 'dish ' .. f.Name .. ' -> ' .. tostring(gid) .. ':' .. tostring(cid) .. ' ' .. why
 end
 
--- ===== report =====
-
 local function report()
     local ty = findTycoon()
     local food = ty and foodFolder(ty)
@@ -326,7 +315,7 @@ local function report()
     note('tables=' .. #surfaceList(ty) .. ' bills=' .. #surfacesWith(ty, 'Bill') .. ' trash=' .. #surfacesWith(ty, 'Trash'))
     note('dishes=' .. tostring(food and #food:GetChildren() or -1) .. ' customers=' .. #cust)
     for i, e in ipairs(cust) do
-        if i <= 6 then note('  cust group=' .. e.groupId .. ' id=' .. e.customerId) end
+        if i <= 6 then note('  cust group=' .. tostring(e.groupId) .. ' id=' .. tostring(e.customerId)) end
     end
     for _, pair in ipairs({
         { 'Restaurant', 'TaskCompleted' }, { 'Restaurant', 'GrabFood' },
@@ -344,8 +333,6 @@ local function report()
     note('counters ' .. table.concat(parts, ' '))
     note('--- end ---')
 end
-
--- ===== menu =====
 
 local function safeToggle(sec, id, label, default, cb)
     for _, v in ipairs({
@@ -384,6 +371,18 @@ if UI then
         UI.AddTab('Restaurant Tycoon 3', function(tab)
             local diag = tab:Section('Diagnostics', 'Left')
             safeButton(diag, 'Report', function() report() end)
+            safeButton(diag, 'Open Restaurant', function()
+                local ty = findTycoon()
+                local r, why = remote('Restaurant', 'RestaurantStatusUpdated')
+                if r and ty then fire(r, ty, 'Open') end
+                note('Open: ' .. tostring(why))
+            end)
+            safeButton(diag, 'Close Restaurant', function()
+                local ty = findTycoon()
+                local r, why = remote('Restaurant', 'RestaurantStatusUpdated')
+                if r and ty then fire(r, ty, 'Closed') end
+                note('Close: ' .. tostring(why))
+            end)
             safeButton(diag, 'Test Cook', function()
                 local ok, d = doCook()
                 note('Cook: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
