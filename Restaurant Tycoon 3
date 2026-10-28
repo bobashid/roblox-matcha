@@ -1,19 +1,14 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 3.1.0
--- Scope: auto pickup dishes (proven) + auto seat (best effort).
--- No Dialog firing anywhere - that was opening WaveyDavey's dialogue.
--- Upgrades untouched. No teleports, no Drawing.
---
--- Not attempted, because the game gives nothing to fire at (probed 2026-10-27):
---   * tip jar   Items.Furniture.K32.Jar  -> MeshPart + BillboardGui only
---   * table bill Items.Surface.T19.Bill  -> Model + 4 Parts only
---   * taking orders -> 0 Dialog prompts inside the plot
--- Those are UI/remote driven and their entry points are not identified yet.
+-- Version: 3.2.0
+-- Scope: auto pickup dishes, auto seat, auto collect tips, auto collect bill.
+-- Payloads for tips and bill are USER-CAPTURED with Remote Spy (2026-10-27), not guessed.
+-- Upgrades untouched. No teleports, no Drawing, no Dialog firing.
+-- Still not attempted: taking a customer's order - no captured payload for it yet.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '3.1.0'
+local VERSION = '3.2.0'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -25,16 +20,20 @@ local RS      = game:GetService('ReplicatedStorage')
 local lp      = Players.LocalPlayer
 
 local CONFIG = {
-    Dish  = true,
-    Seat  = true,
-    Cycle = 0.4,
+    Dish = true,
+    Seat = true,
+    Tips = true,
+    Bill = true,
+    Cycle     = 0.4,
     SeatEvery = 2.0,
+    TipsEvery = 4.0,
+    BillEvery = 2.0,
 }
 
 local running = true
 local toggles = {}
-local lastSeat = 0
-local grabs = 0
+local tSeat, tTips, tBill = 0, 0, 0
+local stat = { grabs = 0, tips = 0, bills = 0 }
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -122,6 +121,40 @@ local function tryGrab(model)
     return (res == true or type(res) == 'table')
 end
 
+-- captured payload: TipsCollected:FireServer(tycoon)
+local function takeTips(ty)
+    local tc = ev('Restaurant', 'TipsCollected')
+    if not tc or not ty then return false end
+    local ok = pcall(function() tc:FireServer(ty) end)
+    if ok then stat.tips = stat.tips + 1 end
+    return ok
+end
+
+-- captured payload:
+-- TaskCompleted:FireServer({Tycoon=tycoon, Name='CollectBill', FurnitureModel=Surface.T19})
+local function billTargets(ty)
+    local out = {}
+    if not ty then return out end
+    local items = ty:FindFirstChild('Items')
+    local surface = items and items:FindFirstChild('Surface')
+    if not surface then return out end
+    for _, m in ipairs(surface:GetChildren()) do
+        local hasBill = false
+        pcall(function() hasBill = (m:FindFirstChild('Bill') ~= nil) end)
+        if hasBill then out[#out + 1] = m end
+    end
+    return out
+end
+
+local function takeBill(ty, model)
+    local tc = ev('Restaurant', 'TaskCompleted')
+    if not tc or not ty or not model then return false end
+    local payload = { Tycoon = ty, Name = 'CollectBill', FurnitureModel = model }
+    local ok = pcall(function() tc:FireServer(payload) end)
+    if ok then stat.bills = stat.bills + 1 end
+    return ok
+end
+
 local function safeToggle(sec, id, label, default, cb)
     local variants = {
         function() sec:Toggle(id, label, default, cb) end,
@@ -160,24 +193,43 @@ local function reg(id, label, key)
     toggles[#toggles + 1] = { id = id, name = label, key = key }
 end
 
+local function report()
+    local ty = findTycoon()
+    local f = ty and foodList(ty)
+    local b = ty and billTargets(ty)
+    local line = 'food=' .. tostring(f and #f or -1) ..
+                 ' grabs=' .. tostring(stat.grabs) ..
+                 ' tips=' .. tostring(stat.tips) ..
+                 ' bills=' .. tostring(stat.bills) ..
+                 ' billsLeft=' .. tostring(b and #b or -1)
+    print('[RT3] ' .. line)
+    pcall(function() notify('RT3', line, 4) end)
+end
+
 if UI then
     pcall(function()
         UI.AddTab('Restaurant Tycoon 3', function(tab)
-            local main = tab:Section('Restaurant', 'Left')
+            local main = tab:Section('Automation', 'Left')
             safeToggle(main, 'rt3_dish', 'Auto Pickup Dishes', CONFIG.Dish, function(v) CONFIG.Dish = v end)
             reg('rt3_dish', 'Auto Pickup Dishes', 'Dish')
             safeToggle(main, 'rt3_seat', 'Auto Seat', CONFIG.Seat, function(v) CONFIG.Seat = v end)
             reg('rt3_seat', 'Auto Seat', 'Seat')
-            safeSlider(main, 'rt3_seatevery', 'Seat Every x10', 5, 60, 20, function(v) CONFIG.SeatEvery = v / 10 end)
-            safeButton(main, 'Report', function()
+            safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
+            reg('rt3_tips', 'Auto Collect Tips', 'Tips')
+            safeToggle(main, 'rt3_bill', 'Auto Collect Bills', CONFIG.Bill, function(v) CONFIG.Bill = v end)
+            reg('rt3_bill', 'Auto Collect Bills', 'Bill')
+
+            local tune = tab:Section('Tuning', 'Right')
+            safeSlider(tune, 'rt3_seatevery', 'Seat Every x10', 5, 60, 20, function(v) CONFIG.SeatEvery = v / 10 end)
+            safeSlider(tune, 'rt3_tipsevery', 'Tips Every x10', 10, 120, 40, function(v) CONFIG.TipsEvery = v / 10 end)
+            safeButton(tune, 'Collect Tips Now', function() local ty = findTycoon() takeTips(ty) end)
+            safeButton(tune, 'Collect Bill Now', function()
                 local ty = findTycoon()
-                local f = ty and foodList(ty)
-                pcall(function()
-                    notify('RT3', 'food=' .. tostring(f and #f or -1) .. ' grabs=' .. tostring(grabs), 4)
-                end)
-                print('[RT3] food=' .. tostring(f and #f or -1) .. ' grabs=' .. tostring(grabs))
+                local b = billTargets(ty)
+                if b[1] then takeBill(ty, b[1]) end
             end)
-            safeButton(main, 'Stop', function() stop() end)
+            safeButton(tune, 'Report', function() report() end)
+            safeButton(tune, 'Stop', function() stop() end)
         end)
     end)
 end
@@ -201,26 +253,34 @@ end)
 task.spawn(function()
     while running do
         local ty = findTycoon()
+        local t = nowT()
 
         if CONFIG.Dish and ty then
             local list = foodList(ty)
             if #list > 0 then
-                if tryGrab(list[1]) then grabs = grabs + 1 end
+                if tryGrab(list[1]) then stat.grabs = stat.grabs + 1 end
             end
         end
 
-        -- one seat per interval at most, so 8 free seats cannot be spammed
-        if CONFIG.Seat and ty then
-            local t = nowT()
-            if (t - lastSeat) >= CONFIG.SeatEvery then
-                local seats = myPrompts(ty, 'SeatPrompt')
-                for i = 1, #seats do
-                    local p = seats[i]
-                    if seatFree(p) then
-                        pcall(fireproximityprompt, p)
-                        lastSeat = t
-                        break
-                    end
+        if CONFIG.Bill and ty and (t - tBill) >= CONFIG.BillEvery then
+            local b = billTargets(ty)
+            if b[1] then
+                if takeBill(ty, b[1]) then tBill = t end
+            end
+        end
+
+        if CONFIG.Tips and ty and (t - tTips) >= CONFIG.TipsEvery then
+            if takeTips(ty) then tTips = t end
+        end
+
+        if CONFIG.Seat and ty and (t - tSeat) >= CONFIG.SeatEvery then
+            local seats = myPrompts(ty, 'SeatPrompt')
+            for i = 1, #seats do
+                local p = seats[i]
+                if seatFree(p) then
+                    pcall(fireproximityprompt, p)
+                    tSeat = t
+                    break
                 end
             end
         end
