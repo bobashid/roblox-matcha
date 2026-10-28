@@ -1,28 +1,23 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 4.0.0
+-- Version: 4.0.1
+-- v4.0.1 FIX: `Matcha:81: Cannot use '...' outside of a vararg function`. The fire() and
+-- invoke() wrappers used `...` inside a nested closure, which is a parse error in Lua and
+-- aborted the whole chunk at load. Args are now packed into a table and unpacked inside.
+--
 -- Ported from the working reference script the user supplied (2026-10-27).
---
--- THREE OF MY EARLIER ASSUMPTIONS WERE WRONG, corrected here:
---   1. NO Interactions.Interacted call is needed. TaskCompleted alone drives
---      SendToTable / CollectBill / CollectDishes / TakeOrder / Serve.
---      (v3.7.0 added Interactions and it was never required.)
---   2. Dirty dishes are TaskCompleted Name='CollectDishes' on an Items.Surface child that
---      contains a `Trash` child. NOT GrabFood on Objects.Food.
---   3. Serve needs CustomerId + GroupId read from the FOOD MODEL's own attributes/values;
---      fall back to the CustomerSpeechUI list. The food model carries the target.
---
--- TakeOrder = TaskCompleted{Name='TakeOrder', GroupId, CustomerId}
---             + CustomerActionReplicated:FireServer(tycoon, 'SetCustomerState',
---                                                     customerId, groupId, 'WaitingForDish')
---
--- Upgrades are deliberately EXCLUDED (user instruction).
--- No Instance.new (nil in Matcha), no Dialog firing, no seat-prompt firing.
--- Matcha note: IsA() always returns true here, so every class test uses ClassName.
+-- Three earlier assumptions were wrong, corrected here:
+--   1. NO Interactions.Interacted call is needed - TaskCompleted alone drives every task.
+--   2. Dirty dishes are TaskCompleted Name='CollectDishes' on an Items.Surface child holding
+--      a `Trash` child. NOT GrabFood on Objects.Food.
+--   3. Serve reads CustomerId + GroupId from the FOOD MODEL itself, falling back to the
+--      CustomerSpeechUI list. The food model carries its target.
+-- Upgrades deliberately EXCLUDED (user instruction).
+-- Matcha notes: no Instance.new; IsA() always true so class tests use ClassName.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '4.0.0'
+local VERSION = '4.0.1'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -32,6 +27,8 @@ end
 local Players = game:GetService('Players')
 local RS      = game:GetService('ReplicatedStorage')
 local lp      = Players.LocalPlayer
+
+local unpackFn = table.unpack or unpack
 
 local EV = RS:FindFirstChild('Events')
 local function ev(folder, name)
@@ -51,7 +48,6 @@ local CONFIG = {
 local running = true
 local toggles = {}
 local stat = { cook = 0, seat = 0, order = 0, serve = 0, dishes = 0, bills = 0, tips = 0, rude = 0 }
-local held = nil
 local idxOrder, idxSeat, idxTable = 1, 1, 1
 local last = {}
 
@@ -67,7 +63,6 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
--- simple per-action throttle
 local function ready(key, gap)
     local t = nowT()
     local l = last[key]
@@ -76,19 +71,25 @@ local function ready(key, gap)
     return true
 end
 
+-- pack varargs so the pcall closure does not need `...` (that was the parse error)
+local function packArgs(...)
+    return { n = select('#', ...), ... }
+end
+
 local function fire(remote, ...)
     if not remote then return false end
-    return (pcall(function() remote:FireServer(...) end))
+    local a = packArgs(...)
+    return (pcall(function() remote:FireServer(unpackFn(a, 1, a.n)) end))
 end
 
 local function invoke(remote, ...)
     if not remote then return false, nil end
-    local ok, a, b = pcall(function() return remote:InvokeServer(...) end)
-    if ok then return true, a, b end
+    local a = packArgs(...)
+    local ok, x, y = pcall(function() return remote:InvokeServer(unpackFn(a, 1, a.n)) end)
+    if ok then return true, x, y end
     return false, nil
 end
 
--- Matcha: IsA() is always true, so compare ClassName
 local function isValueClass(inst)
     local c = inst.ClassName
     return c == 'StringValue' or c == 'IntValue' or c == 'NumberValue' or c == 'ObjectValue'
@@ -98,7 +99,6 @@ local function findTycoon()
     local ty = workspace:FindFirstChild('Tycoons')
     if not ty then return nil end
     local kids = ty:GetChildren()
-    -- direct: ObjectValue named Owner or Player whose Value is us
     for i = 1, #kids do
         local p = kids[i]
         local ch = p:GetChildren()
@@ -111,7 +111,6 @@ local function findTycoon()
             end
         end
     end
-    -- fallback: any ObjectValue one level deeper
     for i = 1, #kids do
         local p = kids[i]
         local ch = p:GetChildren()
@@ -141,7 +140,6 @@ local function surfaceList(ty)
     return out
 end
 
--- Surface children that hold a given child (Bill / Trash)
 local function surfacesWith(ty, childName)
     local out = {}
     local list = surfaceList(ty)
@@ -204,7 +202,6 @@ local function attrOrChild(model, name)
     return nil
 end
 
--- CustomerSpeechUI gives customerId (model name) + groupId (model.Parent.Name)
 local function speechList()
     local out = {}
     local pg
@@ -249,8 +246,6 @@ local function pick(list, idx)
     return list[idx], idx + 1
 end
 
--- ==== actions ====
-
 local function seat(ty, entry, table)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not entry or not table then return false end
@@ -262,7 +257,6 @@ local function takeOrder(ty, entry)
     local ca = ev('Restaurant', 'CustomerActionReplicated')
     if not tc or not ty or not entry then return false end
     local ok = fire(tc, { GroupId = entry.groupId, Tycoon = ty, Name = 'TakeOrder', CustomerId = entry.customerId })
-    -- signature is positional, not a table
     if ca then pcall(function() ca:FireServer(ty, 'SetCustomerState', entry.customerId, entry.groupId, 'WaitingForDish') end) end
     if ok then stat.order = stat.order + 1 end
     return ok
@@ -321,7 +315,7 @@ end
 local function calmRude(ty, entry)
     local g = ev('Restaurant', 'GetRudeCustomerDialog')
     local dc = ev('Dialog', 'DialogCompleted')
-    if not g then return false end
+    if not g or not ty or not entry then return false end
     local ok, res = invoke(g, ty, entry.customerId, entry.groupId)
     if not ok then return false end
     local worth = false
@@ -389,8 +383,6 @@ local function dropMoney()
     end
     if home and CONFIG.DropReturn then pcall(function() hrp.CFrame = home end) end
 end
-
--- ==== menu ====
 
 local function safeToggle(sec, id, label, default, cb)
     local variants = {
