@@ -1,19 +1,22 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 3.6.1
--- Scope: SEAT guests, pickup dishes, serve the held dish, tips, bills.
--- SEAT payload is USER-CAPTURED (2026-10-27):
---   TaskCompleted:FireServer({FurnitureModel = Items.Surface.T1, GroupId = "19",
---                             Tycoon = tycoon, Name = "SendToTable"})
---   GroupId is a STRING there, so this build sends the raw folder name, not a number.
---   In game the flow is: click the guest's prompt, then click an empty table.
--- Tips / bill / seat payloads are USER-CAPTURED. 'Serve' as a Name is getgc-confirmed.
+-- Version: 3.7.0
+-- DIAGNOSIS: only the tip jar works. Tips is the ONLY action that fires a single remote with
+-- no interaction step. Every other action in the captured traffic fires TWO calls:
+--   1) Events.Restaurant.Interactions.Interacted:FireServer(tycoon, promptTable)
+--   2) Events.Restaurant.TaskCompleted:FireServer(taskTable)
+-- v3.6.x sent only (2), which is why seat/bill/serve silently did nothing.
+-- v3.7.0 sends the Interactions call first, shaped exactly like the captured bill payload:
+--   { Id, ActionText, WorldPosition, GamepadKeyCode, TemporaryPart, KeyboardKeyCode, Range,
+--     IsCustomerPrompt, Key, Model, Part, Prompt, InteractionType, HoldDuration }
+-- CONFIRMED: the Interactions call for CollectBill (user capture).
+-- GUESSED: the Key/InteractionType strings for SendToTable and Serve, and the prompt Id.
+--          If seat/serve still fail, those strings are the reason - capture them.
 -- Upgrades untouched. No teleports, no Drawing, no Dialog firing.
--- v3.6.1: fixed a malformed local in the Seat Once Now button (was findTycon and nil or ...).
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '3.6.1'
+local VERSION = '3.7.0'
 print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
@@ -31,7 +34,7 @@ local CONFIG = {
     Tips  = true,
     Bill  = true,
     Cycle     = 0.4,
-    ServeGap  = 0.8,
+    ServeGap  = 1.2,
     SeatGap   = 2.0,
     TipsEvery = 4.0,
     BillEvery = 2.0,
@@ -81,6 +84,45 @@ local function findTycoon()
     return nil
 end
 
+-- first BasePart under a model, for Part / TemporaryPart / WorldPosition
+local function aPart(model)
+    if not model then return nil end
+    local ok, p = pcall(function() return model.PrimaryPart end)
+    if ok and p then return p end
+    local ok2, d = pcall(function() return model:FindFirstChildWhichIsA('BasePart', true) end)
+    if ok2 and d then return d end
+    return nil
+end
+
+-- the Interactions call that must precede TaskCompleted (captured shape)
+local function interact(ty, model, key, promptId)
+    local it = ev('Restaurant', 'Interactions')
+    if not it or not ty or not model then return false end
+    local part = aPart(model)
+    local pos = Vector3.new(0, 0, 0)
+    if part then
+        local ok, p = pcall(function() return part.Position end)
+        if ok and typeof(p) == 'Vector3' then pos = p end
+    end
+    local tbl = {
+        Id = tostring(promptId or '1'),
+        ActionText = '',
+        WorldPosition = pos,
+        GamepadKeyCode = Enum.KeyCode.Thumbstick1,
+        TemporaryPart = part,
+        KeyboardKeyCode = Enum.KeyCode.E,
+        Range = 7.2,
+        IsCustomerPrompt = true,
+        Key = key,
+        Model = model,
+        Part = part,
+        Prompt = promptId or 1,
+        InteractionType = key,
+        HoldDuration = 0,
+    }
+    return (pcall(function() it:FireServer(ty, tbl) end))
+end
+
 local function foodList(ty)
     local out = {}
     if not ty then return out end
@@ -103,7 +145,6 @@ local function tryGrab(model)
     return (res == true or type(res) == 'table')
 end
 
--- GroupId = folder name (STRING, as captured), CustomerId = model name (STRING)
 local function guestList(ty)
     local out = {}
     if not ty then return out end
@@ -133,7 +174,6 @@ local function customersOf(guest)
     return out
 end
 
--- a Surface model is a free table when it holds no Bill and no plate
 local function tableList(ty)
     local out = {}
     if not ty then return out end
@@ -144,37 +184,18 @@ local function tableList(ty)
         local busy = false
         pcall(function()
             if m:FindFirstChild('Bill') then busy = true end
-            for _, d in ipairs(m:GetDescendants()) do
-                local n = string.lower(d.Name)
-                if string.find(n, 'bill', 1, true) or string.find(n, 'plate', 1, true) then
-                    busy = true
-                end
-            end
         end)
         if not busy then out[#out + 1] = m end
     end
     return out
 end
 
-local function seatsBusy(ty)
-    local n = 0
-    if not ty then return n end
-    local ok, desc = pcall(function() return ty:GetDescendants() end)
-    if not ok or not desc then return n end
-    for i = 1, #desc do
-        if desc[i].ClassName == 'Seat' then
-            local occ
-            pcall(function() occ = desc[i].Occupant end)
-            if occ then n = n + 1 end
-        end
-    end
-    return n
-end
-
--- captured: Name='SendToTable', GroupId as a string, FurnitureModel = the table
 local function seat(ty, guest, table)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not guest or not table then return false end
+    -- Interactions first, exactly like the captured traffic; then the task
+    interact(ty, table, 'SendToTable', 1)
+    task.wait(0.05)
     local payload = {
         FurnitureModel = table,
         GroupId = guest.GroupId,
@@ -186,10 +207,11 @@ local function seat(ty, guest, table)
     return ok
 end
 
--- Name='Serve' is getgc-confirmed; ids sent as strings like the seat capture
 local function serve(ty, guest, customerId, foodModel)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not guest or not foodModel then return false end
+    interact(ty, foodModel, 'Serve', 1)
+    task.wait(0.05)
     local payload = {
         Name = 'Serve',
         Tycoon = ty,
@@ -227,6 +249,9 @@ end
 local function takeBill(ty, model)
     local tc = ev('Restaurant', 'TaskCompleted')
     if not tc or not ty or not model then return false end
+    -- This is the captured pair: Interactions first, then TaskCompleted
+    interact(ty, model, 'CollectBill', 142)
+    task.wait(0.05)
     local payload = { Tycoon = ty, Name = 'CollectBill', FurnitureModel = model }
     local ok = pcall(function() tc:FireServer(payload) end)
     if ok then stat.bills = stat.bills + 1 end
@@ -280,8 +305,7 @@ local function report()
     local line = 'counter=' .. tostring(f and #f or -1) ..
                  ' held=' .. tostring(held and held.Name or 'nil') ..
                  ' guests=' .. tostring(g and #g or -1) ..
-                 ' freeTables=' .. tostring(tl and #tl or -1) ..
-                 ' seatsTaken=' .. tostring(seatsBusy(ty)) ..
+                 ' tables=' .. tostring(tl and #tl or -1) ..
                  ' grabs=' .. tostring(stat.grabs) ..
                  ' serves=' .. tostring(stat.serves) ..
                  ' seats=' .. tostring(stat.seats) ..
@@ -296,27 +320,31 @@ if UI then
     pcall(function()
         UI.AddTab('Restaurant Tycoon 3', function(tab)
             local main = tab:Section('Automation', 'Left')
+            safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
+            reg('rt3_tips', 'Auto Collect Tips', 'Tips')
+            safeToggle(main, 'rt3_bill', 'Auto Collect Bills', CONFIG.Bill, function(v) CONFIG.Bill = v end)
+            reg('rt3_bill', 'Auto Collect Bills', 'Bill')
             safeToggle(main, 'rt3_seat', 'Auto Seat Guests', CONFIG.Seat, function(v) CONFIG.Seat = v end)
             reg('rt3_seat', 'Auto Seat Guests', 'Seat')
             safeToggle(main, 'rt3_dish', 'Auto Pickup Dishes', CONFIG.Dish, function(v) CONFIG.Dish = v end)
             reg('rt3_dish', 'Auto Pickup Dishes', 'Dish')
             safeToggle(main, 'rt3_serve', 'Auto Serve To Guest', CONFIG.Serve, function(v) CONFIG.Serve = v end)
             reg('rt3_serve', 'Auto Serve To Guest', 'Serve')
-            safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
-            reg('rt3_tips', 'Auto Collect Tips', 'Tips')
-            safeToggle(main, 'rt3_bill', 'Auto Collect Bills', CONFIG.Bill, function(v) CONFIG.Bill = v end)
-            reg('rt3_bill', 'Auto Collect Bills', 'Bill')
 
             local tune = tab:Section('Tuning', 'Right')
             safeSlider(tune, 'rt3_seatgap', 'Seat Gap x10', 5, 120, 20, function(v) CONFIG.SeatGap = v / 10 end)
-            safeSlider(tune, 'rt3_servegap', 'Serve Gap x10', 5, 60, 8, function(v) CONFIG.ServeGap = v / 10 end)
-            safeButton(tune, 'Seat Once Now', function()
+            safeButton(tune, 'Test Bill', function()
+                local ty = findTycoon()
+                local b = ty and billTargets(ty)
+                if b and b[1] then takeBill(ty, b[1]) end
+            end)
+            safeButton(tune, 'Test Seat', function()
                 local ty = findTycoon()
                 local g = ty and guestList(ty)
                 local tl = ty and tableList(ty)
                 if ty and g and g[1] and tl and tl[1] then seat(ty, g[1], tl[1]) end
             end)
-            safeButton(tune, 'Serve Held Now', function()
+            safeButton(tune, 'Test Serve', function()
                 local ty = findTycoon()
                 local g = ty and guestList(ty)
                 if ty and g and g[1] and held then
@@ -328,12 +356,6 @@ if UI then
                 local c = ev('Restaurant', 'CancelGrabRequested')
                 if c then pcall(function() c:FireServer() end) end
                 held = nil
-            end)
-            safeButton(tune, 'Collect Tips Now', function() local ty = findTycoon() takeTips(ty) end)
-            safeButton(tune, 'Collect Bill Now', function()
-                local ty = findTycoon()
-                local b = ty and billTargets(ty)
-                if b and b[1] then takeBill(ty, b[1]) end
             end)
             safeButton(tune, 'Report', function() report() end)
             safeButton(tune, 'Stop', function() stop() end)
@@ -362,15 +384,12 @@ task.spawn(function()
         local ty = findTycoon()
         local t = nowT()
 
-        -- seat a waiting guest at a free table
         if CONFIG.Seat and ty and (t - tSeat) >= CONFIG.SeatGap then
             local guests = guestList(ty)
             local tables = tableList(ty)
             if #guests > 0 and #tables > 0 then
                 if tableIdx > #tables then tableIdx = 1 end
-                local table = tables[tableIdx]
-                local guest = guests[1]
-                if seat(ty, guest, table) then
+                if seat(ty, guests[1], tables[tableIdx]) then
                     tSeat = t
                     tableIdx = tableIdx + 1
                 end
