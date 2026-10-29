@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v3.2: place 85646026816836 renamed Pulse Fitness Club -> Plunder PVP (user supplied the title).
 -- v3.1: Pulse Fitness Club pinned by place id 85646026816836 (game.Name is 'Ugc').
 -- v3.0: Restaurant Tycoon 3 pinned by place id 119048529960596 (game.Name is 'Ugc').
 -- v2.9: Restaurant Tycoon 3 added to SCRIPTS (name match; place id not known yet).
@@ -26,7 +27,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v3.1'
+local VERSION = 'v3.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -53,7 +54,7 @@ local PLACES = {
     [98689921952741]  = 'CQB Hell',
     [76024476718474]  = 'Merge Block Arena',
     [119048529960596] = 'Restaurant Tycoon 3',
-    [85646026816836]  = 'Pulse Fitness Club',
+    [85646026816836]  = 'Plunder PVP',
 }
 
 -- file name + the names/aliases this place might show up as.
@@ -71,9 +72,9 @@ local SCRIPTS = {
     { file = 'Merge Block Arena',            keys = { 'mergeblockarena', 'mergeblock' } },
     { file = 'Merge Block Arena Weapons',    keys = { 'mergeblockarenaweapons', 'mergeweapons' } },
     { file = 'Piano Rhythm Tiles',           keys = { 'pianorhythmtiles', 'pianotiles' } },
+    { file = 'Plunder PVP',                  keys = { 'plunderpvp', 'plunder' } },
     { file = 'PRISON LIFE TRIGGERBOT',       keys = { 'prisonlifetriggerbot', 'triggerbot' } },
     { file = 'Prison Life HvH',              keys = { 'prisonlifehvh', 'hvh' } },
-    { file = 'Pulse Fitness Club',           keys = { 'pulsefitnessclub', 'pulsefitness' } },
     { file = 'Realistic Home Defense',       keys = { 'realistichomedefense', 'homedefense' } },
     { file = 'Restaurant Tycoon 3',          keys = { 'restauranttycoon3', 'restauranttycoon' } },
     { file = 'Tower Incremental',            keys = { 'towerincremental' } },
