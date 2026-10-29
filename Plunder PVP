@@ -1,8 +1,8 @@
 --[[
   Game:       Plunder [PVP]          (game.Name reports 'Ugc'; title supplied by the user)
   Place IDs:  85646026816836
-  Version:    v1.2
-  Features:   player ESP, item ESP (cleaned names), container/safe ESP with lock state
+  Version:    v1.3
+  Features:   player ESP, item ESP (cleaned names, coins ignored), container/safe ESP with lock state
   Controls:   menu tab "Plunder PVP"; toggles plus two sliders
   Needs:      Matcha Pro (UI + Drawing)
   Confirmed:  players are Workspace Models named R15Rig carrying a numeric 'userid' attribute
@@ -11,15 +11,18 @@
   Confirmed:  items live in Workspace.GameSystem.WorldItem (35-42 children, Tools and Models, live count)
   Confirmed:  containers live in Workspace.GameArea.SpaceCenter.Container (160 children, 20 kinds)
   Confirmed:  v1.1 looked for Workspace.GameScene.Container, which does not exist - the toggle drew
-              nothing. Fixed here, with a name-based fallback if the folder ever moves.
+              nothing. Fixed in v1.2, with a name-based fallback if the folder ever moves.
+  Confirmed:  the container folder is intermittent (PATH true, then PATH false minutes later with
+              identical code) - treated as "area not loaded", not a wrong path
   Confirmed:  containers carry SafeLocked / ContainerOpened / ContainerCid attributes
   Confirmed:  WorldItem children have NO BillboardGui/TextLabel/StringValue at any depth (walked to
               depth 8), so world item names are not replicated - labels use the mesh/part name
   Confirmed:  the 120 ItemName TextLabels belong to Backpack/Pocket inventory GUIs, not world items
+  User-stated: coins should not be drawn by the item ESP (v1.3 adds SKIP_LABEL)
 ]]
 
 local NAME    = 'PlunderESP'
-local VERSION = 'v1.2'
+local VERSION = 'v1.3'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -100,6 +103,20 @@ local JUNK = {
     cbox = true, door = true, root = true, item = true, model = true, tool = true,
     worlditem = true, coll = true, collision = true, hitbox = true, main = true,
 }
+
+-- items the user does not want drawn at all (checked against the resolved label)
+local SKIP_LABEL = {
+    coin = true, coins = true, ccoin = true, ccoins = true,
+    money = true, cash = true, token = true, tokens = true,
+}
+
+local function skipLabel(n)
+    if n == nil then return false end
+    local ln = string.lower(tostring(n))
+    if SKIP_LABEL[ln] then return true end
+    if string.find(ln, 'coin', 1, true) then return true end
+    return false
+end
 
 local function isJunk(n)
     if n == nil then return true end
@@ -259,7 +276,10 @@ local function scanItems()
             local c = kids[i]
             local pos = anchorOf(c)
             if pos then
-                out[#out + 1] = { pos = pos, label = cleanName(c) }
+                local lbl = cleanName(c)
+                if not skipLabel(lbl) then
+                    out[#out + 1] = { pos = pos, label = lbl }
+                end
             end
         end
     end
@@ -636,4 +656,4 @@ end
 _G[NAME] = { stop = stop, version = VERSION }
 
 pcall(function() notify('Plunder PVP', 'v' .. VERSION .. ' loaded', 4) end)
-print('[PlunderESP] running - players, items, containers')
+print('[PlunderESP] running - players, items (coins skipped), containers')
