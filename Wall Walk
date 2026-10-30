@@ -1,40 +1,48 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v2.1
+  Version: v2.2
   ONE toggle: Wall Climb. Hold W at a wall to go up, S to come down.
 
-  HISTORY, because both earlier versions failed the same way - silently.
-    v1.0 wrote Humanoid.PlatformStand, which is not writable in this VM. The
-         pcall around it swallowed 'Unknown property' and nothing happened.
-    v2.0 used workspace:Raycast. PROBED THIS SESSION: it is a stub - it accepts
-         the call and returns nil for every ray, including straight down at the
-         ground. That is why the HUD said 'no wall' while standing at a wall.
-         FindPartOnRay, GetPartBoundsInBox, GetPartsInPart and Region3 are nil
-         as well, so there is no query fallback in this build.
+  HISTORY - three versions, all failing silently in different ways
+    v1.0 wrote Humanoid.PlatformStand. Not writable here, the pcall swallowed
+         'Unknown property', nothing happened.
+    v2.0 used workspace:Raycast. PROBED: it accepts the call and returns nil
+         for every ray, including straight down at the ground. FindPartOnRay,
+         GetPartBoundsInBox, GetPartsInRadius, GetPartsInPart and Region3 are
+         all nil as well. There is no spatial query in this build.
+    v2.1 read part geometry directly (OBB maths). Correct approach, but the
+         probe that was supposed to confirm geometry returned a stale answer
+         (34 objects, 0 Parts) and I wrongly called it dead. The real numbers
+         are 7210 descendants, 1276 Parts, 228 Models, 67 parts within 60
+         studs of the character. Geometry is there and dense.
 
-  v2.1 DETECTS WALLS WITHOUT ANY QUERY. It reads part geometry directly:
-    - Position, Size and CFrame are all readable on a BasePart.
-    - Transform the player position into the part's local space, clamp it to
-      the half-extents, and transform back: that is the closest point on the
-      box, standard OBB maths, pure arithmetic.
-    - The offset from that point to the player is the push direction, and it
-      is the face normal for a point just outside a flat side.
-    - |normal.Y| < 0.7 rejects floors and ceilings, so only walls count.
+  v2.2 - what changed
+    reach raised 4.5 -> 7, because HumanoidRootPart sits at the character's
+      centre and a wall face is roughly 1.5-2 studs out; 4.5 was cutting it fine.
+    The cache now keeps only parts within 80 studs, so the per-tick loop walks
+      a few dozen candidates instead of 1276.
+    HUD reports the measured box distance and the normal components, so one
+      test says whether it sees a wall and which way the face points.
+
+  DETECTION, no queries
+    Transform the player point into the part's local space, clamp to the
+    half-extents, transform back = closest point on the box. The offset from
+    that point to the player is the outward direction, and it is the face
+    normal when the player is just outside a flat side. |n.Y| <= 0.7 rejects
+    floors and ceilings, so only walls qualify.
 
   PERFORMANCE
     Position/CFrame/Velocity writes cost thousands of internal memory ops each,
-    so the climb write is throttled to ~30 Hz on a task.spawn loop and only
-    happens while you are actually holding a direction against a wall.
-    The part list is cached and only rebuilt after you move 25 studs, because
-    static level geometry does not move. That keeps GetDescendants out of the
-    per-frame path entirely. RenderStepped only repaints the HUD text.
+    so the climb write is throttled to ~30 Hz and only fires while a direction
+    key is held against a wall. The part cache is rebuilt only after moving 25
+    studs. RenderStepped repaints text and nothing else.
 
   No Instance.new anywhere - Instance does not exist in this VM at all.
-  Stop with _G.WallWalk.stop() or by toggling off in the menu.
+  Stop with _G.WallWalk.stop() or toggle off in the menu.
 ]]
 
 local NAME    = 'WallWalk'
-local VERSION = 'v2.1'
+local VERSION = 'v2.2'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -59,19 +67,20 @@ end
 
 local CFG = {
     on      = false,
-    climb   = 34,    -- studs/s up while W is held against a wall
-    sink    = 22,    -- studs/s down while S is held
-    stick   = 8,     -- studs/s pressed into the wall
-    reach   = 4.5,   -- how close a part must be to count as your wall
-    maxY    = 0.7,   -- reject a face if |normal.Y| is above this
-    tick    = 0.033, -- ~30 Hz
-    recache = 25,    -- rebuild the part list after moving this far
+    climb   = 34,
+    sink    = 22,
+    stick   = 8,
+    reach   = 7,
+    maxY    = 0.7,
+    tick    = 0.033,
+    recache = 25,
+    keep    = 80,
     keyW    = 0x57,
     keyS    = 0x53,
 }
 
 local status   = 'off'
-local wallName = '-'
+local wallInfo = '-'
 local wallDist = -1
 
 local parts   = {}
@@ -87,31 +96,34 @@ local function held(vk)
     return ok and v == true
 end
 
--- Rebuild the candidate part list. Bounded: one traversal, then pure maths.
 local function rebuildCache(char, at)
     local out = {}
     local ok, list = pcall(function() return workspace:GetDescendants() end)
-    if not ok or not list then return end
+    if not ok or not list then
+        log('GetDescendants failed')
+        return
+    end
     for i = 1, #list do
         local p = list[i]
         local okc, cls = pcall(function() return p.ClassName end)
         if okc and cls == 'Part' then
             local okPos, pos = pcall(function() return p.Position end)
             local okSz, sz  = pcall(function() return p.Size end)
-            if okPos and okSz and pos and sz and sz.X >= 2 and sz.Y >= 2 and sz.Z >= 2 then
-                local okA, anc = pcall(function() return p:IsDescendantOf(char) end)
-                if not okA or anc ~= true then
-                    out[#out + 1] = p
+            if okPos and okSz and pos and sz and sz.X >= 1 and sz.Y >= 1 and sz.Z >= 1 then
+                if (pos - at).Magnitude <= CFG.keep then
+                    local okA, anc = pcall(function() return p:IsDescendantOf(char) end)
+                    if not okA or anc ~= true then
+                        out[#out + 1] = p
+                    end
                 end
             end
         end
     end
     parts = out
     cacheAt = at
-    log('parts cached: ' .. tostring(#out))
+    log('nearby parts cached: ' .. tostring(#out))
 end
 
--- Closest point on a box to p, plus the outward face normal. Pure arithmetic.
 local function nearestOnBox(part, p)
     local okCf, cf = pcall(function() return part.CFrame end)
     local okSz, sz = pcall(function() return part.Size end)
@@ -126,14 +138,12 @@ local function nearestOnBox(part, p)
 
     local localClosest = Vector3.new(cx, cy, cz)
     local worldClosest = cf:PointToWorldSpace(localClosest)
-    local delta = p - worldClosest
-    local dist = delta.Magnitude
+    local dist = (p - worldClosest).Magnitude
 
     local localNormal
     if dist > 1e-4 then
-        localNormal = (rel - localClosest)
+        localNormal = rel - localClosest
     else
-        -- inside the box: exit through the nearest face
         local px, py, pz = hx - math.abs(rel.X), hy - math.abs(rel.Y), hz - math.abs(rel.Z)
         if px <= py and px <= pz then
             localNormal = Vector3.new(rel.X >= 0 and 1 or -1, 0, 0)
@@ -149,31 +159,25 @@ local function nearestOnBox(part, p)
     return worldClosest, worldNormal.Unit, dist
 end
 
--- Best wall within reach: nearest part whose face is flat enough to be a wall.
 local function findWall(char, p)
     if not cacheAt or (cacheAt - p).Magnitude > CFG.recache then
         rebuildCache(char, p)
     end
 
-    local bestN, bestD, bestP = nil, CFG.reach, nil
-    local limit = CFG.reach + 6
-
+    local bestN, bestD = nil, CFG.reach
     for i = 1, #parts do
         local part = parts[i]
         local okP, pp = pcall(function() return part.Position end)
-        if okP and pp and (pp - p).Magnitude < limit then
-            local closest, normal, dist = nearestOnBox(part, p)
-            if normal and dist <= bestD then
-                if math.abs(normal.Y) <= CFG.maxY then
-                    bestN, bestD, bestP = normal, dist, closest
-                end
+        if okP and pp and (pp - p).Magnitude < CFG.reach + 10 then
+            local _, normal, dist = nearestOnBox(part, p)
+            if normal and dist <= bestD and math.abs(normal.Y) <= CFG.maxY then
+                bestN, bestD = normal, dist
             end
         end
     end
-    return bestN, bestD, bestP
+    return bestN, bestD
 end
 
--- main tick
 task.spawn(function()
     while running do
         local char = lp.Character
@@ -181,7 +185,7 @@ task.spawn(function()
         local hrp  = char and char:FindFirstChild('HumanoidRootPart')
 
         if not CFG.on then
-            status, wallName, wallDist = 'off', '-', -1
+            status, wallInfo, wallDist = 'off', '-', -1
         elseif not char or not hum or not hrp then
             status = 'no character'
         elseif hum.Health <= 0 then
@@ -190,7 +194,7 @@ task.spawn(function()
             local p = hrp.Position
             local n, d = findWall(char, p)
             if n then
-                wallName = string.format('n=%.2f,%.2f,%.2f', n.X, n.Y, n.Z)
+                wallInfo = string.format('n=%.2f,%.2f,%.2f parts=%d', n.X, n.Y, n.Z, #parts)
                 wallDist = d
                 local climb = 0
                 if held(CFG.keyW) then
@@ -199,14 +203,16 @@ task.spawn(function()
                     climb = -CFG.sink
                 end
                 if climb ~= 0 then
-                    local v = Vector3.new(-n.X * CFG.stick, climb, -n.Z * CFG.stick)
-                    pcall(function() hrp.Velocity = v end)
+                    pcall(function()
+                        hrp.Velocity = Vector3.new(-n.X * CFG.stick, climb, -n.Z * CFG.stick)
+                    end)
                     status = string.format('climbing %+d', climb)
                 else
-                    status = 'on wall - W up / S down'
+                    status = 'wall found - W up / S down'
                 end
             else
-                wallName, wallDist = '-', -1
+                wallInfo = string.format('parts=%d', #parts)
+                wallDist = -1
                 status = 'no wall within ' .. tostring(CFG.reach)
             end
         end
@@ -215,7 +221,6 @@ task.spawn(function()
     end
 end)
 
--- HUD
 local hud
 pcall(function()
     hud = Drawing.new('Text')
@@ -228,10 +233,9 @@ end)
 
 track(RunService.RenderStepped:Connect(function()
     if not hud then return end
-    hud.Text = string.format('[%s] %s | dist %.2f | %s', VERSION, status, wallDist, wallName)
+    hud.Text = string.format('[%s] %s | dist %.2f | %s', VERSION, status, wallDist, wallInfo)
 end))
 
--- menu
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local built  = false
 
