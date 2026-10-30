@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v3.3: Age Evolution Tycoon pinned by place id 96469185605358.
 -- v3.2: place 85646026816836 renamed Pulse Fitness Club -> Plunder PVP (user supplied the title).
 -- v3.1: Pulse Fitness Club pinned by place id 85646026816836 (game.Name is 'Ugc').
 -- v3.0: Restaurant Tycoon 3 pinned by place id 119048529960596 (game.Name is 'Ugc').
@@ -27,7 +28,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v3.2'
+local VERSION = 'v3.3'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -38,6 +39,7 @@ local BASE = 'https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/head
 
 -- place id -> file name. Wins over name matching. Add lines as you learn ids.
 local PLACES = {
+    [96469185605358]  = 'Age Evolution Tycoon',
     [113273588963037] = '+1 Upgrade Per Kill',
     [125310131519813] = 'Feed A Mosquito',
     [110432290690507] = 'Hike For Eggs',
@@ -61,6 +63,7 @@ local PLACES = {
 -- keys are normalised: lowercase, letters and digits only.
 local SCRIPTS = {
     { file = '+1 Upgrade Per Kill',          keys = { '1upgradeperkill', 'upgradeperkill' } },
+    { file = 'Age Evolution Tycoon',         keys = { 'ageevolutiontycoon', 'ageevolution' } },
     { file = 'Build And Kill Zombies',       keys = { 'buildandkillzombies', 'killzombies' } },
     { file = 'Chop A Forest',                keys = { 'chopaforest', 'chopforest' } },
     { file = 'Clean Everything',             keys = { 'cleaneverything' } },
