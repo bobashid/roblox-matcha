@@ -1,68 +1,71 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v3.1
+  Version: v3.2
   ONE toggle. Hold W at a wall: your feet go ON the wall. WASD then walks
   that wall as if it were the ground. Space steps off.
 
-  HISTORY - five versions, every failure silent until probed
+  WHY v3.2 - "feels unsmooth and i feel like my feet are magnets to walls"
+  That report is not a detection bug. Detection was already correct. It was
+  the CONSTRAINT being applied at full strength on the first frame:
+
+    1. One radius for attach and for stay. reach was 7 while standoff was
+       3.2, so you were grabbed from up to 3.8 studs away and teleported
+       onto the wall in a single frame. That is the magnet.
+    2. The wall pull was binary. Every frame the position was written as
+       closest + normal * standoff, exactly. No ramp, no glide.
+    3. The basis was assigned outright. Any change in the surface normal
+       rotated the character instantly, so corners snapped.
+
+  v3.2 changes three things and nothing else:
+    - attach at 4.5 studs, stay while within 7.5 (hysteresis). Grabs when you
+      are actually at the wall, lets go when you clearly are not.
+    - a `pull` value that starts at 0 on attach and eases to 1 at ~10/s. The
+      tangential movement stays full speed; only the pull onto the surface
+      ramps, so you glide onto the wall over ~0.25 s instead of teleporting.
+    - the up vector is LERPed toward the wall normal at ~8/s instead of being
+      assigned, so corners and face changes round off.
+  Also: attaching now requires you to be facing the wall (camLook dot -n), or
+  brushing past one latches you. And standoff is 2.6, not 3.2, so your feet
+  sit on the surface rather than 1.2 studs off it.
+
+  HISTORY - every earlier failure was silent until probed
     v1.0 wrote Humanoid.PlatformStand. Not writable; the pcall swallowed it.
     v2.0 used workspace:Raycast. PROBED: accepts the call, returns nil for
          every ray. FindPartOnRay, GetPartBoundsInBox, GetPartsInRadius,
-         GetPartsInPart and Region3 are all nil too. No spatial query here.
-    v2.1-v2.3 read part geometry with OBB maths (probe-verified correct) but
-         only wrote Velocity, so the character stayed upright. A climb.
-    v3.0 called CFrame.fromMatrix. PROBED: it is nil. The earlier probe that
-         appeared to confirm it was garbled output, and I built on it anyway.
-         That version would have failed at the write, every frame.
+         GetPartsInPart, Region3 are all nil. No spatial query in this VM.
+    v2.1-v2.3 read part geometry with OBB maths (probe-verified) but only
+         wrote Velocity, so the character stayed upright. A climb.
+    v3.0 called CFrame.fromMatrix. PROBED: nil. Would have failed to write.
+    v3.1 used the 12-number CFrame.new basis and worked, but grabbed hard.
 
-  v3.1 - the constructor that actually exists
-    PROBED this session, in order:
-      CFrame.fromMatrix   -> nil
-      CFrame.fromAxisAngle-> nil
-      CFrame.Angles       -> function, but no way to set a custom up
-      CFrame.lookAt       -> function, but it IGNORED the up argument
-                             (passed (1,0,0), got UpVector (0,1,0) back)
-      CFrame.new(x,y,z, rX,uX,bX, rY,uY,bY, rZ,uZ,bZ) -> works, and the basis
-                             reads back exactly: up (1,0,0), right (0,-1,0)
-    So the 12-number form is the only constructor here that can build an
-    arbitrary orientation. The three vectors are the COLUMNS of the rotation
-    matrix in the order right, up, back.
+  PROBED, and the reason this design exists
+    CFrame.fromMatrix       -> nil
+    CFrame.fromAxisAngle    -> nil
+    CFrame.Angles           -> function, cannot set a custom up
+    CFrame.lookAt           -> function, IGNORES its up argument
+    CFrame.new(x,y,z, rX,uX,bX, rY,uY,bY, rZ,uZ,bZ) -> works; the three
+      vectors are the COLUMNS of the rotation matrix: right, up, back.
+    A rotated write PERSISTS across a physics step (up read back (1,0,0)
+    immediately and still (1,0,0) after 0.1 s), but gravity still acts
+    (Y 24.00 -> 23.02 in that 0.1 s). So position must be rewritten every
+    physics step; the rewrite is what holds you on the wall.
 
-  WHAT THE PROBE ALSO PROVED
-    A rotated write PERSISTS: up read back (1,0,0) immediately and still
-    (1,0,0) after 0.1 s - the humanoid does not snap you upright.
-    But Y fell 24.00 -> 23.02 in that 0.1 s, so gravity still acts. That is
-    exactly why Position is rewritten every physics step: the rewrite is what
-    holds you on the wall, not the rotation alone.
-
-  HOW IT HOLDS YOU
-    Each Heartbeat while attached:
-      up         = wall face normal        (feet on the wall)
-      look       = camera look projected onto the wall plane (WASD direction)
-      right      = look x up
-      back       = -look
-      position   = closest point on the face + normal * standoff
-    Written as one CFrame.new with 12 numbers, and Velocity zeroed so the
-    character does not accumulate downward speed between writes.
+  THE ONE VISUAL CONSTANT TO TUNE
+    CFG.standoff = 2.6 is the HRP centre distance from the wall surface.
+    Feet sit roughly 2 studs below HRP along the character's up, so 2.6 puts
+    them ~0.6 off the wall. Lower it if you float, raise it if you sink in.
 
   COST
-    A CFrame write is thousands of internal memory operations; doing it every
-    Heartbeat is the documented "continuous motion, user asked for it" case.
-    Writes happen ONLY while attached. Detach and they stop entirely.
-
-  DETECTION - unchanged, probe-verified
-    OBB closest-point: transform into part space, clamp to half-extents, back
-    to world. Offset from that point to the player = outward face normal.
-    |n.Y| <= 0.7 rejects floors and ceilings. Broad-phase uses centre distance
-    minus half-diagonal, so a large wall's face is never skipped.
-    The cache entry is carried by reference - never compare two Instances with
-    ==, they do not hash equal in this VM.
+    A CFrame write is thousands of internal memory ops. It happens only
+    while attached, on Heartbeat, and stops the instant you detach.
+    The part cache rebuilds after 40 studs of travel (not 25), which removes
+    a visible hitch from the old value.
 
   Stop with _G.WallWalk.stop(), the toggle, or Space to step off.
 ]]
 
 local NAME    = 'WallWalk'
-local VERSION = 'v3.1'
+local VERSION = 'v3.2'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -88,11 +91,15 @@ end
 local CFG = {
     on       = false,
     walk     = 18,     -- studs/s along the wall
-    reach    = 7,      -- how close a face must be to attach
-    standoff = 3.2,    -- HRP centre distance from the wall surface
+    attach   = 4.5,    -- must be this close to grab
+    keep     = 7.5,    -- stays grabbed until this far (hysteresis)
+    standoff = 2.6,    -- HRP centre distance from the wall surface
+    pullRate = 10,     -- 1/s, how fast the wall pull ramps 0 -> 1
+    turnRate = 8,      -- 1/s, how fast the up vector eases to the normal
+    faceDot  = 0.15,   -- must be looking into the wall to grab
     maxY     = 0.7,    -- reject floor/ceiling faces
-    recache  = 25,     -- rebuild the part cache after moving this far
-    keep     = 120,    -- cache radius
+    recache  = 40,     -- rebuild the part cache after moving this far
+    keepR    = 160,    -- cache radius
     keyW     = 0x57,
     keyA     = 0x41,
     keyS     = 0x53,
@@ -103,7 +110,9 @@ local CFG = {
 local status   = 'off'
 local wallInfo = '-'
 local stuck    = false
-local stuckUp  = nil
+local stuckN   = nil    -- last raw normal, for the face-changed test
+local stuckUp  = nil    -- eased basis up
+local pull     = 0      -- 0 = free, 1 = fully on the wall
 local lastJump = false
 
 local parts   = {}
@@ -119,8 +128,6 @@ local function held(vk)
     return ok and v == true
 end
 
--- One traversal. Each entry caches pos + half-extents so the per-tick loop
--- does no property reads until a candidate passes the broad-phase.
 local function rebuildCache(char, at)
     local out = {}
     local ok, list = pcall(function() return workspace:GetDescendants() end)
@@ -136,7 +143,7 @@ local function rebuildCache(char, at)
             local okSz, sz  = pcall(function() return p.Size end)
             if okPos and okSz and pos and sz and sz.X >= 1 and sz.Y >= 1 and sz.Z >= 1 then
                 local halfDiag = sz.Magnitude * 0.5
-                if (pos - at).Magnitude - halfDiag <= CFG.keep then
+                if (pos - at).Magnitude - halfDiag <= CFG.keepR then
                     local okA, anc = pcall(function() return p:IsDescendantOf(char) end)
                     if not okA or anc ~= true then
                         out[#out + 1] = {
@@ -154,19 +161,18 @@ local function rebuildCache(char, at)
     log('nearby parts cached: ' .. tostring(#out))
 end
 
--- Nearest wall-like face within reach. Returns normal, distance, and the
--- cache ENTRY (never the Instance - instances do not compare equal here).
-local function findWall(char, p)
+-- Nearest wall-like face within `reach`. Returns normal, distance, entry.
+local function findWall(char, p, reach)
     if not cacheAt or (cacheAt - p).Magnitude > CFG.recache then
         rebuildCache(char, p)
     end
 
-    local bestN, bestD, bestE = nil, CFG.reach, nil
+    local bestN, bestD, bestE = nil, reach, nil
     for i = 1, #parts do
         local e = parts[i]
         local dx, dy, dz = e.pos.X - p.X, e.pos.Y - p.Y, e.pos.Z - p.Z
         local d2 = dx*dx + dy*dy + dz*dz
-        local lim = CFG.reach + e.halfDiag
+        local lim = reach + e.halfDiag
         if d2 <= lim * lim then
             local okCf, cf = pcall(function() return e.part.CFrame end)
             if okCf and cf then
@@ -174,12 +180,11 @@ local function findWall(char, p)
                 local cx = clamp(rel.X, -e.hx, e.hx)
                 local cy = clamp(rel.Y, -e.hy, e.hy)
                 local cz = clamp(rel.Z, -e.hz, e.hz)
-                local lc = Vector3.new(cx, cy, cz)
-                local wc = cf:PointToWorldSpace(lc)
+                local wc = cf:PointToWorldSpace(Vector3.new(cx, cy, cz))
                 local bx, by, bz = p.X - wc.X, p.Y - wc.Y, p.Z - wc.Z
                 local bd = math.sqrt(bx*bx + by*by + bz*bz)
                 if bd > 1e-4 and bd <= bestD then
-                    local wn = cf:VectorToWorldSpace(rel - lc)
+                    local wn = cf:VectorToWorldSpace(rel - Vector3.new(cx, cy, cz))
                     if wn.Magnitude > 1e-4 then
                         wn = wn.Unit
                         if math.abs(wn.Y) <= CFG.maxY then
@@ -193,7 +198,6 @@ local function findWall(char, p)
     return bestN, bestD, bestE
 end
 
--- Closest point on the cached entry's box, in world space.
 local function closestOn(e, p)
     local okCf, cf = pcall(function() return e.part.CFrame end)
     if not okCf or not cf then return nil end
@@ -201,16 +205,22 @@ local function closestOn(e, p)
     local cx = clamp(rel.X, -e.hx, e.hx)
     local cy = clamp(rel.Y, -e.hy, e.hy)
     local cz = clamp(rel.Z, -e.hz, e.hz)
-    return cf:PointToWorldSpace(Vector3.new(cx, cy, cz)), cf, rel
+    return cf:PointToWorldSpace(Vector3.new(cx, cy, cz))
+end
+
+-- Project a direction onto the plane whose normal is `up`.
+local function flatten(v, up)
+    local f = v - up * v:Dot(up)
+    if f.Magnitude > 1e-3 then return f.Unit end
+    return nil
 end
 
 local function wallLook(cam, up)
-    local l = cam.CFrame.LookVector
-    local flat = l - up * l:Dot(up)
-    if flat.Magnitude > 1e-3 then return flat.Unit end
+    local l = flatten(cam.CFrame.LookVector, up)
+    if l then return l end
     for _, cand in ipairs({ Vector3.new(0, 1, 0), Vector3.new(1, 0, 0), Vector3.new(0, 0, 1) }) do
-        local f2 = cand - up * cand:Dot(up)
-        if f2.Magnitude > 1e-3 then return f2.Unit end
+        local f = flatten(cand, up)
+        if f then return f end
     end
     return nil
 end
@@ -228,9 +238,11 @@ end
 
 local function detach()
     if not stuck then return end
-    stuck = false
+    stuck   = false
+    stuckN  = nil
     stuckUp = nil
-    status = 'detached'
+    pull    = 0
+    status  = 'detached'
 end
 
 track(RunService.Heartbeat:Connect(function(dt)
@@ -262,25 +274,40 @@ track(RunService.Heartbeat:Connect(function(dt)
     local jumpEdge = jumpDown and not lastJump
     lastJump = jumpDown
 
+    -- ---------- attach ----------
     if not stuck then
         if jumpEdge then return end
         if not held(CFG.keyW) then
             status = 'ready - hold W at a wall'
             return
         end
-        local n, d = findWall(char, hrp.Position)
+        local n, d, e = findWall(char, hrp.Position, CFG.attach)
         if not n then
-            status = 'no wall within ' .. tostring(CFG.reach)
+            status = 'no wall within ' .. tostring(CFG.attach)
             return
         end
-        stuck = true
-        stuckUp = n
+        -- must actually be looking into the wall, or walking past one latches
+        if cam.CFrame.LookVector:Dot(-n) < CFG.faceDot then
+            status = 'wall beside you - face it'
+            return
+        end
+        stuck  = true
+        stuckN = n
+        -- start the basis from where the character actually is, so the
+        -- rotation onto the wall eases instead of snapping
+        local okUp, curUp = pcall(function() return hrp.CFrame.UpVector end)
+        if okUp and curUp and curUp.Magnitude > 0.5 then
+            stuckUp = curUp.Unit
+        else
+            stuckUp = Vector3.new(0, 1, 0)
+        end
+        pull   = 0
         status = 'stuck (d=' .. string.format('%.1f', d) .. ')'
-        wallInfo = string.format('n=%.2f,%.2f,%.2f parts=%d', n.X, n.Y, n.Z, #parts)
     end
 
+    -- ---------- release ----------
     if jumpEdge then
-        local away = stuckUp or Vector3.new(0, 1, 0)
+        local away = stuckN or Vector3.new(0, 1, 0)
         pcall(function()
             hrp.CFrame = CFrame.new(hrp.Position + away * 1.2)
             hrp.Velocity = away * 32 + Vector3.new(0, 14, 0)
@@ -290,27 +317,35 @@ track(RunService.Heartbeat:Connect(function(dt)
     end
 
     local p = hrp.Position
-    local n, d, e = findWall(char, p)
+    local n, d, e = findWall(char, p, CFG.keep)
     if not n or not e then
         detach()
         status = 'wall lost'
         return
     end
-    if stuckUp and n:Dot(stuckUp) < 0.35 then
+    -- compare the RAW normal, not the eased one, or the easing reads as a change
+    if stuckN and n:Dot(stuckN) < 0.35 then
         detach()
         status = 'face changed'
         return
     end
-    stuckUp = n
+    stuckN = n
 
-    local look = wallLook(cam, n)
+    -- ---------- ease the basis ----------
+    local aTurn = math.min(1, dt * CFG.turnRate)
+    local newUp = stuckUp:Lerp(n, aTurn)
+    if newUp.Magnitude < 1e-3 then newUp = n else newUp = newUp.Unit end
+    stuckUp = newUp
+
+    local look = wallLook(cam, newUp)
     if not look then detach() status = 'no look' return end
 
-    local right = look:Cross(n)
+    local right = look:Cross(newUp)
     if right.Magnitude < 1e-3 then detach() status = 'bad basis' return end
     right = right.Unit
     local back = -look
 
+    -- ---------- movement, full speed, tangential ----------
     local f, r = 0, 0
     if held(CFG.keyW) then f = f + 1 end
     if held(CFG.keyS) then f = f - 1 end
@@ -320,20 +355,24 @@ track(RunService.Heartbeat:Connect(function(dt)
     local move = look * f + right * r
     if move.Magnitude > 1e-3 then move = move.Unit else move = Vector3.new(0, 0, 0) end
 
-    local target = p + move * CFG.walk * dt
+    local desired = p + move * CFG.walk * dt
 
-    -- project the target back onto the face at a fixed standoff, so walking
-    -- along the wall can never drift off it or into it
-    local wc = closestOn(e, target)
+    -- ---------- ease the wall pull ----------
+    local target
+    local wc = closestOn(e, desired)
     if wc then
-        target = wc + n * CFG.standoff
+        pull = math.min(1, pull + dt * CFG.pullRate)
+        local onWall = wc + n * CFG.standoff
+        target = desired + (onWall - desired) * pull
+        status = (pull < 0.98) and string.format('settling %.2f', pull) or 'on wall'
     else
+        -- walked past the edge of this face; hold, do not fling
         target = p
         status = 'edge - holding'
     end
 
     local ok = pcall(function()
-        hrp.CFrame = makeCFrame(target, right, n, back)
+        hrp.CFrame = makeCFrame(target, right, newUp, back)
         hrp.Velocity = Vector3.new(0, 0, 0)
     end)
     if not ok then
@@ -342,8 +381,7 @@ track(RunService.Heartbeat:Connect(function(dt)
         return
     end
 
-    status = 'on wall'
-    wallInfo = string.format('n=%.2f,%.2f,%.2f d=%.1f', n.X, n.Y, n.Z, d or -1)
+    wallInfo = string.format('n=%.2f,%.2f,%.2f d=%.1f pull=%.2f', n.X, n.Y, n.Z, d or -1, pull)
 end))
 
 local hud
