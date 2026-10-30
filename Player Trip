@@ -1,13 +1,13 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v1.0
-  One button: Trip. The character pitches face-down and slides forward.
+  Version: v1.1
+  Rebindable key fires the trip. Tap Space to recover early.
 
-  WHY THIS IS NOT THE ORIGINAL SCRIPT
-  The original is two lines:
+  THE ORIGINAL SCRIPT DOES NOT PORT
+  It is two lines:
       hum:ChangeState(0)                       -- FallingDown
       root.Velocity = root.CFrame.LookVector * 30
-  PROBED this session, and neither half ports:
+  PROBED: there is no Humanoid state machine in this VM.
       hum:ChangeState          -> nil
       hum:SetStateEnabled      -> nil
       hum:GetStateEnabled      -> nil
@@ -16,52 +16,53 @@
       hum.PlayEmote            -> nil
       hum.LoadAnimation        -> nil
       Enum.HumanoidStateType   -> nil, so FallingDown cannot even be named
-  There is no Humanoid state machine in this VM, so nothing can put the
-  character into FallingDown. What IS writable, from the same probe:
-      root.CFrame  -> userdata
-      root.Velocity-> userdata
+  What IS writable, from the same probe: root.CFrame and root.Velocity, both
+  userdata. So the trip is faked from those two.
 
-  HOW THE TRIP IS FAKED INSTEAD
-  Wall Walk proved a rotated CFrame write PERSISTS across a physics step - the
-  humanoid does not snap the character upright. So a trip is built from the two
-  things that do work:
+  HOW THE TRIP WORKS
     1. write a basis with the character's up axis lying HORIZONTAL along the
        direction of travel and its front pointing at the floor (a faceplant),
     2. push Velocity along that travel direction, and let physics carry it.
-  Each physics step during the trip we rewrite the CFrame at the position
-  physics produced - so the rotation holds and the velocity still slides the
-  character. After `duration` the basis is eased back upright and Velocity is
-  zeroed, so the humanoid takes over again cleanly.
+  Each physics step during the trip the CFrame is rewritten at the position
+  physics produced, so the rotation holds while the velocity keeps sliding the
+  character. Then the basis eases back upright and Velocity is zeroed.
 
-  THE HONEST LIMIT
-  No ragdoll pose plays. The game's animate script only plays FallingDown when
-  the humanoid enters that state, and the state machine is absent here - so the
-  character rotates and slides but its limbs stay in the walk/idle pose. A
-  physical tumble, not an animated one. Nothing in this VM can change that.
+  v1.1 ADDS
+    - REBINDABLE KEY. Default G. Click "Rebind key" in the menu, then press the
+      key you want. The capture uses UserInputService.InputBegan, which in this
+      VM hands back a table with a .KeyCode field, and maps it to a Windows
+      virtual-key code through the same table the bundled Matcha ImGui uses.
+    - SPACE TO RECOVER. Tapping Space during a trip ends it immediately and
+      eases you upright over CFG.settle, instead of waiting out CFG.duration.
+      Space is checked as a rising edge, so holding it does nothing extra.
 
-  Also: the original's ChangeState(0) is what stopped the player from simply
-  walking out of the trip. There is no equivalent here, so during the trip the
-  humanoid still accepts movement input - it is short (0.55 s), which is the
-  only mitigation available.
+  THE HONEST LIMITS, unchanged
+    - No ragdoll pose plays. The FallingDown animation is driven by the animate
+      script on entering that state, and the state machine is absent. The
+      character rotates and slides, but its limbs stay in the walk/idle pose.
+    - Movement input is still accepted mid-trip, because there is no state to
+      block it. CFG.duration and the Space recovery are the mitigations.
+    - It is local: your own character rotates, so other players see a slide.
 
   THE CONSTANTS TO TUNE
     CFG.speed    = 30   studs/s of slide, same as the original.
     CFG.duration = 0.55 s face-down before standing back up.
     CFG.settle   = 0.18 s to ease upright afterwards.
+    CFG.keyVK    = 0x47 the trip key (G). Change it with the Rebind button.
 
   Cost: one CFrame write per physics step, only while a trip is running.
-  Stop with _G.PlayerTrip.stop(). Fire with the button or
-  _G.PlayerTrip.trip().
+  _G.PlayerTrip.trip() / .stop() / .state() / .bind('G')
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v1.0'
+local VERSION = 'v1.1'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
 
 local Players    = game:GetService('Players')
 local RunService = game:GetService('RunService')
+local UIS        = game:GetService('UserInputService')
 local lp         = Players.LocalPlayer
 
 local running = true
@@ -76,12 +77,56 @@ local CFG = {
     speed    = 30,
     duration = 0.55,
     settle   = 0.18,
+    keyVK    = 0x47,   -- G
+    keyName  = 'G',
+    recoverVK = 0x20,  -- Space
 }
+
+-- Roblox KeyCode -> Windows virtual-key code. This is the same mapping the
+-- bundled Matcha ImGui uses in its MATCHA_KEYS table: InputBegan delivers a
+-- Roblox KeyCode, but iskeypressed/keypress want a Windows VK.
+local VK_OF_CODE = {
+    [8] = 0x08, [9] = 0x09, [13] = 0x0D, [27] = 0x1B, [32] = 0x20,
+    [39] = 0xDE, [44] = 0xBC, [45] = 0xBD, [46] = 0xBE, [47] = 0xBF,
+    [59] = 0xBA, [61] = 0xBB, [91] = 0xDB, [92] = 0xDC, [93] = 0xDD, [96] = 0xC0,
+    [127] = 0x2E,
+    [273] = 0x26, [274] = 0x28, [275] = 0x27, [276] = 0x25,
+    [277] = 0x2D, [278] = 0x24, [279] = 0x23, [280] = 0x21, [281] = 0x22,
+}
+for code = 48, 57 do VK_OF_CODE[code] = code end          -- 0-9
+for code = 97, 122 do VK_OF_CODE[code] = code - 32 end    -- A-Z
+for code = 282, 296 do VK_OF_CODE[code] = 0x70 + code - 282 end -- F1-F12
+
+-- VK -> a short readable name, for the menu and the HUD
+local NAME_OF_VK = {}
+for code, vk in pairs(VK_OF_CODE) do
+    if NAME_OF_VK[vk] == nil then
+        if vk >= 0x41 and vk <= 0x5A then
+            NAME_OF_VK[vk] = string.char(vk)
+        elseif vk >= 0x30 and vk <= 0x39 then
+            NAME_OF_VK[vk] = string.char(vk)
+        elseif vk >= 0x70 and vk <= 0x7B then
+            NAME_OF_VK[vk] = 'F' .. tostring(vk - 0x6F)
+        end
+    end
+end
+NAME_OF_VK[0x20] = 'Space'
+NAME_OF_VK[0x0D] = 'Enter'
+NAME_OF_VK[0x09] = 'Tab'
+NAME_OF_VK[0x1B] = 'Esc'
+NAME_OF_VK[0x08] = 'Backspace'
+NAME_OF_VK[0x26] = 'Up'
+NAME_OF_VK[0x28] = 'Down'
+NAME_OF_VK[0x25] = 'Left'
+NAME_OF_VK[0x27] = 'Right'
 
 local state   = 'idle'
 local untilAt = 0
 local basis   = nil
 local travel  = nil
+local binding = false
+local lastTripKey = false
+local lastSpace   = false
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
@@ -96,6 +141,12 @@ local function rootOf(char)
     end)
     if ok then return r end
     return nil
+end
+
+local function held(vk)
+    if type(iskeypressed) ~= 'function' then return false end
+    local ok, v = pcall(iskeypressed, vk)
+    return ok and v == true
 end
 
 -- The only constructor here that builds an arbitrary orientation.
@@ -165,13 +216,63 @@ local function trip()
     return true
 end
 
+-- end the trip now and ease upright
+local function beginSettle(root, now)
+    local r, u, b = uprightBasis(travel or Vector3.new(0, 0, -1))
+    basis  = { right = r, up = u, back = b }
+    state  = 'settling'
+    untilAt = now + CFG.settle
+    if root then
+        pcall(function() root.Velocity = Vector3.new(0, 0, 0) end)
+    end
+end
+
+-- rebind capture: InputBegan carries a KeyCode in this VM
+local function onInputBegan(e)
+    if not binding then return end
+    if type(e) ~= 'table' then return end
+    local code = e.KeyCode
+    if type(code) ~= 'number' then return end
+    local vk = VK_OF_CODE[code]
+    if not vk then return end
+    CFG.keyVK   = vk
+    CFG.keyName = NAME_OF_VK[vk] or ('VK ' .. tostring(vk))
+    binding     = false
+    log('trip key bound to ' .. CFG.keyName)
+end
+
+track(UIS.InputBegan:Connect(function(e)
+    pcall(onInputBegan, e)
+end))
+
 track(RunService.Heartbeat:Connect(function(dt)
     if not running then return end
-    if state == 'idle' then return end
     if dt <= 0 or dt > 0.5 then dt = 1/60 end
 
     local char = lp.Character
     local root = rootOf(char)
+    local now  = os.clock()
+
+    -- trip key: rising edge only, and never while the menu is waiting for a bind
+    local tripDown = (not binding) and held(CFG.keyVK)
+    local tripEdge = tripDown and not lastTripKey
+    lastTripKey = tripDown
+    if tripEdge and state == 'idle' then
+        trip()
+    end
+
+    -- Space recovers early, also on a rising edge
+    local spaceDown = held(CFG.recoverVK)
+    local spaceEdge = spaceDown and not lastSpace
+    lastSpace = spaceDown
+    if spaceEdge and state == 'tripping' then
+        if root then beginSettle(root, now) else state = 'idle' end
+        log('recovered early (space)')
+        return
+    end
+
+    if state == 'idle' then return end
+
     if not root or not basis then
         state, basis, travel = 'idle', nil, nil
         return
@@ -183,18 +284,12 @@ track(RunService.Heartbeat:Connect(function(dt)
         return
     end
 
-    local now = os.clock()
-
     if state == 'tripping' then
         if now >= untilAt then
-            local r, u, b = uprightBasis(travel or Vector3.new(0, 0, -1))
-            basis  = { right = r, up = u, back = b }
-            state  = 'settling'
-            untilAt = now + CFG.settle
-            pcall(function() root.Velocity = Vector3.new(0, 0, 0) end)
+            beginSettle(root, now)
         else
-            -- rotate only; the position comes from physics so the velocity
-            -- push still slides the character
+            -- rotate only; position comes from physics so the velocity push
+            -- still slides the character
             pcall(function()
                 root.CFrame = makeCFrame(p, basis.right, basis.up, basis.back)
             end)
@@ -222,7 +317,8 @@ end)
 
 track(RunService.RenderStepped:Connect(function()
     if not hud then return end
-    hud.Text = string.format('[%s] %s', VERSION, state)
+    local k = binding and 'press a key...' or CFG.keyName
+    hud.Text = string.format('[%s] %s | trip key: %s | space = recover', VERSION, state, k)
 end))
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
@@ -246,28 +342,18 @@ local function mkSection(tab, name)
     return nil
 end
 
-local function mkToggle(sec, label, id, def, apply)
-    local cb = function(...)
-        local v = firstBool(...)
-        if v ~= nil then apply(v) end
-    end
-    local tries = {
-        function() sec:Toggle(id, label, def, cb) end,
-        function() sec:Toggle(label, id, def, cb) end,
-        function() sec:Toggle(label, def, cb) end,
-    }
-    for i = 1, #tries do
-        if pcall(tries[i]) then return true end
-    end
-    log('toggle failed: ' .. label)
-    return false
-end
-
 local function mkButton(sec, label, cb)
     if pcall(function() sec:Button(label, cb) end) then return true end
     if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
     log('button failed: ' .. label)
     return false
+end
+
+local keyText = nil
+local function refreshKeyText()
+    if not keyText then return end
+    local v = binding and 'press a key...' or CFG.keyName
+    pcall(function() keyText:SetText('Trip key: ' .. v) end)
 end
 
 if HAS_UI then
@@ -278,9 +364,19 @@ if HAS_UI then
             local okB, errB = pcall(function()
                 local sec = mkSection(tab, 'Trip')
                 if not sec then return end
+
                 mkButton(sec, 'Trip', function()
                     if not trip() then log('trip did nothing - see the line above') end
                 end)
+
+                mkButton(sec, 'Rebind key', function()
+                    binding = true
+                    log('press the key you want for the trip')
+                    refreshKeyText()
+                end)
+
+                local okT, t = pcall(function() return sec:Text('Trip key: ' .. CFG.keyName) end)
+                if okT then keyText = t end
             end)
             if not okB then log('menu build error: ' .. tostring(errB)) end
             log('tab built')
@@ -294,7 +390,7 @@ end
 
 local function stop()
     running = false
-    state, basis, travel = 'idle', nil, nil
+    state, basis, travel, binding = 'idle', nil, nil, false
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
     if hud then pcall(function() hud:Remove() end); hud = nil end
@@ -303,6 +399,25 @@ local function stop()
     log('stopped')
 end
 
-_G[NAME] = { stop = stop, trip = trip, version = VERSION, state = function() return state end }
-log(VERSION .. ' loaded - press Trip in the Player Trip tab')
+_G[NAME] = {
+    stop  = stop,
+    trip  = trip,
+    version = VERSION,
+    state = function() return state end,
+    bind  = function(name)
+        local up = string.upper(tostring(name or ''))
+        if #up == 1 then
+            local b = string.byte(up)
+            if (b >= 65 and b <= 90) or (b >= 48 and b <= 57) then
+                CFG.keyVK = b
+                CFG.keyName = up
+                refreshKeyText()
+                return true
+            end
+        end
+        if up == 'SPACE' then CFG.keyVK = 0x20 CFG.keyName = 'Space' refreshKeyText() return true end
+        return false
+    end,
+}
+log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', space recovers')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Player Trip', 3) end)
