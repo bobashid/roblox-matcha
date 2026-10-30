@@ -1,43 +1,42 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v3.4
+  Version: v3.5
   ONE toggle. Hold W at a wall: your feet go ON the wall. WASD then walks
   that wall as if it were the ground. Space steps off.
 
-  WHY v3.4 - "this one feels like im sliding around"
-  Exactly right, and the cause was v3.3's movement model: it wrote the
-  HumanoidRootPart CFrame every step and zeroed Velocity. The humanoid was
-  never asked to move, so its own state stayed idle/standing and the animate
-  script had nothing to play - a static pose translated along a wall. That is
-  precisely what sliding looks like.
+  WHY v3.5 - two probes disagreed, so the script no longer assumes either
+    Probe A: hum.Move -> function, lp.Move -> function, RigType -> R15
+    Probe B: hum.Move -> nil,      lp.Move -> nil,      RigType -> nil,
+             and char:GetChildren() listed Torso / Left Arm / Right Leg,
+             which is an R6 rig, not R15.
+  Two probes disagreeing on the same global means neither is a rule. v3.4
+  called hum:Move unconditionally and would have raised 'attempt to call a
+  nil value' inside a pcall - silently doing nothing, which is the exact
+  failure mode this file has a history of. v3.5 resolves the path at runtime
+  and falls back, and the HUD prints which path is live so this can never be
+  a mystery again.
 
-  PROBED this session, which is why this version is possible:
-    hum.Move  -> function        (the humanoid CAN drive its own movement)
-    lp.Move   -> function        (player-module fallback)
-    RigType   -> R15
-    getgc('WalkSpeed') -> 0 entries, so WalkSpeed is not reachable that way.
-      This version therefore does NOT touch WalkSpeed - it uses whatever the
-      game already gives you, so the animation speed matches the game's own.
+  THE MOVEMENT PATH, resolved on attach and again whenever it fails:
+    hum  -> hum:Move(dir, false)     the humanoid walks; its own animate
+                                     script plays the real walk cycle
+    lp   -> lp:Move(dir, false)      the player module moves the humanoid;
+                                     animations play the same way
+    cf   -> we move the position     no humanoid movement, so NO walk cycle.
+                                     This is v3.3's sliding path - used only
+                                     when neither Move exists.
+  The fix for 'feels like sliding' is the hum/lp path: animation is driven by
+  humanoid movement, so writing CFrame instead of moving the humanoid gives a
+  static pose gliding along the wall. If the HUD says walk=cf, that is why.
 
-  WHAT CHANGED
-  v3.3  position = ours, velocity zeroed.   -> humanoid idle, character slides.
-  v3.4  humanoid does the walking (hum:Move on the wall tangent), and we only
-        write the ORIENTATION plus the distance from the wall.
-        The humanoid is genuinely moving, so its animate script plays the real
-        walk cycle, in sync with the distance actually covered.
+  WHAT EACH PATH DOES TO POSITION
+    hum/lp: target = current position, then pulled to standoff. We correct
+            only the distance from the wall - the humanoid produced the
+            motion itself.
+    cf    : target = current + move * walk * dt, then pulled to standoff.
+            We produce the motion, which is why no animation plays.
 
-  HOW THE CONFLICT IS RESOLVED
-  The humanoid moves in world space with world gravity, so left alone it would
-  walk off the wall and fall. Each Heartbeat, after the physics step:
-    1. read the position the humanoid produced
-    2. pull it back to standoff along the wall normal (the `pull` ramp)
-    3. write the CFrame with the wall as up and the camera tangent as look
-  Step 2 is a small correction, not the motion. That is the whole difference
-  between walking and sliding.
-
-  BOB is still here but defaults to 0 (CFG.bobAmp). With a real walk cycle
-  playing it is usually unnecessary; raise it to 0.2 if you want extra weight
-  shift. It rides on the same write, so it costs nothing.
+  BOB defaults to 0. With a real walk cycle it is unnecessary; raise CFG.bobAmp
+  to ~0.2 if you want extra weight shift. It rides the same write, no cost.
 
   HISTORY - every earlier failure was silent until probed
     v1.0  Humanoid.PlatformStand - not writable, pcall swallowed the error.
@@ -49,9 +48,10 @@
     v3.0  CFrame.fromMatrix - PROBED: nil. Would have failed to write.
     v3.1  the 12-number CFrame.new basis - worked, but grabbed hard.
     v3.2  eased the constraint: hysteresis, ramped pull, lerped basis.
-    v3.3  added a body bob after wrongly concluding no animation could play.
+    v3.3  body bob, after wrongly concluding no animation could play.
+    v3.4  hum:Move unconditionally - would have been a silent no-op.
 
-  PROBED, and the reason this design exists
+  PROBED, and the reason the orientation code looks like this
     CFrame.fromMatrix     -> nil
     CFrame.fromAxisAngle  -> nil
     CFrame.Angles         -> function, cannot set a custom up
@@ -65,19 +65,20 @@
     CFG.standoff = 2.6  HRP centre distance from the wall. Feet sit ~2 studs
                         below HRP along the character's up. Floating -> 2.2,
                         sinking in -> 3.0.
-    CFG.speedMul = 1.0  scales the humanoid's own walk speed while on a wall.
-                        0.6 for a careful climb, 1.4 to move fast.
-    CFG.bobAmp   = 0    raise to ~0.2 only if you want extra weight shift.
+    CFG.speedMul = 1.0  scales the humanoid's own speed on the hum/lp path.
+                        0.6 careful, 1.4 fast. Does nothing on the cf path.
+    CFG.walk     = 18   studs/s on the cf fallback path only.
+    CFG.bobAmp   = 0    raise to ~0.2 for extra weight shift.
 
   COST
     One CFrame write per Heartbeat, only while attached. The humanoid movement
-    itself is ordinary gameplay movement and costs nothing extra.
+    on the hum/lp path is ordinary gameplay movement and costs nothing extra.
 
   Stop with _G.WallWalk.stop(), the toggle, or Space to step off.
 ]]
 
 local NAME = 'WallWalk'
-local VERSION = 'v3.4'
+local VERSION = 'v3.5'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -111,6 +112,7 @@ local CFG = {
     maxY     = 0.7,
     recache  = 40,
     keepR    = 160,
+    walk     = 18,
     speedMul = 1.0,
     bobAmp   = 0,
     bobRate  = 7,
@@ -131,6 +133,7 @@ local pull = 0
 local bobPhase = 0
 local bobAmp = 0
 local lastJump = false
+local walkPath = '?'
 
 local parts = {}
 local cacheAt = nil
@@ -143,6 +146,21 @@ local function held(vk)
     if type(iskeypressed) ~= 'function' then return false end
     local ok, v = pcall(iskeypressed, vk)
     return ok and v == true
+end
+
+local function fnOf(obj, name)
+    if obj == nil then return nil end
+    local ok, v = pcall(function() return obj[name] end)
+    if ok and type(v) == 'function' then return v end
+    return nil
+end
+
+-- Resolve the movement path from what is actually there, not from what a
+-- single probe once said. Probe A gave hum.Move = function; Probe B gave nil.
+local function resolvePath(hum)
+    if fnOf(hum, 'Move') then return 'hum' end
+    if fnOf(lp, 'Move') then return 'lp' end
+    return 'cf'
 end
 
 local function rebuildCache(char, at)
@@ -260,6 +278,29 @@ local function detach()
     status = 'detached'
 end
 
+-- hand the direction to whichever mover exists; returns true if one took it
+local function pushMove(hum, move)
+    if walkPath == 'hum' then
+        local f = fnOf(hum, 'Move')
+        if f then
+            local ok = pcall(function() f(hum, move, false) end)
+            if ok then return true end
+        end
+        walkPath = resolvePath(hum)
+        return false
+    end
+    if walkPath == 'lp' then
+        local f = fnOf(lp, 'Move')
+        if f then
+            local ok = pcall(function() f(lp, move, false) end)
+            if ok then return true end
+        end
+        walkPath = resolvePath(hum)
+        return false
+    end
+    return false
+end
+
 track(RunService.Heartbeat:Connect(function(dt)
     if not running then return end
     if dt <= 0 or dt > 0.5 then dt = 1/60 end
@@ -289,6 +330,7 @@ track(RunService.Heartbeat:Connect(function(dt)
     local jumpEdge = jumpDown and not lastJump
     lastJump = jumpDown
 
+    -- ---------- attach ----------
     if not stuck then
         if jumpEdge then return end
         if not held(CFG.keyW) then
@@ -306,6 +348,8 @@ track(RunService.Heartbeat:Connect(function(dt)
         end
         stuck = true
         stuckN = n
+        walkPath = resolvePath(hum)
+        log('move path: ' .. walkPath)
         local okUp, curUp = pcall(function() return hrp.CFrame.UpVector end)
         if okUp and curUp and curUp.Magnitude > 0.5 then
             stuckUp = curUp.Unit
@@ -318,6 +362,7 @@ track(RunService.Heartbeat:Connect(function(dt)
         status = 'stuck (d=' .. string.format('%.1f', d) .. ')'
     end
 
+    -- ---------- release ----------
     if jumpEdge then
         local away = stuckN or Vector3.new(0, 1, 0)
         pcall(function()
@@ -364,26 +409,30 @@ track(RunService.Heartbeat:Connect(function(dt)
     local move = look * f + right * r
     if move.Magnitude > 1e-3 then move = move.Unit else move = Vector3.new(0, 0, 0) end
 
-    -- LET THE HUMANOID WALK. This is the animation fix: its animate script
-    -- only plays the walk cycle when the humanoid is genuinely moving. We give
-    -- it the wall tangent and let it produce the motion, then correct only the
-    -- distance from the wall below.
-    if type(hum.Move) == 'function' then
-        if move.Magnitude > 1e-3 then
-            pcall(function() hum:Move(move * CFG.speedMul, false) end)
-        else
-            pcall(function() hum:Move(Vector3.new(0, 0, 0), false) end)
+    -- ---------- movement ----------
+    -- hum/lp: the humanoid moves itself, so the real walk cycle plays.
+    -- cf    : we move the position, which cannot animate - v3.3's slide.
+    local moved = false
+    if walkPath ~= 'cf' then
+        moved = pushMove(hum, move)
+        if not moved and walkPath == 'cf' then
+            log('move path fell back to cf')
         end
     end
 
     local target = p
-    local wc = closestOn(e, p)
+    if walkPath == 'cf' then
+        target = p + move * CFG.walk * dt
+    end
+
+    local wc = closestOn(e, target)
     if wc then
         pull = math.min(1, pull + dt * CFG.pullRate)
         local onWall = wc + n * CFG.standoff
-        target = p + (onWall - p) * pull
+        target = target + (onWall - target) * pull
         status = (pull < 0.98) and string.format('settling %.2f', pull) or 'on wall'
     else
+        target = p
         status = 'edge - holding'
     end
 
@@ -411,8 +460,8 @@ track(RunService.Heartbeat:Connect(function(dt)
         return
     end
 
-    wallInfo = string.format('n=%.2f,%.2f,%.2f d=%.1f pull=%.2f',
-        n.X, n.Y, n.Z, d or -1, pull)
+    wallInfo = string.format('walk=%s n=%.2f,%.2f,%.2f d=%.1f',
+        walkPath, n.X, n.Y, n.Z, d or -1)
 end))
 
 local hud
@@ -503,6 +552,6 @@ local function stop()
     log('stopped')
 end
 
-_G[NAME] = { stop = stop, version = VERSION }
+_G[NAME] = { stop = stop, version = VERSION, path = function() return walkPath end }
 log(VERSION .. ' loaded - toggle on, hold W at a wall, WASD to walk, Space to step off')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Wall Walk', 3) end)
