@@ -1,61 +1,59 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v1.1
+  Version: v2.0
   Rebindable key fires the trip. Tap Space to recover early.
 
-  THE ORIGINAL SCRIPT DOES NOT PORT
-  It is two lines:
-      hum:ChangeState(0)                       -- FallingDown
-      root.Velocity = root.CFrame.LookVector * 30
-  PROBED: there is no Humanoid state machine in this VM.
-      hum:ChangeState          -> nil
-      hum:SetStateEnabled      -> nil
-      hum:GetStateEnabled      -> nil
-      hum:GetState             -> nil  (calling it raised 'attempt to call
-                                        missing method GetState of Instance')
-      hum.PlayEmote            -> nil
-      hum.LoadAnimation        -> nil
-      Enum.HumanoidStateType   -> nil, so FallingDown cannot even be named
-  What IS writable, from the same probe: root.CFrame and root.Velocity, both
-  userdata. So the trip is faked from those two.
+  WHY v2.0 - "yours didnt feel good", "it should ragdoll me"
+  v1.x rotated the HumanoidRootPart only. In this VM that is all a root
+  rotation does: the welds carry the limbs with it, so the character tilts as
+  one rigid board. Stiff, not a tumble.
 
-  HOW THE TRIP WORKS
-    1. write a basis with the character's up axis lying HORIZONTAL along the
-       direction of travel and its front pointing at the floor (a faceplant),
-    2. push Velocity along that travel direction, and let physics carry it.
-  Each physics step during the trip the CFrame is rewritten at the position
-  physics produced, so the rotation holds while the velocity keeps sliding the
-  character. Then the basis eases back upright and Velocity is zeroed.
+  PROBED this session, which is what makes v2.0 possible:
+    char children: Head, Torso, Left Arm, Right Arm, Left Leg, Right Leg,
+                   HumanoidRootPart   (R6)
+    Torso holds SIX Motor6D joints: Neck, Left Shoulder, Right Shoulder,
+                   Left Hip, Right Hip, RootJoint
+    motor.C0  read  -> ok=true, userdata
+    motor.C0  WRITE -> ok=true, err=nil, and the value STICKS on read-back
+  So the joints are writable here. A ragdoll flop is therefore real: throw
+  each limb out by rotating its Motor6D C0, not just the root.
 
-  v1.1 ADDS
-    - REBINDABLE KEY. Default G. Click "Rebind key" in the menu, then press the
-      key you want. The capture uses UserInputService.InputBegan, which in this
-      VM hands back a table with a .KeyCode field, and maps it to a Windows
-      virtual-key code through the same table the bundled Matcha ImGui uses.
-    - SPACE TO RECOVER. Tapping Space during a trip ends it immediately and
-      eases you upright over CFG.settle, instead of waiting out CFG.duration.
-      Space is checked as a rising edge, so holding it does nothing extra.
+  HOW THE TRIP WORKS NOW
+    1. rotate the root so the body pitches face-down along travel (as before)
+    2. THROW THE LIMBS: each Motor6D gets a C0 offset with a random flail, so
+       arms and legs splay and swing instead of staying in the walk pose
+    3. push Velocity along travel and let physics slide you
+    4. recover: joints ease back to their captured rest C0, root eases upright
+  Joint rest poses are CAPTURED on first trip, not hardcoded, so the character
+  returns to exactly its own original pose and a custom rig is not broken.
 
-  THE HONEST LIMITS, unchanged
-    - No ragdoll pose plays. The FallingDown animation is driven by the animate
-      script on entering that state, and the state machine is absent. The
-      character rotates and slides, but its limbs stay in the walk/idle pose.
-    - Movement input is still accepted mid-trip, because there is no state to
-      block it. CFG.duration and the Space recovery are the mitigations.
-    - It is local: your own character rotates, so other players see a slide.
+  STILL TRUE: there is no Humanoid state machine in this VM (ChangeState,
+  GetState, SetStateEnabled, GetStateEnabled, PlayEmote, LoadAnimation all
+  nil, Enum.HumanoidStateType nil). So the game's own ragdoll ANIMATION cannot
+  play - what you get is a joint-driven flop, which is physical, not animated.
+
+  v1.1 FEATURES KEPT
+    - REBINDABLE KEY, default G. Click "Rebind key", press the key you want.
+      InputBegan gives a Roblox KeyCode here, so it is mapped to a Windows VK
+      through the same table the bundled Matcha ImGui uses.
+    - SPACE RECOVERS EARLY on a rising edge, instead of waiting out duration.
 
   THE CONSTANTS TO TUNE
-    CFG.speed    = 30   studs/s of slide, same as the original.
-    CFG.duration = 0.55 s face-down before standing back up.
-    CFG.settle   = 0.18 s to ease upright afterwards.
-    CFG.keyVK    = 0x47 the trip key (G). Change it with the Rebind button.
+    CFG.speed    = 30   studs/s of slide
+    CFG.duration = 0.75 s face-down (longer than v1.x, the flop reads better)
+    CFG.settle   = 0.22 s to ease joints and root back
+    CFG.flail    = 0.85 rad maximum limb throw
+    CFG.keyVK    = 0x47 the trip key (G)
 
-  Cost: one CFrame write per physics step, only while a trip is running.
-  _G.PlayerTrip.trip() / .stop() / .state() / .bind('G')
+  Cost: one root CFrame write and up to six C0 writes per physics step, only
+  while a trip is running. C0 is a joint property, not a part transform, so it
+  does not pay the full part-write cost.
+
+  _G.PlayerTrip.trip() / .stop() / .state() / .bind('G') / .flail(0.85)
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v1.1'
+local VERSION = 'v2.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -75,16 +73,16 @@ end
 
 local CFG = {
     speed    = 30,
-    duration = 0.55,
-    settle   = 0.18,
-    keyVK    = 0x47,   -- G
+    duration = 0.75,
+    settle   = 0.22,
+    flail    = 0.85,
+    keyVK    = 0x47,
     keyName  = 'G',
-    recoverVK = 0x20,  -- Space
+    recoverVK = 0x20,
 }
 
--- Roblox KeyCode -> Windows virtual-key code. This is the same mapping the
--- bundled Matcha ImGui uses in its MATCHA_KEYS table: InputBegan delivers a
--- Roblox KeyCode, but iskeypressed/keypress want a Windows VK.
+-- Roblox KeyCode -> Windows virtual-key code, same mapping the bundled
+-- Matcha ImGui uses: InputBegan delivers a KeyCode, iskeypressed wants a VK.
 local VK_OF_CODE = {
     [8] = 0x08, [9] = 0x09, [13] = 0x0D, [27] = 0x1B, [32] = 0x20,
     [39] = 0xDE, [44] = 0xBC, [45] = 0xBD, [46] = 0xBE, [47] = 0xBF,
@@ -93,17 +91,14 @@ local VK_OF_CODE = {
     [273] = 0x26, [274] = 0x28, [275] = 0x27, [276] = 0x25,
     [277] = 0x2D, [278] = 0x24, [279] = 0x23, [280] = 0x21, [281] = 0x22,
 }
-for code = 48, 57 do VK_OF_CODE[code] = code end          -- 0-9
-for code = 97, 122 do VK_OF_CODE[code] = code - 32 end    -- A-Z
-for code = 282, 296 do VK_OF_CODE[code] = 0x70 + code - 282 end -- F1-F12
+for code = 48, 57 do VK_OF_CODE[code] = code end
+for code = 97, 122 do VK_OF_CODE[code] = code - 32 end
+for code = 282, 296 do VK_OF_CODE[code] = 0x70 + code - 282 end
 
--- VK -> a short readable name, for the menu and the HUD
 local NAME_OF_VK = {}
 for code, vk in pairs(VK_OF_CODE) do
     if NAME_OF_VK[vk] == nil then
-        if vk >= 0x41 and vk <= 0x5A then
-            NAME_OF_VK[vk] = string.char(vk)
-        elseif vk >= 0x30 and vk <= 0x39 then
+        if (vk >= 0x41 and vk <= 0x5A) or (vk >= 0x30 and vk <= 0x39) then
             NAME_OF_VK[vk] = string.char(vk)
         elseif vk >= 0x70 and vk <= 0x7B then
             NAME_OF_VK[vk] = 'F' .. tostring(vk - 0x6F)
@@ -127,6 +122,8 @@ local travel  = nil
 local binding = false
 local lastTripKey = false
 local lastSpace   = false
+local motors  = {}   -- { motor = Motor6D, rest = CFrame, throw = CFrame }
+local captured = false
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
@@ -149,8 +146,6 @@ local function held(vk)
     return ok and v == true
 end
 
--- The only constructor here that builds an arbitrary orientation.
--- Columns are right, up, back.
 local function makeCFrame(pos, right, up, back)
     return CFrame.new(
         pos.X, pos.Y, pos.Z,
@@ -172,7 +167,6 @@ local function uprightBasis(look)
     return right, up, back
 end
 
--- up = travel direction (feet behind, head forward), front = floor.
 local function flatBasis(dir)
     local up    = dir
     local front = Vector3.new(0, -1, 0)
@@ -180,6 +174,48 @@ local function flatBasis(dir)
     local right = up:Cross(back)
     if right.Magnitude < 1e-3 then return nil end
     return right.Unit, up, back
+end
+
+-- Capture each joint's rest pose once, and roll a throw per joint. Capturing
+-- rather than hardcoding means the character returns to exactly its own pose
+-- and a custom rig is not broken by the trip.
+local function captureJoints(char)
+    motors = {}
+    local torso = char and (char:FindFirstChild('Torso') or char:FindFirstChild('UpperTorso'))
+    if not torso then return 0 end
+    local kids = torso:GetChildren()
+    for i = 1, #kids do
+        local m = kids[i]
+        if m.ClassName == 'Motor6D' then
+            local ok, c0 = pcall(function() return m.C0 end)
+            if ok and c0 and type(c0) == 'userdata' then
+                local mag = CFG.flail * (0.5 + math.random())
+                local ax  = (math.random() - 0.5) * 2
+                local ay  = (math.random() - 0.5) * 2
+                local az  = (math.random() - 0.5) * 2
+                motors[#motors + 1] = {
+                    motor = m,
+                    rest  = c0,
+                    throw = CFrame.Angles(ax * mag, ay * mag, az * mag),
+                }
+            end
+        end
+    end
+    captured = true
+    return #motors
+end
+
+local function setJoints(amount)
+    for i = 1, #motors do
+        local e = motors[i]
+        local target
+        if amount <= 0 then
+            target = e.rest
+        else
+            target = e.rest * CFrame.new(0, 0, 0):Lerp(e.throw, amount)
+        end
+        pcall(function() e.motor.C0 = target end)
+    end
 end
 
 local function trip()
@@ -191,6 +227,11 @@ local function trip()
 
     local okCf, cf = pcall(function() return root.CFrame end)
     if not okCf or not cf then log('no CFrame'); return false end
+
+    if not captured then
+        local n = captureJoints(char)
+        log('joints captured: ' .. tostring(n))
+    end
 
     local look = cf.LookVector
     local flat = Vector3.new(look.X, 0, look.Z)
@@ -208,6 +249,8 @@ local function trip()
     state  = 'tripping'
     untilAt = os.clock() + CFG.duration
 
+    setJoints(1)
+
     pcall(function()
         root.Velocity = flat * CFG.speed + Vector3.new(0, 6, 0)
     end)
@@ -216,18 +259,17 @@ local function trip()
     return true
 end
 
--- end the trip now and ease upright
 local function beginSettle(root, now)
     local r, u, b = uprightBasis(travel or Vector3.new(0, 0, -1))
     basis  = { right = r, up = u, back = b }
     state  = 'settling'
     untilAt = now + CFG.settle
+    setJoints(0)
     if root then
         pcall(function() root.Velocity = Vector3.new(0, 0, 0) end)
     end
 end
 
--- rebind capture: InputBegan carries a KeyCode in this VM
 local function onInputBegan(e)
     if not binding then return end
     if type(e) ~= 'table' then return end
@@ -235,6 +277,10 @@ local function onInputBegan(e)
     if type(code) ~= 'number' then return end
     local vk = VK_OF_CODE[code]
     if not vk then return end
+    if vk == CFG.recoverVK then
+        log('space is reserved for recover - pick another key')
+        return
+    end
     CFG.keyVK   = vk
     CFG.keyName = NAME_OF_VK[vk] or ('VK ' .. tostring(vk))
     binding     = false
@@ -253,7 +299,6 @@ track(RunService.Heartbeat:Connect(function(dt)
     local root = rootOf(char)
     local now  = os.clock()
 
-    -- trip key: rising edge only, and never while the menu is waiting for a bind
     local tripDown = (not binding) and held(CFG.keyVK)
     local tripEdge = tripDown and not lastTripKey
     lastTripKey = tripDown
@@ -261,7 +306,6 @@ track(RunService.Heartbeat:Connect(function(dt)
         trip()
     end
 
-    -- Space recovers early, also on a rising edge
     local spaceDown = held(CFG.recoverVK)
     local spaceEdge = spaceDown and not lastSpace
     lastSpace = spaceDown
@@ -288,8 +332,6 @@ track(RunService.Heartbeat:Connect(function(dt)
         if now >= untilAt then
             beginSettle(root, now)
         else
-            -- rotate only; position comes from physics so the velocity push
-            -- still slides the character
             pcall(function()
                 root.CFrame = makeCFrame(p, basis.right, basis.up, basis.back)
             end)
@@ -318,19 +360,12 @@ end)
 track(RunService.RenderStepped:Connect(function()
     if not hud then return end
     local k = binding and 'press a key...' or CFG.keyName
-    hud.Text = string.format('[%s] %s | trip key: %s | space = recover', VERSION, state, k)
+    hud.Text = string.format('[%s] %s | trip key: %s | space = recover | joints %d',
+        VERSION, state, k, #motors)
 end))
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local built  = false
-
-local function firstBool(...)
-    for i = 1, select('#', ...) do
-        local v = select(i, ...)
-        if type(v) == 'boolean' then return v end
-    end
-    return nil
-end
 
 local function mkSection(tab, name)
     for _, side in ipairs({ 'Left', 'Right' }) do
@@ -375,6 +410,12 @@ if HAS_UI then
                     refreshKeyText()
                 end)
 
+                mkButton(sec, 'Re-roll flail', function()
+                    captured = false
+                    local char = lp.Character
+                    if char then log('flail re-rolled: ' .. tostring(captureJoints(char)) .. ' joints') end
+                end)
+
                 local okT, t = pcall(function() return sec:Text('Trip key: ' .. CFG.keyName) end)
                 if okT then keyText = t end
             end)
@@ -391,6 +432,7 @@ end
 local function stop()
     running = false
     state, basis, travel, binding = 'idle', nil, nil, false
+    setJoints(0)
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
     if hud then pcall(function() hud:Remove() end); hud = nil end
@@ -400,11 +442,14 @@ local function stop()
 end
 
 _G[NAME] = {
-    stop  = stop,
-    trip  = trip,
+    stop    = stop,
+    trip    = trip,
     version = VERSION,
-    state = function() return state end,
-    bind  = function(name)
+    state   = function() return state end,
+    flail   = function(v)
+        if type(v) == 'number' and v > 0 and v < 2 then CFG.flail = v captured = false end
+    end,
+    bind    = function(name)
         local up = string.upper(tostring(name or ''))
         if #up == 1 then
             local b = string.byte(up)
@@ -415,9 +460,14 @@ _G[NAME] = {
                 return true
             end
         end
-        if up == 'SPACE' then CFG.keyVK = 0x20 CFG.keyName = 'Space' refreshKeyText() return true end
+        if up == 'SPACE' then
+            CFG.keyVK = 0x20
+            CFG.keyName = 'Space'
+            refreshKeyText()
+            return true
+        end
         return false
     end,
 }
-log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', space recovers')
+log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', space recovers, joint flop enabled')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Player Trip', 3) end)
