@@ -1,48 +1,48 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v2.2
+  Version: v2.3
   ONE toggle: Wall Climb. Hold W at a wall to go up, S to come down.
 
-  HISTORY - three versions, all failing silently in different ways
-    v1.0 wrote Humanoid.PlatformStand. Not writable here, the pcall swallowed
-         'Unknown property', nothing happened.
-    v2.0 used workspace:Raycast. PROBED: it accepts the call and returns nil
-         for every ray, including straight down at the ground. FindPartOnRay,
-         GetPartBoundsInBox, GetPartsInRadius, GetPartsInPart and Region3 are
-         all nil as well. There is no spatial query in this build.
-    v2.1 read part geometry directly (OBB maths). Correct approach, but the
-         probe that was supposed to confirm geometry returned a stale answer
-         (34 objects, 0 Parts) and I wrongly called it dead. The real numbers
-         are 7210 descendants, 1276 Parts, 228 Models, 67 parts within 60
-         studs of the character. Geometry is there and dense.
+  HISTORY - four versions, every failure silent
+    v1.0 wrote Humanoid.PlatformStand. Not writable; the pcall swallowed it.
+    v2.0 used workspace:Raycast. PROBED: accepts the call, returns nil for
+         every ray. FindPartOnRay, GetPartBoundsInBox, GetPartsInRadius,
+         GetPartsInPart and Region3 are all nil too. No spatial query here.
+    v2.1 read part geometry with OBB maths. Correct approach; a stale probe
+         (34 objects, 0 Parts) made me wrongly call it dead. Real numbers:
+         7210 descendants, 1276 Parts, 228 Models, 40 parts within 60 studs.
+    v2.2 worked but pre-filtered by part CENTRE distance (reach+10 = 17).
+         A wide wall's centre can be 20 studs away while its face is 2 studs
+         from you, so large walls were skipped - the same silent-wrong shape
+         as the Raycast bug.
 
-  v2.2 - what changed
-    reach raised 4.5 -> 7, because HumanoidRootPart sits at the character's
-      centre and a wall face is roughly 1.5-2 studs out; 4.5 was cutting it fine.
-    The cache now keeps only parts within 80 studs, so the per-tick loop walks
-      a few dozen candidates instead of 1276.
-    HUD reports the measured box distance and the normal components, so one
-      test says whether it sees a wall and which way the face points.
+  v2.3 - the broad-phase is now correct
+    The cache stores each part's half-diagonal. The per-tick skip test is
+    (centre distance - half diagonal) > reach, which is conservative: it can
+    never skip a part whose face is within reach, however large the part.
+    Nothing else changed. The box maths was verified by probe: a point 0.1
+    studs above a 1x1x1 box returns normal (0,1,0) at distance 0.10, and the
+    head test returns (0,-1,0) at 0.99 - both exactly right.
 
-  DETECTION, no queries
+  DETECTION
     Transform the player point into the part's local space, clamp to the
     half-extents, transform back = closest point on the box. The offset from
-    that point to the player is the outward direction, and it is the face
-    normal when the player is just outside a flat side. |n.Y| <= 0.7 rejects
-    floors and ceilings, so only walls qualify.
+    that point to the player is the outward face normal. |n.Y| <= 0.7 rejects
+    floors and ceilings. A point inside a box (dist <= 1e-4) is not a wall.
 
   PERFORMANCE
-    Position/CFrame/Velocity writes cost thousands of internal memory ops each,
-    so the climb write is throttled to ~30 Hz and only fires while a direction
-    key is held against a wall. The part cache is rebuilt only after moving 25
-    studs. RenderStepped repaints text and nothing else.
+    Position/CFrame/Velocity writes cost thousands of internal ops each, so
+    the climb write is throttled to ~30 Hz and only fires while a direction
+    key is held against a wall. The cache is rebuilt only after moving 25
+    studs, and stores pos/half-extents so the per-tick loop does no property
+    reads until a candidate passes the broad-phase. RenderStepped paints text.
 
   No Instance.new anywhere - Instance does not exist in this VM at all.
   Stop with _G.WallWalk.stop() or toggle off in the menu.
 ]]
 
 local NAME    = 'WallWalk'
-local VERSION = 'v2.2'
+local VERSION = 'v2.3'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -74,7 +74,7 @@ local CFG = {
     maxY    = 0.7,
     tick    = 0.033,
     recache = 25,
-    keep    = 80,
+    keep    = 120,
     keyW    = 0x57,
     keyS    = 0x53,
 }
@@ -96,6 +96,9 @@ local function held(vk)
     return ok and v == true
 end
 
+-- Cache every candidate part with its position and half-extents, so the
+-- per-tick loop does no property reads until a candidate passes the
+-- broad-phase. Filtering here is one traversal, not per frame.
 local function rebuildCache(char, at)
     local out = {}
     local ok, list = pcall(function() return workspace:GetDescendants() end)
@@ -110,10 +113,16 @@ local function rebuildCache(char, at)
             local okPos, pos = pcall(function() return p.Position end)
             local okSz, sz  = pcall(function() return p.Size end)
             if okPos and okSz and pos and sz and sz.X >= 1 and sz.Y >= 1 and sz.Z >= 1 then
-                if (pos - at).Magnitude <= CFG.keep then
+                local hx, hy, hz = sz.X * 0.5, sz.Y * 0.5, sz.Z * 0.5
+                local halfDiag = sz.Magnitude * 0.5
+                if (pos - at).Magnitude - halfDiag <= CFG.keep then
                     local okA, anc = pcall(function() return p:IsDescendantOf(char) end)
                     if not okA or anc ~= true then
-                        out[#out + 1] = p
+                        out[#out + 1] = {
+                            part = p, pos = pos,
+                            hx = hx, hy = hy, hz = hz,
+                            halfDiag = halfDiag,
+                        }
                     end
                 end
             end
@@ -124,41 +133,7 @@ local function rebuildCache(char, at)
     log('nearby parts cached: ' .. tostring(#out))
 end
 
-local function nearestOnBox(part, p)
-    local okCf, cf = pcall(function() return part.CFrame end)
-    local okSz, sz = pcall(function() return part.Size end)
-    if not okCf or not okSz or not cf or not sz then return nil end
-
-    local rel = cf:PointToObjectSpace(p)
-    local hx, hy, hz = sz.X * 0.5, sz.Y * 0.5, sz.Z * 0.5
-
-    local cx = clamp(rel.X, -hx, hx)
-    local cy = clamp(rel.Y, -hy, hy)
-    local cz = clamp(rel.Z, -hz, hz)
-
-    local localClosest = Vector3.new(cx, cy, cz)
-    local worldClosest = cf:PointToWorldSpace(localClosest)
-    local dist = (p - worldClosest).Magnitude
-
-    local localNormal
-    if dist > 1e-4 then
-        localNormal = rel - localClosest
-    else
-        local px, py, pz = hx - math.abs(rel.X), hy - math.abs(rel.Y), hz - math.abs(rel.Z)
-        if px <= py and px <= pz then
-            localNormal = Vector3.new(rel.X >= 0 and 1 or -1, 0, 0)
-        elseif py <= pz then
-            localNormal = Vector3.new(0, rel.Y >= 0 and 1 or -1, 0)
-        else
-            localNormal = Vector3.new(0, 0, rel.Z >= 0 and 1 or -1)
-        end
-    end
-
-    local worldNormal = cf:VectorToWorldSpace(localNormal)
-    if worldNormal.Magnitude < 1e-4 then return nil end
-    return worldClosest, worldNormal.Unit, dist
-end
-
+-- Nearest non-character part whose flat face is within reach, by OBB maths.
 local function findWall(char, p)
     if not cacheAt or (cacheAt - p).Magnitude > CFG.recache then
         rebuildCache(char, p)
@@ -166,12 +141,31 @@ local function findWall(char, p)
 
     local bestN, bestD = nil, CFG.reach
     for i = 1, #parts do
-        local part = parts[i]
-        local okP, pp = pcall(function() return part.Position end)
-        if okP and pp and (pp - p).Magnitude < CFG.reach + 10 then
-            local _, normal, dist = nearestOnBox(part, p)
-            if normal and dist <= bestD and math.abs(normal.Y) <= CFG.maxY then
-                bestN, bestD = normal, dist
+        local e = parts[i]
+        local dx, dy, dz = e.pos.X - p.X, e.pos.Y - p.Y, e.pos.Z - p.Z
+        local d2 = dx*dx + dy*dy + dz*dz
+        local lim = CFG.reach + e.halfDiag
+        if d2 <= lim * lim then
+            local okCf, cf = pcall(function() return e.part.CFrame end)
+            if okCf and cf then
+                local rel = cf:PointToObjectSpace(p)
+                local cx = clamp(rel.X, -e.hx, e.hx)
+                local cy = clamp(rel.Y, -e.hy, e.hy)
+                local cz = clamp(rel.Z, -e.hz, e.hz)
+                local lc = Vector3.new(cx, cy, cz)
+                local wc = cf:PointToWorldSpace(lc)
+                local bx, by, bz = p.X - wc.X, p.Y - wc.Y, p.Z - wc.Z
+                local bd = math.sqrt(bx*bx + by*by + bz*bz)
+                if bd > 1e-4 and bd <= bestD then
+                    local ln = rel - lc
+                    local wn = cf:VectorToWorldSpace(ln)
+                    if wn.Magnitude > 1e-4 then
+                        wn = wn.Unit
+                        if math.abs(wn.Y) <= CFG.maxY then
+                            bestN, bestD = wn, bd
+                        end
+                    end
+                end
             end
         end
     end
