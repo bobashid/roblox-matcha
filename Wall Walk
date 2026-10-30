@@ -1,13 +1,31 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v3.2
+  Version: v3.3
   ONE toggle. Hold W at a wall: your feet go ON the wall. WASD then walks
   that wall as if it were the ground. Space steps off.
 
-  WHY v3.2 - "feels unsmooth and i feel like my feet are magnets to walls"
-  That report is not a detection bug. Detection was already correct. It was
-  the CONSTRAINT being applied at full strength on the first frame:
+  WHY v3.3 - "is it possible for me to have an actual walk animation"
+  PROBED this session, and the answer is no - there is nothing to play:
+    char.Animate has 10 StringValue children (idle, walk, run, jump, climb,
+      toolnone, fall, sit) and EVERY Animation child under them reads
+      AnimationId = nil. No assets are loaded.
+    Humanoid.LoadAnimation                -> nil
+    Animator exists as a child, but Animator.LoadAnimation -> nil
+    char.LeftUpperLeg / char.LeftUpperArm -> false. The limb parts do not
+      resolve at all, so joint-by-joint posing by CFrame is not possible
+      either.
+  A skeletal walk animation therefore cannot be played, loaded, or faked
+  limb by limb. The only motion available is the whole HumanoidRootPart.
 
+  v3.3 adds a BODY BOB: while you are moving on a wall the root part rises
+  and falls along the wall's up vector by bobAmp studs at bobRate rad/s -
+  the weight shift of a footfall. It is one multiply and one add on a value
+  that is already being written, so there are NO extra CFrame writes. The
+  amplitude eases to 0 when you stop, so it never freezes mid-step.
+
+  WHY v3.2 - "feels unsmooth and i feel like my feet are magnets to walls"
+  That report was not a detection bug. Detection was already correct. It was
+  the CONSTRAINT being applied at full strength on the first frame:
     1. One radius for attach and for stay. reach was 7 while standoff was
        3.2, so you were grabbed from up to 3.8 studs away and teleported
        onto the wall in a single frame. That is the magnet.
@@ -15,18 +33,14 @@
        closest + normal * standoff, exactly. No ramp, no glide.
     3. The basis was assigned outright. Any change in the surface normal
        rotated the character instantly, so corners snapped.
-
-  v3.2 changes three things and nothing else:
-    - attach at 4.5 studs, stay while within 7.5 (hysteresis). Grabs when you
-      are actually at the wall, lets go when you clearly are not.
-    - a `pull` value that starts at 0 on attach and eases to 1 at ~10/s. The
-      tangential movement stays full speed; only the pull onto the surface
-      ramps, so you glide onto the wall over ~0.25 s instead of teleporting.
-    - the up vector is LERPed toward the wall normal at ~8/s instead of being
-      assigned, so corners and face changes round off.
-  Also: attaching now requires you to be facing the wall (camLook dot -n), or
-  brushing past one latches you. And standoff is 2.6, not 3.2, so your feet
-  sit on the surface rather than 1.2 studs off it.
+  v3.2 fixed those three:
+    - attach at 4.5 studs, stay while within 7.5 (hysteresis).
+    - a `pull` value that starts at 0 on attach and eases to 1 at ~10/s, so
+      you glide onto the wall over ~0.25 s instead of teleporting.
+    - the up vector is LERPed toward the wall normal at ~8/s, so corners and
+      face changes round off.
+  Also: attaching requires you to be facing the wall (camLook dot -n), or
+  brushing past one latches you. And standoff is 2.6, not 3.2.
 
   HISTORY - every earlier failure was silent until probed
     v1.0 wrote Humanoid.PlatformStand. Not writable; the pcall swallowed it.
@@ -50,22 +64,24 @@
     (Y 24.00 -> 23.02 in that 0.1 s). So position must be rewritten every
     physics step; the rewrite is what holds you on the wall.
 
-  THE ONE VISUAL CONSTANT TO TUNE
-    CFG.standoff = 2.6 is the HRP centre distance from the wall surface.
-    Feet sit roughly 2 studs below HRP along the character's up, so 2.6 puts
-    them ~0.6 off the wall. Lower it if you float, raise it if you sink in.
+  THE CONSTANTS TO TUNE
+    CFG.standoff = 2.6  HRP centre distance from the wall surface. Feet sit
+                        roughly 2 studs below HRP along the character's up,
+                        so 2.6 puts them ~0.6 off the wall. Lower (2.2) if
+                        you float, raise (3.0) if you sink in.
+    CFG.bobAmp   = 0.28 studs of body rise/fall per step.
+    CFG.bobRate  = 7    rad/s, i.e. about 1.1 steps per second.
 
   COST
     A CFrame write is thousands of internal memory ops. It happens only
-    while attached, on Heartbeat, and stops the instant you detach.
-    The part cache rebuilds after 40 studs of travel (not 25), which removes
-    a visible hitch from the old value.
+    while attached, on Heartbeat, and stops the instant you detach. The bob
+    rides on that same write, so it adds no cost.
 
   Stop with _G.WallWalk.stop(), the toggle, or Space to step off.
 ]]
 
 local NAME    = 'WallWalk'
-local VERSION = 'v3.2'
+local VERSION = 'v3.3'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -100,6 +116,9 @@ local CFG = {
     maxY     = 0.7,    -- reject floor/ceiling faces
     recache  = 40,     -- rebuild the part cache after moving this far
     keepR    = 160,    -- cache radius
+    bobAmp   = 0.28,   -- studs of body rise/fall per step
+    bobRate  = 7,      -- rad/s
+    bobEase  = 6,      -- 1/s, amplitude fade in/out
     keyW     = 0x57,
     keyA     = 0x41,
     keyS     = 0x53,
@@ -113,6 +132,8 @@ local stuck    = false
 local stuckN   = nil    -- last raw normal, for the face-changed test
 local stuckUp  = nil    -- eased basis up
 local pull     = 0      -- 0 = free, 1 = fully on the wall
+local bobPhase = 0
+local bobAmp   = 0
 local lastJump = false
 
 local parts   = {}
@@ -161,7 +182,6 @@ local function rebuildCache(char, at)
     log('nearby parts cached: ' .. tostring(#out))
 end
 
--- Nearest wall-like face within `reach`. Returns normal, distance, entry.
 local function findWall(char, p, reach)
     if not cacheAt or (cacheAt - p).Magnitude > CFG.recache then
         rebuildCache(char, p)
@@ -208,7 +228,6 @@ local function closestOn(e, p)
     return cf:PointToWorldSpace(Vector3.new(cx, cy, cz))
 end
 
--- Project a direction onto the plane whose normal is `up`.
 local function flatten(v, up)
     local f = v - up * v:Dot(up)
     if f.Magnitude > 1e-3 then return f.Unit end
@@ -238,11 +257,13 @@ end
 
 local function detach()
     if not stuck then return end
-    stuck   = false
-    stuckN  = nil
-    stuckUp = nil
-    pull    = 0
-    status  = 'detached'
+    stuck    = false
+    stuckN   = nil
+    stuckUp  = nil
+    pull     = 0
+    bobPhase = 0
+    bobAmp   = 0
+    status   = 'detached'
 end
 
 track(RunService.Heartbeat:Connect(function(dt)
@@ -286,23 +307,22 @@ track(RunService.Heartbeat:Connect(function(dt)
             status = 'no wall within ' .. tostring(CFG.attach)
             return
         end
-        -- must actually be looking into the wall, or walking past one latches
         if cam.CFrame.LookVector:Dot(-n) < CFG.faceDot then
             status = 'wall beside you - face it'
             return
         end
         stuck  = true
         stuckN = n
-        -- start the basis from where the character actually is, so the
-        -- rotation onto the wall eases instead of snapping
         local okUp, curUp = pcall(function() return hrp.CFrame.UpVector end)
         if okUp and curUp and curUp.Magnitude > 0.5 then
             stuckUp = curUp.Unit
         else
             stuckUp = Vector3.new(0, 1, 0)
         end
-        pull   = 0
-        status = 'stuck (d=' .. string.format('%.1f', d) .. ')'
+        pull     = 0
+        bobPhase = 0
+        bobAmp   = 0
+        status   = 'stuck (d=' .. string.format('%.1f', d) .. ')'
     end
 
     -- ---------- release ----------
@@ -371,6 +391,24 @@ track(RunService.Heartbeat:Connect(function(dt)
         status = 'edge - holding'
     end
 
+    -- ---------- body bob: the only "animation" this VM allows ----------
+    -- No AnimationId assets, no LoadAnimation on Humanoid or Animator, and the
+    -- limb parts do not resolve, so a skeletal walk cannot be played or posed.
+    -- The whole root part rising and falling along the wall up is all that is
+    -- left, and it costs one multiply on a value already being written.
+    local moving = (move.Magnitude > 1e-3) and (pull > 0.5)
+    if moving then
+        bobPhase = bobPhase + dt * CFG.bobRate
+        if bobPhase > 6.283185307179586 then
+            bobPhase = bobPhase - 6.283185307179586
+        end
+    end
+    local wantAmp = moving and CFG.bobAmp or 0
+    bobAmp = bobAmp + (wantAmp - bobAmp) * math.min(1, dt * CFG.bobEase)
+    if bobAmp > 0.001 then
+        target = target + newUp * (math.sin(bobPhase) * bobAmp)
+    end
+
     local ok = pcall(function()
         hrp.CFrame = makeCFrame(target, right, newUp, back)
         hrp.Velocity = Vector3.new(0, 0, 0)
@@ -381,7 +419,8 @@ track(RunService.Heartbeat:Connect(function(dt)
         return
     end
 
-    wallInfo = string.format('n=%.2f,%.2f,%.2f d=%.1f pull=%.2f', n.X, n.Y, n.Z, d or -1, pull)
+    wallInfo = string.format('n=%.2f,%.2f,%.2f d=%.1f pull=%.2f bob=%.2f',
+        n.X, n.Y, n.Z, d or -1, pull, bobAmp)
 end))
 
 local hud
