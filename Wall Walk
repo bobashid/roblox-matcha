@@ -1,0 +1,234 @@
+--[[
+  Wall Walk (universal) - Matcha LuauVM
+  Version: v1.0
+  ONE toggle. No Instance creation, no raycast required.
+
+  Why it is built this way:
+  The internal-executor original needs Instance.new for a collider Part, a
+  VectorForce, a BodyGyro and a Weld, then raycasts 24 down-rays + 9 feelers to
+  find a surface normal. Instance is nil in this VM, so none of that can exist.
+  This version replaces the mechanism, not the code:
+    1. read WASD with iskeypressed (no InputBegan, which this VM drops)
+    2. detect "against a wall" by measuring horizontal travel over a short
+       window while a key is held - held key + no travel = blocked
+    3. while blocked and W held, set HumanoidRootPart.Velocity upward and keep
+       a small push into the surface
+  PlatformStand is switched on ONLY while climbing, so normal walking is
+  untouched the rest of the time. Every key is released and PlatformStand is
+  cleared on toggle-off, on death, and in stop().
+
+  Confirmed elsewhere in the brain: iskeypressed / keypress / keyrelease exist;
+  RenderStepped works and PreRender is nil; property writes on Humanoid and
+  BasePart are allowed.
+  UNVERIFIED: that setting HRP.Velocity every frame survives the humanoid's own
+  physics step in this VM. If nothing moves, the fallback is CFrame writes.
+  Limits by design: this CLIMBS upright, it does not rotate gravity to walk on
+  ceilings, because that needs a surface normal from a raycast.
+]]
+
+local NAME    = 'WallWalk'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players    = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local lp         = Players.LocalPlayer
+
+local running = true
+local conns   = {}
+
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
+
+local CFG = {
+    on          = false,
+    climbSpeed  = 26,     -- studs/s upward while climbing
+    pushSpeed   = 8,      -- studs/s into the surface, keeps contact
+    window      = 0.20,   -- seconds between blocked checks
+    stillEps    = 0.6,    -- horizontal studs below this = blocked
+    keyW        = 0x57,
+    keyA        = 0x41,
+    keyS        = 0x53,
+    keyD        = 0x44,
+}
+
+local lastPos  = nil
+local lastT    = 0
+local blocked  = false
+local standing = false
+local UP       = Vector3.new(0, 1, 0)
+
+local function log(m)
+    print('[' .. NAME .. '] ' .. tostring(m))
+end
+
+local function held(vk)
+    if type(iskeypressed) ~= 'function' then return false end
+    local ok, v = pcall(iskeypressed, vk)
+    return ok and v == true
+end
+
+local function setStanding(want)
+    if want == standing then return end
+    local ch = lp.Character
+    local hum = ch and ch:FindFirstChildOfClass('Humanoid')
+    if not hum then return end
+    local ok = pcall(function() hum.PlatformStand = want end)
+    if ok then standing = want end
+end
+
+local function wishDir()
+    local cam = workspace.CurrentCamera
+    if not cam then return Vector3.new(0, 0, 0) end
+    local f = 0
+    if held(CFG.keyW) then f = f + 1 end
+    if held(CFG.keyS) then f = f - 1 end
+    local r = 0
+    if held(CFG.keyD) then r = r + 1 end
+    if held(CFG.keyA) then r = r - 1 end
+    if f == 0 and r == 0 then return Vector3.new(0, 0, 0) end
+    local look = cam.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 1e-3 then return Vector3.new(0, 0, 0) end
+    flat = flat.Unit
+    local right = flat:Cross(UP)
+    if right.Magnitude < 1e-3 then return Vector3.new(0, 0, 0) end
+    right = right.Unit
+    local v = flat * f + right * r
+    if v.Magnitude < 1e-3 then return Vector3.new(0, 0, 0) end
+    return v.Unit
+end
+
+local function step()
+    if not running then return end
+    local ch  = lp.Character
+    local hum = ch and ch:FindFirstChildOfClass('Humanoid')
+    local hrp = ch and ch:FindFirstChild('HumanoidRootPart')
+    if not hum or not hrp or hum.Health <= 0 then
+        setStanding(false)
+        lastPos, blocked = nil, false
+        return
+    end
+
+    local now  = os.clock()
+    local pos  = hrp.Position
+    local wish = wishDir()
+
+    if lastPos and (now - lastT) >= CFG.window then
+        local a = Vector3.new(pos.X, 0, pos.Z)
+        local b = Vector3.new(lastPos.X, 0, lastPos.Z)
+        local moved = (a - b).Magnitude
+        blocked = (wish.Magnitude > 0.1) and (moved < CFG.stillEps)
+        lastPos = pos
+        lastT   = now
+    elseif not lastPos then
+        lastPos = pos
+        lastT   = now
+    end
+
+    local climbing = CFG.on and blocked
+    setStanding(climbing)
+
+    if climbing then
+        local push = wish * CFG.pushSpeed
+        local up   = 0
+        if held(CFG.keyW) then
+            up = CFG.climbSpeed
+        elseif held(CFG.keyS) then
+            up = -CFG.climbSpeed
+        end
+        pcall(function()
+            hrp.Velocity = Vector3.new(push.X, up, push.Z)
+        end)
+    end
+end
+
+local function stop()
+    running = false
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    setStanding(false)
+    if type(UI) == 'table' and type(UI.RemoveTab) == 'function' then
+        pcall(function() UI.RemoveTab('Wall Walk') end)
+    end
+    _G[NAME] = nil
+    log('stopped')
+end
+
+local okRender = pcall(function()
+    track(RunService.RenderStepped:Connect(function()
+        pcall(step)
+    end))
+end)
+if not okRender then log('RenderStepped connect failed') end
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built  = false
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    return nil
+end
+
+local function mkToggle(sec, label, id, def, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(id, label, def, cb) end,
+        function() sec:Toggle(label, id, def, cb) end,
+        function() sec:Toggle(label, def, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    log('toggle failed: ' .. label)
+    return false
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Wall Walk', function(tab)
+            if built then return end
+            built = true
+            local okB, errB = pcall(function()
+                local sec = mkSection(tab, 'Wall Walk')
+                if not sec then return end
+                mkToggle(sec, 'Wall Climb', 'ww_on', CFG.on, function(v)
+                    CFG.on = v
+                    if not v then setStanding(false) end
+                    log('wall climb ' .. (v and 'ON' or 'off'))
+                end)
+            end)
+            if not okB then log('menu build error: ' .. tostring(errB)) end
+            log('tab built')
+        end)
+    end)
+    if not ok then
+        HAS_UI = false
+        log('UI.AddTab failed: ' .. tostring(err))
+    end
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
+log(VERSION .. ' loaded - hold W against a wall to climb, S to descend')
+pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Wall Walk', 3) end)
