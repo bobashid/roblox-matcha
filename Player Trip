@@ -1,0 +1,308 @@
+--[[
+  Player Trip (universal) - Matcha LuauVM
+  Version: v1.0
+  One button: Trip. The character pitches face-down and slides forward.
+
+  WHY THIS IS NOT THE ORIGINAL SCRIPT
+  The original is two lines:
+      hum:ChangeState(0)                       -- FallingDown
+      root.Velocity = root.CFrame.LookVector * 30
+  PROBED this session, and neither half ports:
+      hum:ChangeState          -> nil
+      hum:SetStateEnabled      -> nil
+      hum:GetStateEnabled      -> nil
+      hum:GetState             -> nil  (calling it raised 'attempt to call
+                                        missing method GetState of Instance')
+      hum.PlayEmote            -> nil
+      hum.LoadAnimation        -> nil
+      Enum.HumanoidStateType   -> nil, so FallingDown cannot even be named
+  There is no Humanoid state machine in this VM, so nothing can put the
+  character into FallingDown. What IS writable, from the same probe:
+      root.CFrame  -> userdata
+      root.Velocity-> userdata
+
+  HOW THE TRIP IS FAKED INSTEAD
+  Wall Walk proved a rotated CFrame write PERSISTS across a physics step - the
+  humanoid does not snap the character upright. So a trip is built from the two
+  things that do work:
+    1. write a basis with the character's up axis lying HORIZONTAL along the
+       direction of travel and its front pointing at the floor (a faceplant),
+    2. push Velocity along that travel direction, and let physics carry it.
+  Each physics step during the trip we rewrite the CFrame at the position
+  physics produced - so the rotation holds and the velocity still slides the
+  character. After `duration` the basis is eased back upright and Velocity is
+  zeroed, so the humanoid takes over again cleanly.
+
+  THE HONEST LIMIT
+  No ragdoll pose plays. The game's animate script only plays FallingDown when
+  the humanoid enters that state, and the state machine is absent here - so the
+  character rotates and slides but its limbs stay in the walk/idle pose. A
+  physical tumble, not an animated one. Nothing in this VM can change that.
+
+  Also: the original's ChangeState(0) is what stopped the player from simply
+  walking out of the trip. There is no equivalent here, so during the trip the
+  humanoid still accepts movement input - it is short (0.55 s), which is the
+  only mitigation available.
+
+  THE CONSTANTS TO TUNE
+    CFG.speed    = 30   studs/s of slide, same as the original.
+    CFG.duration = 0.55 s face-down before standing back up.
+    CFG.settle   = 0.18 s to ease upright afterwards.
+
+  Cost: one CFrame write per physics step, only while a trip is running.
+  Stop with _G.PlayerTrip.stop(). Fire with the button or
+  _G.PlayerTrip.trip().
+]]
+
+local NAME    = 'PlayerTrip'
+local VERSION = 'v1.0'
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+print('[' .. NAME .. '] ' .. VERSION)
+
+local Players    = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local lp         = Players.LocalPlayer
+
+local running = true
+local conns   = {}
+
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
+
+local CFG = {
+    speed    = 30,
+    duration = 0.55,
+    settle   = 0.18,
+}
+
+local state   = 'idle'
+local untilAt = 0
+local basis   = nil
+local travel  = nil
+
+local function log(m)
+    print('[' .. NAME .. '] ' .. tostring(m))
+end
+
+local function rootOf(char)
+    if not char then return nil end
+    local ok, r = pcall(function()
+        return char:FindFirstChild('HumanoidRootPart')
+            or char:FindFirstChild('Torso')
+            or char:FindFirstChild('UpperTorso')
+    end)
+    if ok then return r end
+    return nil
+end
+
+-- The only constructor here that builds an arbitrary orientation.
+-- Columns are right, up, back.
+local function makeCFrame(pos, right, up, back)
+    return CFrame.new(
+        pos.X, pos.Y, pos.Z,
+        right.X, up.X, back.X,
+        right.Y, up.Y, back.Y,
+        right.Z, up.Z, back.Z
+    )
+end
+
+local function uprightBasis(look)
+    local up    = Vector3.new(0, 1, 0)
+    local back  = -look
+    local right = up:Cross(back)
+    if right.Magnitude < 1e-3 then
+        right = Vector3.new(1, 0, 0)
+    else
+        right = right.Unit
+    end
+    return right, up, back
+end
+
+-- up = travel direction (feet behind, head forward), front = floor.
+local function flatBasis(dir)
+    local up    = dir
+    local front = Vector3.new(0, -1, 0)
+    local back  = -front
+    local right = up:Cross(back)
+    if right.Magnitude < 1e-3 then return nil end
+    return right.Unit, up, back
+end
+
+local function trip()
+    if state ~= 'idle' then return false end
+
+    local char = lp.Character
+    local root = rootOf(char)
+    if not root then log('no character'); return false end
+
+    local okCf, cf = pcall(function() return root.CFrame end)
+    if not okCf or not cf then log('no CFrame'); return false end
+
+    local look = cf.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 1e-3 then
+        flat = Vector3.new(0, 0, -1)
+    else
+        flat = flat.Unit
+    end
+
+    local r, u, b = flatBasis(flat)
+    if not r then log('bad basis'); return false end
+
+    basis  = { right = r, up = u, back = b }
+    travel = flat
+    state  = 'tripping'
+    untilAt = os.clock() + CFG.duration
+
+    pcall(function()
+        root.Velocity = flat * CFG.speed + Vector3.new(0, 6, 0)
+    end)
+
+    log('trip fired, ' .. string.format('%.0f', CFG.speed) .. ' studs/s')
+    return true
+end
+
+track(RunService.Heartbeat:Connect(function(dt)
+    if not running then return end
+    if state == 'idle' then return end
+    if dt <= 0 or dt > 0.5 then dt = 1/60 end
+
+    local char = lp.Character
+    local root = rootOf(char)
+    if not root or not basis then
+        state, basis, travel = 'idle', nil, nil
+        return
+    end
+
+    local okP, p = pcall(function() return root.Position end)
+    if not okP or not p then
+        state, basis, travel = 'idle', nil, nil
+        return
+    end
+
+    local now = os.clock()
+
+    if state == 'tripping' then
+        if now >= untilAt then
+            local r, u, b = uprightBasis(travel or Vector3.new(0, 0, -1))
+            basis  = { right = r, up = u, back = b }
+            state  = 'settling'
+            untilAt = now + CFG.settle
+            pcall(function() root.Velocity = Vector3.new(0, 0, 0) end)
+        else
+            -- rotate only; the position comes from physics so the velocity
+            -- push still slides the character
+            pcall(function()
+                root.CFrame = makeCFrame(p, basis.right, basis.up, basis.back)
+            end)
+        end
+    elseif state == 'settling' then
+        pcall(function()
+            root.CFrame = makeCFrame(p, basis.right, basis.up, basis.back)
+        end)
+        if now >= untilAt then
+            state, basis, travel = 'idle', nil, nil
+            log('recovered')
+        end
+    end
+end))
+
+local hud
+pcall(function()
+    hud = Drawing.new('Text')
+    hud.Size = 14
+    hud.Outline = true
+    hud.Color = Color3.fromRGB(235, 235, 245)
+    hud.Position = Vector2.new(12, 60)
+    hud.Visible = true
+end)
+
+track(RunService.RenderStepped:Connect(function()
+    if not hud then return end
+    hud.Text = string.format('[%s] %s', VERSION, state)
+end))
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built  = false
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function mkSection(tab, name)
+    for _, side in ipairs({ 'Left', 'Right' }) do
+        local ok, sec = pcall(function() return tab:Section(name, side) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    return nil
+end
+
+local function mkToggle(sec, label, id, def, apply)
+    local cb = function(...)
+        local v = firstBool(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:Toggle(id, label, def, cb) end,
+        function() sec:Toggle(label, id, def, cb) end,
+        function() sec:Toggle(label, def, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    log('toggle failed: ' .. label)
+    return false
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    log('button failed: ' .. label)
+    return false
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Player Trip', function(tab)
+            if built then return end
+            built = true
+            local okB, errB = pcall(function()
+                local sec = mkSection(tab, 'Trip')
+                if not sec then return end
+                mkButton(sec, 'Trip', function()
+                    if not trip() then log('trip did nothing - see the line above') end
+                end)
+            end)
+            if not okB then log('menu build error: ' .. tostring(errB)) end
+            log('tab built')
+        end)
+    end)
+    if not ok then
+        HAS_UI = false
+        log('UI.AddTab failed: ' .. tostring(err))
+    end
+end
+
+local function stop()
+    running = false
+    state, basis, travel = 'idle', nil, nil
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    if hud then pcall(function() hud:Remove() end); hud = nil end
+    if HAS_UI then pcall(function() UI.RemoveTab('Player Trip') end) end
+    _G[NAME] = nil
+    log('stopped')
+end
+
+_G[NAME] = { stop = stop, trip = trip, version = VERSION, state = function() return state end }
+log(VERSION .. ' loaded - press Trip in the Player Trip tab')
+pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Player Trip', 3) end)
