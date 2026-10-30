@@ -1,35 +1,40 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v2.0
+  Version: v2.1
   ONE toggle: Wall Climb. Hold W at a wall to go up, S to come down.
 
-  WHAT WAS WRONG IN v1.0 (both real bugs, both silent)
-    1. It wrote Humanoid.PlatformStand. That property is NOT in Matcha's
-       writable list, so the assignment raised 'Unknown property'. The pcall
-       around it swallowed the error, so the write never happened and the
-       script looked like it did nothing.
-    2. Wall detection measured how far you had moved over 0.2 s. That is a
-       guess, not a signal: it fires on lag, on slopes, on stepping into a
-       corner, and it does not know which way the wall faces.
+  HISTORY, because both earlier versions failed the same way - silently.
+    v1.0 wrote Humanoid.PlatformStand, which is not writable in this VM. The
+         pcall around it swallowed 'Unknown property' and nothing happened.
+    v2.0 used workspace:Raycast. PROBED THIS SESSION: it is a stub - it accepts
+         the call and returns nil for every ray, including straight down at the
+         ground. That is why the HUD said 'no wall' while standing at a wall.
+         FindPartOnRay, GetPartBoundsInBox, GetPartsInPart and Region3 are nil
+         as well, so there is no query fallback in this build.
 
-  WHAT CHANGED IN v2.0
-    workspace:Raycast exists in this VM, with RaycastParams and a real
-    surface Normal. Wall detection is now a forward ray - 5 studs along the
-    camera's flattened look vector, character filtered out. A hit means you
-    are facing a wall, and res.Normal tells us which way to push into it.
+  v2.1 DETECTS WALLS WITHOUT ANY QUERY. It reads part geometry directly:
+    - Position, Size and CFrame are all readable on a BasePart.
+    - Transform the player position into the part's local space, clamp it to
+      the half-extents, and transform back: that is the closest point on the
+      box, standard OBB maths, pure arithmetic.
+    - The offset from that point to the player is the push direction, and it
+      is the face normal for a point just outside a flat side.
+    - |normal.Y| < 0.7 rejects floors and ceilings, so only walls count.
 
   PERFORMANCE
-    Assigning Velocity performs thousands of internal memory writes each
-    time, so the write is throttled to about 30 Hz on a task.spawn loop. It
-    is never done per RenderStepped. The raycast is cheap and runs on the
-    same tick. RenderStepped is used only for the HUD text.
+    Position/CFrame/Velocity writes cost thousands of internal memory ops each,
+    so the climb write is throttled to ~30 Hz on a task.spawn loop and only
+    happens while you are actually holding a direction against a wall.
+    The part list is cached and only rebuilt after you move 25 studs, because
+    static level geometry does not move. That keeps GetDescendants out of the
+    per-frame path entirely. RenderStepped only repaints the HUD text.
 
   No Instance.new anywhere - Instance does not exist in this VM at all.
   Stop with _G.WallWalk.stop() or by toggling off in the menu.
 ]]
 
 local NAME    = 'WallWalk'
-local VERSION = 'v2.0'
+local VERSION = 'v2.1'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -46,20 +51,31 @@ local function track(c)
     return c
 end
 
+local clamp = math.clamp or function(v, a, b)
+    if v < a then return a end
+    if v > b then return b end
+    return v
+end
+
 local CFG = {
-    on    = false,
-    climb = 34,     -- studs/s upward while W is held
-    sink  = 22,     -- studs/s downward while S is held
-    stick = 9,      -- studs/s pressed into the wall
-    reach = 5,      -- forward ray length
-    tick  = 0.033,  -- about 30 Hz
-    keyW  = 0x57,
-    keyS  = 0x53,
+    on      = false,
+    climb   = 34,    -- studs/s up while W is held against a wall
+    sink    = 22,    -- studs/s down while S is held
+    stick   = 8,     -- studs/s pressed into the wall
+    reach   = 4.5,   -- how close a part must be to count as your wall
+    maxY    = 0.7,   -- reject a face if |normal.Y| is above this
+    tick    = 0.033, -- ~30 Hz
+    recache = 25,    -- rebuild the part list after moving this far
+    keyW    = 0x57,
+    keyS    = 0x53,
 }
 
-local UP      = Vector3.new(0, 1, 0)
-local status  = 'off'
-local wallHit = false
+local status   = 'off'
+local wallName = '-'
+local wallDist = -1
+
+local parts   = {}
+local cacheAt = nil
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
@@ -71,86 +87,127 @@ local function held(vk)
     return ok and v == true
 end
 
-local function newParams(char)
-    local ok, p = pcall(function() return RaycastParams.new() end)
-    if not ok or not p then return nil end
-    pcall(function() p.FilterDescendantsInstances = { char } end)
-    pcall(function() p.FilterType = Enum.RaycastFilterType.Exclude end)
-    pcall(function() p.FilterType = Enum.RaycastFilterType.Blacklist end)
-    pcall(function() p.IgnoreWater = true end)
-    return p
+-- Rebuild the candidate part list. Bounded: one traversal, then pure maths.
+local function rebuildCache(char, at)
+    local out = {}
+    local ok, list = pcall(function() return workspace:GetDescendants() end)
+    if not ok or not list then return end
+    for i = 1, #list do
+        local p = list[i]
+        local okc, cls = pcall(function() return p.ClassName end)
+        if okc and cls == 'Part' then
+            local okPos, pos = pcall(function() return p.Position end)
+            local okSz, sz  = pcall(function() return p.Size end)
+            if okPos and okSz and pos and sz and sz.X >= 2 and sz.Y >= 2 and sz.Z >= 2 then
+                local okA, anc = pcall(function() return p:IsDescendantOf(char) end)
+                if not okA or anc ~= true then
+                    out[#out + 1] = p
+                end
+            end
+        end
+    end
+    parts = out
+    cacheAt = at
+    log('parts cached: ' .. tostring(#out))
 end
 
-local function flatLook(cam)
-    local l = cam.CFrame.LookVector
-    local f = Vector3.new(l.X, 0, l.Z)
-    if f.Magnitude < 1e-3 then return nil end
-    return f.Unit
+-- Closest point on a box to p, plus the outward face normal. Pure arithmetic.
+local function nearestOnBox(part, p)
+    local okCf, cf = pcall(function() return part.CFrame end)
+    local okSz, sz = pcall(function() return part.Size end)
+    if not okCf or not okSz or not cf or not sz then return nil end
+
+    local rel = cf:PointToObjectSpace(p)
+    local hx, hy, hz = sz.X * 0.5, sz.Y * 0.5, sz.Z * 0.5
+
+    local cx = clamp(rel.X, -hx, hx)
+    local cy = clamp(rel.Y, -hy, hy)
+    local cz = clamp(rel.Z, -hz, hz)
+
+    local localClosest = Vector3.new(cx, cy, cz)
+    local worldClosest = cf:PointToWorldSpace(localClosest)
+    local delta = p - worldClosest
+    local dist = delta.Magnitude
+
+    local localNormal
+    if dist > 1e-4 then
+        localNormal = (rel - localClosest)
+    else
+        -- inside the box: exit through the nearest face
+        local px, py, pz = hx - math.abs(rel.X), hy - math.abs(rel.Y), hz - math.abs(rel.Z)
+        if px <= py and px <= pz then
+            localNormal = Vector3.new(rel.X >= 0 and 1 or -1, 0, 0)
+        elseif py <= pz then
+            localNormal = Vector3.new(0, rel.Y >= 0 and 1 or -1, 0)
+        else
+            localNormal = Vector3.new(0, 0, rel.Z >= 0 and 1 or -1)
+        end
+    end
+
+    local worldNormal = cf:VectorToWorldSpace(localNormal)
+    if worldNormal.Magnitude < 1e-4 then return nil end
+    return worldClosest, worldNormal.Unit, dist
 end
 
-local params, paramsChar = nil, nil
+-- Best wall within reach: nearest part whose face is flat enough to be a wall.
+local function findWall(char, p)
+    if not cacheAt or (cacheAt - p).Magnitude > CFG.recache then
+        rebuildCache(char, p)
+    end
 
--- main tick: raycast + throttled velocity write
+    local bestN, bestD, bestP = nil, CFG.reach, nil
+    local limit = CFG.reach + 6
+
+    for i = 1, #parts do
+        local part = parts[i]
+        local okP, pp = pcall(function() return part.Position end)
+        if okP and pp and (pp - p).Magnitude < limit then
+            local closest, normal, dist = nearestOnBox(part, p)
+            if normal and dist <= bestD then
+                if math.abs(normal.Y) <= CFG.maxY then
+                    bestN, bestD, bestP = normal, dist, closest
+                end
+            end
+        end
+    end
+    return bestN, bestD, bestP
+end
+
+-- main tick
 task.spawn(function()
     while running do
         local char = lp.Character
         local hum  = char and char:FindFirstChild('Humanoid')
         local hrp  = char and char:FindFirstChild('HumanoidRootPart')
-        local cam  = workspace.CurrentCamera
-
-        wallHit = false
 
         if not CFG.on then
-            status = 'off'
+            status, wallName, wallDist = 'off', '-', -1
         elseif not char or not hum or not hrp then
             status = 'no character'
         elseif hum.Health <= 0 then
             status = 'dead'
-        elseif not cam then
-            status = 'no camera'
         else
-            local dir = flatLook(cam)
-            if not dir then
-                status = 'camera straight up/down'
-            else
-                if paramsChar ~= char then
-                    params = newParams(char)
-                    paramsChar = char
+            local p = hrp.Position
+            local n, d = findWall(char, p)
+            if n then
+                wallName = string.format('n=%.2f,%.2f,%.2f', n.X, n.Y, n.Z)
+                wallDist = d
+                local climb = 0
+                if held(CFG.keyW) then
+                    climb = CFG.climb
+                elseif held(CFG.keyS) then
+                    climb = -CFG.sink
                 end
-
-                local res = nil
-                if params then
-                    local ok, r = pcall(function()
-                        return workspace:Raycast(hrp.Position, dir * CFG.reach, params)
-                    end)
-                    if ok then res = r end
-                end
-
-                if not res or not res.Normal then
-                    status = 'no wall'
+                if climb ~= 0 then
+                    local v = Vector3.new(-n.X * CFG.stick, climb, -n.Z * CFG.stick)
+                    pcall(function() hrp.Velocity = v end)
+                    status = string.format('climbing %+d', climb)
                 else
-                    local n  = res.Normal
-                    local fn = Vector3.new(n.X, 0, n.Z)
-                    if fn.Magnitude < 1e-3 then
-                        status = 'wall normal is vertical'
-                    else
-                        fn = fn.Unit
-                        wallHit = true
-                        local climb = 0
-                        if held(CFG.keyW) then
-                            climb = CFG.climb
-                        elseif held(CFG.keyS) then
-                            climb = -CFG.sink
-                        end
-                        if climb ~= 0 then
-                            local v = Vector3.new(-fn.X * CFG.stick, climb, -fn.Z * CFG.stick)
-                            pcall(function() hrp.Velocity = v end)
-                            status = string.format('climbing %+d', climb)
-                        else
-                            status = 'on wall - W up / S down'
-                        end
-                    end
+                    status = 'on wall - W up / S down'
                 end
+            else
+                wallName, wallDist = '-', -1
+                status = 'no wall within ' .. tostring(CFG.reach)
             end
         end
 
@@ -158,7 +215,7 @@ task.spawn(function()
     end
 end)
 
--- HUD: the only thing that runs per frame
+-- HUD
 local hud
 pcall(function()
     hud = Drawing.new('Text')
@@ -171,10 +228,10 @@ end)
 
 track(RunService.RenderStepped:Connect(function()
     if not hud then return end
-    hud.Text = string.format('[%s] %s | wall %s', VERSION, status, tostring(wallHit))
+    hud.Text = string.format('[%s] %s | dist %.2f | %s', VERSION, status, wallDist, wallName)
 end))
 
--- menu: exactly one toggle
+-- menu
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local built  = false
 
