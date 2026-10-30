@@ -1,97 +1,93 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v3.3
+  Version: v3.4
   ONE toggle. Hold W at a wall: your feet go ON the wall. WASD then walks
   that wall as if it were the ground. Space steps off.
 
-  WHY v3.3 - "is it possible for me to have an actual walk animation"
-  PROBED this session, and the answer is no - there is nothing to play:
-    char.Animate has 10 StringValue children (idle, walk, run, jump, climb,
-      toolnone, fall, sit) and EVERY Animation child under them reads
-      AnimationId = nil. No assets are loaded.
-    Humanoid.LoadAnimation                -> nil
-    Animator exists as a child, but Animator.LoadAnimation -> nil
-    char.LeftUpperLeg / char.LeftUpperArm -> false. The limb parts do not
-      resolve at all, so joint-by-joint posing by CFrame is not possible
-      either.
-  A skeletal walk animation therefore cannot be played, loaded, or faked
-  limb by limb. The only motion available is the whole HumanoidRootPart.
+  WHY v3.4 - "this one feels like im sliding around"
+  Exactly right, and the cause was v3.3's movement model: it wrote the
+  HumanoidRootPart CFrame every step and zeroed Velocity. The humanoid was
+  never asked to move, so its own state stayed idle/standing and the animate
+  script had nothing to play - a static pose translated along a wall. That is
+  precisely what sliding looks like.
 
-  v3.3 adds a BODY BOB: while you are moving on a wall the root part rises
-  and falls along the wall's up vector by bobAmp studs at bobRate rad/s -
-  the weight shift of a footfall. It is one multiply and one add on a value
-  that is already being written, so there are NO extra CFrame writes. The
-  amplitude eases to 0 when you stop, so it never freezes mid-step.
+  PROBED this session, which is why this version is possible:
+    hum.Move  -> function        (the humanoid CAN drive its own movement)
+    lp.Move   -> function        (player-module fallback)
+    RigType   -> R15
+    getgc('WalkSpeed') -> 0 entries, so WalkSpeed is not reachable that way.
+      This version therefore does NOT touch WalkSpeed - it uses whatever the
+      game already gives you, so the animation speed matches the game's own.
 
-  WHY v3.2 - "feels unsmooth and i feel like my feet are magnets to walls"
-  That report was not a detection bug. Detection was already correct. It was
-  the CONSTRAINT being applied at full strength on the first frame:
-    1. One radius for attach and for stay. reach was 7 while standoff was
-       3.2, so you were grabbed from up to 3.8 studs away and teleported
-       onto the wall in a single frame. That is the magnet.
-    2. The wall pull was binary. Every frame the position was written as
-       closest + normal * standoff, exactly. No ramp, no glide.
-    3. The basis was assigned outright. Any change in the surface normal
-       rotated the character instantly, so corners snapped.
-  v3.2 fixed those three:
-    - attach at 4.5 studs, stay while within 7.5 (hysteresis).
-    - a `pull` value that starts at 0 on attach and eases to 1 at ~10/s, so
-      you glide onto the wall over ~0.25 s instead of teleporting.
-    - the up vector is LERPed toward the wall normal at ~8/s, so corners and
-      face changes round off.
-  Also: attaching requires you to be facing the wall (camLook dot -n), or
-  brushing past one latches you. And standoff is 2.6, not 3.2.
+  WHAT CHANGED
+  v3.3  position = ours, velocity zeroed.   -> humanoid idle, character slides.
+  v3.4  humanoid does the walking (hum:Move on the wall tangent), and we only
+        write the ORIENTATION plus the distance from the wall.
+        The humanoid is genuinely moving, so its animate script plays the real
+        walk cycle, in sync with the distance actually covered.
+
+  HOW THE CONFLICT IS RESOLVED
+  The humanoid moves in world space with world gravity, so left alone it would
+  walk off the wall and fall. Each Heartbeat, after the physics step:
+    1. read the position the humanoid produced
+    2. pull it back to standoff along the wall normal (the `pull` ramp)
+    3. write the CFrame with the wall as up and the camera tangent as look
+  Step 2 is a small correction, not the motion. That is the whole difference
+  between walking and sliding.
+
+  BOB is still here but defaults to 0 (CFG.bobAmp). With a real walk cycle
+  playing it is usually unnecessary; raise it to 0.2 if you want extra weight
+  shift. It rides on the same write, so it costs nothing.
 
   HISTORY - every earlier failure was silent until probed
-    v1.0 wrote Humanoid.PlatformStand. Not writable; the pcall swallowed it.
-    v2.0 used workspace:Raycast. PROBED: accepts the call, returns nil for
-         every ray. FindPartOnRay, GetPartBoundsInBox, GetPartsInRadius,
-         GetPartsInPart, Region3 are all nil. No spatial query in this VM.
-    v2.1-v2.3 read part geometry with OBB maths (probe-verified) but only
-         wrote Velocity, so the character stayed upright. A climb.
-    v3.0 called CFrame.fromMatrix. PROBED: nil. Would have failed to write.
-    v3.1 used the 12-number CFrame.new basis and worked, but grabbed hard.
+    v1.0  Humanoid.PlatformStand - not writable, pcall swallowed the error.
+    v2.0  workspace:Raycast - PROBED: accepts the call, returns nil for every
+          ray. FindPartOnRay, GetPartBoundsInBox, GetPartsInRadius,
+          GetPartsInPart, Region3 all nil. No spatial query in this VM.
+    v2.1-3 OBB geometry detection (probe-verified correct) but Velocity-only,
+          so the character stayed upright - a climb, not a walk.
+    v3.0  CFrame.fromMatrix - PROBED: nil. Would have failed to write.
+    v3.1  the 12-number CFrame.new basis - worked, but grabbed hard.
+    v3.2  eased the constraint: hysteresis, ramped pull, lerped basis.
+    v3.3  added a body bob after wrongly concluding no animation could play.
 
   PROBED, and the reason this design exists
-    CFrame.fromMatrix       -> nil
-    CFrame.fromAxisAngle    -> nil
-    CFrame.Angles           -> function, cannot set a custom up
-    CFrame.lookAt           -> function, IGNORES its up argument
+    CFrame.fromMatrix     -> nil
+    CFrame.fromAxisAngle  -> nil
+    CFrame.Angles         -> function, cannot set a custom up
+    CFrame.lookAt         -> function, IGNORES its up argument
     CFrame.new(x,y,z, rX,uX,bX, rY,uY,bY, rZ,uZ,bZ) -> works; the three
       vectors are the COLUMNS of the rotation matrix: right, up, back.
-    A rotated write PERSISTS across a physics step (up read back (1,0,0)
-    immediately and still (1,0,0) after 0.1 s), but gravity still acts
-    (Y 24.00 -> 23.02 in that 0.1 s). So position must be rewritten every
-    physics step; the rewrite is what holds you on the wall.
+    A rotated write PERSISTS across a physics step, but gravity still acts, so
+    position has to be corrected every step.
 
   THE CONSTANTS TO TUNE
-    CFG.standoff = 2.6  HRP centre distance from the wall surface. Feet sit
-                        roughly 2 studs below HRP along the character's up,
-                        so 2.6 puts them ~0.6 off the wall. Lower (2.2) if
-                        you float, raise (3.0) if you sink in.
-    CFG.bobAmp   = 0.28 studs of body rise/fall per step.
-    CFG.bobRate  = 7    rad/s, i.e. about 1.1 steps per second.
+    CFG.standoff = 2.6  HRP centre distance from the wall. Feet sit ~2 studs
+                        below HRP along the character's up. Floating -> 2.2,
+                        sinking in -> 3.0.
+    CFG.speedMul = 1.0  scales the humanoid's own walk speed while on a wall.
+                        0.6 for a careful climb, 1.4 to move fast.
+    CFG.bobAmp   = 0    raise to ~0.2 only if you want extra weight shift.
 
   COST
-    A CFrame write is thousands of internal memory ops. It happens only
-    while attached, on Heartbeat, and stops the instant you detach. The bob
-    rides on that same write, so it adds no cost.
+    One CFrame write per Heartbeat, only while attached. The humanoid movement
+    itself is ordinary gameplay movement and costs nothing extra.
 
   Stop with _G.WallWalk.stop(), the toggle, or Space to step off.
 ]]
 
-local NAME    = 'WallWalk'
-local VERSION = 'v3.3'
+local NAME = 'WallWalk'
+local VERSION = 'v3.4'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
 
-local Players    = game:GetService('Players')
+local Players = game:GetService('Players')
 local RunService = game:GetService('RunService')
-local lp         = Players.LocalPlayer
+local lp = Players.LocalPlayer
 
 local running = true
-local conns   = {}
+local conns = {}
 
 local function track(c)
     conns[#conns + 1] = c
@@ -106,19 +102,19 @@ end
 
 local CFG = {
     on       = false,
-    walk     = 18,     -- studs/s along the wall
-    attach   = 4.5,    -- must be this close to grab
-    keep     = 7.5,    -- stays grabbed until this far (hysteresis)
-    standoff = 2.6,    -- HRP centre distance from the wall surface
-    pullRate = 10,     -- 1/s, how fast the wall pull ramps 0 -> 1
-    turnRate = 8,      -- 1/s, how fast the up vector eases to the normal
-    faceDot  = 0.15,   -- must be looking into the wall to grab
-    maxY     = 0.7,    -- reject floor/ceiling faces
-    recache  = 40,     -- rebuild the part cache after moving this far
-    keepR    = 160,    -- cache radius
-    bobAmp   = 0.28,   -- studs of body rise/fall per step
-    bobRate  = 7,      -- rad/s
-    bobEase  = 6,      -- 1/s, amplitude fade in/out
+    attach   = 4.5,
+    keep     = 7.5,
+    standoff = 2.6,
+    pullRate = 10,
+    turnRate = 8,
+    faceDot  = 0.15,
+    maxY     = 0.7,
+    recache  = 40,
+    keepR    = 160,
+    speedMul = 1.0,
+    bobAmp   = 0,
+    bobRate  = 7,
+    bobEase  = 6,
     keyW     = 0x57,
     keyA     = 0x41,
     keyS     = 0x53,
@@ -126,17 +122,17 @@ local CFG = {
     keyJump  = 0x20,
 }
 
-local status   = 'off'
+local status = 'off'
 local wallInfo = '-'
-local stuck    = false
-local stuckN   = nil    -- last raw normal, for the face-changed test
-local stuckUp  = nil    -- eased basis up
-local pull     = 0      -- 0 = free, 1 = fully on the wall
+local stuck = false
+local stuckN = nil
+local stuckUp = nil
+local pull = 0
 local bobPhase = 0
-local bobAmp   = 0
+local bobAmp = 0
 local lastJump = false
 
-local parts   = {}
+local parts = {}
 local cacheAt = nil
 
 local function log(m)
@@ -161,7 +157,7 @@ local function rebuildCache(char, at)
         local okc, cls = pcall(function() return p.ClassName end)
         if okc and cls == 'Part' then
             local okPos, pos = pcall(function() return p.Position end)
-            local okSz, sz  = pcall(function() return p.Size end)
+            local okSz, sz = pcall(function() return p.Size end)
             if okPos and okSz and pos and sz and sz.X >= 1 and sz.Y >= 1 and sz.Z >= 1 then
                 local halfDiag = sz.Magnitude * 0.5
                 if (pos - at).Magnitude - halfDiag <= CFG.keepR then
@@ -244,8 +240,6 @@ local function wallLook(cam, up)
     return nil
 end
 
--- The only constructor here that builds an arbitrary orientation.
--- Columns are right, up, back.
 local function makeCFrame(pos, right, up, back)
     return CFrame.new(
         pos.X, pos.Y, pos.Z,
@@ -257,13 +251,13 @@ end
 
 local function detach()
     if not stuck then return end
-    stuck    = false
-    stuckN   = nil
-    stuckUp  = nil
-    pull     = 0
+    stuck = false
+    stuckN = nil
+    stuckUp = nil
+    pull = 0
     bobPhase = 0
-    bobAmp   = 0
-    status   = 'detached'
+    bobAmp = 0
+    status = 'detached'
 end
 
 track(RunService.Heartbeat:Connect(function(dt)
@@ -271,9 +265,9 @@ track(RunService.Heartbeat:Connect(function(dt)
     if dt <= 0 or dt > 0.5 then dt = 1/60 end
 
     local char = lp.Character
-    local hum  = char and char:FindFirstChild('Humanoid')
-    local hrp  = char and char:FindFirstChild('HumanoidRootPart')
-    local cam  = workspace.CurrentCamera
+    local hum = char and char:FindFirstChild('Humanoid')
+    local hrp = char and char:FindFirstChild('HumanoidRootPart')
+    local cam = workspace.CurrentCamera
 
     if not CFG.on then
         if stuck then detach() end
@@ -295,7 +289,6 @@ track(RunService.Heartbeat:Connect(function(dt)
     local jumpEdge = jumpDown and not lastJump
     lastJump = jumpDown
 
-    -- ---------- attach ----------
     if not stuck then
         if jumpEdge then return end
         if not held(CFG.keyW) then
@@ -311,7 +304,7 @@ track(RunService.Heartbeat:Connect(function(dt)
             status = 'wall beside you - face it'
             return
         end
-        stuck  = true
+        stuck = true
         stuckN = n
         local okUp, curUp = pcall(function() return hrp.CFrame.UpVector end)
         if okUp and curUp and curUp.Magnitude > 0.5 then
@@ -319,13 +312,12 @@ track(RunService.Heartbeat:Connect(function(dt)
         else
             stuckUp = Vector3.new(0, 1, 0)
         end
-        pull     = 0
+        pull = 0
         bobPhase = 0
-        bobAmp   = 0
-        status   = 'stuck (d=' .. string.format('%.1f', d) .. ')'
+        bobAmp = 0
+        status = 'stuck (d=' .. string.format('%.1f', d) .. ')'
     end
 
-    -- ---------- release ----------
     if jumpEdge then
         local away = stuckN or Vector3.new(0, 1, 0)
         pcall(function()
@@ -343,7 +335,6 @@ track(RunService.Heartbeat:Connect(function(dt)
         status = 'wall lost'
         return
     end
-    -- compare the RAW normal, not the eased one, or the easing reads as a change
     if stuckN and n:Dot(stuckN) < 0.35 then
         detach()
         status = 'face changed'
@@ -351,7 +342,6 @@ track(RunService.Heartbeat:Connect(function(dt)
     end
     stuckN = n
 
-    -- ---------- ease the basis ----------
     local aTurn = math.min(1, dt * CFG.turnRate)
     local newUp = stuckUp:Lerp(n, aTurn)
     if newUp.Magnitude < 1e-3 then newUp = n else newUp = newUp.Unit end
@@ -365,7 +355,6 @@ track(RunService.Heartbeat:Connect(function(dt)
     right = right.Unit
     local back = -look
 
-    -- ---------- movement, full speed, tangential ----------
     local f, r = 0, 0
     if held(CFG.keyW) then f = f + 1 end
     if held(CFG.keyS) then f = f - 1 end
@@ -375,43 +364,46 @@ track(RunService.Heartbeat:Connect(function(dt)
     local move = look * f + right * r
     if move.Magnitude > 1e-3 then move = move.Unit else move = Vector3.new(0, 0, 0) end
 
-    local desired = p + move * CFG.walk * dt
+    -- LET THE HUMANOID WALK. This is the animation fix: its animate script
+    -- only plays the walk cycle when the humanoid is genuinely moving. We give
+    -- it the wall tangent and let it produce the motion, then correct only the
+    -- distance from the wall below.
+    if type(hum.Move) == 'function' then
+        if move.Magnitude > 1e-3 then
+            pcall(function() hum:Move(move * CFG.speedMul, false) end)
+        else
+            pcall(function() hum:Move(Vector3.new(0, 0, 0), false) end)
+        end
+    end
 
-    -- ---------- ease the wall pull ----------
-    local target
-    local wc = closestOn(e, desired)
+    local target = p
+    local wc = closestOn(e, p)
     if wc then
         pull = math.min(1, pull + dt * CFG.pullRate)
         local onWall = wc + n * CFG.standoff
-        target = desired + (onWall - desired) * pull
+        target = p + (onWall - p) * pull
         status = (pull < 0.98) and string.format('settling %.2f', pull) or 'on wall'
     else
-        -- walked past the edge of this face; hold, do not fling
-        target = p
         status = 'edge - holding'
     end
 
-    -- ---------- body bob: the only "animation" this VM allows ----------
-    -- No AnimationId assets, no LoadAnimation on Humanoid or Animator, and the
-    -- limb parts do not resolve, so a skeletal walk cannot be played or posed.
-    -- The whole root part rising and falling along the wall up is all that is
-    -- left, and it costs one multiply on a value already being written.
     local moving = (move.Magnitude > 1e-3) and (pull > 0.5)
-    if moving then
-        bobPhase = bobPhase + dt * CFG.bobRate
-        if bobPhase > 6.283185307179586 then
-            bobPhase = bobPhase - 6.283185307179586
+    if CFG.bobAmp > 0 then
+        if moving then
+            bobPhase = bobPhase + dt * CFG.bobRate
+            if bobPhase > 6.283185307179586 then
+                bobPhase = bobPhase - 6.283185307179586
+            end
         end
-    end
-    local wantAmp = moving and CFG.bobAmp or 0
-    bobAmp = bobAmp + (wantAmp - bobAmp) * math.min(1, dt * CFG.bobEase)
-    if bobAmp > 0.001 then
-        target = target + newUp * (math.sin(bobPhase) * bobAmp)
+        local wantAmp = moving and CFG.bobAmp or 0
+        bobAmp = bobAmp + (wantAmp - bobAmp) * math.min(1, dt * CFG.bobEase)
+        if bobAmp > 0.001 then
+            target = target + newUp * (math.sin(bobPhase) * bobAmp)
+        end
     end
 
     local ok = pcall(function()
         hrp.CFrame = makeCFrame(target, right, newUp, back)
-        hrp.Velocity = Vector3.new(0, 0, 0)
     end)
     if not ok then
         detach()
@@ -419,8 +411,8 @@ track(RunService.Heartbeat:Connect(function(dt)
         return
     end
 
-    wallInfo = string.format('n=%.2f,%.2f,%.2f d=%.1f pull=%.2f bob=%.2f',
-        n.X, n.Y, n.Z, d or -1, pull, bobAmp)
+    wallInfo = string.format('n=%.2f,%.2f,%.2f d=%.1f pull=%.2f',
+        n.X, n.Y, n.Z, d or -1, pull)
 end))
 
 local hud
@@ -439,7 +431,7 @@ track(RunService.RenderStepped:Connect(function()
 end))
 
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
-local built  = false
+local built = false
 
 local function firstBool(...)
     for i = 1, select('#', ...) do
