@@ -1,0 +1,207 @@
+-- Age Evolution Tycoon | place 96469185605358
+-- Nuke: fires BuyNukeWithMoney directly, so the client's 900 s local cooldown never runs.
+local NAME = 'AgeEvolutionTycoon'
+local VERSION = '1.0'
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+print('[' .. NAME .. '] ' .. VERSION .. ' loaded')
+
+local RS = game:GetService('ReplicatedStorage')
+local LP = game.Players.LocalPlayer
+
+local running = true
+local conns = {}
+local TOGGLES, getterWorks = {}, {}
+local CFG = { auto = false, delay = 2, freemoney = true, fired = 0 }
+
+local function firstBool(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'boolean' then return v end
+    end
+    return nil
+end
+
+local function firstNumber(...)
+    for i = 1, select('#', ...) do
+        local v = select(i, ...)
+        if type(v) == 'number' then return v end
+    end
+    return nil
+end
+
+local function getRemote()
+    return RS:FindFirstChild('BuyNukeWithMoney')
+end
+
+local function forceMoney()
+    if not CFG.freemoney then return end
+    local ls = LP:FindFirstChild('leaderstats')
+    if ls == nil then return end
+    local m = ls:FindFirstChild('Money')
+    if m == nil then return end
+    pcall(function() m.Value = 1e12 end)
+end
+
+local function fireNuke()
+    local r = getRemote()
+    if r == nil then
+        warn('[' .. NAME .. '] BuyNukeWithMoney missing')
+        return false
+    end
+    forceMoney()
+    local ok, err = pcall(function() r:FireServer() end)
+    if not ok then
+        warn('[' .. NAME .. '] fire error: ' .. tostring(err))
+        return false
+    end
+    CFG.fired = CFG.fired + 1
+    print('[' .. NAME .. '] nuke fired #' .. tostring(CFG.fired))
+    return true
+end
+
+local function mkSection(tab, label)
+    local sides = { 'Left', 'Right' }
+    for i = 1, #sides do
+        local ok, sec = pcall(function() return tab:Section(label, sides[i]) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(label) end)
+    if ok and sec ~= nil then return sec end
+    warn('[' .. NAME .. '] section failed: ' .. label)
+    return nil
+end
+
+local function mkButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label .. '_btn', cb) end) then return true end
+    warn('[' .. NAME .. '] button failed: ' .. label)
+    return false
+end
+
+local function applyBool(key)
+    return function(...)
+        if getterWorks[key] then return end
+        local v = firstBool(...)
+        if v ~= nil then CFG[key] = v end
+    end
+end
+
+local function mkToggle(sec, label, id, default, key)
+    local cb = applyBool(key)
+    local tries = {
+        function() sec:Toggle(id, label, default, cb) end,
+        function() sec:Toggle(label, id, default, cb) end,
+        function() sec:Toggle(label, default, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then
+            TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = label }
+            return true
+        end
+    end
+    warn('[' .. NAME .. '] toggle failed: ' .. label)
+    return false
+end
+
+local function mkSlider(sec, label, id, mn, mx, def, apply)
+    local cb = function(...)
+        local v = firstNumber(...)
+        if v ~= nil then apply(v) end
+    end
+    local tries = {
+        function() sec:SliderInt(id, label, mn, mx, def, cb) end,
+        function() sec:SliderInt(label, id, mn, mx, def, cb) end,
+        function() sec:SliderInt(label, mn, mx, def, cb) end,
+    }
+    for i = 1, #tries do
+        if pcall(tries[i]) then return true end
+    end
+    warn('[' .. NAME .. '] slider failed: ' .. label)
+    return false
+end
+
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built = false
+local TAB = 'Age Evolution Tycoon'
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = mkSection(tab, 'Nuke')
+        if sec == nil then return end
+        mkToggle(sec, 'Auto nuke', 'aet_auto', false, 'auto')
+        mkSlider(sec, 'Interval (s)', 'aet_delay', 1, 30, 2, function(v) CFG.delay = v end)
+        mkToggle(sec, 'Force money (free try)', 'aet_free', true, 'freemoney')
+        mkButton(sec, 'Nuke once', function() fireNuke() end)
+        mkButton(sec, 'Stop script', function() if _G[NAME] then _G[NAME].stop() end end)
+    end)
+    if not ok then warn('[' .. NAME .. '] build error: ' .. tostring(err)) end
+    print('[' .. NAME .. '] tab widgets built')
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab(TAB, function(tab)
+            print('[' .. NAME .. '] tab opened')
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then
+        warn('[' .. NAME .. '] UI.AddTab failed: ' .. tostring(err))
+        HAS_UI = false
+    end
+else
+    warn('[' .. NAME .. '] no UI available')
+end
+
+if HAS_UI then
+    task.spawn(function()
+        while running do
+            for i = 1, #TOGGLES do
+                local t = TOGGLES[i]
+                local val = nil
+                local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
+                if ok1 and type(v1) == 'boolean' then
+                    val = v1
+                else
+                    local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
+                    if ok2 and type(v2) == 'boolean' then val = v2 end
+                end
+                if val ~= nil then
+                    getterWorks[t.key] = true
+                    CFG[t.key] = val
+                end
+            end
+            task.wait(0.15)
+        end
+    end)
+end
+
+task.spawn(function()
+    while running do
+        if CFG.auto then
+            fireNuke()
+            local t0 = os.clock()
+            while running and CFG.auto and (os.clock() - t0) < CFG.delay do
+                task.wait(0.05)
+            end
+        else
+            task.wait(0.15)
+        end
+    end
+end)
+
+local function stop()
+    running = false
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    if HAS_UI and type(UI.RemoveTab) == 'function' then
+        pcall(function() UI.RemoveTab(TAB) end)
+    end
+    print('[' .. NAME .. '] stopped')
+    _G[NAME] = nil
+end
+
+_G[NAME] = { stop = stop, version = VERSION }
