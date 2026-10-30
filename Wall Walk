@@ -1,33 +1,35 @@
 --[[
   Wall Walk (universal) - Matcha LuauVM
-  Version: v1.0
-  ONE toggle. No Instance creation, no raycast required.
+  Version: v2.0
+  ONE toggle: Wall Climb. Hold W at a wall to go up, S to come down.
 
-  Why it is built this way:
-  The internal-executor original needs Instance.new for a collider Part, a
-  VectorForce, a BodyGyro and a Weld, then raycasts 24 down-rays + 9 feelers to
-  find a surface normal. Instance is nil in this VM, so none of that can exist.
-  This version replaces the mechanism, not the code:
-    1. read WASD with iskeypressed (no InputBegan, which this VM drops)
-    2. detect "against a wall" by measuring horizontal travel over a short
-       window while a key is held - held key + no travel = blocked
-    3. while blocked and W held, set HumanoidRootPart.Velocity upward and keep
-       a small push into the surface
-  PlatformStand is switched on ONLY while climbing, so normal walking is
-  untouched the rest of the time. Every key is released and PlatformStand is
-  cleared on toggle-off, on death, and in stop().
+  WHAT WAS WRONG IN v1.0 (both real bugs, both silent)
+    1. It wrote Humanoid.PlatformStand. That property is NOT in Matcha's
+       writable list, so the assignment raised 'Unknown property'. The pcall
+       around it swallowed the error, so the write never happened and the
+       script looked like it did nothing.
+    2. Wall detection measured how far you had moved over 0.2 s. That is a
+       guess, not a signal: it fires on lag, on slopes, on stepping into a
+       corner, and it does not know which way the wall faces.
 
-  Confirmed elsewhere in the brain: iskeypressed / keypress / keyrelease exist;
-  RenderStepped works and PreRender is nil; property writes on Humanoid and
-  BasePart are allowed.
-  UNVERIFIED: that setting HRP.Velocity every frame survives the humanoid's own
-  physics step in this VM. If nothing moves, the fallback is CFrame writes.
-  Limits by design: this CLIMBS upright, it does not rotate gravity to walk on
-  ceilings, because that needs a surface normal from a raycast.
+  WHAT CHANGED IN v2.0
+    workspace:Raycast exists in this VM, with RaycastParams and a real
+    surface Normal. Wall detection is now a forward ray - 5 studs along the
+    camera's flattened look vector, character filtered out. A hit means you
+    are facing a wall, and res.Normal tells us which way to push into it.
+
+  PERFORMANCE
+    Assigning Velocity performs thousands of internal memory writes each
+    time, so the write is throttled to about 30 Hz on a task.spawn loop. It
+    is never done per RenderStepped. The raycast is cheap and runs on the
+    same tick. RenderStepped is used only for the HUD text.
+
+  No Instance.new anywhere - Instance does not exist in this VM at all.
+  Stop with _G.WallWalk.stop() or by toggling off in the menu.
 ]]
 
 local NAME    = 'WallWalk'
-local VERSION = 'v1.0'
+local VERSION = 'v2.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -45,22 +47,19 @@ local function track(c)
 end
 
 local CFG = {
-    on          = false,
-    climbSpeed  = 26,     -- studs/s upward while climbing
-    pushSpeed   = 8,      -- studs/s into the surface, keeps contact
-    window      = 0.20,   -- seconds between blocked checks
-    stillEps    = 0.6,    -- horizontal studs below this = blocked
-    keyW        = 0x57,
-    keyA        = 0x41,
-    keyS        = 0x53,
-    keyD        = 0x44,
+    on    = false,
+    climb = 34,     -- studs/s upward while W is held
+    sink  = 22,     -- studs/s downward while S is held
+    stick = 9,      -- studs/s pressed into the wall
+    reach = 5,      -- forward ray length
+    tick  = 0.033,  -- about 30 Hz
+    keyW  = 0x57,
+    keyS  = 0x53,
 }
 
-local lastPos  = nil
-local lastT    = 0
-local blocked  = false
-local standing = false
-local UP       = Vector3.new(0, 1, 0)
+local UP      = Vector3.new(0, 1, 0)
+local status  = 'off'
+local wallHit = false
 
 local function log(m)
     print('[' .. NAME .. '] ' .. tostring(m))
@@ -72,100 +71,110 @@ local function held(vk)
     return ok and v == true
 end
 
-local function setStanding(want)
-    if want == standing then return end
-    local ch = lp.Character
-    local hum = ch and ch:FindFirstChildOfClass('Humanoid')
-    if not hum then return end
-    local ok = pcall(function() hum.PlatformStand = want end)
-    if ok then standing = want end
+local function newParams(char)
+    local ok, p = pcall(function() return RaycastParams.new() end)
+    if not ok or not p then return nil end
+    pcall(function() p.FilterDescendantsInstances = { char } end)
+    pcall(function() p.FilterType = Enum.RaycastFilterType.Exclude end)
+    pcall(function() p.FilterType = Enum.RaycastFilterType.Blacklist end)
+    pcall(function() p.IgnoreWater = true end)
+    return p
 end
 
-local function wishDir()
-    local cam = workspace.CurrentCamera
-    if not cam then return Vector3.new(0, 0, 0) end
-    local f = 0
-    if held(CFG.keyW) then f = f + 1 end
-    if held(CFG.keyS) then f = f - 1 end
-    local r = 0
-    if held(CFG.keyD) then r = r + 1 end
-    if held(CFG.keyA) then r = r - 1 end
-    if f == 0 and r == 0 then return Vector3.new(0, 0, 0) end
-    local look = cam.CFrame.LookVector
-    local flat = Vector3.new(look.X, 0, look.Z)
-    if flat.Magnitude < 1e-3 then return Vector3.new(0, 0, 0) end
-    flat = flat.Unit
-    local right = flat:Cross(UP)
-    if right.Magnitude < 1e-3 then return Vector3.new(0, 0, 0) end
-    right = right.Unit
-    local v = flat * f + right * r
-    if v.Magnitude < 1e-3 then return Vector3.new(0, 0, 0) end
-    return v.Unit
+local function flatLook(cam)
+    local l = cam.CFrame.LookVector
+    local f = Vector3.new(l.X, 0, l.Z)
+    if f.Magnitude < 1e-3 then return nil end
+    return f.Unit
 end
 
-local function step()
-    if not running then return end
-    local ch  = lp.Character
-    local hum = ch and ch:FindFirstChildOfClass('Humanoid')
-    local hrp = ch and ch:FindFirstChild('HumanoidRootPart')
-    if not hum or not hrp or hum.Health <= 0 then
-        setStanding(false)
-        lastPos, blocked = nil, false
-        return
-    end
+local params, paramsChar = nil, nil
 
-    local now  = os.clock()
-    local pos  = hrp.Position
-    local wish = wishDir()
+-- main tick: raycast + throttled velocity write
+task.spawn(function()
+    while running do
+        local char = lp.Character
+        local hum  = char and char:FindFirstChild('Humanoid')
+        local hrp  = char and char:FindFirstChild('HumanoidRootPart')
+        local cam  = workspace.CurrentCamera
 
-    if lastPos and (now - lastT) >= CFG.window then
-        local a = Vector3.new(pos.X, 0, pos.Z)
-        local b = Vector3.new(lastPos.X, 0, lastPos.Z)
-        local moved = (a - b).Magnitude
-        blocked = (wish.Magnitude > 0.1) and (moved < CFG.stillEps)
-        lastPos = pos
-        lastT   = now
-    elseif not lastPos then
-        lastPos = pos
-        lastT   = now
-    end
+        wallHit = false
 
-    local climbing = CFG.on and blocked
-    setStanding(climbing)
+        if not CFG.on then
+            status = 'off'
+        elseif not char or not hum or not hrp then
+            status = 'no character'
+        elseif hum.Health <= 0 then
+            status = 'dead'
+        elseif not cam then
+            status = 'no camera'
+        else
+            local dir = flatLook(cam)
+            if not dir then
+                status = 'camera straight up/down'
+            else
+                if paramsChar ~= char then
+                    params = newParams(char)
+                    paramsChar = char
+                end
 
-    if climbing then
-        local push = wish * CFG.pushSpeed
-        local up   = 0
-        if held(CFG.keyW) then
-            up = CFG.climbSpeed
-        elseif held(CFG.keyS) then
-            up = -CFG.climbSpeed
+                local res = nil
+                if params then
+                    local ok, r = pcall(function()
+                        return workspace:Raycast(hrp.Position, dir * CFG.reach, params)
+                    end)
+                    if ok then res = r end
+                end
+
+                if not res or not res.Normal then
+                    status = 'no wall'
+                else
+                    local n  = res.Normal
+                    local fn = Vector3.new(n.X, 0, n.Z)
+                    if fn.Magnitude < 1e-3 then
+                        status = 'wall normal is vertical'
+                    else
+                        fn = fn.Unit
+                        wallHit = true
+                        local climb = 0
+                        if held(CFG.keyW) then
+                            climb = CFG.climb
+                        elseif held(CFG.keyS) then
+                            climb = -CFG.sink
+                        end
+                        if climb ~= 0 then
+                            local v = Vector3.new(-fn.X * CFG.stick, climb, -fn.Z * CFG.stick)
+                            pcall(function() hrp.Velocity = v end)
+                            status = string.format('climbing %+d', climb)
+                        else
+                            status = 'on wall - W up / S down'
+                        end
+                    end
+                end
+            end
         end
-        pcall(function()
-            hrp.Velocity = Vector3.new(push.X, up, push.Z)
-        end)
-    end
-end
 
-local function stop()
-    running = false
-    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
-    conns = {}
-    setStanding(false)
-    if type(UI) == 'table' and type(UI.RemoveTab) == 'function' then
-        pcall(function() UI.RemoveTab('Wall Walk') end)
+        task.wait(CFG.tick)
     end
-    _G[NAME] = nil
-    log('stopped')
-end
-
-local okRender = pcall(function()
-    track(RunService.RenderStepped:Connect(function()
-        pcall(step)
-    end))
 end)
-if not okRender then log('RenderStepped connect failed') end
 
+-- HUD: the only thing that runs per frame
+local hud
+pcall(function()
+    hud = Drawing.new('Text')
+    hud.Size = 14
+    hud.Outline = true
+    hud.Color = Color3.fromRGB(235, 235, 245)
+    hud.Position = Vector2.new(12, 60)
+    hud.Visible = true
+end)
+
+track(RunService.RenderStepped:Connect(function()
+    if not hud then return end
+    hud.Text = string.format('[%s] %s | wall %s', VERSION, status, tostring(wallHit))
+end))
+
+-- menu: exactly one toggle
 local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
 local built  = false
 
@@ -178,9 +187,8 @@ local function firstBool(...)
 end
 
 local function mkSection(tab, name)
-    local sides = { 'Left', 'Right' }
-    for i = 1, #sides do
-        local ok, sec = pcall(function() return tab:Section(name, sides[i]) end)
+    for _, side in ipairs({ 'Left', 'Right' }) do
+        local ok, sec = pcall(function() return tab:Section(name, side) end)
         if ok and sec ~= nil then return sec end
     end
     local ok, sec = pcall(function() return tab:Section(name) end)
@@ -215,7 +223,6 @@ if HAS_UI then
                 if not sec then return end
                 mkToggle(sec, 'Wall Climb', 'ww_on', CFG.on, function(v)
                     CFG.on = v
-                    if not v then setStanding(false) end
                     log('wall climb ' .. (v and 'ON' or 'off'))
                 end)
             end)
@@ -229,6 +236,16 @@ if HAS_UI then
     end
 end
 
+local function stop()
+    running = false
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    if hud then pcall(function() hud:Remove() end); hud = nil end
+    if HAS_UI then pcall(function() UI.RemoveTab('Wall Walk') end) end
+    _G[NAME] = nil
+    log('stopped')
+end
+
 _G[NAME] = { stop = stop, version = VERSION }
-log(VERSION .. ' loaded - hold W against a wall to climb, S to descend')
+log(VERSION .. ' loaded - toggle on, hold W at a wall')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Wall Walk', 3) end)
