@@ -1,31 +1,55 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.9.0 -- ROLLBACK to the 6.8.0 line + food hand-out fix
+-- Version: 6.10.0 -- SERVE VIA THE GAME'S OWN CLICK PATH
 --
--- Base is v6.8.0 (seat only ^T%d+$, tray pickup with no text filter, token bucket
--- 8 calls / 0.5 s, ClassName-only part lookup, no task.wait inside collection).
--- v7.x and v8.0.0 are discarded: the user's baseline is 6.8.0.
+-- Base is 6.9.0 / 6.8.0. Bills, tips, dishes, orders and seating are unchanged and
+-- user-confirmed working.
 --
--- ONLY the SERVE path changed from 6.8.0:
--- BUG: oneServe() read foodList(ty) BEFORE pickupViaPrompt(), then handed out those
--- pre-pickup models. The tray grab replaces what is on the counter, so the models being
--- served were stale. FIX: pickup -> task.wait(0.15) settle -> re-read foodList -> serve.
--- Also: one dish at a time with a 0.12 s gap (a burst of 5 in one frame was dropped), and a
--- dish that fails twice is skipped for 8 s so one bad model cannot stall the loop.
+-- WHY 6.9.0 STILL DID NOT HAND OUT FOOD (decompiled this session, 2026-10-31):
 --
--- Call shapes unchanged (confirmed, differ - never assume uniformity):
---   bill  = Interacted THEN TaskCompleted 'CollectBill'   (2)
---   dish  = TaskCompleted 'CollectDishes'                 (1)
---   tips  = TipsCollected                                 (1)
---   order = TaskCompleted 'TakeOrder'                     (1)
---   seat  = TaskCompleted 'SendToTable'                   (1)
---   serve = fireproximityprompt (tray) then TaskCompleted 'Serve' per dish
+-- Serve is not a remote. It cannot be. Two decompiled modules prove it:
+--
+-- 1. Source.Systems.Restaurant.GrabFood.AttemptGrab(tycoon, foodModel):
+--        local ok, info = Events.Restaurant.GrabFood:InvokeServer(foodModel)
+--        Storage[#+1] = { Model = foodModel, FoodKey = foodModel.Name, Tycoon = tycoon,
+--                         TargetPlayerName = info.TargetPlayerName,
+--                         TargetCarId = info.TargetCarId, KidFlag = info.KidFlag }
+--    The tray contents and the TARGET come from the server's InvokeServer return, and
+--    GrabFood:IsHoldingFoodForNPC(order, kidFlag) only accepts an entry whose FoodKey ==
+--    the customer's order. There is no client function that serves from a payload we build,
+--    so TaskCompleted 'Serve' was never a serve call - the server ignored it. That is the
+--    whole reason 6.9.0 picked up fine and handed out nothing.
+--
+-- 2. Source.Systems.Restaurant.Tasks: serving happens on Tasks.TaskInputReceived, which is
+--    fired only by Tasks:HandleInput(part, position). HandleInput is reached from
+--    OnInputBegan (a real UserInputService MouseButton1 raycast) or OnSpeechBubbleClicked.
+--    HandleInput itself rejects a target when dx^2 + dz^2 > 1024 or |dy| > 32 relative to
+--    your HumanoidRootPart. So a click on the customer, from within ~32 studs, is the only
+--    route that runs ServeFood at all.
+--
+-- 3. require() cannot load these modules in this VM (matches api-memory: require cannot load
+--    instances), and getgc() with no key returns 0 entries here, so the Tasks table cannot be
+--    reached to fire TaskInputReceived directly. Dead end, do not retry.
+--
+-- WHAT THIS BUILD DOES, per serve pass:
+--   a. grab the tray with fireproximityprompt (works - fills GrabFood.Storage, sets the task)
+--   b. list customers, keep only those inside the game's own range limit
+--   c. for each: point the camera at the customer, put the mouse at the viewport centre,
+--      mouse1click, wait, and check whether Objects.Food shrank (= the dish left the tray)
+--   d. stop when the tray is empty or the click budget is spent; keep holding otherwise
+--      (no CancelGrab spam - CancelGrabRequested is a menu button now)
+--
+-- Aiming resolves CFrame.lookAt -> CFrame.new(eye,pos) at runtime and reports which worked,
+-- because CFrame.new in this VM only takes numbers and lookAt is unverified.
+-- UNVERIFIED: that Matcha's mouse1click reaches UserInputService.InputBegan while the Roblox
+-- window is focused. The Report button prints rbxActive, clicks, in-range guests and tray
+-- count so the next message can be a diagnosis instead of a guess.
 --
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.9.0'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (rollback 6.8.0 + serve fix)')
+local VERSION = '6.10.0'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (serve by click path)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -39,24 +63,28 @@ local unpackFn = table.unpack or unpack
 local CONFIG = {
     Bills = true, Tips = true, Dishes = true, Orders = true, Seat = true, Serve = true,
     Gap = 0.2, TipsEvery = 1.0, BillEvery = 0.35, DishEvery = 0.35,
-    OrderEvery = 0.35, SeatEvery = 0.5, ServeEvery = 1.2,
+    OrderEvery = 0.35, SeatEvery = 0.5, ServeEvery = 1.5,
     OrderCooldown = 6.0, SeatCooldown = 15.0,
-    MaxServesPerPass = 5,
-    ServeGap = 0.12,
-    ServeFailCooldown = 8.0,
+    MaxClicksPerPass = 6,
+    AimSettle = 0.08,
+    ClickSettle = 0.12,
+    ServeGap = 0.15,
+    RangeXZ2 = 900,        -- game rejects > 1024; stay inside it
+    MaxY = 30,             -- game rejects |dy| > 32
     MaxPickupPrompts = 3,
     MaxPerHalf = 8,
 }
 
 local running = true
 local stat = { bills=0, tips=0, dishes=0, orders=0, seats=0, serves=0,
-               promptPicks=0, remotePicks=0, passes=0, skipped=0, blocked=0 }
+               promptPicks=0, remotePicks=0, clicks=0, aimFail=0,
+               passes=0, skipped=0, blocked=0 }
 local lastTips, lastBill, lastDish, lastOrder, lastSeat, lastServe = 0,0,0,0,0,0
 local windowStart, windowCount = 0, 0
-local orderIdx, seatIdx, tableIdx, serveIdx = 1,1,1,1
+local orderIdx, seatIdx, tableIdx = 1,1,1
 local orderAt, seatAt, seatTable = {}, {}, {}
-local serveFail = {}
-local lastServeErr = 'none'
+local aimMode = 'not tried'
+local lastServeDetail = 'none'
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -186,6 +214,8 @@ end
 local function billTargets(ty) return surfacesWith(ty, 'Bill') end
 local function dishTargets(ty) return surfacesWith(ty, 'Trash') end
 
+-- Objects.Food holds every plate; AttemptGrab marks the grabbed ones with a Taken attribute,
+-- so the tray contents are the Taken children and FoodKey is simply the model's Name.
 local function foodList(ty)
     local out = {}
     if not ty then return out end
@@ -197,6 +227,16 @@ local function foodList(ty)
     return out
 end
 
+local function takenList(ty)
+    local out = {}
+    for _, c in ipairs(foodList(ty)) do
+        local t = false
+        pcall(function() t = c:GetAttribute('Taken') end)
+        if t then out[#out + 1] = c end
+    end
+    return out
+end
+
 local function customerList(ty)
     local out = {}
     if not ty then return out end
@@ -204,7 +244,16 @@ local function customerList(ty)
     if not cc then return out end
     for _, g in ipairs(cc:GetChildren()) do
         for _, c in ipairs(g:GetChildren()) do
-            out[#out + 1] = { groupId = g.Name, customerId = c.Name }
+            local pos
+            for _, nm in ipairs({ 'HumanoidRootPart', 'Head' }) do
+                local p = c:FindFirstChild(nm)
+                if p then
+                    local v
+                    pcall(function() v = p.Position end)
+                    if typeof(v) == 'Vector3' then pos = v break end
+                end
+            end
+            out[#out + 1] = { groupId = g.Name, customerId = c.Name, model = c, pos = pos }
         end
     end
     return out
@@ -223,7 +272,7 @@ local function groupList(ty)
     return out
 end
 
--- There is no per-dish prompt; workspace.Temp holds the single GROUP (tray) pickup prompt.
+-- There is no per-dish prompt; workspace.Temp holds the GROUP (tray) pickup prompt(s).
 local function servePrompts()
     local out = {}
     local temp = workspace:FindFirstChild('Temp')
@@ -236,18 +285,20 @@ local function servePrompts()
     return out
 end
 
-local function nearestCounter(ty)
-    local origin
+local function rootPos()
     local c
     pcall(function() c = lp.Character end)
-    if c then
-        local r = c:FindFirstChild('HumanoidRootPart')
-        if r then
-            local p
-            pcall(function() p = r.Position end)
-            if typeof(p) == 'Vector3' then origin = p end
-        end
-    end
+    if not c then return nil end
+    local r = c:FindFirstChild('HumanoidRootPart')
+    if not r then return nil end
+    local p
+    pcall(function() p = r.Position end)
+    if typeof(p) == 'Vector3' then return p end
+    return nil
+end
+
+local function nearestCounter(ty)
+    local origin = rootPos()
     local best, bestD = nil, math.huge
     for _, m in ipairs(surfaceList(ty)) do
         if string.match(m.Name, '^K%d+$') then
@@ -300,7 +351,7 @@ local function freeTables(ty)
     return out
 end
 
--- PICKUP: fire the tray prompt(s) under workspace.Temp, no text filter
+-- ===== STEP 1: grab, through the game's own prompt (fills GrabFood.Storage) =====
 local function pickupViaPrompt()
     local prompts = servePrompts()
     if #prompts == 0 then return false, 'no prompt under workspace.Temp (stand at the counter)' end
@@ -349,25 +400,81 @@ local function pickupViaRemote(ty)
     return ok, err
 end
 
--- HAND-OFF: any dish to any guest (wrong orders accepted, user-stated)
-local function serveToGuest(ty, food, cust, tbl)
-    if not ty or not food or not cust then return false, 'missing food/guest' end
-    local tc = remote('Restaurant', 'TaskCompleted')
-    if not tc then return false, 'TaskCompleted missing' end
-    local payload = {
-        FoodModel = food,
-        FoodName = food.Name,
-        Name = 'Serve',
-        Tycoon = ty,
-        GroupId = cust.groupId,
-        CustomerId = cust.customerId,
-    }
-    if tbl then payload.FurnitureModel = tbl end
-    local ok, err = fire(tc, payload)
-    if ok then stat.serves = stat.serves + 1 end
-    return ok, err
+local function cancelGrab()
+    local c = remote('Restaurant', 'CancelGrabRequested')
+    if c then
+        fire(c)
+        note('cancel grab sent')
+    else
+        note('CancelGrabRequested missing')
+    end
 end
 
+-- ===== STEP 2: serve by clicking the customer (the only route that runs ServeFood) =====
+local function camera()
+    local cam
+    pcall(function() cam = workspace.CurrentCamera end)
+    return cam
+end
+
+local function aimAt(pos)
+    local cam = camera()
+    if not cam or typeof(pos) ~= 'Vector3' then return false, 'no camera' end
+    local eye
+    pcall(function() eye = cam.CFrame.Position end)
+    if typeof(eye) ~= 'Vector3' then return false, 'no camera position' end
+    if pcall(function() cam.CFrame = CFrame.lookAt(eye, pos) end) then
+        aimMode = 'lookAt'
+        return true
+    end
+    if pcall(function() cam.CFrame = CFrame.new(eye, pos) end) then
+        aimMode = 'new(eye,pos)'
+        return true
+    end
+    aimMode = 'unavailable'
+    stat.aimFail = stat.aimFail + 1
+    return false, 'cannot aim camera'
+end
+
+local function clickCentre()
+    local cam = camera()
+    if not cam then return false end
+    local vp
+    pcall(function() vp = cam.ViewportSize end)
+    if vp then
+        pcall(function() mousemoveabs(math.floor(vp.X / 2), math.floor(vp.Y / 2)) end)
+    end
+    local ok = pcall(mouse1click)
+    if not ok then
+        pcall(mouse1press)
+        pcall(mouse1release)
+    end
+    stat.clicks = stat.clicks + 1
+    return true
+end
+
+local function clickCustomer(g)
+    if not g then return false, 'no customer' end
+    if not g.pos then return false, 'no position for ' .. tostring(g.customerId) end
+    local origin = rootPos()
+    if origin then
+        local dx, dz, dy = g.pos.X - origin.X, g.pos.Z - origin.Z, g.pos.Y - origin.Y
+        local d2 = dx * dx + dz * dz
+        if d2 > CONFIG.RangeXZ2 then
+            return false, 'out of range d2=' .. math.floor(d2)
+        end
+        if math.abs(dy) > CONFIG.MaxY then
+            return false, 'too high dy=' .. math.floor(dy)
+        end
+    end
+    local ok, err = aimAt(g.pos)
+    if not ok then return false, tostring(err) end
+    task.wait(CONFIG.AimSettle)
+    if not clickCentre() then return false, 'click failed' end
+    return true, 'clicked ' .. tostring(g.groupId) .. ':' .. tostring(g.customerId)
+end
+
+-- ===== the rest of the restaurant actions: unchanged, user-confirmed =====
 local function collectBill(ty, model)
     if not ty or not model then return false, 'missing model' end
     local tc = remote('Restaurant', 'TaskCompleted')
@@ -493,64 +600,80 @@ local function oneSeat(ty)
     return false, 'all groups on cooldown'
 end
 
--- SERVE: tray pickup FIRST, then re-read what the tray actually holds, then hand out.
+-- SERVE: grab if the tray is empty, then click each in-range customer and watch the tray.
 local function oneServe(ty)
     if not ty then return false, 'no tycoon' end
     local guests = customerList(ty)
     if #guests == 0 then return false, 'no customers' end
 
-    local pok, pdetail = pickupViaPrompt()
-    if not pok then
-        local rok, rdetail = pickupViaRemote(ty)
-        if not rok then
-            return false, 'pickup failed (prompt: ' .. tostring(pdetail) ..
-                          ' | remote: ' .. tostring(rdetail) .. ')'
+    local total0 = #foodList(ty)
+    local held = #takenList(ty)
+
+    if held == 0 then
+        local pok, pdetail = pickupViaPrompt()
+        if not pok then
+            local rok, rdetail = pickupViaRemote(ty)
+            if not rok then
+                return false, 'grab failed (prompt: ' .. tostring(pdetail) ..
+                              ' | remote: ' .. tostring(rdetail) .. ')'
+            end
+            pdetail = 'remote: ' .. tostring(rdetail)
         end
-        pdetail = 'remote: ' .. tostring(rdetail)
+        task.wait(0.15)
+        held = #takenList(ty)
+        if held == 0 and #foodList(ty) == 0 then
+            lastServeDetail = 'tray empty after grab'
+            return false, lastServeDetail
+        end
     end
 
-    task.wait(0.15) -- let the server finish the tray hand-off
-
-    local dishes = foodList(ty)   -- read AFTER pickup: these are the real tray models
-    if #dishes == 0 then return false, 'tray empty after pickup' end
-
-    if serveIdx > #guests then serveIdx = 1 end
-    local t = nowT()
-    local tried, served = 0, 0
-
-    for _, dish in ipairs(dishes) do
-        if served >= CONFIG.MaxServesPerPass then break end
-        if dish and dish.Parent then
-            local f = serveFail[dish]
-            if not f or (t - f.t) >= CONFIG.ServeFailCooldown then
-                local cust = guests[serveIdx]
-                serveIdx = serveIdx + 1
-                if serveIdx > #guests then serveIdx = 1 end
-                tried = tried + 1
-                local ok, err = serveToGuest(ty, dish, cust, seatTable[cust.groupId])
-                if ok then
-                    served = served + 1
-                    serveFail[dish] = nil
-                else
-                    local n = (f and f.n or 0) + 1
-                    serveFail[dish] = { n = n, t = nowT() }
-                    lastServeErr = tostring(err)
+    local inRange = 0
+    local origin = rootPos()
+    if origin then
+        for _, g in ipairs(guests) do
+            if g.pos then
+                local dx, dz, dy = g.pos.X - origin.X, g.pos.Z - origin.Z, g.pos.Y - origin.Y
+                if (dx * dx + dz * dz) <= CONFIG.RangeXZ2 and math.abs(dy) <= CONFIG.MaxY then
+                    inRange = inRange + 1
                 end
-                task.wait(CONFIG.ServeGap)
             end
         end
     end
 
-    if tried == 0 then return false, 'every dish on fail-cooldown' end
-    if served == 0 then
-        return false, tostring(pdetail) .. ', 0/' .. tried .. ' accepted (err ' .. tostring(lastServeErr) .. ')'
+    local clicks, served, lastDetail = 0, 0, ''
+    for _, g in ipairs(guests) do
+        if clicks >= CONFIG.MaxClicksPerPass then break end
+        if total0 > 0 and #foodList(ty) == 0 then break end
+        local before = #foodList(ty)
+        local ok, d = clickCustomer(g)
+        lastDetail = tostring(d)
+        clicks = clicks + 1
+        if ok then
+            task.wait(CONFIG.ClickSettle)
+            local after = #foodList(ty)
+            if before > 0 and after < before then
+                served = served + (before - after)
+                stat.serves = stat.serves + (before - after)
+            end
+        end
+        task.wait(CONFIG.ServeGap)
     end
-    return true, tostring(pdetail) .. ', served ' .. served .. '/' .. tried .. ' dish(es)'
+
+    local detail = 'held=' .. tostring(held) .. ' tray=' .. #foodList(ty) ..
+                   ' guests=' .. #guests .. ' inRange=' .. inRange ..
+                   ' clicks=' .. clicks .. ' leftTray=' .. served
+    lastServeDetail = detail
+    if clicks == 0 then return false, 'no guest to click (' .. detail .. ')' end
+    if served == 0 then
+        return false, detail .. ' (last: ' .. tostring(lastDetail) .. ') - no dish left the tray'
+    end
+    return true, detail
 end
 
 local function report()
     local ty = findTycoon()
     local food = ty and foodList(ty) or {}
+    local taken = ty and takenList(ty) or {}
     local cust = ty and customerList(ty) or {}
     local prompts = servePrompts()
     local tables = ty and freeTables(ty) or {}
@@ -558,34 +681,28 @@ local function report()
     for _, m in ipairs(surfaceList(ty)) do
         if string.match(m.Name, '^K%d+$') then counters[#counters + 1] = m.Name end
     end
+    local rbx
+    pcall(function() rbx = isrbxactive() end)
     note('--- REPORT v' .. VERSION .. ' ---')
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
     note('bills=' .. #(ty and billTargets(ty) or {}) .. ' trash=' .. #(ty and dishTargets(ty) or {}) ..
-         ' customers=' .. #cust .. ' foodOnCounter=' .. #food)
+         ' customers=' .. #cust)
+    note('foodOnCounter=' .. #food .. ' taken(held)=' .. #taken)
+    for i, m in ipairs(taken) do
+        if i <= 6 then note('  held ' .. tostring(m.Name)) end
+    end
     note('freeTables=' .. #tables .. ' counters=' .. table.concat(counters, ','))
-    for i, m in ipairs(food) do
-        if i <= 8 then note('  food ' .. tostring(m.Name) .. ' (' .. tostring(m.ClassName) .. ')') end
-    end
     note('promptsUnderTemp=' .. #prompts)
-    for i, p in ipairs(prompts) do
-        if i <= 4 then
-            local act, hold, dist
-            pcall(function() act = p.ActionText end)
-            pcall(function() hold = p.HoldDuration end)
-            pcall(function() dist = p.MaxActivationDistance end)
-            note('  prompt ' .. tostring(p.Name) .. ' act=' .. tostring(act) ..
-                 ' hold=' .. tostring(hold) .. ' dist=' .. tostring(dist) ..
-                 ' parent=' .. tostring(p.Parent and p.Parent.Name))
-        end
-    end
     note('remote Interacted=' .. tostring(interacted() ~= nil) ..
          ' TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil) ..
          ' TipsCollected=' .. tostring(remote('Restaurant', 'TipsCollected') ~= nil))
-    note('lastServeErr=' .. tostring(lastServeErr))
+    note('aimMode=' .. tostring(aimMode) .. ' rbxActive=' .. tostring(rbx) .. ' clicks=' .. stat.clicks)
+    note('lastServe=' .. tostring(lastServeDetail))
     note('counters promptPicks=' .. stat.promptPicks .. ' remotePicks=' .. stat.remotePicks ..
          ' serves=' .. stat.serves .. ' orders=' .. stat.orders .. ' seats=' .. stat.seats ..
          ' bills=' .. stat.bills .. ' dishes=' .. stat.dishes .. ' tips=' .. stat.tips)
-    note('skippedNoPart=' .. stat.skipped .. ' rateBlocked=' .. stat.blocked .. ' passes=' .. stat.passes)
+    note('skippedNoPart=' .. stat.skipped .. ' rateBlocked=' .. stat.blocked ..
+         ' aimFail=' .. stat.aimFail .. ' passes=' .. stat.passes)
     note('--- end ---')
 end
 
@@ -629,11 +746,7 @@ if UI then
                 local ok, d = pickupViaPrompt()
                 note('prompt pickup: ' .. (ok and 'OK ' or 'FAIL ') .. ' ' .. tostring(d))
             end)
-            safeButton(main, 'Pickup Only (remote)', function()
-                local ty = findTycoon()
-                local ok, d = pickupViaRemote(ty)
-                note('remote pickup: ' .. (ok and 'OK ' or 'FAIL ') .. ' ' .. tostring(d))
-            end)
+            safeButton(main, 'Unstick My Hands', function() cancelGrab() end)
             safeButton(main, 'Seat One Customer', function()
                 local ty = findTycoon()
                 local ok, d = oneSeat(ty)
@@ -753,5 +866,5 @@ task.spawn(function()
     end
 end)
 
-note('loaded. Serve: pickup -> 0.15s settle -> re-read tray -> 1 dish per 0.12s.')
+note('loaded. Serve = grab tray, then aim + mouse1click each in-range customer.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
