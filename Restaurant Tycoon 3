@@ -1,65 +1,56 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.8.0 -- FIX seating-onto-counters + prompt filter
+-- Version: 7.1.0 -- MULTI-TARGET, no test buttons
 --
--- TWO REAL BUGS FOUND FROM THE USER'S v6.7.0 LOG (2026-10-27):
+-- User diagnosis (2026-10-27): "you try the task once, you need to spam them on different
+-- objectives to make it faster ... you held a food for a long time ... for seating it had not
+-- enough seats, then you waited for around 7 seconds to retry"
 --
--- 1. SEATING TARGETED COUNTERS. Log showed:
---      seated: group 24 -> K3 / group 25 -> K16 / group 27 -> T19
---    K3/K16/K28 are kitchen COUNTERS, not tables. freeTables() accepted any
---    Items.Surface child with no Bill/Trash/occupant, which includes every counter.
---    FIX: tables must match ^T%d+$ ; counters (^K%d+$) are excluded from seating.
+-- That was the bug: ONE attempt per pass, then a cooldown. A rejected target cost a whole
+-- cooldown window. v7.1.0 tries MANY targets per pass:
+--   serve: pickup once, then each dish is offered to up to ServeTriesPerDish guests.
+--   seat : up to SeatTriesPerPass (group, table) PAIRS, cooldown keyed "group>table" so a
+--          busy table never blocks a different pair.
 --
--- 2. PICKUP PROMPT FILTER WAS WRONG. Log showed:
---      prompt: 0 | remote: no prompt object to reference
---    servePrompts() required ActionText == 'Serve' and found none. The user states there is
---    NO per-dish pickup prompt - only the GROUP (tray) pickup prompt. So the text filter was
---    invented and is removed: fireproximityprompt on every ProximityPrompt under
---    workspace.Temp (probe W4 showed exactly one there: "ProximityPrompt 176").
+-- Also: one shared rate limit starves the heaviest feature. Two budgets now -
+--   serve 8 / 0.5 s, other 12 / 0.5 s (~40 calls/s worst case; 16/s was slow, ~96/s crashed).
+-- If anything feels unstable, lower ServeBudget to 4 FIRST, not the loop timings.
 --
--- Because the tray pickup takes a whole tray, multiple dishes can be handed out per pass:
--- MaxServesPerPass 2 -> 5. Guests accept the wrong order (user-stated), so no matching.
---
--- Call shapes per action (confirmed, differ - never assume uniformity):
---   bill  = Interacted THEN TaskCompleted 'CollectBill'   (2)
---   dish  = TaskCompleted 'CollectDishes'                 (1)
---   tips  = TipsCollected                                 (1)
---   order = TaskCompleted 'TakeOrder'                     (1)
---   seat  = TaskCompleted 'SendToTable'                   (1)
---   serve = fireproximityprompt (tray) then TaskCompleted 'Serve' per dish
---
--- Crash hardening unchanged: token bucket 8 calls / 0.5 s (do NOT raise), ClassName-only part
--- lookup, no task.wait inside collection, one seat target per pass.
+-- Test buttons removed (user request). Menu = 6 toggles + Report + Stop.
+-- Rules kept: ClassName-only part lookup; seats only on ^T%d+$; counters are ^K%d+$;
+-- pickup fires every ProximityPrompt under workspace.Temp (no per-dish prompt exists);
+-- guests accept the wrong order; food in hand is served even if pickup fails.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.8.0'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (seat fix + tray pickup)')
+local VERSION = '7.1.0'
+print('[Restaurant Tycoon 3] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 
-local Players = game:GetService('Players')
-local RS      = game:GetService('ReplicatedStorage')
-local lp      = Players.LocalPlayer
+local Players  = game:GetService('Players')
+local RS       = game:GetService('ReplicatedStorage')
+local lp       = Players.LocalPlayer
 local unpackFn = table.unpack or unpack
 
 local CONFIG = {
     Bills = true, Tips = true, Dishes = true, Orders = true, Seat = true, Serve = true,
-    Gap = 0.2, TipsEvery = 1.0, BillEvery = 0.35, DishEvery = 0.35,
-    OrderEvery = 0.35, SeatEvery = 0.5, ServeEvery = 1.2,
-    OrderCooldown = 6.0, SeatCooldown = 15.0,
-    MaxServesPerPass = 5,     -- tray pickup, so hand out several per pass
-    MaxPickupPrompts = 3,
-    MaxPerHalf = 8,
+    Gap = 0.15, TipsEvery = 2.0, BillEvery = 0.3, DishEvery = 0.3,
+    OrderEvery = 0.5, SeatEvery = 0.2, ServeEvery = 0.35,
+    OrderCooldown = 10.0, SeatCooldown = 2.0,
+    MaxPerPass = 6, ServeTriesPerDish = 3, SeatTriesPerPass = 8, MaxPickupPrompts = 2,
+    ServeBudget = 8, OtherBudget = 12,
 }
 
 local running = true
 local stat = { bills=0, tips=0, dishes=0, orders=0, seats=0, serves=0,
-               promptPicks=0, remotePicks=0, passes=0, skipped=0, blocked=0 }
+               promptPicks=0, remotePicks=0, passes=0, skipped=0,
+               blockedServe=0, blockedOther=0 }
 local lastTips, lastBill, lastDish, lastOrder, lastSeat, lastServe = 0,0,0,0,0,0
-local windowStart, windowCount = 0, 0
+local bServe = { start = 0, count = 0 }
+local bOther = { start = 0, count = 0 }
 local orderIdx, seatIdx, tableIdx, serveIdx = 1,1,1,1
 local orderAt, seatAt = {}, {}
 
@@ -68,7 +59,9 @@ local function nowT()
     return os.clock()
 end
 
-local function note(s) print('[RT3] ' .. s) end
+local function note(s)
+    print('[RT3] ' .. tostring(s))
+end
 
 local function stop()
     running = false
@@ -77,24 +70,34 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
-local function allow()
+local function allow(kind)
+    local b = bOther
+    local cap = CONFIG.OtherBudget
+    if kind == 'serve' then b = bServe cap = CONFIG.ServeBudget end
     local t = nowT()
-    if (t - windowStart) >= 0.5 then windowStart = t windowCount = 0 end
-    if windowCount >= CONFIG.MaxPerHalf then stat.blocked = stat.blocked + 1 return false end
-    windowCount = windowCount + 1
+    if (t - b.start) >= 0.5 then b.start = t b.count = 0 end
+    if b.count >= cap then
+        if kind == 'serve' then stat.blockedServe = stat.blockedServe + 1
+        else stat.blockedOther = stat.blockedOther + 1 end
+        return false
+    end
+    b.count = b.count + 1
     return true
 end
 
-local function packArgs(...) return { n = select('#', ...), ... } end
+local function packArgs(...)
+    return { n = select('#', ...), ... }
+end
 
-local function fire(r, ...)
+local function fire(kind, r, ...)
     if not r then return false, 'missing' end
-    if not allow() then return false, 'rate capped' end
+    if not allow(kind) then return false, 'rate capped' end
     local a = packArgs(...)
     return (pcall(function() r:FireServer(unpackFn(a, 1, a.n)) end))
 end
 
 local EV = RS:FindFirstChild('Events')
+
 local function folder(...)
     local node = EV
     if not node then return nil end
@@ -228,8 +231,7 @@ local function groupList(ty)
     return out
 end
 
--- FIX 2: no ActionText filter. There is no per-dish prompt; workspace.Temp holds the
--- single GROUP (tray) pickup prompt. Probe W4 showed exactly one there.
+-- no ActionText filter: only the GROUP (tray) pickup prompt exists
 local function servePrompts()
     local out = {}
     local temp = workspace:FindFirstChild('Temp')
@@ -295,7 +297,7 @@ local function tableFree(m)
     return true
 end
 
--- FIX 1: tables are T<n> only. K<n> are kitchen counters and must never be seated on.
+-- tables are T<n> only; K<n> are kitchen counters
 local function freeTables(ty)
     local out = {}
     for _, m in ipairs(surfaceList(ty)) do
@@ -306,36 +308,34 @@ local function freeTables(ty)
     return out
 end
 
--- PICKUP: fire the tray prompt(s) under workspace.Temp, no text filter
 local function pickupViaPrompt()
     local prompts = servePrompts()
-    if #prompts == 0 then return false, 'no prompt under workspace.Temp (stand at the counter)' end
+    if #prompts == 0 then return false, 'no prompt under workspace.Temp' end
     local n = 0
     for i = 1, math.min(#prompts, CONFIG.MaxPickupPrompts) do
-        if allow() then
+        if allow('serve') then
             local ok = pcall(fireproximityprompt, prompts[i])
             if ok then n = n + 1 end
         end
     end
     if n > 0 then stat.promptPicks = stat.promptPicks + n end
-    return n > 0, 'fireproximityprompt x' .. n .. ' of ' .. #prompts
+    return n > 0, 'prompt x' .. n .. '/' .. #prompts
 end
 
--- FALLBACK: the captured Interacted call (range gated, so it needs you at the counter)
 local function pickupViaRemote(ty)
     local it = interacted()
     if not it then return false, 'Interacted missing' end
     local prompts = servePrompts()
     local prompt = prompts[1]
-    if not prompt then return false, 'no prompt object to reference' end
+    if not prompt then return false, 'no prompt object' end
     local part = prompt.Parent
     if not part then return false, 'prompt has no parent part' end
     local counter = nearestCounter(ty)
-    if not counter then return false, 'no K counter model' end
+    if not counter then return false, 'no K counter' end
     local pos = Vector3.new(0, 0, 0)
     local okp, p = pcall(function() return part.Position end)
     if okp and typeof(p) == 'Vector3' then pos = p end
-    local ok, err = fire(it, ty, {
+    local ok, err = fire('serve', it, ty, {
         HoldDuration = 0.25,
         Id = tostring(prompt.Name),
         ActionText = 'Serve',
@@ -355,12 +355,11 @@ local function pickupViaRemote(ty)
     return ok, err
 end
 
--- HAND-OFF: any dish to any guest (wrong orders accepted, user-stated)
 local function serveToGuest(ty, food, cust)
     if not ty or not food or not cust then return false, 'missing food/guest' end
     local tc = remote('Restaurant', 'TaskCompleted')
     if not tc then return false, 'TaskCompleted missing' end
-    local ok, err = fire(tc, {
+    local ok, err = fire('serve', tc, {
         FoodModel = food, Name = 'Serve', Tycoon = ty,
         GroupId = cust.groupId, CustomerId = cust.customerId,
     })
@@ -382,7 +381,7 @@ local function collectBill(ty, model)
     if okp and typeof(p) == 'Vector3' then pos = p end
     local it = interacted()
     if it then
-        fire(it, ty, {
+        fire('other', it, ty, {
             Id = '1', ActionText = '', WorldPosition = pos,
             GamepadKeyCode = 1000, TemporaryPart = part, KeyboardKeyCode = 101,
             Range = 7.2, IsCustomerPrompt = true, Key = 'CollectBill',
@@ -390,7 +389,7 @@ local function collectBill(ty, model)
             InteractionType = 'CollectBill', HoldDuration = 0,
         })
     end
-    local ok, err = fire(tc, { Tycoon = ty, Name = 'CollectBill', FurnitureModel = model })
+    local ok, err = fire('other', tc, { Tycoon = ty, Name = 'CollectBill', FurnitureModel = model })
     if ok then stat.bills = stat.bills + 1 end
     return ok, err
 end
@@ -399,7 +398,7 @@ local function collectDish(ty, model)
     if not ty or not model then return false, 'missing model' end
     local tc = remote('Restaurant', 'TaskCompleted')
     if not tc then return false, 'TaskCompleted missing' end
-    local ok, err = fire(tc, { Tycoon = ty, Name = 'CollectDishes', FurnitureModel = model })
+    local ok, err = fire('other', tc, { Tycoon = ty, Name = 'CollectDishes', FurnitureModel = model })
     if ok then stat.dishes = stat.dishes + 1 end
     return ok, err
 end
@@ -408,7 +407,7 @@ local function takeOrder(ty, cust)
     if not ty or not cust then return false, 'missing customer' end
     local tc = remote('Restaurant', 'TaskCompleted')
     if not tc then return false, 'TaskCompleted missing' end
-    local ok, err = fire(tc, {
+    local ok, err = fire('other', tc, {
         CustomerId = cust.customerId, GroupId = cust.groupId,
         Tycoon = ty, Name = 'TakeOrder',
     })
@@ -420,7 +419,7 @@ local function sendToTable(ty, groupId, table)
     if not ty or not groupId or not table then return false, 'missing group/table' end
     local tc = remote('Restaurant', 'TaskCompleted')
     if not tc then return false, 'TaskCompleted missing' end
-    local ok, err = fire(tc, {
+    local ok, err = fire('other', tc, {
         FurnitureModel = table, GroupId = groupId, Tycoon = ty, Name = 'SendToTable',
     })
     if ok then stat.seats = stat.seats + 1 end
@@ -430,7 +429,7 @@ end
 local function takeTips(ty)
     local tips = remote('Restaurant', 'TipsCollected')
     if not tips or not ty then return false, 'TipsCollected missing' end
-    local ok, err = fire(tips, ty)
+    local ok, err = fire('other', tips, ty)
     if ok then stat.tips = stat.tips + 1 end
     return ok, err
 end
@@ -438,13 +437,21 @@ end
 local function oneBill(ty)
     local l = billTargets(ty)
     if #l == 0 then return false, 'no bills' end
-    return collectBill(ty, l[1])
+    local n = 0
+    for i = 1, math.min(#l, CONFIG.MaxPerPass) do
+        if collectBill(ty, l[i]) then n = n + 1 end
+    end
+    return n > 0, 'bills ' .. n .. '/' .. #l
 end
 
 local function oneDish(ty)
     local l = dishTargets(ty)
     if #l == 0 then return false, 'no trash' end
-    return collectDish(ty, l[1])
+    local n = 0
+    for i = 1, math.min(#l, CONFIG.MaxPerPass) do
+        if collectDish(ty, l[i]) then n = n + 1 end
+    end
+    return n > 0, 'dishes ' .. n .. '/' .. #l
 end
 
 local function oneOrder(ty)
@@ -452,6 +459,7 @@ local function oneOrder(ty)
     if #l == 0 then return false, 'no customers' end
     if orderIdx > #l then orderIdx = 1 end
     local t = nowT()
+    local tried = 0
     for _ = 1, #l do
         local c = l[orderIdx]
         orderIdx = orderIdx + 1
@@ -460,67 +468,86 @@ local function oneOrder(ty)
         local last = orderAt[key]
         if not last or (t - last) >= CONFIG.OrderCooldown then
             orderAt[key] = t
-            return takeOrder(ty, c)
+            tried = tried + 1
+            if takeOrder(ty, c) then
+                return true, 'order ' .. tostring(c.groupId) .. ':' .. tostring(c.customerId)
+            end
         end
     end
-    return false, 'all customers on cooldown'
+    return false, 'all on cooldown (' .. tried .. ' tried)'
 end
 
+-- spam (group, table) PAIRS; cooldown keyed on the pair so a busy table blocks nothing else
 local function oneSeat(ty)
     local groups = groupList(ty)
     if #groups == 0 then return false, 'no customers' end
     local tables = freeTables(ty)
-    if #tables == 0 then return false, 'no free TABLES (counters excluded)' end
-    if seatIdx > #groups then seatIdx = 1 end
-    if tableIdx > #tables then tableIdx = 1 end
+    if #tables == 0 then return false, 'no free TABLES' end
     local t = nowT()
-    for _ = 1, #groups do
-        local gid = groups[seatIdx]
-        seatIdx = seatIdx + 1
+    local done, detail, attempts = 0, '', 0
+    for _ = 1, CONFIG.SeatTriesPerPass do
         if seatIdx > #groups then seatIdx = 1 end
-        local last = seatAt[gid]
-        if not last or (t - last) >= CONFIG.SeatCooldown then
-            local table = tables[tableIdx]
-            tableIdx = tableIdx + 1
-            if tableIdx > #tables then tableIdx = 1 end
-            seatAt[gid] = t
-            local ok, err = sendToTable(ty, gid, table)
-            return ok, 'group ' .. tostring(gid) .. ' -> ' .. table.Name .. (ok and '' or (' err ' .. tostring(err)))
+        if tableIdx > #tables then tableIdx = 1 end
+        local gid = groups[seatIdx]
+        local table = tables[tableIdx]
+        seatIdx = seatIdx + 1
+        tableIdx = tableIdx + 1
+        if gid and table then
+            local key = tostring(gid) .. '>' .. table.Name
+            local last = seatAt[key]
+            if not last or (t - last) >= CONFIG.SeatCooldown then
+                seatAt[key] = t
+                attempts = attempts + 1
+                local ok = sendToTable(ty, gid, table)
+                detail = tostring(gid) .. '->' .. table.Name
+                if ok then done = done + 1 end
+            end
         end
     end
-    return false, 'all groups on cooldown'
+    if done == 0 then
+        return false, 'no pair landed (' .. attempts .. ' tried, last ' .. detail .. ')'
+    end
+    return true, done .. ' seat(s), last ' .. detail
 end
 
--- SERVE: tray pickup (prompt first, remote fallback), then hand out up to N dishes
+-- serve: pickup once, then each dish offered to several guests
 local function oneServe(ty)
     local dishes = foodList(ty)
     if #dishes == 0 then return false, 'no dishes on counter' end
     local guests = customerList(ty)
     if #guests == 0 then return false, 'no customers' end
 
-    local pok, pdetail = pickupViaPrompt()
-    if not pok then
-        local rok, rdetail = pickupViaRemote(ty)
-        if not rok then
-            return false, 'pickup failed (prompt: ' .. tostring(pdetail) .. ' | remote: ' .. tostring(rdetail) .. ')'
-        end
+    local pdetail = 'no pickup'
+    local pok, pd = pickupViaPrompt()
+    if pok then
+        pdetail = pd
+    else
+        local rok = pickupViaRemote(ty)
+        if rok then pdetail = 'remote pickup' else pdetail = tostring(pd) end
     end
 
     if serveIdx > #guests then serveIdx = 1 end
-    local fired, accepted = 0, 0
-    for i = 1, math.min(#dishes, CONFIG.MaxServesPerPass) do
+    local calls, dishesDone = 0, 0
+    for i = 1, math.min(#dishes, CONFIG.MaxPerPass) do
         local dish = dishes[i]
-        local cust = guests[serveIdx]
-        serveIdx = serveIdx + 1
-        if serveIdx > #guests then serveIdx = 1 end
-        if dish and dish.Parent and cust then
-            fired = fired + 1
-            if serveToGuest(ty, dish, cust) then accepted = accepted + 1 end
+        if dish and dish.Parent then
+            local gotIt = false
+            for _ = 1, math.min(#guests, CONFIG.ServeTriesPerDish) do
+                if serveIdx > #guests then serveIdx = 1 end
+                local cust = guests[serveIdx]
+                serveIdx = serveIdx + 1
+                if cust then
+                    calls = calls + 1
+                    if serveToGuest(ty, dish, cust) then gotIt = true end
+                end
+                if not dish.Parent then break end
+            end
+            if gotIt then dishesDone = dishesDone + 1 end
         end
     end
 
-    if fired == 0 then return false, 'nothing left to serve' end
-    return accepted > 0, tostring(pdetail) .. ', served ' .. accepted .. '/' .. fired .. ' dish(es)'
+    if calls == 0 then return false, 'nothing to serve' end
+    return dishesDone > 0, pdetail .. ', dishes ' .. dishesDone .. ', calls ' .. calls
 end
 
 local function report()
@@ -529,37 +556,16 @@ local function report()
     local cust = ty and customerList(ty) or {}
     local prompts = servePrompts()
     local tables = ty and freeTables(ty) or {}
-    local counters = {}
-    for _, m in ipairs(surfaceList(ty)) do
-        if string.match(m.Name, '^K%d+$') then counters[#counters + 1] = m.Name end
-    end
     note('--- REPORT v' .. VERSION .. ' ---')
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
-    note('bills=' .. #(ty and billTargets(ty) or {}) .. ' trash=' .. #(ty and dishTargets(ty) or {}) ..
-         ' customers=' .. #cust .. ' foodOnCounter=' .. #food)
-    note('freeTables=' .. #tables .. ' counters=' .. table.concat(counters, ','))
-    for i, m in ipairs(tables) do
-        if i <= 8 then note('  freeTable ' .. m.Name) end
-    end
-    note('promptsUnderTemp=' .. #prompts)
-    for i, p in ipairs(prompts) do
-        if i <= 4 then
-            local act, hold, dist
-            pcall(function() act = p.ActionText end)
-            pcall(function() hold = p.HoldDuration end)
-            pcall(function() dist = p.MaxActivationDistance end)
-            note('  prompt ' .. tostring(p.Name) .. ' act=' .. tostring(act) ..
-                 ' hold=' .. tostring(hold) .. ' dist=' .. tostring(dist) ..
-                 ' parent=' .. tostring(p.Parent and p.Parent.Name))
-        end
-    end
-    note('remote Interacted=' .. tostring(interacted() ~= nil) ..
-         ' TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil) ..
-         ' TipsCollected=' .. tostring(remote('Restaurant', 'TipsCollected') ~= nil))
-    note('counters promptPicks=' .. stat.promptPicks .. ' remotePicks=' .. stat.remotePicks ..
-         ' serves=' .. stat.serves .. ' orders=' .. stat.orders .. ' seats=' .. stat.seats ..
-         ' bills=' .. stat.bills .. ' dishes=' .. stat.dishes .. ' tips=' .. stat.tips)
-    note('skippedNoPart=' .. stat.skipped .. ' rateBlocked=' .. stat.blocked .. ' passes=' .. stat.passes)
+    note('bills=' .. #(ty and billTargets(ty) or {}) .. ' trash=' .. #(ty and dishTargets(ty) or {}))
+    note('customers=' .. #cust .. ' foodOnCounter=' .. #food)
+    note('freeTables=' .. #tables .. ' promptsUnderTemp=' .. #prompts)
+    note('promptPicks=' .. stat.promptPicks .. ' remotePicks=' .. stat.remotePicks)
+    note('serves=' .. stat.serves .. ' orders=' .. stat.orders .. ' seats=' .. stat.seats)
+    note('bills=' .. stat.bills .. ' dishes=' .. stat.dishes .. ' tips=' .. stat.tips)
+    note('blockedServe=' .. stat.blockedServe .. ' blockedOther=' .. stat.blockedOther)
+    note('skippedNoPart=' .. stat.skipped .. ' passes=' .. stat.passes)
     note('--- end ---')
 end
 
@@ -594,45 +600,6 @@ if UI then
             safeToggle(main, 'rt3_bills', 'Auto Collect Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
             safeToggle(main, 'rt3_dishes', 'Auto Pickup Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
             safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
-            safeButton(main, 'Serve One Dish', function()
-                local ty = findTycoon()
-                local ok, d = oneServe(ty)
-                note('one serve: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
-            end)
-            safeButton(main, 'Pickup Only (prompt)', function()
-                local ok, d = pickupViaPrompt()
-                note('prompt pickup: ' .. (ok and 'OK ' or 'FAIL ') .. ' ' .. tostring(d))
-            end)
-            safeButton(main, 'Pickup Only (remote)', function()
-                local ty = findTycoon()
-                local ok, d = pickupViaRemote(ty)
-                note('remote pickup: ' .. (ok and 'OK ' or 'FAIL ') .. ' ' .. tostring(d))
-            end)
-            safeButton(main, 'Seat One Customer', function()
-                local ty = findTycoon()
-                local ok, d = oneSeat(ty)
-                note('one seat: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
-            end)
-            safeButton(main, 'Take One Order', function()
-                local ty = findTycoon()
-                local ok, d = oneOrder(ty)
-                note('one order: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
-            end)
-            safeButton(main, 'Collect One Bill', function()
-                local ty = findTycoon()
-                local ok, d = oneBill(ty)
-                note('one bill: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
-            end)
-            safeButton(main, 'Collect One Dish', function()
-                local ty = findTycoon()
-                local ok, d = oneDish(ty)
-                note('one dish: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
-            end)
-            safeButton(main, 'Collect Tips Now', function()
-                local ty = findTycoon()
-                local ok, d = takeTips(ty)
-                note('tips: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
-            end)
             safeButton(main, 'Report', function() report() end)
             safeButton(main, 'Stop', function() stop() end)
         end)
@@ -648,16 +615,25 @@ local function pollToggle()
         if ok and type(v) == 'boolean' then return v end
         return nil
     end
-    local s = getv('rt3_serve', 'Auto Serve Food') if s ~= nil then CONFIG.Serve = s end
-    local st = getv('rt3_seat', 'Auto Seat Customers') if st ~= nil then CONFIG.Seat = st end
-    local o = getv('rt3_orders', 'Auto Take Order') if o ~= nil then CONFIG.Orders = o end
-    local b = getv('rt3_bills', 'Auto Collect Bills') if b ~= nil then CONFIG.Bills = b end
-    local d = getv('rt3_dishes', 'Auto Pickup Dishes') if d ~= nil then CONFIG.Dishes = d end
-    local t = getv('rt3_tips', 'Auto Collect Tips') if t ~= nil then CONFIG.Tips = t end
+    local s = getv('rt3_serve', 'Auto Serve Food')
+    if s ~= nil then CONFIG.Serve = s end
+    local st = getv('rt3_seat', 'Auto Seat Customers')
+    if st ~= nil then CONFIG.Seat = st end
+    local o = getv('rt3_orders', 'Auto Take Order')
+    if o ~= nil then CONFIG.Orders = o end
+    local b = getv('rt3_bills', 'Auto Collect Bills')
+    if b ~= nil then CONFIG.Bills = b end
+    local d = getv('rt3_dishes', 'Auto Pickup Dishes')
+    if d ~= nil then CONFIG.Dishes = d end
+    local t = getv('rt3_tips', 'Auto Collect Tips')
+    if t ~= nil then CONFIG.Tips = t end
 end
 
 task.spawn(function()
-    while running do pollToggle() task.wait(0.15) end
+    while running do
+        pollToggle()
+        task.wait(0.15)
+    end
 end)
 
 task.spawn(function()
@@ -673,8 +649,7 @@ task.spawn(function()
                 local ok, d = oneServe(ty)
                 if ok then
                     note('served: ' .. tostring(d))
-                elseif d ~= 'no dishes on counter' and d ~= 'no customers'
-                    and (t - lastMsgT) > 10 then
+                elseif d ~= 'no dishes on counter' and d ~= 'no customers' and (t - lastMsgT) > 12 then
                     note('serve idle: ' .. tostring(d))
                     lastMsgT = t
                 end
@@ -683,50 +658,61 @@ task.spawn(function()
             if CONFIG.Seat and (t - lastSeat) >= CONFIG.SeatEvery then
                 lastSeat = t
                 local ok, d = oneSeat(ty)
-                if ok then note('seated: ' .. tostring(d))
-                elseif d ~= 'no customers' and d ~= 'no free TABLES (counters excluded)'
-                    and (t - lastMsgT) > 10 then
-                    note('seat idle: ' .. tostring(d)) lastMsgT = t
+                if ok then
+                    note('seated: ' .. tostring(d))
+                elseif d ~= 'no customers' and d ~= 'no free TABLES' and (t - lastMsgT) > 12 then
+                    note('seat idle: ' .. tostring(d))
+                    lastMsgT = t
                 end
             end
 
             if CONFIG.Orders and (t - lastOrder) >= CONFIG.OrderEvery then
                 lastOrder = t
                 local ok, d = oneOrder(ty)
-                if ok then note('order taken')
-                elseif d ~= 'no customers' and (t - lastMsgT) > 10 then
-                    note('order idle: ' .. tostring(d)) lastMsgT = t
+                if ok then
+                    note('order taken')
+                elseif d ~= 'no customers' and (t - lastMsgT) > 12 then
+                    note('order idle: ' .. tostring(d))
+                    lastMsgT = t
                 end
             end
 
             if CONFIG.Bills and (t - lastBill) >= CONFIG.BillEvery then
                 lastBill = t
                 local ok, d = oneBill(ty)
-                if ok then note('bill collected')
-                elseif d ~= 'no bills' and (t - lastMsgT) > 10 then
-                    note('bill idle: ' .. tostring(d)) lastMsgT = t
+                if ok then
+                    note('bill: ' .. tostring(d))
+                elseif d ~= 'no bills' and (t - lastMsgT) > 12 then
+                    note('bill idle: ' .. tostring(d))
+                    lastMsgT = t
                 end
             end
 
             if CONFIG.Dishes and (t - lastDish) >= CONFIG.DishEvery then
                 lastDish = t
                 local ok, d = oneDish(ty)
-                if ok then note('dish collected')
-                elseif d ~= 'no trash' and (t - lastMsgT) > 10 then
-                    note('dish idle: ' .. tostring(d)) lastMsgT = t
+                if ok then
+                    note('dish: ' .. tostring(d))
+                elseif d ~= 'no trash' and (t - lastMsgT) > 12 then
+                    note('dish idle: ' .. tostring(d))
+                    lastMsgT = t
                 end
             end
 
             if CONFIG.Tips and (t - lastTips) >= CONFIG.TipsEvery then
-                lastTips = t takeTips(ty)
+                lastTips = t
+                takeTips(ty)
             end
         else
-            if (t - lastMsgT) > 12 then note('idle: tycoon not found') lastMsgT = t end
+            if (t - lastMsgT) > 12 then
+                note('idle: tycoon not found')
+                lastMsgT = t
+            end
         end
 
         task.wait(CONFIG.Gap)
     end
 end)
 
-note('loaded. Seating restricted to T tables. Pickup = every prompt under workspace.Temp.')
+note('loaded. Multi-target per pass; no test buttons.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
