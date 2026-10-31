@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v3.4: Restaurant Tycoon 3 serve fix (v6.11.0) confirmed against place 119048529960596.
 -- v3.3: Age Evolution Tycoon pinned by place id 96469185605358.
 -- v3.2: place 85646026816836 renamed Pulse Fitness Club -> Plunder PVP (user supplied the title).
 -- v3.1: Pulse Fitness Club pinned by place id 85646026816836 (game.Name is 'Ugc').
@@ -28,7 +29,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v3.3'
+local VERSION = 'v3.4'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
