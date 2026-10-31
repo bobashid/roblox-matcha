@@ -1,34 +1,38 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.1.0 -- AUTO MONEY + AUTO DISHES
+-- Version: 6.2.0 -- AUTO MONEY + DISHES + TAKE ORDER
 --
--- v6.0.1 is CONFIRMED WORKING by the user (2026-10-27): "nice everything there works".
--- This build keeps every v6.0.1 fix untouched and adds one thing: auto dish pickup.
+-- v6.0.1 (bills + tips) and v6.1.0 (dishes) are CONFIRMED WORKING by the user:
+--   "nice everything works the auto dish pickup and cash+tips".
+-- This build adds ONE thing and changes nothing else: auto take order.
 --
--- User-captured dish payload (2026-10-27):
---   TaskCompleted:FireServer({Tycoon=tycoon, Name="CollectDishes",
---                             FurnitureModel=Items.Surface.T19})
--- NOTE the shape difference from bills:
---   * bill  = Interactions.Interacted  THEN TaskCompleted 'CollectBill'
---   * dish  = TaskCompleted 'CollectDishes' ONLY - no interaction call
---   * target is the Items.Surface model that holds a `Trash` child (same model shape
---     as a bill's `Bill` child), NOT the Trash itself and NOT Objects.Food.
+-- User-captured take-order payload (2026-10-27):
+--   TaskCompleted:FireServer({CustomerId="2", GroupId="8",
+--                             Tycoon=game.Workspace.Tycoons.Tycoon, Name="TakeOrder"})
+-- ONE call, no Interactions partner. GroupId/CustomerId are STRINGS.
 --
--- v6.0.1 fixes still in force (do not regress):
---   1. `Interacted` lives INSIDE the Restaurant.Interactions FOLDER (probed: X2 Folder,
---      X3 RemoteEvent Interacted). Resolving the folder and firing it was the v6.0.0 crash path.
---   2. BaseParts are found by ClassName only - FindFirstChildWhichIsA is unreliable here
---      because IsA always returns true. A target with no findable part is SKIPPED, not sent.
---   3. Token bucket caps outgoing calls (8 per 0.5 s) and only ONE target is collected per
---      pass per feature.
---   4. No task.wait inside collection; the loop yields between passes only.
+-- Targeting: live probe this turn confirmed Tycoon.ClientCustomers holds:
+--   Folder "8"  -> Model "1", Model "2"
+--   Folder "9"  -> Model "1", Model "2"
+--   Folder "10" -> Model "1", Model "2"
+-- Folder name = GroupId, child model name = CustomerId. Matches the capture exactly.
+--
+-- Call shapes differ per action - do NOT assume uniformity:
+--   bill   = Interactions.Interacted THEN TaskCompleted 'CollectBill'   (2 calls)
+--   dish   = TaskCompleted 'CollectDishes'                              (1 call)
+--   tips   = TipsCollected                                              (1 call)
+--   order  = TaskCompleted 'TakeOrder'                                  (1 call)
+--
+-- Crash hardening from v6.0.1 still in force: Interactions is a FOLDER (Interacted lives
+-- inside it); parts found by ClassName only; token bucket 8 calls/0.5s; ONE target per
+-- feature per pass; no task.wait inside collection.
 --
 -- Upgrades excluded. No Instance.new. ClassName tests only.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.1.0'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (money + dishes)')
+local VERSION = '6.2.0'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (money + dishes + orders)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -43,17 +47,22 @@ local CONFIG = {
     Bills  = true,
     Tips   = true,
     Dishes = true,
+    Orders = true,
     Gap       = 0.5,
     TipsEvery = 2.0,
     BillEvery = 0.8,
     DishEvery = 0.8,
+    OrderEvery = 0.8,
+    OrderCooldown = 6.0,  -- per group:customer, so one guest is not re-ordered every pass
     MaxPerHalf = 8,
 }
 
 local running = true
-local stat = { bills = 0, tips = 0, dishes = 0, passes = 0, skipped = 0, blocked = 0 }
-local lastTips, lastBill, lastDish = 0, 0, 0
+local stat = { bills = 0, tips = 0, dishes = 0, orders = 0, passes = 0, skipped = 0, blocked = 0 }
+local lastTips, lastBill, lastDish, lastOrder = 0, 0, 0, 0
 local windowStart, windowCount = 0, 0
+local orderIdx = 1
+local orderAt = {}
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -69,7 +78,6 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
--- token bucket (v6.0.1)
 local function allow()
     local t = nowT()
     if (t - windowStart) >= 0.5 then
@@ -170,7 +178,6 @@ local function aPart(model)
     return nil
 end
 
--- Surface models holding a given child name ('Bill' or 'Trash')
 local function surfacesWith(ty, childName)
     local out = {}
     if not ty then return out end
@@ -187,6 +194,20 @@ end
 
 local function billTargets(ty) return surfacesWith(ty, 'Bill') end
 local function dishTargets(ty) return surfacesWith(ty, 'Trash') end
+
+-- guests currently present: folder name = GroupId, model name = CustomerId (opaque strings)
+local function customerList(ty)
+    local out = {}
+    if not ty then return out end
+    local cc = ty:FindFirstChild('ClientCustomers')
+    if not cc then return out end
+    for _, g in ipairs(cc:GetChildren()) do
+        for _, c in ipairs(g:GetChildren()) do
+            out[#out + 1] = { groupId = g.Name, customerId = c.Name }
+        end
+    end
+    return out
+end
 
 -- BILL: captured two-call pair
 local function collectBill(ty, model)
@@ -207,20 +228,11 @@ local function collectBill(ty, model)
     local it = interacted()
     if it then
         fire(it, ty, {
-            Id = '1',
-            ActionText = '',
-            WorldPosition = pos,
-            GamepadKeyCode = 1000,
-            TemporaryPart = part,
-            KeyboardKeyCode = 101,
-            Range = 7.2,
-            IsCustomerPrompt = true,
-            Key = 'CollectBill',
-            Model = model,
-            Part = part,
-            Prompt = 1,
-            InteractionType = 'CollectBill',
-            HoldDuration = 0,
+            Id = '1', ActionText = '', WorldPosition = pos,
+            GamepadKeyCode = 1000, TemporaryPart = part, KeyboardKeyCode = 101,
+            Range = 7.2, IsCustomerPrompt = true, Key = 'CollectBill',
+            Model = model, Part = part, Prompt = 1,
+            InteractionType = 'CollectBill', HoldDuration = 0,
         })
     end
 
@@ -229,13 +241,28 @@ local function collectBill(ty, model)
     return ok, err
 end
 
--- DISHES: user-captured single call, no Interacted
+-- DISHES: captured single call, no Interacted
 local function collectDish(ty, model)
     if not ty or not model then return false, 'missing model' end
     local tc = remote('Restaurant', 'TaskCompleted')
     if not tc then return false, 'TaskCompleted missing' end
     local ok, err = fire(tc, { Tycoon = ty, Name = 'CollectDishes', FurnitureModel = model })
     if ok then stat.dishes = stat.dishes + 1 end
+    return ok, err
+end
+
+-- ORDER: captured single call, ids as strings
+local function takeOrder(ty, cust)
+    if not ty or not cust then return false, 'missing customer' end
+    local tc = remote('Restaurant', 'TaskCompleted')
+    if not tc then return false, 'TaskCompleted missing' end
+    local ok, err = fire(tc, {
+        CustomerId = cust.customerId,
+        GroupId = cust.groupId,
+        Tycoon = ty,
+        Name = 'TakeOrder',
+    })
+    if ok then stat.orders = stat.orders + 1 end
     return ok, err
 end
 
@@ -259,26 +286,49 @@ local function oneDish(ty)
     return collectDish(ty, list[1])
 end
 
+-- one guest per pass, round-robin, with a per-guest cooldown
+local function oneOrder(ty)
+    local list = customerList(ty)
+    if #list == 0 then return false, 'no customers' end
+    if orderIdx > #list then orderIdx = 1 end
+    local t = nowT()
+    local tries = 0
+    while tries < #list do
+        local c = list[orderIdx]
+        orderIdx = orderIdx + 1
+        if orderIdx > #list then orderIdx = 1 end
+        tries = tries + 1
+        local key = tostring(c.groupId) .. ':' .. tostring(c.customerId)
+        local last = orderAt[key]
+        if not last or (t - last) >= CONFIG.OrderCooldown then
+            orderAt[key] = t
+            return takeOrder(ty, c)
+        end
+    end
+    return false, 'all customers on cooldown'
+end
+
 local function report()
     local ty = findTycoon()
     local bills = ty and billTargets(ty) or {}
     local dishes = ty and dishTargets(ty) or {}
+    local cust = ty and customerList(ty) or {}
     note('--- REPORT v' .. VERSION .. ' ---')
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
-    note('bills on tables=' .. #bills .. '  dishes on tables=' .. #dishes)
+    note('bills=' .. #bills .. ' dishes=' .. #dishes .. ' customers=' .. #cust)
+    for i, c in ipairs(cust) do
+        if i <= 8 then note('  cust group=' .. tostring(c.groupId) .. ' id=' .. tostring(c.customerId)) end
+    end
     for i, m in ipairs(bills) do
-        if i <= 4 then
+        if i <= 3 then
             local part = aPart(m)
             note('  bill ' .. m.Name .. ' part=' .. tostring(part and part.Name or 'NONE'))
         end
     end
-    for i, m in ipairs(dishes) do
-        if i <= 4 then note('  dish ' .. m.Name) end
-    end
     note('remote Interacted=' .. tostring(interacted() ~= nil))
     note('remote TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil))
     note('remote TipsCollected=' .. tostring(remote('Restaurant', 'TipsCollected') ~= nil))
-    note('bills=' .. stat.bills .. ' tips=' .. stat.tips .. ' dishes=' .. stat.dishes .. ' passes=' .. stat.passes)
+    note('bills=' .. stat.bills .. ' tips=' .. stat.tips .. ' dishes=' .. stat.dishes .. ' orders=' .. stat.orders .. ' passes=' .. stat.passes)
     note('skippedNoPart=' .. stat.skipped .. ' rateBlocked=' .. stat.blocked)
     note('--- end ---')
 end
@@ -307,10 +357,11 @@ end
 if UI then
     pcall(function()
         UI.AddTab('Restaurant Tycoon 3', function(tab)
-            local main = tab:Section('Auto Money', 'Left')
+            local main = tab:Section('Automation', 'Left')
             safeToggle(main, 'rt3_bills', 'Auto Collect Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
             safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
             safeToggle(main, 'rt3_dishes', 'Auto Pickup Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
+            safeToggle(main, 'rt3_orders', 'Auto Take Order', CONFIG.Orders, function(v) CONFIG.Orders = v end)
             safeButton(main, 'Collect One Bill', function()
                 local ty = findTycoon()
                 local ok, d = oneBill(ty)
@@ -320,6 +371,11 @@ if UI then
                 local ty = findTycoon()
                 local ok, d = oneDish(ty)
                 note('one dish: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
+            end)
+            safeButton(main, 'Take One Order', function()
+                local ty = findTycoon()
+                local ok, d = oneOrder(ty)
+                note('one order: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
             end)
             safeButton(main, 'Collect Tips Now', function()
                 local ty = findTycoon()
@@ -347,6 +403,8 @@ local function pollToggle()
     if t ~= nil then CONFIG.Tips = t end
     local d = getv('rt3_dishes', 'Auto Pickup Dishes')
     if d ~= nil then CONFIG.Dishes = d end
+    local o = getv('rt3_orders', 'Auto Take Order')
+    if o ~= nil then CONFIG.Orders = o end
 end
 
 task.spawn(function()
@@ -364,6 +422,17 @@ task.spawn(function()
         local t = nowT()
 
         if ty then
+            if CONFIG.Orders and (t - lastOrder) >= CONFIG.OrderEvery then
+                lastOrder = t
+                local ok, d = oneOrder(ty)
+                if ok then
+                    note('order taken')
+                elseif d ~= 'no customers' and (t - lastMsgT) > 10 then
+                    note('order idle: ' .. tostring(d))
+                    lastMsgT = t
+                end
+            end
+
             if CONFIG.Bills and (t - lastBill) >= CONFIG.BillEvery then
                 lastBill = t
                 local ok, d = oneBill(ty)
@@ -401,5 +470,5 @@ task.spawn(function()
     end
 end)
 
-note('loaded. Bills (2 calls), dishes (1 call), tips - one target each per pass, calls capped.')
+note('loaded. Orders (1 call), bills (2), dishes (1), tips (1) - one target per pass, calls capped.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
