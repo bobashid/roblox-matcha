@@ -1,28 +1,37 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.0.0 -- AUTO MONEY ONLY (bills from tables + tips)
+-- Version: 6.0.1 -- AUTO MONEY ONLY (bills + tips), SAFE RATE
 --
--- Built from the user's own Remote Spy captures (2026-10-27). Collecting a table bill is
--- TWO calls, in this order:
---   1) Events.Restaurant.Interactions.Interacted:FireServer(tycoon, {
---        Id="1", ActionText="", WorldPosition=<part pos>, GamepadKeyCode=1000,
---        TemporaryPart=Part, KeyboardKeyCode=101, Range=7.2, IsCustomerPrompt=true,
---        Key="CollectBill", Model=<Items.Surface.T?>, Part=Part, Prompt=1,
---        InteractionType="CollectBill", HoldDuration=0 })
---   2) Events.Restaurant.TaskCompleted:FireServer({
---        Tycoon=tycoon, Name="CollectBill", FurnitureModel=<same Surface model> })
--- Tips is a single call: Events.Restaurant.TipsCollected:FireServer(tycoon).
+-- v6.0.0 CRASHED THE USER'S GAME. Per the crash protocol this build adds NO features:
+-- it removes the defects that could have caused it and hardens everything else.
 --
--- The bill target is the Items.Surface MODEL that contains a `Bill` child - not the Bill.
--- The first capture used Id="142"/Prompt=142, the second Id="1"/Prompt=1, so the Id is just a
--- prompt number: it is sent as captured ("1") which the second capture proves is accepted.
+-- Defects found in v6.0.0 and fixed here:
+--   1. `Interactions` is a **Folder**, not a RemoteEvent. `remote('Restaurant','Interactions')`
+--      returned the Folder and `Folder:FireServer(...)` threw inside pcall - the first of the
+--      two bill calls never fired. Now `Interacted` is resolved INSIDE that folder.
+--   2. `FindFirstChildWhichIsA('BasePart', true)` is unreliable in this VM (IsA is always true).
+--      Parts are now found by ClassName only, and a bill with no findable part is SKIPPED
+--      instead of sending a Model where the server expects a Part.
+--   3. No rate limit: up to 12 bills x 2 calls every 0.25 s. Now a token bucket caps every
+--      outgoing call (default 8 per 0.5 s) and only ONE bill is collected per pass.
+--   4. `task.wait` inside the collect loop is gone; the loop yields between passes only.
 --
--- Upgrades excluded. No Instance.new. ClassName tests only (IsA is always true in Matcha).
+-- Captures this is built on (user, 2026-10-27):
+--   Interactions.Interacted:FireServer(tycoon, {Id="1", ActionText="", WorldPosition=...,
+--     GamepadKeyCode=1000, TemporaryPart=Part, KeyboardKeyCode=101, Range=7.2,
+--     IsCustomerPrompt=true, Key="CollectBill", Model=Items.Surface.T1, Part=Part,
+--     Prompt=1, InteractionType="CollectBill", HoldDuration=0})
+--   TaskCompleted:FireServer({Tycoon=tycoon, Name="CollectBill", FurnitureModel=Surface.T1})
+--   TipsCollected:FireServer(tycoon)
+-- An earlier capture used Id="142"/Prompt=142/KeyCode E, so those are just prompt numbers
+-- and key codes - not fixed constants.
+--
+-- Upgrades excluded. No Instance.new. ClassName tests only.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.0.0'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (auto money)')
+local VERSION = '6.0.1'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (auto money, safe rate)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -36,14 +45,16 @@ local unpackFn = table.unpack or unpack
 local CONFIG = {
     Bills = true,
     Tips  = true,
-    Gap       = 0.25,
-    TipsEvery = 1.0,
-    MaxBills  = 12,
+    Gap       = 0.5,    -- seconds between passes
+    TipsEvery = 2.0,    -- seconds between tip calls
+    BillEvery = 0.8,    -- seconds between bill attempts
+    MaxPerHalf = 8,     -- hard cap on outgoing calls per 0.5 s
 }
 
 local running = true
-local stat = { bills = 0, tips = 0, passes = 0 }
-local lastTips = 0
+local stat = { bills = 0, tips = 0, passes = 0, skipped = 0, blocked = 0 }
+local lastTips, lastBill = 0, 0
+local windowStart, windowCount = 0, 0
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -59,32 +70,68 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
--- `...` inside a nested closure is a parse error, so pack and unpack
+-- token bucket: the reference caps at ~260/0.5s; we cap far lower on purpose
+local function allow()
+    local t = nowT()
+    if (t - windowStart) >= 0.5 then
+        windowStart = t
+        windowCount = 0
+    end
+    if windowCount >= CONFIG.MaxPerHalf then
+        stat.blocked = stat.blocked + 1
+        return false
+    end
+    windowCount = windowCount + 1
+    return true
+end
+
 local function packArgs(...)
     return { n = select('#', ...), ... }
 end
 
 local function fire(remote, ...)
     if not remote then return false, 'missing' end
+    if not allow() then return false, 'rate capped' end
     local a = packArgs(...)
     local ok, err = pcall(function() remote:FireServer(unpackFn(a, 1, a.n)) end)
     return ok, err
 end
 
 local EV = RS:FindFirstChild('Events')
+local function folder(...)
+    local node = EV
+    if not node then return nil end
+    for _, name in ipairs({ ... }) do
+        node = node:FindFirstChild(name)
+        if not node then return nil end
+    end
+    return node
+end
+
+-- a fireable remote by name inside a folder
 local function remote(folderName, remoteName)
-    if not EV then return nil end
-    local f = folderName and EV:FindFirstChild(folderName) or EV
+    local f = folderName and folder(folderName) or EV
     if not f then return nil end
     for _, c in ipairs(f:GetChildren()) do
         if c.Name == remoteName then
             local cn = c.ClassName
-            if cn == 'RemoteEvent' or cn == 'UnreliableRemoteEvent' then
-                return c
-            end
+            if cn == 'RemoteEvent' or cn == 'UnreliableRemoteEvent' then return c end
         end
     end
-    return f:FindFirstChild(remoteName)
+    return nil
+end
+
+-- FIX 1: Interacted lives INSIDE the Interactions folder
+local function interacted()
+    local f = folder('Restaurant', 'Interactions')
+    if not f then return nil end
+    for _, c in ipairs(f:GetChildren()) do
+        if c.Name == 'Interacted' then
+            local cn = c.ClassName
+            if cn == 'RemoteEvent' or cn == 'UnreliableRemoteEvent' then return c end
+        end
+    end
+    return nil
 end
 
 local function findTycoon()
@@ -102,27 +149,29 @@ local function findTycoon()
     return nil
 end
 
--- first BasePart under a model, for Part / TemporaryPart / WorldPosition
+-- FIX 2: ClassName only; IsA / FindFirstChildWhichIsA are unreliable here
 local function aPart(model)
     if not model then return nil end
-    local ok, p = pcall(function() return model.PrimaryPart end)
-    if ok and p and p.ClassName ~= 'Model' then return p end
-    local ok2, d = pcall(function() return model:FindFirstChildWhichIsA('BasePart', true) end)
-    if ok2 and d then return d end
-    -- fallback: scan for a Part/MeshPart/UnionOperation by ClassName
-    local ok3, desc = pcall(function() return model:GetDescendants() end)
-    if ok3 and desc then
-        for _, x in ipairs(desc) do
-            local cn = x.ClassName
+    local pp
+    pcall(function() pp = model.PrimaryPart end)
+    if pp then
+        local cn = pp.ClassName
+        if cn == 'Part' or cn == 'MeshPart' or cn == 'UnionOperation' or cn == 'WedgePart' then
+            return pp
+        end
+    end
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+    if ok and desc then
+        for _, d in ipairs(desc) do
+            local cn = d.ClassName
             if cn == 'Part' or cn == 'MeshPart' or cn == 'UnionOperation' or cn == 'WedgePart' then
-                return x
+                return d
             end
         end
     end
     return nil
 end
 
--- Surface models that currently hold a Bill child
 local function billTargets(ty)
     local out = {}
     if not ty then return out end
@@ -137,20 +186,23 @@ local function billTargets(ty)
     return out
 end
 
--- the captured pair, in the captured order and shape
+-- one bill, captured order and shape; skips if no real BasePart is present
 local function collectBill(ty, model)
-    local it = remote('Restaurant', 'Interactions')
+    if not ty or not model then return false, 'missing model' end
     local tc = remote('Restaurant', 'TaskCompleted')
-    if not ty or not model then return false, 'missing tycoon/model' end
     if not tc then return false, 'TaskCompleted missing' end
 
     local part = aPart(model)
-    local pos = Vector3.new(0, 0, 0)
-    if part then
-        local ok, p = pcall(function() return part.Position end)
-        if ok and typeof(p) == 'Vector3' then pos = p end
+    if not part then
+        stat.skipped = stat.skipped + 1
+        return false, 'no BasePart under ' .. model.Name .. ' - skipped'
     end
 
+    local pos = Vector3.new(0, 0, 0)
+    local okp, p = pcall(function() return part.Position end)
+    if okp and typeof(p) == 'Vector3' then pos = p end
+
+    local it = interacted()
     if it then
         fire(it, ty, {
             Id = '1',
@@ -170,8 +222,6 @@ local function collectBill(ty, model)
         })
     end
 
-    task.wait(0.04)
-
     local ok, err = fire(tc, { Tycoon = ty, Name = 'CollectBill', FurnitureModel = model })
     if ok then stat.bills = stat.bills + 1 end
     return ok, err
@@ -185,15 +235,11 @@ local function takeTips(ty)
     return ok, err
 end
 
-local function collectAllBills(ty)
+-- FIX 3/4: exactly one bill per pass, no waits inside the loop
+local function oneBill(ty)
     local list = billTargets(ty)
-    if #list == 0 then return 0 end
-    local n = 0
-    for i = 1, math.min(#list, CONFIG.MaxBills) do
-        local ok = collectBill(ty, list[i])
-        if ok then n = n + 1 end
-    end
-    return n
+    if #list == 0 then return false, 'no bills' end
+    return collectBill(ty, list[1])
 end
 
 local function report()
@@ -203,12 +249,16 @@ local function report()
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
     note('bills on tables=' .. #list)
     for i, m in ipairs(list) do
-        if i <= 6 then note('  bill on ' .. m.Name) end
+        if i <= 6 then
+            local part = aPart(m)
+            note('  bill on ' .. m.Name .. ' part=' .. tostring(part and part.Name or 'NONE'))
+        end
     end
-    note('remote Interactions=' .. tostring(remote('Restaurant', 'Interactions') ~= nil))
+    note('remote Interacted=' .. tostring(interacted() ~= nil))
     note('remote TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil))
     note('remote TipsCollected=' .. tostring(remote('Restaurant', 'TipsCollected') ~= nil))
     note('bills=' .. stat.bills .. ' tips=' .. stat.tips .. ' passes=' .. stat.passes)
+    note('skippedNoPart=' .. stat.skipped .. ' rateBlocked=' .. stat.blocked)
     note('--- end ---')
 end
 
@@ -239,15 +289,15 @@ if UI then
             local main = tab:Section('Auto Money', 'Left')
             safeToggle(main, 'rt3_bills', 'Auto Collect Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
             safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
-            safeButton(main, 'Collect Bills Now', function()
+            safeButton(main, 'Collect One Bill', function()
                 local ty = findTycoon()
-                local n = collectAllBills(ty)
-                note('bills fired: ' .. n)
+                local ok, d = oneBill(ty)
+                note('one bill: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
             end)
             safeButton(main, 'Collect Tips Now', function()
                 local ty = findTycoon()
-                local ok = takeTips(ty)
-                note('tips fired: ' .. tostring(ok))
+                local ok, d = takeTips(ty)
+                note('tips: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
             end)
             safeButton(main, 'Report', function() report() end)
             safeButton(main, 'Stop', function() stop() end)
@@ -271,38 +321,43 @@ end
 task.spawn(function()
     while running do
         pollToggle()
-        task.wait(0.15)
+        task.wait(0.2)
     end
 end)
 
 task.spawn(function()
-    local lastMsg, lastMsgT = '', 0
+    local lastMsgT = 0
     while running do
         stat.passes = stat.passes + 1
         local ty = findTycoon()
+        local t = nowT()
+
         if ty then
-            if CONFIG.Bills then
-                local n = collectAllBills(ty)
-                if n > 0 then
-                    note('bills collected: ' .. n)
-                elseif (nowT() - lastMsgT) > 12 then
-                    note('idle: no bills on tables')
-                    lastMsgT = nowT()
+            if CONFIG.Bills and (t - lastBill) >= CONFIG.BillEvery then
+                lastBill = t
+                local ok, d = oneBill(ty)
+                if ok then
+                    note('bill collected')
+                elseif d ~= 'no bills' and (t - lastMsgT) > 10 then
+                    note('bill idle: ' .. tostring(d))
+                    lastMsgT = t
                 end
             end
-            if CONFIG.Tips and (nowT() - lastTips) >= CONFIG.TipsEvery then
+
+            if CONFIG.Tips and (t - lastTips) >= CONFIG.TipsEvery then
+                lastTips = t
                 takeTips(ty)
-                lastTips = nowT()
             end
         else
-            if (nowT() - lastMsgT) > 12 then
+            if (t - lastMsgT) > 12 then
                 note('idle: tycoon not found')
-                lastMsgT = nowT()
+                lastMsgT = t
             end
         end
+
         task.wait(CONFIG.Gap)
     end
 end)
 
-note('loaded. Collects table bills (2 calls, as captured) and tips.')
+note('loaded. One bill per pass, tips every 2s, outgoing calls capped.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
