@@ -1,40 +1,40 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.7.0 -- AUTO SERVE, prompt-first pickup
+-- Version: 6.8.0 -- FIX seating-onto-counters + prompt filter
 --
--- User feedback that drives this build (2026-10-27):
---   "still not working whats wrong with picking it up from cross map, also they dont care if
---    you give them the wrong order btw ... also your method doesnt work for auto serve"
+-- TWO REAL BUGS FOUND FROM THE USER'S v6.7.0 LOG (2026-10-27):
 --
--- TWO CORRECTIONS:
+-- 1. SEATING TARGETED COUNTERS. Log showed:
+--      seated: group 24 -> K3 / group 25 -> K16 / group 27 -> T19
+--    K3/K16/K28 are kitchen COUNTERS, not tables. freeTables() accepted any
+--    Items.Surface child with no Bill/Trash/occupant, which includes every counter.
+--    FIX: tables must match ^T%d+$ ; counters (^K%d+$) are excluded from seating.
 --
--- 1. GUESTS ACCEPT THE WRONG ORDER. So the dish->guest matching guess (ServeTries, per-pair
---    cooldowns) is pointless and is REMOVED. Any dish is served to any guest. Simpler and
---    faster: no cooldown table keyed on dish>guest, just fire Serve once per dish.
+-- 2. PICKUP PROMPT FILTER WAS WRONG. Log showed:
+--      prompt: 0 | remote: no prompt object to reference
+--    servePrompts() required ActionText == 'Serve' and found none. The user states there is
+--    NO per-dish pickup prompt - only the GROUP (tray) pickup prompt. So the text filter was
+--    invented and is removed: fireproximityprompt on every ProximityPrompt under
+--    workspace.Temp (probe W4 showed exactly one there: "ProximityPrompt 176").
 --
--- 2. PICKUP WAS RANGE/PROMPT GATED, not payload-gated. The captured call carries Range = 9
---    and WorldPosition, and the prompt object only exists at workspace.Temp.Part while you
---    are near a counter. Firing the remote with a hand-built table from across the map is
---    therefore refused no matter how correct the table is.
---    The fix is to use the game's OWN prompt instead of hand-firing the remote:
---      fireproximityprompt(prompt) on every ProximityPrompt under workspace.Temp whose
---      ActionText is 'Serve'.
---    fireproximityprompt is the Matcha-native way to activate a prompt and it runs whatever
---    client handler the game attached - including the pickup. The captured Interacted call
---    is kept only as a FALLBACK for when no prompt object is present.
+-- Because the tray pickup takes a whole tray, multiple dishes can be handed out per pass:
+-- MaxServesPerPass 2 -> 5. Guests accept the wrong order (user-stated), so no matching.
 --
--- Live probe evidence for the prompt object:
---   W2 temp Folder 2 / W3 part Part 1 / W4 ProximityPrompt 176
--- Its name changes (140, 172, 176), so it is never hardcoded - it is found by ClassName
--- and ActionText at call time.
+-- Call shapes per action (confirmed, differ - never assume uniformity):
+--   bill  = Interacted THEN TaskCompleted 'CollectBill'   (2)
+--   dish  = TaskCompleted 'CollectDishes'                 (1)
+--   tips  = TipsCollected                                 (1)
+--   order = TaskCompleted 'TakeOrder'                     (1)
+--   seat  = TaskCompleted 'SendToTable'                   (1)
+--   serve = fireproximityprompt (tray) then TaskCompleted 'Serve' per dish
 --
--- Crash hardening unchanged: token bucket 8 calls / 0.5 s, one target per feature per pass,
--- ClassName-only part lookup, no task.wait inside collection.
+-- Crash hardening unchanged: token bucket 8 calls / 0.5 s (do NOT raise), ClassName-only part
+-- lookup, no task.wait inside collection, one seat target per pass.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.7.0'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (auto serve, prompt pickup)')
+local VERSION = '6.8.0'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (seat fix + tray pickup)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -48,9 +48,10 @@ local unpackFn = table.unpack or unpack
 local CONFIG = {
     Bills = true, Tips = true, Dishes = true, Orders = true, Seat = true, Serve = true,
     Gap = 0.2, TipsEvery = 1.0, BillEvery = 0.35, DishEvery = 0.35,
-    OrderEvery = 0.35, SeatEvery = 0.3, ServeEvery = 1.0,
-    OrderCooldown = 6.0, SeatCooldown = 10.0,
-    MaxServesPerPass = 2,     -- dishes fired per pass (guests accept any dish)
+    OrderEvery = 0.35, SeatEvery = 0.5, ServeEvery = 1.2,
+    OrderCooldown = 6.0, SeatCooldown = 15.0,
+    MaxServesPerPass = 5,     -- tray pickup, so hand out several per pass
+    MaxPickupPrompts = 3,
     MaxPerHalf = 8,
 }
 
@@ -227,8 +228,8 @@ local function groupList(ty)
     return out
 end
 
--- every ProximityPrompt under workspace.Temp whose ActionText is 'Serve'
--- (the counter prompt lives at workspace.Temp.Part -> ProximityPrompt <id>, id changes)
+-- FIX 2: no ActionText filter. There is no per-dish prompt; workspace.Temp holds the
+-- single GROUP (tray) pickup prompt. Probe W4 showed exactly one there.
 local function servePrompts()
     local out = {}
     local temp = workspace:FindFirstChild('Temp')
@@ -236,16 +237,11 @@ local function servePrompts()
     local ok, desc = pcall(function() return temp:GetDescendants() end)
     if not ok or not desc then return out end
     for _, d in ipairs(desc) do
-        if d.ClassName == 'ProximityPrompt' then
-            local act
-            pcall(function() act = d.ActionText end)
-            if act == 'Serve' then out[#out + 1] = d end
-        end
+        if d.ClassName == 'ProximityPrompt' then out[#out + 1] = d end
     end
     return out
 end
 
--- counters are K3/K16/K28 (capture used K16); pick nearest to the player
 local function nearestCounter(ty)
     local origin
     local c
@@ -299,30 +295,33 @@ local function tableFree(m)
     return true
 end
 
+-- FIX 1: tables are T<n> only. K<n> are kitchen counters and must never be seated on.
 local function freeTables(ty)
     local out = {}
     for _, m in ipairs(surfaceList(ty)) do
-        if tableFree(m) then out[#out + 1] = m end
+        if string.match(m.Name, '^T%d+$') and tableFree(m) then
+            out[#out + 1] = m
+        end
     end
     return out
 end
 
--- PICKUP, preferred path: activate the game's own Serve prompt with fireproximityprompt
+-- PICKUP: fire the tray prompt(s) under workspace.Temp, no text filter
 local function pickupViaPrompt()
     local prompts = servePrompts()
-    if #prompts == 0 then return false, 0, 'no Serve prompt under workspace.Temp' end
+    if #prompts == 0 then return false, 'no prompt under workspace.Temp (stand at the counter)' end
     local n = 0
-    for i = 1, math.min(#prompts, 3) do
+    for i = 1, math.min(#prompts, CONFIG.MaxPickupPrompts) do
         if allow() then
             local ok = pcall(fireproximityprompt, prompts[i])
             if ok then n = n + 1 end
         end
     end
     if n > 0 then stat.promptPicks = stat.promptPicks + n end
-    return n > 0, n, 'fireproximityprompt x' .. n
+    return n > 0, 'fireproximityprompt x' .. n .. ' of ' .. #prompts
 end
 
--- PICKUP, fallback: the captured Interacted call with the live prompt id
+-- FALLBACK: the captured Interacted call (range gated, so it needs you at the counter)
 local function pickupViaRemote(ty)
     local it = interacted()
     if not it then return false, 'Interacted missing' end
@@ -356,7 +355,7 @@ local function pickupViaRemote(ty)
     return ok, err
 end
 
--- HAND-OFF: any dish to any guest - the user confirmed wrong orders are accepted
+-- HAND-OFF: any dish to any guest (wrong orders accepted, user-stated)
 local function serveToGuest(ty, food, cust)
     if not ty or not food or not cust then return false, 'missing food/guest' end
     local tc = remote('Restaurant', 'TaskCompleted')
@@ -471,7 +470,7 @@ local function oneSeat(ty)
     local groups = groupList(ty)
     if #groups == 0 then return false, 'no customers' end
     local tables = freeTables(ty)
-    if #tables == 0 then return false, 'no free tables' end
+    if #tables == 0 then return false, 'no free TABLES (counters excluded)' end
     if seatIdx > #groups then seatIdx = 1 end
     if tableIdx > #tables then tableIdx = 1 end
     local t = nowT()
@@ -492,7 +491,7 @@ local function oneSeat(ty)
     return false, 'all groups on cooldown'
 end
 
--- SERVE: pickup (prompt first, remote fallback), then Serve each dish to any guest
+-- SERVE: tray pickup (prompt first, remote fallback), then hand out up to N dishes
 local function oneServe(ty)
     local dishes = foodList(ty)
     if #dishes == 0 then return false, 'no dishes on counter' end
@@ -521,7 +520,7 @@ local function oneServe(ty)
     end
 
     if fired == 0 then return false, 'nothing left to serve' end
-    return accepted > 0, 'pickup ok, served ' .. accepted .. '/' .. fired .. ' dish(es)'
+    return accepted > 0, tostring(pdetail) .. ', served ' .. accepted .. '/' .. fired .. ' dish(es)'
 end
 
 local function report()
@@ -529,21 +528,30 @@ local function report()
     local food = ty and foodList(ty) or {}
     local cust = ty and customerList(ty) or {}
     local prompts = servePrompts()
-    local counter = ty and nearestCounter(ty)
+    local tables = ty and freeTables(ty) or {}
+    local counters = {}
+    for _, m in ipairs(surfaceList(ty)) do
+        if string.match(m.Name, '^K%d+$') then counters[#counters + 1] = m.Name end
+    end
     note('--- REPORT v' .. VERSION .. ' ---')
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
     note('bills=' .. #(ty and billTargets(ty) or {}) .. ' trash=' .. #(ty and dishTargets(ty) or {}) ..
          ' customers=' .. #cust .. ' foodOnCounter=' .. #food)
-    note('servePrompts=' .. #prompts .. ' counter=' .. tostring(counter and counter.Name or 'NONE'))
+    note('freeTables=' .. #tables .. ' counters=' .. table.concat(counters, ','))
+    for i, m in ipairs(tables) do
+        if i <= 8 then note('  freeTable ' .. m.Name) end
+    end
+    note('promptsUnderTemp=' .. #prompts)
     for i, p in ipairs(prompts) do
         if i <= 4 then
-            local act
+            local act, hold, dist
             pcall(function() act = p.ActionText end)
-            note('  prompt ' .. tostring(p.Name) .. ' action=' .. tostring(act) .. ' parent=' .. tostring(p.Parent and p.Parent.Name))
+            pcall(function() hold = p.HoldDuration end)
+            pcall(function() dist = p.MaxActivationDistance end)
+            note('  prompt ' .. tostring(p.Name) .. ' act=' .. tostring(act) ..
+                 ' hold=' .. tostring(hold) .. ' dist=' .. tostring(dist) ..
+                 ' parent=' .. tostring(p.Parent and p.Parent.Name))
         end
-    end
-    for i, f in ipairs(food) do
-        if i <= 6 then note('  food ' .. tostring(f.Name)) end
     end
     note('remote Interacted=' .. tostring(interacted() ~= nil) ..
          ' TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil) ..
@@ -592,7 +600,7 @@ if UI then
                 note('one serve: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
             end)
             safeButton(main, 'Pickup Only (prompt)', function()
-                local ok, n, d = pickupViaPrompt()
+                local ok, d = pickupViaPrompt()
                 note('prompt pickup: ' .. (ok and 'OK ' or 'FAIL ') .. ' ' .. tostring(d))
             end)
             safeButton(main, 'Pickup Only (remote)', function()
@@ -676,7 +684,8 @@ task.spawn(function()
                 lastSeat = t
                 local ok, d = oneSeat(ty)
                 if ok then note('seated: ' .. tostring(d))
-                elseif d ~= 'no customers' and d ~= 'no free tables' and (t - lastMsgT) > 10 then
+                elseif d ~= 'no customers' and d ~= 'no free TABLES (counters excluded)'
+                    and (t - lastMsgT) > 10 then
                     note('seat idle: ' .. tostring(d)) lastMsgT = t
                 end
             end
@@ -719,5 +728,5 @@ task.spawn(function()
     end
 end)
 
-note('loaded. Pickup via fireproximityprompt (fallback: Interacted), then Serve any dish to any guest.')
+note('loaded. Seating restricted to T tables. Pickup = every prompt under workspace.Temp.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
