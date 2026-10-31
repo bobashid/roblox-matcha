@@ -1,38 +1,35 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.2.0 -- AUTO MONEY + DISHES + TAKE ORDER
+-- Version: 6.3.0 -- FASTER + AUTO SEAT
 --
--- v6.0.1 (bills + tips) and v6.1.0 (dishes) are CONFIRMED WORKING by the user:
---   "nice everything works the auto dish pickup and cash+tips".
--- This build adds ONE thing and changes nothing else: auto take order.
+-- User-confirmed working: v6.0.1 (bills + tips), v6.1.0 (dishes), v6.2.0 (orders).
+--   "nice everything worked once again"
+-- This build (a) tightens every scan interval and (b) adds auto seating.
 --
--- User-captured take-order payload (2026-10-27):
---   TaskCompleted:FireServer({CustomerId="2", GroupId="8",
---                             Tycoon=game.Workspace.Tycoons.Tycoon, Name="TakeOrder"})
--- ONE call, no Interactions partner. GroupId/CustomerId are STRINGS.
+-- User-captured seat payload (2026-10-27):
+--   TaskCompleted:FireServer({FurnitureModel = Items.Surface.T1, GroupId = "15",
+--                             Tycoon = tycoon, Name = "SendToTable"})
+-- Important: the user reports that clicking the guest's own prompt fired NO event - only
+-- clicking the empty table fired this. So seating is ONE TaskCompleted call:
+--   FurnitureModel = the table, GroupId = the guest group (string). No Interacted partner.
 --
--- Targeting: live probe this turn confirmed Tycoon.ClientCustomers holds:
---   Folder "8"  -> Model "1", Model "2"
---   Folder "9"  -> Model "1", Model "2"
---   Folder "10" -> Model "1", Model "2"
--- Folder name = GroupId, child model name = CustomerId. Matches the capture exactly.
+-- Call shapes per action (confirmed, differ - never assume uniformity):
+--   bill  = Interacted THEN TaskCompleted 'CollectBill'   (2)
+--   dish  = TaskCompleted 'CollectDishes'                 (1)
+--   tips  = TipsCollected                                 (1)
+--   order = TaskCompleted 'TakeOrder'                     (1)
+--   seat  = TaskCompleted 'SendToTable'                   (1)
 --
--- Call shapes differ per action - do NOT assume uniformity:
---   bill   = Interactions.Interacted THEN TaskCompleted 'CollectBill'   (2 calls)
---   dish   = TaskCompleted 'CollectDishes'                              (1 call)
---   tips   = TipsCollected                                              (1 call)
---   order  = TaskCompleted 'TakeOrder'                                  (1 call)
+-- SPEED: loop Gap 0.5 -> 0.2; bill/dish/order 0.8 -> 0.35; tips 2.0 -> 1.0; seat 0.5.
+-- The token bucket (8 calls / 0.5 s) is UNCHANGED on purpose - faster scanning must not
+-- reintroduce the v6.0.0 crash. One target per feature per pass still holds.
 --
--- Crash hardening from v6.0.1 still in force: Interactions is a FOLDER (Interacted lives
--- inside it); parts found by ClassName only; token bucket 8 calls/0.5s; ONE target per
--- feature per pass; no task.wait inside collection.
---
--- Upgrades excluded. No Instance.new. ClassName tests only.
+-- Upgrades excluded. No Instance.new. ClassName tests only (IsA always true in Matcha).
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.2.0'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (money + dishes + orders)')
+local VERSION = '6.3.0'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (faster + seat)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -48,21 +45,25 @@ local CONFIG = {
     Tips   = true,
     Dishes = true,
     Orders = true,
-    Gap       = 0.5,
-    TipsEvery = 2.0,
-    BillEvery = 0.8,
-    DishEvery = 0.8,
-    OrderEvery = 0.8,
-    OrderCooldown = 6.0,  -- per group:customer, so one guest is not re-ordered every pass
-    MaxPerHalf = 8,
+    Seat   = true,
+    Gap        = 0.2,
+    TipsEvery  = 1.0,
+    BillEvery  = 0.35,
+    DishEvery  = 0.35,
+    OrderEvery = 0.35,
+    SeatEvery  = 0.5,
+    OrderCooldown = 6.0,
+    SeatCooldown  = 10.0,
+    MaxPerHalf = 8,      -- crash safety: do NOT raise
 }
 
 local running = true
-local stat = { bills = 0, tips = 0, dishes = 0, orders = 0, passes = 0, skipped = 0, blocked = 0 }
-local lastTips, lastBill, lastDish, lastOrder = 0, 0, 0, 0
+local stat = { bills = 0, tips = 0, dishes = 0, orders = 0, seats = 0,
+               passes = 0, skipped = 0, blocked = 0 }
+local lastTips, lastBill, lastDish, lastOrder, lastSeat = 0, 0, 0, 0, 0
 local windowStart, windowCount = 0, 0
-local orderIdx = 1
-local orderAt = {}
+local orderIdx, seatIdx, tableIdx = 1, 1, 1
+local orderAt, seatAt = {}, {}
 
 local function nowT()
     if type(tick) == 'function' then return tick() end
@@ -78,6 +79,7 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
+-- token bucket: unchanged from the build that stopped crashing
 local function allow()
     local t = nowT()
     if (t - windowStart) >= 0.5 then
@@ -92,6 +94,7 @@ local function allow()
     return true
 end
 
+-- `...` inside a nested closure is a parse error, so pack/unpack
 local function packArgs(...)
     return { n = select('#', ...), ... }
 end
@@ -127,7 +130,7 @@ local function remote(folderName, remoteName)
     return nil
 end
 
--- v6.0.1 fix: Interacted is a child of the Interactions FOLDER
+-- Interacted lives INSIDE the Interactions FOLDER (v6.0.0 crash fix)
 local function interacted()
     local f = folder('Restaurant', 'Interactions')
     if not f then return nil end
@@ -155,7 +158,7 @@ local function findTycoon()
     return nil
 end
 
--- v6.0.1 fix: ClassName only
+-- ClassName only - FindFirstChildWhichIsA is unreliable here
 local function aPart(model)
     if not model then return nil end
     local pp
@@ -178,13 +181,19 @@ local function aPart(model)
     return nil
 end
 
-local function surfacesWith(ty, childName)
+local function surfaceList(ty)
     local out = {}
     if not ty then return out end
     local items = ty:FindFirstChild('Items')
     local surface = items and items:FindFirstChild('Surface')
     if not surface then return out end
-    for _, m in ipairs(surface:GetChildren()) do
+    for _, m in ipairs(surface:GetChildren()) do out[#out + 1] = m end
+    return out
+end
+
+local function surfacesWith(ty, childName)
+    local out = {}
+    for _, m in ipairs(surfaceList(ty)) do
         local has = false
         pcall(function() has = (m:FindFirstChild(childName) ~= nil) end)
         if has then out[#out + 1] = m end
@@ -195,7 +204,7 @@ end
 local function billTargets(ty) return surfacesWith(ty, 'Bill') end
 local function dishTargets(ty) return surfacesWith(ty, 'Trash') end
 
--- guests currently present: folder name = GroupId, model name = CustomerId (opaque strings)
+-- guests: folder name = GroupId, model name = CustomerId (opaque strings)
 local function customerList(ty)
     local out = {}
     if not ty then return out end
@@ -205,6 +214,51 @@ local function customerList(ty)
         for _, c in ipairs(g:GetChildren()) do
             out[#out + 1] = { groupId = g.Name, customerId = c.Name }
         end
+    end
+    return out
+end
+
+-- one entry per group folder (SendToTable takes GroupId only)
+local function groupList(ty)
+    local out = {}
+    if not ty then return out end
+    local cc = ty:FindFirstChild('ClientCustomers')
+    if not cc then return out end
+    for _, g in ipairs(cc:GetChildren()) do
+        local n = 0
+        for _, c in ipairs(g:GetChildren()) do n = n + 1 end
+        if n > 0 then out[#out + 1] = g.Name end
+    end
+    return out
+end
+
+-- a table is free when it has no Bill, no Trash, no occupied flag, no occupied Seat
+local function tableFree(m)
+    if not m or not m.Parent then return false end
+    if m:FindFirstChild('Bill') then return false end
+    if m:FindFirstChild('Trash') then return false end
+    for _, att in ipairs({ 'Occupied', 'IsOccupied', 'InUse', 'Taken' }) do
+        local v
+        pcall(function() v = m:GetAttribute(att) end)
+        if v then return false end
+    end
+    local ok, desc = pcall(function() return m:GetDescendants() end)
+    if ok and desc then
+        for _, d in ipairs(desc) do
+            if d.ClassName == 'Seat' then
+                local occ
+                pcall(function() occ = d.Occupant end)
+                if occ then return false end
+            end
+        end
+    end
+    return true
+end
+
+local function freeTables(ty)
+    local out = {}
+    for _, m in ipairs(surfaceList(ty)) do
+        if tableFree(m) then out[#out + 1] = m end
     end
     return out
 end
@@ -241,7 +295,7 @@ local function collectBill(ty, model)
     return ok, err
 end
 
--- DISHES: captured single call, no Interacted
+-- DISHES: single call
 local function collectDish(ty, model)
     if not ty or not model then return false, 'missing model' end
     local tc = remote('Restaurant', 'TaskCompleted')
@@ -251,7 +305,7 @@ local function collectDish(ty, model)
     return ok, err
 end
 
--- ORDER: captured single call, ids as strings
+-- ORDER: single call, ids as strings
 local function takeOrder(ty, cust)
     if not ty or not cust then return false, 'missing customer' end
     local tc = remote('Restaurant', 'TaskCompleted')
@@ -263,6 +317,21 @@ local function takeOrder(ty, cust)
         Name = 'TakeOrder',
     })
     if ok then stat.orders = stat.orders + 1 end
+    return ok, err
+end
+
+-- SEAT: single call, FurnitureModel = table, GroupId = group folder name (string)
+local function sendToTable(ty, groupId, table)
+    if not ty or not groupId or not table then return false, 'missing group/table' end
+    local tc = remote('Restaurant', 'TaskCompleted')
+    if not tc then return false, 'TaskCompleted missing' end
+    local ok, err = fire(tc, {
+        FurnitureModel = table,
+        GroupId = groupId,
+        Tycoon = ty,
+        Name = 'SendToTable',
+    })
+    if ok then stat.seats = stat.seats + 1 end
     return ok, err
 end
 
@@ -286,7 +355,6 @@ local function oneDish(ty)
     return collectDish(ty, list[1])
 end
 
--- one guest per pass, round-robin, with a per-guest cooldown
 local function oneOrder(ty)
     local list = customerList(ty)
     if #list == 0 then return false, 'no customers' end
@@ -308,27 +376,57 @@ local function oneOrder(ty)
     return false, 'all customers on cooldown'
 end
 
+-- one GROUP per pass, round-robin over groups, per-group cooldown, needs a free table
+local function oneSeat(ty)
+    local groups = groupList(ty)
+    if #groups == 0 then return false, 'no customers' end
+    local tables = freeTables(ty)
+    if #tables == 0 then return false, 'no free tables' end
+    if seatIdx > #groups then seatIdx = 1 end
+    if tableIdx > #tables then tableIdx = 1 end
+
+    local t = nowT()
+    local tries = 0
+    while tries < #groups do
+        local gid = groups[seatIdx]
+        seatIdx = seatIdx + 1
+        if seatIdx > #groups then seatIdx = 1 end
+        tries = tries + 1
+        local last = seatAt[gid]
+        if not last or (t - last) >= CONFIG.SeatCooldown then
+            local table = tables[tableIdx]
+            tableIdx = tableIdx + 1
+            if tableIdx > #tables then tableIdx = 1 end
+            seatAt[gid] = t
+            local ok, err = sendToTable(ty, gid, table)
+            return ok, 'group ' .. tostring(gid) .. ' -> ' .. table.Name .. (ok and '' or (' err ' .. tostring(err)))
+        end
+    end
+    return false, 'all groups on cooldown'
+end
+
 local function report()
     local ty = findTycoon()
     local bills = ty and billTargets(ty) or {}
     local dishes = ty and dishTargets(ty) or {}
     local cust = ty and customerList(ty) or {}
+    local groups = ty and groupList(ty) or {}
+    local free = ty and freeTables(ty) or {}
     note('--- REPORT v' .. VERSION .. ' ---')
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
     note('bills=' .. #bills .. ' dishes=' .. #dishes .. ' customers=' .. #cust)
+    note('groups=' .. #groups .. ' freeTables=' .. #free)
     for i, c in ipairs(cust) do
         if i <= 8 then note('  cust group=' .. tostring(c.groupId) .. ' id=' .. tostring(c.customerId)) end
     end
-    for i, m in ipairs(bills) do
-        if i <= 3 then
-            local part = aPart(m)
-            note('  bill ' .. m.Name .. ' part=' .. tostring(part and part.Name or 'NONE'))
-        end
+    for i, m in ipairs(free) do
+        if i <= 6 then note('  free table ' .. m.Name) end
     end
     note('remote Interacted=' .. tostring(interacted() ~= nil))
     note('remote TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil))
     note('remote TipsCollected=' .. tostring(remote('Restaurant', 'TipsCollected') ~= nil))
-    note('bills=' .. stat.bills .. ' tips=' .. stat.tips .. ' dishes=' .. stat.dishes .. ' orders=' .. stat.orders .. ' passes=' .. stat.passes)
+    note('bills=' .. stat.bills .. ' tips=' .. stat.tips .. ' dishes=' .. stat.dishes ..
+         ' orders=' .. stat.orders .. ' seats=' .. stat.seats .. ' passes=' .. stat.passes)
     note('skippedNoPart=' .. stat.skipped .. ' rateBlocked=' .. stat.blocked)
     note('--- end ---')
 end
@@ -358,10 +456,21 @@ if UI then
     pcall(function()
         UI.AddTab('Restaurant Tycoon 3', function(tab)
             local main = tab:Section('Automation', 'Left')
-            safeToggle(main, 'rt3_bills', 'Auto Collect Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
-            safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
-            safeToggle(main, 'rt3_dishes', 'Auto Pickup Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
+            safeToggle(main, 'rt3_seat', 'Auto Seat Customers', CONFIG.Seat, function(v) CONFIG.Seat = v end)
             safeToggle(main, 'rt3_orders', 'Auto Take Order', CONFIG.Orders, function(v) CONFIG.Orders = v end)
+            safeToggle(main, 'rt3_bills', 'Auto Collect Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
+            safeToggle(main, 'rt3_dishes', 'Auto Pickup Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
+            safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
+            safeButton(main, 'Seat One Customer', function()
+                local ty = findTycoon()
+                local ok, d = oneSeat(ty)
+                note('one seat: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
+            end)
+            safeButton(main, 'Take One Order', function()
+                local ty = findTycoon()
+                local ok, d = oneOrder(ty)
+                note('one order: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
+            end)
             safeButton(main, 'Collect One Bill', function()
                 local ty = findTycoon()
                 local ok, d = oneBill(ty)
@@ -371,11 +480,6 @@ if UI then
                 local ty = findTycoon()
                 local ok, d = oneDish(ty)
                 note('one dish: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
-            end)
-            safeButton(main, 'Take One Order', function()
-                local ty = findTycoon()
-                local ok, d = oneOrder(ty)
-                note('one order: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
             end)
             safeButton(main, 'Collect Tips Now', function()
                 local ty = findTycoon()
@@ -397,20 +501,22 @@ local function pollToggle()
         if ok and type(v) == 'boolean' then return v end
         return nil
     end
-    local b = getv('rt3_bills', 'Auto Collect Bills')
-    if b ~= nil then CONFIG.Bills = b end
-    local t = getv('rt3_tips', 'Auto Collect Tips')
-    if t ~= nil then CONFIG.Tips = t end
-    local d = getv('rt3_dishes', 'Auto Pickup Dishes')
-    if d ~= nil then CONFIG.Dishes = d end
+    local s = getv('rt3_seat', 'Auto Seat Customers')
+    if s ~= nil then CONFIG.Seat = s end
     local o = getv('rt3_orders', 'Auto Take Order')
     if o ~= nil then CONFIG.Orders = o end
+    local b = getv('rt3_bills', 'Auto Collect Bills')
+    if b ~= nil then CONFIG.Bills = b end
+    local d = getv('rt3_dishes', 'Auto Pickup Dishes')
+    if d ~= nil then CONFIG.Dishes = d end
+    local t = getv('rt3_tips', 'Auto Collect Tips')
+    if t ~= nil then CONFIG.Tips = t end
 end
 
 task.spawn(function()
     while running do
         pollToggle()
-        task.wait(0.2)
+        task.wait(0.15)
     end
 end)
 
@@ -422,6 +528,17 @@ task.spawn(function()
         local t = nowT()
 
         if ty then
+            if CONFIG.Seat and (t - lastSeat) >= CONFIG.SeatEvery then
+                lastSeat = t
+                local ok, d = oneSeat(ty)
+                if ok then
+                    note('seated: ' .. tostring(d))
+                elseif d ~= 'no customers' and d ~= 'no free tables' and (t - lastMsgT) > 10 then
+                    note('seat idle: ' .. tostring(d))
+                    lastMsgT = t
+                end
+            end
+
             if CONFIG.Orders and (t - lastOrder) >= CONFIG.OrderEvery then
                 lastOrder = t
                 local ok, d = oneOrder(ty)
@@ -470,5 +587,5 @@ task.spawn(function()
     end
 end)
 
-note('loaded. Orders (1 call), bills (2), dishes (1), tips (1) - one target per pass, calls capped.')
+note('loaded. Faster scan (0.2s loop). Seat (1 call), order (1), dish (1), tips (1), bill (2).')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
