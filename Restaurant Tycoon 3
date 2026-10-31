@@ -1,32 +1,37 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.11.0 -- 6.8.0/6.9.0 serve path, made persistent
+-- Version: 6.12.0 -- SERVE: confirmed by the plate leaving the tray, own thread
 --
--- The user confirmed the 6.8.0 line DOES hand out food ("that version i said that worked did
--- work"); it was just inconsistent. v6.10.0 (click path) is discarded - it removed the
--- TaskCompleted 'Serve' call that the server actually accepts.
+-- v6.11.0 report from the user: "good pickup, but it felt like it took forever to give the food
+-- or like it never even gave it out". Both symptoms have ONE cause and it is a logic bug:
 --
--- What changed vs 6.9.0 - all of it aimed at "works all the time" instead of some of the time:
+--   fire() returns pcall success, NOT server acceptance. FireServer on a RemoteEvent almost
+--   never errors, so in 6.11.0 `local ok = serveToGuest(...)` was true on the FIRST attempt of
+--   every dish. `landed = true` therefore fired immediately and GuestTriesPerDish = 3 was
+--   never actually used - one blind attempt per dish per pass, at whatever guest serveIdx
+--   happened to point at. When that guest was not waiting for that dish the server refused it
+--   silently, the plate stayed in hand, and the next pass tried a different guest. That is
+--   exactly "sometimes it works and it feels slow".
 --
--- 1. SEPARATE CALL BUDGET. 6.9.0 shared one bucket of 8 calls / 0.5 s across bills, dishes,
---    orders, seating AND serving, so a busy kitchen starved the serve calls. Serve now has its
---    own bucket (CONFIG.ServeBudget) - the same fix the brain note records for the other
---    features.
+-- FIX: stop trusting the return value and look at the world instead.
+--   ACCEPTED  <=>  the dish model is no longer a descendant of Tycoon.Objects.Food
+-- (it is destroyed or reparented by the server when the hand-off lands). Each dish is now tried
+-- against up to GuestAttemptsPerDish different guests until that test passes, then moves on.
 --
--- 2. RETRY A DISH ON OTHER GUESTS IN THE SAME PASS. 6.9.0 tried each dish against exactly one
---    guest and then parked the dish for 8 s if it was refused. Now each dish is tried against
---    up to CONFIG.GuestTriesPerDish different guests before it is parked, and the park is 3 s
---    (CONFIG.PairCooldown is per dish+guest pair, so a pair that was refused does not block
---    the dish against everybody else).
+-- Also in this version:
+-- 1. Serve runs in its OWN loop (task.spawn), so a long serve pass can no longer stall bills,
+--    dishes, orders, seating or tips - that shared loop was the "everything feels slow" part.
+-- 2. Payload is EXACTLY the 6.8.0 one that the user confirmed works:
+--      { FoodModel, Name='Serve', Tycoon, GroupId, CustomerId }
+--    FoodName and FurnitureModel were added in 6.9.0/6.11.0 on a guess and are removed again.
+-- 3. ServeGap 0.1 -> 0.06, and the serve loop waits only 0.15 s after a successful hand-off
+--    (0.4 s when nothing landed) instead of a fixed 0.7 s cadence.
+-- 4. Pair-cooldown bookkeeping dropped - it existed to work around the fake success above.
+--    A dish that fails every guest is parked only 1.5 s.
+-- 5. Tray detection kept: plates carrying Taken are the held ones (GrabFood.AttemptGrab sets
+--    it); if no plate is flagged, every plate is tried.
 --
--- 3. TRAY-AWARE. If Objects.Food children carry a Taken attribute, only the held ones are
---    served; otherwise every plate is tried (the 6.8.0 behaviour). Pickup only fires when
---    nothing is held, and it is retried with the Interacted fallback.
---
--- 4. FASTER CADENCE. ServeEvery 1.2 -> 0.7, ServeGap 0.12 -> 0.1, and serving keeps going for
---    up to CONFIG.MaxServesPerPass dishes per pass instead of stopping after the first refusal.
---
--- Everything else is 6.8.0: seating on ^T%d+$ only, tray prompt with no text filter, token
--- bucket on the non-serve calls, ClassName-only part lookup, no task.wait inside collection.
+-- Everything else is the user-confirmed 6.8.0: seating on ^T%d+$ only, tray prompt with no text
+-- filter, ClassName-only part lookup, token bucket on the non-serve calls.
 --
 -- Call shapes (confirmed, differ - never assume uniformity):
 --   bill  = Interacted THEN TaskCompleted 'CollectBill'   (2)
@@ -40,8 +45,8 @@
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.11.0'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (persistent serve)')
+local VERSION = '6.12.0'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (serve verified by tray)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -55,29 +60,29 @@ local unpackFn = table.unpack or unpack
 local CONFIG = {
     Bills = true, Tips = true, Dishes = true, Orders = true, Seat = true, Serve = true,
     Gap = 0.15, TipsEvery = 1.0, BillEvery = 0.3, DishEvery = 0.3,
-    OrderEvery = 0.3, SeatEvery = 0.4, ServeEvery = 0.7,
+    OrderEvery = 0.3, SeatEvery = 0.4,
+    ServeEveryOk = 0.15,     -- after a hand-off landed
+    ServeEveryIdle = 0.4,    -- after nothing landed
     OrderCooldown = 6.0, SeatCooldown = 12.0,
     MaxServesPerPass = 6,
-    GuestTriesPerDish = 3,
-    PairCooldown = 3.0,      -- per dish+guest pair, not per dish
-    DishParkCooldown = 3.0,  -- how long a dish that failed every try is left alone
-    ServeGap = 0.1,
-    PickupSettle = 0.18,
+    GuestAttemptsPerDish = 8,
+    DishParkCooldown = 1.5,
+    ServeGap = 0.06,
+    PickupSettle = 0.15,
     MaxPickupPrompts = 3,
     MaxPerHalf = 8,          -- non-serve calls
-    ServeBudget = 10,        -- serve calls, its own bucket
+    ServeBudget = 14,        -- serve calls, its own bucket
 }
 
 local running = true
 local stat = { bills=0, tips=0, dishes=0, orders=0, seats=0, serves=0,
                promptPicks=0, remotePicks=0, passes=0, skipped=0,
                blocked=0, blockedServe=0, tries=0 }
-local lastTips, lastBill, lastDish, lastOrder, lastSeat, lastServe = 0,0,0,0,0,0
+local lastTips, lastBill, lastDish, lastOrder, lastSeat = 0,0,0,0,0
 local bOther = { start = 0, count = 0 }
 local bServe = { start = 0, count = 0 }
 local orderIdx, seatIdx, tableIdx, serveIdx = 1,1,1,1
 local orderAt, seatAt, seatTable = {}, {}, {}
-local pairAt = {}      -- [dish] = { [guestKey] = time }
 local dishPark = {}    -- [dish] = { t = time }
 local lastServeErr = 'none'
 local lastServeDetail = 'none'
@@ -216,19 +221,21 @@ end
 local function billTargets(ty) return surfacesWith(ty, 'Bill') end
 local function dishTargets(ty) return surfacesWith(ty, 'Trash') end
 
+local function foodFolder(ty)
+    local objs = ty and ty:FindFirstChild('Objects')
+    if not objs then return nil end
+    return objs:FindFirstChild('Food') or objs:FindFirstChild('Foods')
+end
+
 local function foodList(ty)
     local out = {}
-    if not ty then return out end
-    local objs = ty:FindFirstChild('Objects')
-    if not objs then return out end
-    local food = objs:FindFirstChild('Food') or objs:FindFirstChild('Foods')
-    if not food then return out end
-    for _, c in ipairs(food:GetChildren()) do out[#out + 1] = c end
+    local ff = foodFolder(ty)
+    if not ff then return out end
+    for _, c in ipairs(ff:GetChildren()) do out[#out + 1] = c end
     return out
 end
 
--- Grabbed plates carry a Taken attribute (GrabFood.AttemptGrab reads it). If nothing is
--- flagged, the attribute is not used in this build and every plate is fair game.
+-- GrabFood.AttemptGrab sets a Taken attribute on the plate it grabs, so those are the held ones.
 local function takenList(ty)
     local out = {}
     for _, c in ipairs(foodList(ty)) do
@@ -243,6 +250,18 @@ local function serveDishes(ty)
     local held = takenList(ty)
     if #held > 0 then return held, true end
     return foodList(ty), false
+end
+
+-- THE acceptance test: the plate left Objects.Food => the server took it.
+local function stillOnTray(ty, dish)
+    if not dish then return false end
+    local ok, parent = pcall(function() return dish.Parent end)
+    if not ok or not parent then return false end
+    local ff = foodFolder(ty)
+    if not ff then return false end
+    local ok2, isDesc = pcall(function() return dish:IsDescendantOf(ff) end)
+    if ok2 then return isDesc == true end
+    return parent == ff
 end
 
 local function customerList(ty)
@@ -397,22 +416,18 @@ local function pickupViaRemote(ty)
     return ok, err
 end
 
--- HAND-OFF: any dish to any guest
-local function serveToGuest(ty, food, cust, tbl)
+-- HAND-OFF: payload is EXACTLY the 6.8.0 one the user confirmed works. No extra keys.
+local function serveToGuest(ty, food, cust)
     if not ty or not food or not cust then return false, 'missing food/guest' end
     local tc = remote('Restaurant', 'TaskCompleted')
     if not tc then return false, 'TaskCompleted missing' end
-    local payload = {
+    local ok, err = fire('serve', tc, {
         FoodModel = food,
-        FoodName = food.Name,
         Name = 'Serve',
         Tycoon = ty,
         GroupId = cust.groupId,
         CustomerId = cust.customerId,
-    }
-    if tbl then payload.FurnitureModel = tbl end
-    local ok, err = fire('serve', tc, payload)
-    if ok then stat.serves = stat.serves + 1 end
+    })
     return ok, err
 end
 
@@ -541,13 +556,14 @@ local function oneSeat(ty)
     return false, 'all groups on cooldown'
 end
 
--- SERVE: pickup if nothing is held, then push each dish at several guests until one lands.
+-- SERVE: pickup if the tray is empty, then try each held dish on guests until the plate LEAVES
+-- Objects.Food. That test is the only honest proof the server accepted the hand-off.
 local function oneServe(ty)
     if not ty then return false, 'no tycoon' end
     local guests = customerList(ty)
     if #guests == 0 then return false, 'no customers' end
 
-    local dishes, isHeld = serveDishes(ty)
+    local dishes = serveDishes(ty)
     local pdetail = 'already holding'
 
     if #dishes == 0 then
@@ -562,57 +578,44 @@ local function oneServe(ty)
             end
         end
         task.wait(CONFIG.PickupSettle)
-        dishes, isHeld = serveDishes(ty)
+        dishes = serveDishes(ty)
         if #dishes == 0 then
-            lastServeDetail = 'tray still empty after grab (' .. pdetail .. ')'
+            lastServeDetail = 'tray empty after grab (' .. pdetail .. ')'
             return false, lastServeDetail
         end
     end
 
     if serveIdx > #guests then serveIdx = 1 end
-    local t = nowT()
-    local tried, served, parked, lastDetail = 0, 0, 0, ''
+    local served, attempts, parked = 0, 0, 0
 
     for _, dish in ipairs(dishes) do
         if served >= CONFIG.MaxServesPerPass then break end
-        if dish and dish.Parent then
-            local dp = dishPark[dish]
-            if not dp or (t - dp.t) >= CONFIG.DishParkCooldown then
-                local pairList = pairAt[dish]
-                if not pairList then pairList = {} pairAt[dish] = pairList end
+        local dp = dishPark[dish]
+        if (not dp) or (nowT() - dp.t) >= CONFIG.DishParkCooldown then
+            if stillOnTray(ty, dish) then
                 local landed = false
-                local refuses = 0
-
-                for _ = 1, math.min(#guests, CONFIG.GuestTriesPerDish) do
+                local maxTries = math.min(#guests, CONFIG.GuestAttemptsPerDish)
+                for _ = 1, maxTries do
                     if landed then break end
                     local cust = guests[serveIdx]
                     serveIdx = serveIdx + 1
                     if serveIdx > #guests then serveIdx = 1 end
                     if cust then
-                        local gkey = tostring(cust.groupId) .. ':' .. tostring(cust.customerId)
-                        local last = pairList[gkey]
-                        if not last or (t - last) >= CONFIG.PairCooldown then
-                            pairList[gkey] = t
-                            tried = tried + 1
-                            stat.tries = stat.tries + 1
-                            local ok, err = serveToGuest(ty, dish, cust, seatTable[cust.groupId])
-                            lastDetail = tostring(cust.groupId) .. ':' .. tostring(cust.customerId)
-                            if ok then
-                                served = served + 1
-                                landed = true
-                                pairList = {}
-                                pairAt[dish] = pairList
-                                dishPark[dish] = nil
-                            else
-                                refuses = refuses + 1
-                                lastServeErr = tostring(err)
-                            end
-                            task.wait(CONFIG.ServeGap)
+                        attempts = attempts + 1
+                        stat.tries = stat.tries + 1
+                        local ok, err = serveToGuest(ty, dish, cust)
+                        if not ok then lastServeErr = tostring(err) end
+                        task.wait(CONFIG.ServeGap)
+                        if not stillOnTray(ty, dish) then
+                            landed = true
+                            served = served + 1
+                            stat.serves = stat.serves + 1
+                            dishPark[dish] = nil
+                            lastServeErr = 'none'
                         end
                     end
                 end
-
-                if not landed and refuses > 0 then
+                if not landed then
                     dishPark[dish] = { t = nowT() }
                     parked = parked + 1
                 end
@@ -622,14 +625,11 @@ local function oneServe(ty)
 
     local tray = #(serveDishes(ty))
     local detail = 'tray=' .. tostring(tray) .. ' guests=' .. #guests ..
-                   ' tries=' .. tried .. ' served=' .. served .. ' parked=' .. parked
+                   ' tries=' .. attempts .. ' served=' .. served .. ' parked=' .. parked
     lastServeDetail = detail
-    if tried == 0 then
-        return false, 'no pair available (' .. detail .. ')'
-    end
+    if attempts == 0 then return false, 'nothing to try (' .. detail .. ')' end
     if served == 0 then
-        return false, detail .. ' (last ' .. tostring(lastDetail) .. ', err ' ..
-               tostring(lastServeErr) .. ')'
+        return false, detail .. ' (no plate left the tray, err ' .. tostring(lastServeErr) .. ')'
     end
     return true, detail .. ' [' .. pdetail .. ']'
 end
@@ -649,23 +649,19 @@ local function report()
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
     note('bills=' .. #(ty and billTargets(ty) or {}) .. ' trash=' .. #(ty and dishTargets(ty) or {}) ..
          ' customers=' .. #cust)
-    note('foodOnCounter=' .. #food .. ' taken(held)=' .. #held)
+    note('platesInFood=' .. #food .. ' taken(held)=' .. #held)
     for i, m in ipairs(held) do
         if i <= 6 then note('  held ' .. tostring(m.Name)) end
     end
-    note('freeTables=' .. #tables .. ' counters=' .. table.concat(counters, ','))
-    note('promptsUnderTemp=' .. #prompts)
-    for i, p in ipairs(prompts) do
-        if i <= 3 then
-            local act, hold, dist
-            pcall(function() act = p.ActionText end)
-            pcall(function() hold = p.HoldDuration end)
-            pcall(function() dist = p.MaxActivationDistance end)
-            note('  prompt ' .. tostring(p.Name) .. ' act=' .. tostring(act) ..
-                 ' hold=' .. tostring(hold) .. ' dist=' .. tostring(dist) ..
-                 ' parent=' .. tostring(p.Parent and p.Parent.Name))
+    for i, m in ipairs(food) do
+        if i <= 6 then
+            local tk = false
+            pcall(function() tk = m:GetAttribute('Taken') end)
+            note('  plate ' .. tostring(m.Name) .. ' taken=' .. tostring(tk))
         end
     end
+    note('freeTables=' .. #tables .. ' counters=' .. table.concat(counters, ','))
+    note('promptsUnderTemp=' .. #prompts)
     note('remote Interacted=' .. tostring(interacted() ~= nil) ..
          ' TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil) ..
          ' TipsCollected=' .. tostring(remote('Restaurant', 'TipsCollected') ~= nil))
@@ -777,6 +773,33 @@ task.spawn(function()
     while running do pollToggle() task.wait(0.15) end
 end)
 
+-- SERVE gets its own loop: a long serve pass can never stall the other features again.
+task.spawn(function()
+    local lastMsgT = 0
+    while running do
+        if CONFIG.Serve then
+            local ty = findTycoon()
+            if ty then
+                local ok, d = oneServe(ty)
+                local t = nowT()
+                if ok then
+                    note('served: ' .. tostring(d))
+                    lastMsgT = t
+                elseif (t - lastMsgT) > 8 then
+                    note('serve idle: ' .. tostring(d))
+                    lastMsgT = t
+                end
+                task.wait(ok and CONFIG.ServeEveryOk or CONFIG.ServeEveryIdle)
+            else
+                task.wait(0.4)
+            end
+        else
+            task.wait(0.3)
+        end
+    end
+end)
+
+-- Everything except serve.
 task.spawn(function()
     local lastMsgT = 0
     while running do
@@ -785,17 +808,6 @@ task.spawn(function()
         local t = nowT()
 
         if ty then
-            if CONFIG.Serve and (t - lastServe) >= CONFIG.ServeEvery then
-                lastServe = t
-                local ok, d = oneServe(ty)
-                if ok then
-                    note('served: ' .. tostring(d))
-                elseif (t - lastMsgT) > 8 then
-                    note('serve idle: ' .. tostring(d))
-                    lastMsgT = t
-                end
-            end
-
             if CONFIG.Seat and (t - lastSeat) >= CONFIG.SeatEvery then
                 lastSeat = t
                 local ok, d = oneSeat(ty)
@@ -844,6 +856,5 @@ task.spawn(function()
     end
 end)
 
-note('loaded. Serve: prompt grab, then each dish tried on up to ' ..
-     CONFIG.GuestTriesPerDish .. ' guests, own call budget.')
+note('loaded. Serve = grab, then try each held dish on guests until the plate leaves the tray.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
