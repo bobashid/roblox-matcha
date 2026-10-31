@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v3.6: Restaurant Tycoon 3 v6.13.0 - barista / cook prompts are skipped, only the tray is used.
 -- v3.5: Restaurant Tycoon 3 v6.12.0 - serve verified by the plate leaving the tray.
 -- v3.4: Restaurant Tycoon 3 serve fix (v6.11.0) confirmed against place 119048529960596.
 -- v3.3: Age Evolution Tycoon pinned by place id 96469185605358.
@@ -30,7 +31,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v3.5'
+local VERSION = 'v3.6'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
