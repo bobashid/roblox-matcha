@@ -1,37 +1,34 @@
 -- Restaurant Tycoon 3 (place 119048529960596) - Matcha LuauVM
--- Version: 6.0.1 -- AUTO MONEY ONLY (bills + tips), SAFE RATE
+-- Version: 6.1.0 -- AUTO MONEY + AUTO DISHES
 --
--- v6.0.0 CRASHED THE USER'S GAME. Per the crash protocol this build adds NO features:
--- it removes the defects that could have caused it and hardens everything else.
+-- v6.0.1 is CONFIRMED WORKING by the user (2026-10-27): "nice everything there works".
+-- This build keeps every v6.0.1 fix untouched and adds one thing: auto dish pickup.
 --
--- Defects found in v6.0.0 and fixed here:
---   1. `Interactions` is a **Folder**, not a RemoteEvent. `remote('Restaurant','Interactions')`
---      returned the Folder and `Folder:FireServer(...)` threw inside pcall - the first of the
---      two bill calls never fired. Now `Interacted` is resolved INSIDE that folder.
---   2. `FindFirstChildWhichIsA('BasePart', true)` is unreliable in this VM (IsA is always true).
---      Parts are now found by ClassName only, and a bill with no findable part is SKIPPED
---      instead of sending a Model where the server expects a Part.
---   3. No rate limit: up to 12 bills x 2 calls every 0.25 s. Now a token bucket caps every
---      outgoing call (default 8 per 0.5 s) and only ONE bill is collected per pass.
---   4. `task.wait` inside the collect loop is gone; the loop yields between passes only.
+-- User-captured dish payload (2026-10-27):
+--   TaskCompleted:FireServer({Tycoon=tycoon, Name="CollectDishes",
+--                             FurnitureModel=Items.Surface.T19})
+-- NOTE the shape difference from bills:
+--   * bill  = Interactions.Interacted  THEN TaskCompleted 'CollectBill'
+--   * dish  = TaskCompleted 'CollectDishes' ONLY - no interaction call
+--   * target is the Items.Surface model that holds a `Trash` child (same model shape
+--     as a bill's `Bill` child), NOT the Trash itself and NOT Objects.Food.
 --
--- Captures this is built on (user, 2026-10-27):
---   Interactions.Interacted:FireServer(tycoon, {Id="1", ActionText="", WorldPosition=...,
---     GamepadKeyCode=1000, TemporaryPart=Part, KeyboardKeyCode=101, Range=7.2,
---     IsCustomerPrompt=true, Key="CollectBill", Model=Items.Surface.T1, Part=Part,
---     Prompt=1, InteractionType="CollectBill", HoldDuration=0})
---   TaskCompleted:FireServer({Tycoon=tycoon, Name="CollectBill", FurnitureModel=Surface.T1})
---   TipsCollected:FireServer(tycoon)
--- An earlier capture used Id="142"/Prompt=142/KeyCode E, so those are just prompt numbers
--- and key codes - not fixed constants.
+-- v6.0.1 fixes still in force (do not regress):
+--   1. `Interacted` lives INSIDE the Restaurant.Interactions FOLDER (probed: X2 Folder,
+--      X3 RemoteEvent Interacted). Resolving the folder and firing it was the v6.0.0 crash path.
+--   2. BaseParts are found by ClassName only - FindFirstChildWhichIsA is unreliable here
+--      because IsA always returns true. A target with no findable part is SKIPPED, not sent.
+--   3. Token bucket caps outgoing calls (8 per 0.5 s) and only ONE target is collected per
+--      pass per feature.
+--   4. No task.wait inside collection; the loop yields between passes only.
 --
 -- Upgrades excluded. No Instance.new. ClassName tests only.
 -- Loader:
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/heads/main/Restaurant%20Tycoon%203?v=" .. tostring(os.time()), true))()
 
 local NAME    = 'RestaurantTycoon3'
-local VERSION = '6.0.1'
-print('[Restaurant Tycoon 3] v' .. VERSION .. ' (auto money, safe rate)')
+local VERSION = '6.1.0'
+print('[Restaurant Tycoon 3] v' .. VERSION .. ' (money + dishes)')
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -43,17 +40,19 @@ local lp      = Players.LocalPlayer
 local unpackFn = table.unpack or unpack
 
 local CONFIG = {
-    Bills = true,
-    Tips  = true,
-    Gap       = 0.5,    -- seconds between passes
-    TipsEvery = 2.0,    -- seconds between tip calls
-    BillEvery = 0.8,    -- seconds between bill attempts
-    MaxPerHalf = 8,     -- hard cap on outgoing calls per 0.5 s
+    Bills  = true,
+    Tips   = true,
+    Dishes = true,
+    Gap       = 0.5,
+    TipsEvery = 2.0,
+    BillEvery = 0.8,
+    DishEvery = 0.8,
+    MaxPerHalf = 8,
 }
 
 local running = true
-local stat = { bills = 0, tips = 0, passes = 0, skipped = 0, blocked = 0 }
-local lastTips, lastBill = 0, 0
+local stat = { bills = 0, tips = 0, dishes = 0, passes = 0, skipped = 0, blocked = 0 }
+local lastTips, lastBill, lastDish = 0, 0, 0
 local windowStart, windowCount = 0, 0
 
 local function nowT()
@@ -70,7 +69,7 @@ local function stop()
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
--- token bucket: the reference caps at ~260/0.5s; we cap far lower on purpose
+-- token bucket (v6.0.1)
 local function allow()
     local t = nowT()
     if (t - windowStart) >= 0.5 then
@@ -108,7 +107,6 @@ local function folder(...)
     return node
 end
 
--- a fireable remote by name inside a folder
 local function remote(folderName, remoteName)
     local f = folderName and folder(folderName) or EV
     if not f then return nil end
@@ -121,7 +119,7 @@ local function remote(folderName, remoteName)
     return nil
 end
 
--- FIX 1: Interacted lives INSIDE the Interactions folder
+-- v6.0.1 fix: Interacted is a child of the Interactions FOLDER
 local function interacted()
     local f = folder('Restaurant', 'Interactions')
     if not f then return nil end
@@ -149,7 +147,7 @@ local function findTycoon()
     return nil
 end
 
--- FIX 2: ClassName only; IsA / FindFirstChildWhichIsA are unreliable here
+-- v6.0.1 fix: ClassName only
 local function aPart(model)
     if not model then return nil end
     local pp
@@ -172,7 +170,8 @@ local function aPart(model)
     return nil
 end
 
-local function billTargets(ty)
+-- Surface models holding a given child name ('Bill' or 'Trash')
+local function surfacesWith(ty, childName)
     local out = {}
     if not ty then return out end
     local items = ty:FindFirstChild('Items')
@@ -180,13 +179,16 @@ local function billTargets(ty)
     if not surface then return out end
     for _, m in ipairs(surface:GetChildren()) do
         local has = false
-        pcall(function() has = (m:FindFirstChild('Bill') ~= nil) end)
+        pcall(function() has = (m:FindFirstChild(childName) ~= nil) end)
         if has then out[#out + 1] = m end
     end
     return out
 end
 
--- one bill, captured order and shape; skips if no real BasePart is present
+local function billTargets(ty) return surfacesWith(ty, 'Bill') end
+local function dishTargets(ty) return surfacesWith(ty, 'Trash') end
+
+-- BILL: captured two-call pair
 local function collectBill(ty, model)
     if not ty or not model then return false, 'missing model' end
     local tc = remote('Restaurant', 'TaskCompleted')
@@ -227,6 +229,16 @@ local function collectBill(ty, model)
     return ok, err
 end
 
+-- DISHES: user-captured single call, no Interacted
+local function collectDish(ty, model)
+    if not ty or not model then return false, 'missing model' end
+    local tc = remote('Restaurant', 'TaskCompleted')
+    if not tc then return false, 'TaskCompleted missing' end
+    local ok, err = fire(tc, { Tycoon = ty, Name = 'CollectDishes', FurnitureModel = model })
+    if ok then stat.dishes = stat.dishes + 1 end
+    return ok, err
+end
+
 local function takeTips(ty)
     local tips = remote('Restaurant', 'TipsCollected')
     if not tips or not ty then return false, 'TipsCollected missing' end
@@ -235,29 +247,38 @@ local function takeTips(ty)
     return ok, err
 end
 
--- FIX 3/4: exactly one bill per pass, no waits inside the loop
 local function oneBill(ty)
     local list = billTargets(ty)
     if #list == 0 then return false, 'no bills' end
     return collectBill(ty, list[1])
 end
 
+local function oneDish(ty)
+    local list = dishTargets(ty)
+    if #list == 0 then return false, 'no trash' end
+    return collectDish(ty, list[1])
+end
+
 local function report()
     local ty = findTycoon()
-    local list = ty and billTargets(ty) or {}
+    local bills = ty and billTargets(ty) or {}
+    local dishes = ty and dishTargets(ty) or {}
     note('--- REPORT v' .. VERSION .. ' ---')
     note('tycoon=' .. tostring(ty and ty:GetFullName() or 'NIL'))
-    note('bills on tables=' .. #list)
-    for i, m in ipairs(list) do
-        if i <= 6 then
+    note('bills on tables=' .. #bills .. '  dishes on tables=' .. #dishes)
+    for i, m in ipairs(bills) do
+        if i <= 4 then
             local part = aPart(m)
-            note('  bill on ' .. m.Name .. ' part=' .. tostring(part and part.Name or 'NONE'))
+            note('  bill ' .. m.Name .. ' part=' .. tostring(part and part.Name or 'NONE'))
         end
+    end
+    for i, m in ipairs(dishes) do
+        if i <= 4 then note('  dish ' .. m.Name) end
     end
     note('remote Interacted=' .. tostring(interacted() ~= nil))
     note('remote TaskCompleted=' .. tostring(remote('Restaurant', 'TaskCompleted') ~= nil))
     note('remote TipsCollected=' .. tostring(remote('Restaurant', 'TipsCollected') ~= nil))
-    note('bills=' .. stat.bills .. ' tips=' .. stat.tips .. ' passes=' .. stat.passes)
+    note('bills=' .. stat.bills .. ' tips=' .. stat.tips .. ' dishes=' .. stat.dishes .. ' passes=' .. stat.passes)
     note('skippedNoPart=' .. stat.skipped .. ' rateBlocked=' .. stat.blocked)
     note('--- end ---')
 end
@@ -289,10 +310,16 @@ if UI then
             local main = tab:Section('Auto Money', 'Left')
             safeToggle(main, 'rt3_bills', 'Auto Collect Bills', CONFIG.Bills, function(v) CONFIG.Bills = v end)
             safeToggle(main, 'rt3_tips', 'Auto Collect Tips', CONFIG.Tips, function(v) CONFIG.Tips = v end)
+            safeToggle(main, 'rt3_dishes', 'Auto Pickup Dishes', CONFIG.Dishes, function(v) CONFIG.Dishes = v end)
             safeButton(main, 'Collect One Bill', function()
                 local ty = findTycoon()
                 local ok, d = oneBill(ty)
                 note('one bill: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
+            end)
+            safeButton(main, 'Collect One Dish', function()
+                local ty = findTycoon()
+                local ok, d = oneDish(ty)
+                note('one dish: ' .. (ok and 'OK ' or 'FAIL ') .. tostring(d))
             end)
             safeButton(main, 'Collect Tips Now', function()
                 local ty = findTycoon()
@@ -306,16 +333,20 @@ if UI then
 end
 
 local function pollToggle()
-    local ok, v = pcall(function() return UI.GetValue('rt3_bills') end)
-    if not ok or type(v) ~= 'boolean' then
-        ok, v = pcall(function() return UI.GetValue('Auto Collect Bills') end)
+    local function getv(id, name)
+        local ok, v = pcall(function() return UI.GetValue(id) end)
+        if not ok or type(v) ~= 'boolean' then
+            ok, v = pcall(function() return UI.GetValue(name) end)
+        end
+        if ok and type(v) == 'boolean' then return v end
+        return nil
     end
-    if ok and type(v) == 'boolean' then CONFIG.Bills = v end
-    local ok2, v2 = pcall(function() return UI.GetValue('rt3_tips') end)
-    if not ok2 or type(v2) ~= 'boolean' then
-        ok2, v2 = pcall(function() return UI.GetValue('Auto Collect Tips') end)
-    end
-    if ok2 and type(v2) == 'boolean' then CONFIG.Tips = v2 end
+    local b = getv('rt3_bills', 'Auto Collect Bills')
+    if b ~= nil then CONFIG.Bills = b end
+    local t = getv('rt3_tips', 'Auto Collect Tips')
+    if t ~= nil then CONFIG.Tips = t end
+    local d = getv('rt3_dishes', 'Auto Pickup Dishes')
+    if d ~= nil then CONFIG.Dishes = d end
 end
 
 task.spawn(function()
@@ -344,6 +375,17 @@ task.spawn(function()
                 end
             end
 
+            if CONFIG.Dishes and (t - lastDish) >= CONFIG.DishEvery then
+                lastDish = t
+                local ok, d = oneDish(ty)
+                if ok then
+                    note('dish collected')
+                elseif d ~= 'no trash' and (t - lastMsgT) > 10 then
+                    note('dish idle: ' .. tostring(d))
+                    lastMsgT = t
+                end
+            end
+
             if CONFIG.Tips and (t - lastTips) >= CONFIG.TipsEvery then
                 lastTips = t
                 takeTips(ty)
@@ -359,5 +401,5 @@ task.spawn(function()
     end
 end)
 
-note('loaded. One bill per pass, tips every 2s, outgoing calls capped.')
+note('loaded. Bills (2 calls), dishes (1 call), tips - one target each per pass, calls capped.')
 print('[Restaurant Tycoon 3] running. Stop with: _G.RestaurantTycoon3.stop()')
