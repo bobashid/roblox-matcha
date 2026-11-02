@@ -1,0 +1,436 @@
+-- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
+-- Version: 2.2.0 -- nearest-first, radius-gated, teleport-to-loot
+--
+-- WHY v2.1.0 WAS INCONSISTENT (diagnosis, not a guess):
+--   The game's own PlayerScripts.LootPickupScript destroys loot CLIENT-SIDE inside a
+--   5x15x5 box around the HumanoidRootPart and fires LootPickup for it. That means a
+--   scan almost only ever sees loot OUTSIDE that box - the loot the server is least
+--   likely to accept from a far position. v2.1.0 took the first N children of
+--   LootSpawned with no distance sort and no radius gate, so it mostly fired at loot
+--   the server silently dropped. That is the "works sometimes" symptom.
+--
+-- FIX: sort loot nearest-first, gate by a radius the server will plausibly accept, and
+--   (default) TELEPORT next to the nearest loot before firing. Standing next to loot is
+--   the one condition the game's own client always satisfies when it works.
+--
+-- CONFIRMED this session:
+--   LootPickup:FireServer(<array of LootTier numbers>, <isDeckHand bool>) - decompiled.
+--   Loot parts are named Loot<n>; there is NO LootTier attribute (tierHits=0).
+--   CurrentCount = LocalPlayer:GetAttribute("CurrentCount") (number, 77 / 642 seen).
+--   Net Worth in leaderstats reads EMPTY in tests - not used as a witness.
+--   CollectionService:GetTagged is nil here - targets come from a descendants walk.
+--   firetouchinterest on CollectButton does NOTHING (two tests, dead end #7).
+--
+-- UNKNOWN: the server's exact distance tolerance. Radius is a knob; the Report prints
+--   the nearest loot distance and landed/missed passes so the number can be tuned from
+--   real data instead of guessed.
+
+local NAME    = 'SellAMillionSushi'
+local VERSION = '2.2.0'
+print('[Sell a Million Sushi] v' .. VERSION)
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+
+local Players = game:GetService('Players')
+local RS      = game:GetService('ReplicatedStorage')
+local lp      = Players.LocalPlayer
+
+local CONFIG = {
+    Enabled      = false,
+    Mode         = 'Teleport',  -- 'Teleport' | 'Batch' | 'Walk'
+    Radius       = 12,          -- studs from the HRP when firing
+    Standoff     = 3,           -- studs from the loot part when teleporting
+    Settle       = 0.22,        -- wait after teleporting, before firing
+    PerPass      = 6,           -- tiers per LootPickup call
+    BatchSize    = 6,
+    PassCooldown = 0.18,
+    ReturnHome   = true,
+    OwnPlotOnly  = true,
+}
+
+local running  = true
+local busy     = false
+local savedCF  = nil
+local stat = {
+    passes=0, landed=0, missed=0, tiersSent=0,
+    teleports=0, lastDelta=0, lastErr='none',
+    nearCount=0, totalCount=0, nearestDist=-1,
+    startCount=nil, lastCount=nil,
+}
+
+local function note(s) print('[SMS] ' .. s) end
+
+local function stop()
+    running = false
+    local hrp = getHrp()
+    if hrp and savedCF then pcall(function() hrp.CFrame = savedCF end) end
+    _G[NAME] = nil
+    print('[Sell a Million Sushi] stopped')
+end
+_G[NAME] = { stop = stop, version = VERSION }
+
+-- ---------------- readers ----------------
+local function numAttr(n)
+    local v
+    pcall(function() v = lp:GetAttribute(n) end)
+    if type(v) == 'number' then return v end
+    return nil
+end
+
+local function getHrp()
+    local c
+    pcall(function() c = lp.Character end)
+    if not c then return nil end
+    local r
+    pcall(function() r = c:FindFirstChild('HumanoidRootPart') end)
+    return r
+end
+
+local function getHum()
+    local c
+    pcall(function() c = lp.Character end)
+    if not c then return nil end
+    local h
+    pcall(function() h = c:FindFirstChildOfClass('Humanoid') end)
+    return h
+end
+
+local function origin()
+    local hrp = getHrp()
+    if not hrp then return nil end
+    local p
+    pcall(function() p = hrp.Position end)
+    if typeof(p) ~= 'Vector3' then return nil end
+    if p.X == 0 and p.Y == 0 and p.Z == 0 then return nil end   -- known bad read
+    return p
+end
+
+local function myPlot()
+    local n
+    pcall(function() n = lp:GetAttribute('assignedPlot') end)
+    if type(n) ~= 'string' or n == '' then return nil end
+    local plots = workspace:FindFirstChild('Plots')
+    if plots then
+        local p = plots:FindFirstChild(n)
+        if p then return p end
+    end
+    return workspace:FindFirstChild(n)
+end
+
+local function lootFolders()
+    local all = {}
+    local plots = workspace:FindFirstChild('Plots')
+    if plots then
+        for _, p in ipairs(plots:GetChildren()) do
+            local f = p:FindFirstChild('LootSpawned')
+            if f then all[#all + 1] = f end
+        end
+    end
+    if not CONFIG.OwnPlotOnly then return all end
+    local mine, keep = myPlot(), {}
+    for _, f in ipairs(all) do
+        if f.Parent == mine then keep[#keep + 1] = f end
+    end
+    return keep
+end
+
+-- name first, attribute second (v1.1.0's bug was attribute-only)
+local function tierOf(inst)
+    if not inst then return nil end
+    local t
+    pcall(function() t = inst:GetAttribute('LootTier') end)
+    if type(t) == 'number' then return t end
+    local m
+    pcall(function() m = string.match(inst.Name, '^Loot(%d+)$') end)
+    if m then return tonumber(m) end
+    return nil
+end
+
+local function posOf(inst)
+    if not inst then return nil end
+    local p
+    pcall(function() p = inst.Position end)
+    if typeof(p) == 'Vector3' then return p end
+    pcall(function() p = inst.PrimaryPart and inst.PrimaryPart.Position end)
+    if typeof(p) == 'Vector3' then return p end
+    return nil
+end
+
+-- Sorted nearest-first. dist = -1 when the origin could not be read.
+local function lootList()
+    local out = {}
+    local org = origin()
+    for _, ff in ipairs(lootFolders()) do
+        for _, c in ipairs(ff:GetChildren()) do
+            local part, tier = c, tierOf(c)
+            if not tier and c.ClassName == 'Model' then
+                local ok, desc = pcall(function() return c:GetDescendants() end)
+                if ok and desc then
+                    for j = 1, #desc do
+                        local t2 = tierOf(desc[j])
+                        if t2 then tier = t2; part = desc[j]; break end
+                    end
+                end
+            end
+            if tier and part and part.Parent then
+                local p = posOf(part)
+                local d = -1
+                if org and p then d = (p - org).Magnitude end
+                out[#out + 1] = { part = part, tier = tier, dist = d, pos = p }
+            end
+        end
+    end
+    if org then
+        table.sort(out, function(a, b)
+            if a.dist < 0 then return false end
+            if b.dist < 0 then return true end
+            return a.dist < b.dist
+        end)
+    end
+    return out
+end
+
+-- ---------------- movement ----------------
+local function saveHome()
+    local hrp = getHrp()
+    if not hrp then return end
+    pcall(function() savedCF = hrp.CFrame end)
+end
+
+local function goHome()
+    if not CONFIG.ReturnHome or not savedCF then return end
+    local hrp = getHrp()
+    if hrp then pcall(function() hrp.CFrame = savedCF end) end
+end
+
+-- Teleport beside a loot part. CFrame.new(x,y,z) only - never CFrame.new(Vector3).
+local function teleportNear(targetPos, orgPos)
+    local hrp = getHrp()
+    if not hrp or not targetPos then return false end
+    local dir
+    if orgPos then
+        dir = Vector3.new(orgPos.X - targetPos.X, 0, orgPos.Z - targetPos.Z)
+    end
+    if not dir or dir.Magnitude < 0.1 then dir = Vector3.new(0, 0, 1) end
+    local u = dir.Unit
+    local x = targetPos.X + u.X * CONFIG.Standoff
+    local y = targetPos.Y + 3
+    local z = targetPos.Z + u.Z * CONFIG.Standoff
+    local ok = pcall(function() hrp.CFrame = CFrame.new(x, y, z) end)
+    if ok then stat.teleports = stat.teleports + 1 end
+    return ok
+end
+
+local function walkTo(targetPos)
+    local hum = getHum()
+    if not hum or not targetPos then return false end
+    local ok = pcall(function() hum:MoveTo(targetPos) end)
+    if not ok then
+        local ok2 = pcall(function() hum.WalkToPoint = targetPos end)
+        return ok2
+    end
+    return true
+end
+
+-- ---------------- firing ----------------
+local function fireLoot(tiers)
+    local re = RS:FindFirstChild('RemoteEvents')
+    if not re then return false end
+    local r = re:FindFirstChild('LootPickup')
+    if not r then return false end
+    return (pcall(function() r:FireServer(tiers, false) end))
+end
+
+-- Re-verify Parent right before firing: the game's own script destroys parts
+-- client-side every 0.05 s, so a tier read one frame ago can be stale.
+local function buildBatch(list, limit)
+    local tiers = {}
+    for i = 1, math.min(#list, limit) do
+        local e = list[i]
+        if e.part and e.part.Parent then
+            tiers[#tiers + 1] = e.tier
+        end
+    end
+    return tiers
+end
+
+-- ---------------- pass ----------------
+local function pass()
+    if busy then return end
+    busy = true
+    local before = numAttr('CurrentCount')
+    local ok, err = pcall(function()
+        local list = lootList()
+        stat.totalCount = #list
+        stat.nearestDist = (#list > 0) and list[1].dist or -1
+        if #list == 0 then stat.nearCount = 0 return end
+
+        -- Teleport / Walk mode: get next to the nearest loot first.
+        if CONFIG.Mode ~= 'Batch' and list[1].dist > CONFIG.Radius then
+            local target = list[1].pos
+            if target then
+                if CONFIG.Mode == 'Teleport' then
+                    if not savedCF then saveHome() end
+                    if teleportNear(target, origin()) then
+                        task.wait(CONFIG.Settle)
+                    end
+                else
+                    walkTo(target)
+                    task.wait(0.35)
+                end
+                list = lootList()   -- re-read from the new position
+            end
+        end
+
+        -- Radius gate: only fire at loot the server will plausibly accept.
+        local inRange = {}
+        for i = 1, #list do
+            local e = list[i]
+            if e.dist < 0 or e.dist <= CONFIG.Radius then
+                inRange[#inRange + 1] = e
+            end
+        end
+        stat.nearCount = #inRange
+        if #inRange == 0 then return end
+
+        local tiers = buildBatch(inRange, CONFIG.PerPass)
+        if #tiers == 0 then return end
+
+        -- Let the game's own 5-stud script take the near ones first, then supplement.
+        task.wait(0.08)
+        if fireLoot(tiers) then
+            stat.tiersSent = stat.tiersSent + #tiers
+        end
+    end)
+    if not ok then stat.lastErr = tostring(err) end
+
+    task.wait(0.25)   -- let the server reply before measuring
+    local after = numAttr('CurrentCount')
+    if type(before) == 'number' and type(after) == 'number' then
+        local d = after - before
+        stat.lastDelta = d
+        stat.lastCount = after
+        if d > 0 then stat.landed = stat.landed + 1
+        else stat.missed = stat.missed + 1 end
+    end
+    stat.passes = stat.passes + 1
+    busy = false
+end
+
+-- ---------------- report ----------------
+local function report()
+    local list = lootList()
+    local cc = numAttr('CurrentCount')
+    if stat.startCount == nil then stat.startCount = cc end
+    note('--- REPORT v' .. VERSION .. ' ---')
+    note('mode=' .. CONFIG.Mode .. '  radius=' .. CONFIG.Radius ..
+         '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly))
+    note('lootTotal=' .. #list .. '  nearest=' ..
+         tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm')
+    for i = 1, math.min(#list, 5) do
+        note('  ' .. list[i].part.Name .. ' d=' .. math.floor(list[i].dist) .. 'm')
+    end
+    note('CurrentCount ' .. tostring(stat.startCount) .. ' -> ' .. tostring(cc))
+    note('passes=' .. stat.passes .. ' landed=' .. stat.landed ..
+         ' missed=' .. stat.missed .. ' tiersSent=' .. stat.tiersSent)
+    note('teleports=' .. stat.teleports .. ' lastDelta=' .. tostring(stat.lastDelta) ..
+         ' lastErr=' .. tostring(stat.lastErr))
+    if stat.passes == 0 then
+        note('VERDICT: not run yet.')
+    elseif stat.landed == 0 then
+        note('VERDICT: nothing landing. Nearest loot is ' ..
+             tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm -')
+        note('         lower Radius, or switch Mode to Teleport.')
+    elseif stat.missed > stat.landed then
+        note('VERDICT: landing sometimes - tune Radius down until landed >= missed.')
+    else
+        note('VERDICT: consistent. ' .. stat.landed .. '/' .. stat.passes .. ' passes paid.')
+    end
+    note('--- end ---')
+end
+
+-- ---------------- menu ----------------
+local function safeToggle(sec, id, label, default, cb)
+    if pcall(function() sec:Toggle(id, label, default, cb) end) then return true end
+    if pcall(function() sec:Toggle(label, id, default, cb) end) then return true end
+    if pcall(function() sec:Toggle(label, default, cb) end) then return true end
+    return false
+end
+
+local function safeButton(sec, label, cb)
+    if pcall(function() sec:Button(label, cb) end) then return true end
+    if pcall(function() sec:Button(label, label, cb) end) then return true end
+    return false
+end
+
+local function arm()
+    stat.startCount = numAttr('CurrentCount')
+    stat.landed, stat.missed, stat.passes = 0, 0, 0
+    stat.tiersSent = 0
+end
+
+if UI then
+    pcall(function()
+        UI.AddTab('Sell a Million Sushi', function(tab)
+            local main = tab:Section('Auto', 'Left')
+            safeToggle(main, 'sms_on', 'Auto Fish Pickup', CONFIG.Enabled, function(v)
+                CONFIG.Enabled = v
+                if v then arm() end
+            end)
+            safeButton(main, 'Mode: Teleport', function()
+                CONFIG.Mode = 'Teleport'; note('mode=Teleport')
+            end)
+            safeButton(main, 'Mode: Batch', function()
+                CONFIG.Mode = 'Batch'; note('mode=Batch')
+            end)
+            safeButton(main, 'Mode: Walk', function()
+                CONFIG.Mode = 'Walk'; note('mode=Walk')
+            end)
+            safeButton(main, 'Radius +5', function()
+                CONFIG.Radius = CONFIG.Radius + 5; note('radius=' .. CONFIG.Radius)
+            end)
+            safeButton(main, 'Radius -5', function()
+                CONFIG.Radius = math.max(5, CONFIG.Radius - 5); note('radius=' .. CONFIG.Radius)
+            end)
+            safeButton(main, 'Report', function() report() end)
+            safeButton(main, 'Stop', function() stop() end)
+        end)
+    end)
+end
+
+local function poll()
+    local function getv(id, name)
+        local ok, v = pcall(function() return UI.GetValue(id) end)
+        if not ok or type(v) ~= 'boolean' then
+            ok, v = pcall(function() return UI.GetValue(name) end)
+        end
+        if ok and type(v) == 'boolean' then return v end
+        return nil
+    end
+    local o = getv('sms_on', 'Auto Fish Pickup')
+    if o ~= nil and o ~= CONFIG.Enabled then
+        CONFIG.Enabled = o
+        if o then arm() end
+    end
+end
+
+task.spawn(function()
+    while running do
+        poll()
+        if CONFIG.Enabled then
+            pass()
+            if CONFIG.Mode == 'Walk' and CONFIG.ReturnHome then
+                -- walk mode: come back after a few passes so you don't drift off
+            end
+            task.wait(CONFIG.PassCooldown)
+        else
+            task.wait(0.25)
+        end
+    end
+end)
+
+arm()
+note('loaded. plot=' .. tostring(myPlot() and myPlot().Name or 'NIL') ..
+     '  loot=' .. #lootList() .. '  count=' .. tostring(stat.startCount) ..
+     '  mode=' .. CONFIG.Mode)
+print('[Sell a Million Sushi] running. Stop with: _G.SellAMillionSushi.stop()')
