@@ -1,28 +1,33 @@
 -- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
--- Version: 2.5.0 -- v2.4.1 pickup + overlay, plus market-gated auto deposit
+-- Version: 2.6.0 -- simple menu: one toggle per feature, slider for the deposit value
 --
--- WHAT THIS ADDS: when the live fish-market multiplier reaches the slider value, teleport
--- ONTO Plot.Sell.DepositButton.Button ONCE, fire the touch, return, and measure whether
--- CurrentCount actually dropped. Latch until the value falls below the threshold again.
+-- v2.6.0 is a MENU change only. Behaviour is identical to v2.5.0:
+--   * Auto Fish Pickup   -> toggle
+--   * Auto Deposit Fish  -> toggle  +  Deposit At (x) slider (1.0 .. 2.0, 0.1 steps)
+--   * Fish Value Overlay -> toggle
+-- Every helper button (Per Pass +/-, Threshold +/-, Deposit Now, Re-arm, Overlay
+-- Higher/Lower, Read Market Now) is gone. Report and Stop remain, because you need a
+-- way to read the result and a way to stop it.
 --
 -- CONFIRMED (probed 2026-11-02):
 --   Market value is readable text on Plot.Restaurant.Interior.KitchenBoard.MarketBoard:
 --       Price = "Fish Value: 1.4x"   -> parse (%d+%.?%d*)x
 --       Next  = "Updating in 9s"
 --   Deposit target: Workspace.Plots.<plot>.Sell.DepositButton.Button
---     (Model -> Part "Button" -> TouchTransmitter "TouchInterest")
 --   CurrentCount = LocalPlayer:GetAttribute("CurrentCount") (number)
 --   NetWorth     = LocalPlayer:GetAttribute("NetWorth") (STRING like "$2.6M")
 --   Drawing.new supports Text/Square/Line/Circle/Quad/Triangle/Image
 --
--- UNVERIFIED, and why this build MEASURES instead of claiming:
---   firetouchinterest on Sell.CollectButton did nothing in two earlier tests, and every
---   button's server script returns "Invalid bytecodes" so we cannot read what it checks.
---   v2.5.0 therefore reports `lastDeposit=` as either "took N fish" (CurrentCount fell)
---   or "no change". Do not trust a deposit that the report did not see.
+-- WHY v2.3.0 FIRED ZERO TIMES: it gated LootPickup on arrival, Humanoid:MoveTo is inert
+--   here, so the distance never closed and tiersSent stayed 0 for 38 passes. Nothing in
+--   this build gates on a value that can fail to arrive.
+--
+-- UNVERIFIED: firetouchinterest on these buttons has never been confirmed to do anything.
+--   The deposit therefore measures CurrentCount before and after and reports
+--   "took N fish" or "no change" instead of assuming it worked.
 
 local NAME    = 'SellAMillionSushi'
-local VERSION = '2.5.0'
+local VERSION = '2.6.0'
 print('[Sell a Million Sushi] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -51,9 +56,9 @@ local CONFIG = {
     -- deposit
     AutoDeposit  = true,
     DepositAt    = 1.5,    -- slider: 1.0 .. 2.0 in 0.1 steps
-    DepositStand = 0.18,   -- how long to stand on the button
-    DepositGap   = 3.0,    -- minimum seconds between two deposit attempts
-    VerifyWait   = 0.45,   -- wait before reading CurrentCount back
+    DepositStand = 0.18,
+    DepositGap   = 3.0,
+    VerifyWait   = 0.45,
 }
 
 local running  = true
@@ -262,7 +267,7 @@ end
 
 local function overlayColor(mult)
     if mult >= CONFIG.DepositAt then
-        return Color3.fromRGB(120, 255, 140)   -- at/above your deposit threshold
+        return Color3.fromRGB(120, 255, 140)
     elseif mult >= 1.0 then
         return Color3.fromRGB(255, 225, 90)
     else
@@ -398,7 +403,6 @@ local function depositPart()
     return nil
 end
 
--- Stand ON the button (user approved teleporting), fire the touch, come back.
 local function depositOnce()
     local part = depositPart()
     if not part then return false, 'DepositButton.Button missing' end
@@ -454,7 +458,7 @@ local function tryDeposit(mult)
     end
 end
 
--- Own loop. Latches after one deposit; re-arms only when the value falls BELOW the
+-- Own loop. Latches after one attempt; re-arms only when the value falls BELOW the
 -- threshold, which is exactly "once when it hits".
 task.spawn(function()
     while running do
@@ -486,37 +490,34 @@ local function report()
     local mult, nextTxt = readMarket()
     if stat.startCount == nil then stat.startCount = cc end
     note('--- REPORT v' .. VERSION .. ' ---')
-    note('perPass=' .. CONFIG.PerPass .. '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly))
+    note('pickup=' .. tostring(CONFIG.Enabled) .. '  overlay=' .. tostring(CONFIG.ShowMarket) ..
+         '  autoDeposit=' .. tostring(CONFIG.AutoDeposit))
     note('market=' .. tostring(mult) .. 'x  next=' .. tostring(nextTxt) ..
-         '  overlay=' .. tostring(CONFIG.ShowMarket))
-    note('deposit: auto=' .. tostring(CONFIG.AutoDeposit) ..
-         '  threshold=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x' ..
-         '  armed=' .. tostring(depositArmed) ..
-         '  count=' .. stat.deposits)
+         '  depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x')
     note('depositPart=' .. tostring(depositPart() ~= nil) ..
+         '  armed=' .. tostring(depositArmed) ..
+         '  deposits=' .. stat.deposits ..
          '  lastDeposit=' .. tostring(stat.lastDeposit))
     note('lootTotal=' .. #list .. '  nearest=' ..
          tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm')
     note('CurrentCount ' .. tostring(stat.startCount) .. ' -> ' .. tostring(cc))
     note('passes=' .. stat.passes .. ' landed=' .. stat.landed ..
          ' missed=' .. stat.missed .. ' tiersSent=' .. stat.tiersSent)
-    note('lastDelta=' .. tostring(stat.lastDelta) .. ' lastGain=' .. tostring(stat.lastLanded) ..
-         ' lastErr=' .. tostring(stat.lastErr))
+    note('lastDelta=' .. tostring(stat.lastDelta) .. ' lastErr=' .. tostring(stat.lastErr))
     if mult == nil then
-        note('OVERLAY: market unreadable - deposit cannot trigger.')
+        note('NOTE: market unreadable - deposit cannot trigger.')
     elseif stat.deposits > 0 then
         note('VERDICT: deposit worked ' .. stat.deposits .. ' time(s).')
     elseif stat.lastDeposit ~= 'none' then
-        note('VERDICT: deposit attempted but CurrentCount did not fall.')
-        note('         The button wants contact firetouchinterest cannot fake.')
+        note('VERDICT: deposit attempted, CurrentCount did not fall.')
     else
-        note('VERDICT: not triggered yet - market has not reached ' ..
-             string.format('%.1f', CONFIG.DepositAt) .. 'x.')
+        note('VERDICT: deposit has not triggered yet (market below ' ..
+             string.format('%.1f', CONFIG.DepositAt) .. 'x).')
     end
     note('--- end ---')
 end
 
--- ---------------- menu ----------------
+-- ---------------- menu: one toggle per feature + one slider ----------------
 local function safeToggle(sec, id, label, default, cb)
     if pcall(function() sec:Toggle(id, label, default, cb) end) then return true end
     if pcall(function() sec:Toggle(label, id, default, cb) end) then return true end
@@ -563,71 +564,23 @@ if UI then
                 CONFIG.Enabled = v
                 if v then arm() end
             end)
-            safeButton(main, 'Per Pass +4', function()
-                CONFIG.PerPass = CONFIG.PerPass + 4; note('perPass=' .. CONFIG.PerPass)
-            end)
-            safeButton(main, 'Per Pass -4', function()
-                CONFIG.PerPass = math.max(1, CONFIG.PerPass - 4); note('perPass=' .. CONFIG.PerPass)
-            end)
-            safeButton(main, 'Fire Once Now', function() pass() end)
-            safeButton(main, 'Report', function() report() end)
-            safeButton(main, 'Stop', function() stop() end)
-
-            local dep = tab:Section('Deposit', 'Right')
-            safeToggle(dep, 'sms_dep', 'Auto Deposit Fish', CONFIG.AutoDeposit,
+            safeToggle(main, 'sms_dep', 'Auto Deposit Fish', CONFIG.AutoDeposit,
                 function(v) CONFIG.AutoDeposit = v end)
-            safeSlider(dep, 'sms_dep_at', 'Deposit At (x)', 1.0, 2.0, CONFIG.DepositAt,
+            safeSlider(main, 'sms_dep_at', 'Deposit At (x)', 1.0, 2.0, CONFIG.DepositAt,
                 function(v)
                     local n = clampRound(v)
                     if n then CONFIG.DepositAt = n end
                 end)
-            safeButton(dep, 'Threshold +0.1', function()
-                CONFIG.DepositAt = clampRound(CONFIG.DepositAt + 0.1) or CONFIG.DepositAt
-                note('depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x')
-            end)
-            safeButton(dep, 'Threshold -0.1', function()
-                CONFIG.DepositAt = clampRound(CONFIG.DepositAt - 0.1) or CONFIG.DepositAt
-                note('depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x')
-            end)
-            safeButton(dep, 'Deposit Now (ignore value)', function()
-                local m = readMarket()
-                depositArmed = false
-                tryDeposit(m)
-            end)
-            safeButton(dep, 'Re-arm Deposit', function()
-                depositArmed = true
-                note('deposit re-armed')
-            end)
-
-            local ov = tab:Section('Overlay', 'Left')
-            safeToggle(ov, 'sms_market', 'Show Fish Value Overlay', CONFIG.ShowMarket,
+            safeToggle(main, 'sms_market', 'Fish Value Overlay', CONFIG.ShowMarket,
                 function(v) CONFIG.ShowMarket = v end)
-            safeButton(ov, 'Overlay Higher', function()
-                CONFIG.OverlayY = math.max(0, CONFIG.OverlayY - 20)
-                if overlayLbl then overlayLbl.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY) end
-                if overlaySub then
-                    overlaySub.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY + CONFIG.OverlaySize + 4)
-                end
-                note('overlayY=' .. CONFIG.OverlayY)
-            end)
-            safeButton(ov, 'Overlay Lower', function()
-                CONFIG.OverlayY = CONFIG.OverlayY + 20
-                if overlayLbl then overlayLbl.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY) end
-                if overlaySub then
-                    overlaySub.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY + CONFIG.OverlaySize + 4)
-                end
-                note('overlayY=' .. CONFIG.OverlayY)
-            end)
-            safeButton(ov, 'Read Market Now', function()
-                local m, n = readMarket()
-                note('market=' .. tostring(m) .. 'x  next=' .. tostring(n))
-            end)
+            safeButton(main, 'Report', function() report() end)
+            safeButton(main, 'Stop', function() stop() end)
         end)
     end)
 end
 
 local function poll()
-    local function getb(id, name)
+    local function getv(id, name)
         local ok, v = pcall(function() return UI.GetValue(id) end)
         if not ok or type(v) ~= 'boolean' then
             ok, v = pcall(function() return UI.GetValue(name) end)
@@ -635,17 +588,16 @@ local function poll()
         if ok and type(v) == 'boolean' then return v end
         return nil
     end
-    local o = getb('sms_on', 'Auto Fish Pickup')
+    local o = getv('sms_on', 'Auto Fish Pickup')
     if o ~= nil and o ~= CONFIG.Enabled then
         CONFIG.Enabled = o
         if o then arm() end
     end
-    local m = getb('sms_market', 'Show Fish Value Overlay')
-    if m ~= nil then CONFIG.ShowMarket = m end
-    local d = getb('sms_dep', 'Auto Deposit Fish')
+    local d = getv('sms_dep', 'Auto Deposit Fish')
     if d ~= nil then CONFIG.AutoDeposit = d end
+    local m = getv('sms_market', 'Fish Value Overlay')
+    if m ~= nil then CONFIG.ShowMarket = m end
 
-    -- slider value: signature unverified, so accept a number and round it
     local okn, v = pcall(function() return UI.GetValue('sms_dep_at') end)
     if not okn or type(v) ~= 'number' then
         local okn2, v2 = pcall(function() return UI.GetValue('Deposit At (x)') end)
