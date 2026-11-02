@@ -1,58 +1,45 @@
 -- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
--- Version: 2.4.1 -- v2.4.0 pickup + fish-market multiplier overlay
+-- Version: 2.5.0 -- v2.4.1 pickup + overlay, plus market-gated auto deposit
 --
--- v2.4.1 adds ONE thing to v2.4.0: an on-screen overlay showing the live fish value
--- multiplier. Pickup behaviour is byte-identical to v2.4.0.
+-- WHAT THIS ADDS: when the live fish-market multiplier reaches the slider value, teleport
+-- ONTO Plot.Sell.DepositButton.Button ONCE, fire the touch, return, and measure whether
+-- CurrentCount actually dropped. Latch until the value falls below the threshold again.
 --
--- THE MARKET VALUE IS REAL READABLE TEXT (probed 2026-11-02):
---   Workspace.Plots.<plot>.Restaurant.Interior.KitchenBoard.MarketBoard
---   carries a SurfaceGui "MarketGui" with TextLabels:
---       Title = "Fish Market"
---       Price = "Fish Value: 1.4x <garbage char>"   <- the live multiplier
---       Next  = "Updating in 9s"                    <- countdown to the next change
---   Parsed with string.match(text, '(%d+%.?%d*)%s*[xX]') -> 1.4
---   No WorldToScreen needed: this is a fixed on-screen Drawing.Text, so it does not
---   depend on camera projection at all.
+-- CONFIRMED (probed 2026-11-02):
+--   Market value is readable text on Plot.Restaurant.Interior.KitchenBoard.MarketBoard:
+--       Price = "Fish Value: 1.4x"   -> parse (%d+%.?%d*)x
+--       Next  = "Updating in 9s"
+--   Deposit target: Workspace.Plots.<plot>.Sell.DepositButton.Button
+--     (Model -> Part "Button" -> TouchTransmitter "TouchInterest")
+--   CurrentCount = LocalPlayer:GetAttribute("CurrentCount") (number)
+--   NetWorth     = LocalPlayer:GetAttribute("NetWorth") (STRING like "$2.6M")
+--   Drawing.new supports Text/Square/Line/Circle/Quad/Triangle/Image
 --
--- Drawing constructors confirmed present in this VM (probe):
---   Square, Line, Text, Circle, Quad, Triangle, Image - all true.
---   Drawings are created ONCE and only mutated, never created in the render loop.
---
--- WHY v2.3.0 FIRED ZERO TIMES (the user's own log, 2026-11-02):
---   passes=23..38   walks=21..37   walkFails=0   tiersSent=0   nearest=33m (never moved)
---   Humanoid:MoveTo returned successfully 37 times and the character did not move one
---   stud. v2.3.0 only fired when nearest <= Radius (10), so it never fired at all.
---
--- MEASURED (2026-11-02): ONE far loot item fired alone at 98 studs returned delta=0 on
---   CurrentCount. Very long range does fail server-side; fire every pass and read
---   landed vs missed rather than gating.
---
--- CONFIRMED:
---   LootPickup:FireServer(<array of LootTier numbers>, <isDeckHand bool>) - decompiled.
---   Loot parts are named Loot<n>; there is NO LootTier attribute (tierHits=0).
---   CurrentCount = LocalPlayer:GetAttribute("CurrentCount") (number).
---   leaderstats["Net Worth"] reads EMPTY - not used as a witness.
---   CollectionService:GetTagged is nil here - targets come from a children walk.
---   firetouchinterest on CollectButton does nothing (dead end #7).
+-- UNVERIFIED, and why this build MEASURES instead of claiming:
+--   firetouchinterest on Sell.CollectButton did nothing in two earlier tests, and every
+--   button's server script returns "Invalid bytecodes" so we cannot read what it checks.
+--   v2.5.0 therefore reports `lastDeposit=` as either "took N fish" (CurrentCount fell)
+--   or "no change". Do not trust a deposit that the report did not see.
 
 local NAME    = 'SellAMillionSushi'
-local VERSION = '2.4.1'
+local VERSION = '2.5.0'
 print('[Sell a Million Sushi] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
-local Players   = game:GetService('Players')
-local RS        = game:GetService('ReplicatedStorage')
+local Players    = game:GetService('Players')
+local RS         = game:GetService('ReplicatedStorage')
 local RunService = game:GetService('RunService')
-local lp        = Players.LocalPlayer
+local lp         = Players.LocalPlayer
 
 local CONFIG = {
+    -- pickup
     Enabled     = false,
-    PerPass     = 8,      -- tiers fired per LootPickup call
+    PerPass     = 8,
     BatchSize   = 8,
     PassCooldown = 0.22,
     OwnPlotOnly = true,
-    TryWalk     = false,  -- MoveTo is inert in this VM; off by default
+    TryWalk     = false,
     WalkEvery   = 6,
 
     -- overlay
@@ -60,18 +47,28 @@ local CONFIG = {
     OverlayX    = 24,
     OverlayY    = 120,
     OverlaySize = 22,
+
+    -- deposit
+    AutoDeposit  = true,
+    DepositAt    = 1.5,    -- slider: 1.0 .. 2.0 in 0.1 steps
+    DepositStand = 0.18,   -- how long to stand on the button
+    DepositGap   = 3.0,    -- minimum seconds between two deposit attempts
+    VerifyWait   = 0.45,   -- wait before reading CurrentCount back
 }
 
-local running = true
-local busy    = false
+local running  = true
+local busy     = false
+local depositArmed = true
+local lastDepositT = 0
+
 local stat = {
     passes=0, landed=0, missed=0, tiersSent=0, walks=0,
     lastDelta=0, lastErr='none', lastLanded='none',
     totalCount=0, nearestDist=-1,
     startCount=nil, lastCount=nil,
+    deposits=0, lastDeposit='none', market=nil,
 }
 
--- forward declarations: stop() uses these before their bodies appear
 local getHrp, getHum, myPlot, readMarket, overlayLbl, overlaySub
 
 local function note(s) print('[SMS] ' .. s) end
@@ -156,7 +153,6 @@ local function lootFolders()
     return keep
 end
 
--- name first, attribute second (v1.1.0's bug was attribute-only)
 local function tierOf(inst)
     if not inst then return nil end
     local t
@@ -178,7 +174,6 @@ local function posOf(inst)
     return nil
 end
 
--- Nearest-first. dist = -1 when the origin could not be read.
 local function lootList()
     local out = {}
     local org = origin()
@@ -213,8 +208,6 @@ local function lootList()
 end
 
 -- ---------------- market reader ----------------
--- Walks the whole MarketBoard subtree so it works whether the labels sit directly
--- under the Part or under the SurfaceGui child.
 function readMarket()
     local plot = myPlot()
     if not plot then return nil, nil end
@@ -247,8 +240,6 @@ function readMarket()
 end
 
 -- ---------------- overlay ----------------
--- Fixed screen position, so no WorldToScreen and no camera dependence.
--- Drawings are created once here and only mutated in the render loop.
 if Drawing then
     pcall(function()
         overlayLbl = Drawing.new('Text')
@@ -269,6 +260,16 @@ if Drawing then
     end)
 end
 
+local function overlayColor(mult)
+    if mult >= CONFIG.DepositAt then
+        return Color3.fromRGB(120, 255, 140)   -- at/above your deposit threshold
+    elseif mult >= 1.0 then
+        return Color3.fromRGB(255, 225, 90)
+    else
+        return Color3.fromRGB(255, 130, 110)
+    end
+end
+
 local function renderOverlay()
     if not overlayLbl then return end
     if not CONFIG.ShowMarket then
@@ -277,16 +278,16 @@ local function renderOverlay()
         return
     end
     local mult, nextTxt = readMarket()
+    stat.market = mult
     if mult then
         overlayLbl.Visible = true
-        overlayLbl.Text = string.format('Fish Value: %.2fx', mult)
-        if mult >= 1.5 then
-            overlayLbl.Color = Color3.fromRGB(120, 255, 140)
-        elseif mult >= 1.0 then
-            overlayLbl.Color = Color3.fromRGB(255, 225, 90)
-        else
-            overlayLbl.Color = Color3.fromRGB(255, 130, 110)
+        local tag = ''
+        if CONFIG.AutoDeposit then
+            tag = depositArmed and '  [DEPOSIT READY]' or '  [latched]'
         end
+        overlayLbl.Text = string.format('Fish Value: %.2fx  (dep at %.1fx)%s',
+            mult, CONFIG.DepositAt, tag)
+        overlayLbl.Color = overlayColor(mult)
         if overlaySub then
             overlaySub.Visible = (nextTxt ~= nil)
             if nextTxt then overlaySub.Text = nextTxt end
@@ -299,8 +300,6 @@ local function renderOverlay()
     end
 end
 
--- Throttled: reading a subtree every frame is waste. ~7 Hz is plenty for a number
--- that changes every 9 s.
 task.spawn(function()
     local acc = 0
     pcall(function()
@@ -314,7 +313,7 @@ task.spawn(function()
     end)
 end)
 
--- ---------------- firing ----------------
+-- ---------------- pickup ----------------
 local function fireLoot(tiers)
     local re = RS:FindFirstChild('RemoteEvents')
     if not re then return false, 'RemoteEvents missing' end
@@ -324,7 +323,6 @@ local function fireLoot(tiers)
     return ok, err
 end
 
--- Re-verify Parent right before firing: the game destroys parts client-side every 0.05 s.
 local function buildBatch(list, limit)
     local tiers = {}
     for i = 1, math.min(#list, limit) do
@@ -347,8 +345,6 @@ local function tryWalk(targetPos)
     end
 end
 
--- ---------------- pass ----------------
--- Fires EVERY pass. No arrival gate. That gate is what silently disabled v2.3.0.
 local function pass()
     if busy then return end
     busy = true
@@ -358,15 +354,11 @@ local function pass()
         stat.totalCount = #list
         stat.nearestDist = (#list > 0) and list[1].dist or -1
         if #list == 0 then return end
-
-        -- optional best-effort walk; never blocks the fire below
         if CONFIG.TryWalk and stat.passes % CONFIG.WalkEvery == 0 then
             tryWalk(list[1].pos)
         end
-
         local tiers = buildBatch(list, CONFIG.PerPass)
         if #tiers == 0 then return end
-
         local sent, serr = fireLoot(tiers)
         if sent then
             stat.tiersSent = stat.tiersSent + #tiers
@@ -394,6 +386,99 @@ local function pass()
     busy = false
 end
 
+-- ---------------- deposit ----------------
+local function depositPart()
+    local plot = myPlot()
+    if not plot then return nil end
+    local sell = plot:FindFirstChild('Sell')
+    local model = sell and sell:FindFirstChild('DepositButton')
+    if not model then return nil end
+    local part = model:FindFirstChild('Button')
+    if part and part:IsA('BasePart') then return part end
+    return nil
+end
+
+-- Stand ON the button (user approved teleporting), fire the touch, come back.
+local function depositOnce()
+    local part = depositPart()
+    if not part then return false, 'DepositButton.Button missing' end
+    local hrp = getHrp()
+    if not hrp then return false, 'no HumanoidRootPart' end
+    local saved
+    pcall(function() saved = hrp.CFrame end)
+    local p
+    pcall(function() p = part.Position end)
+    if typeof(p) ~= 'Vector3' then return false, 'no button position' end
+
+    pcall(function() hrp.CFrame = CFrame.new(p.X, p.Y + 3, p.Z) end)
+    task.wait(CONFIG.DepositStand)
+
+    if type(firetouchinterest) == 'function' then
+        pcall(firetouchinterest, hrp, part, 0)
+        task.wait(0.05)
+        pcall(firetouchinterest, hrp, part, 1)
+    end
+    task.wait(0.12)
+
+    if saved then pcall(function() hrp.CFrame = saved end) end
+    return true, 'touched'
+end
+
+local function tryDeposit(mult)
+    local t = os.clock()
+    if (t - lastDepositT) < CONFIG.DepositGap then return end
+    lastDepositT = t
+
+    local before = numAttr('CurrentCount')
+    local ok, detail = depositOnce()
+    if not ok then
+        stat.lastDeposit = 'FAILED: ' .. tostring(detail)
+        note('deposit attempt failed: ' .. tostring(detail))
+        return
+    end
+
+    task.wait(CONFIG.VerifyWait)
+    local after = numAttr('CurrentCount')
+    if type(before) == 'number' and type(after) == 'number' then
+        if after < before then
+            stat.deposits = stat.deposits + 1
+            stat.lastDeposit = 'took ' .. (before - after) ..
+                ' fish @ ' .. string.format('%.2f', mult or 0) .. 'x'
+            note('deposited: ' .. stat.lastDeposit)
+        else
+            stat.lastDeposit = 'no change (button may need real contact)'
+            note('deposit: no change in CurrentCount')
+        end
+    else
+        stat.lastDeposit = 'unreadable CurrentCount'
+    end
+end
+
+-- Own loop. Latches after one deposit; re-arms only when the value falls BELOW the
+-- threshold, which is exactly "once when it hits".
+task.spawn(function()
+    while running do
+        if CONFIG.AutoDeposit then
+            local mult = readMarket()
+            stat.market = mult
+            if mult then
+                if mult >= CONFIG.DepositAt then
+                    if depositArmed then
+                        depositArmed = false
+                        tryDeposit(mult)
+                    end
+                else
+                    if not depositArmed then
+                        depositArmed = true
+                        note('re-armed at ' .. string.format('%.2f', mult) .. 'x')
+                    end
+                end
+            end
+        end
+        task.wait(0.3)
+    end
+end)
+
 -- ---------------- report ----------------
 local function report()
     local list = lootList()
@@ -401,34 +486,32 @@ local function report()
     local mult, nextTxt = readMarket()
     if stat.startCount == nil then stat.startCount = cc end
     note('--- REPORT v' .. VERSION .. ' ---')
-    note('perPass=' .. CONFIG.PerPass .. '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly) ..
-         '  tryWalk=' .. tostring(CONFIG.TryWalk))
+    note('perPass=' .. CONFIG.PerPass .. '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly))
     note('market=' .. tostring(mult) .. 'x  next=' .. tostring(nextTxt) ..
          '  overlay=' .. tostring(CONFIG.ShowMarket))
+    note('deposit: auto=' .. tostring(CONFIG.AutoDeposit) ..
+         '  threshold=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x' ..
+         '  armed=' .. tostring(depositArmed) ..
+         '  count=' .. stat.deposits)
+    note('depositPart=' .. tostring(depositPart() ~= nil) ..
+         '  lastDeposit=' .. tostring(stat.lastDeposit))
     note('lootTotal=' .. #list .. '  nearest=' ..
-         tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm  (fired regardless)')
-    for i = 1, math.min(#list, 5) do
-        note('  ' .. list[i].part.Name .. ' d=' .. math.floor(list[i].dist) .. 'm')
-    end
+         tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm')
     note('CurrentCount ' .. tostring(stat.startCount) .. ' -> ' .. tostring(cc))
     note('passes=' .. stat.passes .. ' landed=' .. stat.landed ..
          ' missed=' .. stat.missed .. ' tiersSent=' .. stat.tiersSent)
     note('lastDelta=' .. tostring(stat.lastDelta) .. ' lastGain=' .. tostring(stat.lastLanded) ..
          ' lastErr=' .. tostring(stat.lastErr))
     if mult == nil then
-        note('OVERLAY: market unreadable - check Plot.Restaurant.Interior.KitchenBoard.MarketBoard')
-    end
-    if stat.tiersSent == 0 then
-        note('VERDICT: nothing fired - no Loot<n> part found in the plot folders.')
-    elseif stat.landed > 0 then
-        note('VERDICT: firing works. ' .. stat.landed .. ' of ' .. stat.passes ..
-             ' passes moved CurrentCount (nearest ' ..
-             tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm).')
+        note('OVERLAY: market unreadable - deposit cannot trigger.')
+    elseif stat.deposits > 0 then
+        note('VERDICT: deposit worked ' .. stat.deposits .. ' time(s).')
+    elseif stat.lastDeposit ~= 'none' then
+        note('VERDICT: deposit attempted but CurrentCount did not fall.')
+        note('         The button wants contact firetouchinterest cannot fake.')
     else
-        note('VERDICT: fired ' .. stat.tiersSent .. ' tiers, CurrentCount never moved.')
-        note('         Nearest loot is ' ..
-             tostring(#list > 0 and math.floor(list[1].dist) or -1) ..
-             'm - this is the server distance limit, or the plot is not yours.')
+        note('VERDICT: not triggered yet - market has not reached ' ..
+             string.format('%.1f', CONFIG.DepositAt) .. 'x.')
     end
     note('--- end ---')
 end
@@ -447,11 +530,29 @@ local function safeButton(sec, label, cb)
     return false
 end
 
+local function clampRound(v)
+    local n = tonumber(v)
+    if not n then return nil end
+    n = math.floor(n * 10 + 0.5) / 10
+    if n < 1.0 then n = 1.0 end
+    if n > 2.0 then n = 2.0 end
+    return n
+end
+
+local function safeSlider(sec, id, label, min, max, default, cb)
+    if pcall(function() sec:Slider(id, label, min, max, default, cb) end) then return true end
+    if pcall(function() sec:Slider(label, min, max, default, cb) end) then return true end
+    if pcall(function() sec:Slider(id, label, default, min, max, cb) end) then return true end
+    return false
+end
+
 local function arm()
     stat.startCount = numAttr('CurrentCount')
     stat.landed, stat.missed, stat.passes = 0, 0, 0
     stat.tiersSent, stat.walks, stat.lastDelta = 0, 0, 0
     stat.lastLanded, stat.lastErr = 'none', 'none'
+    stat.deposits, stat.lastDeposit = 0, 'none'
+    depositArmed = true
 end
 
 if UI then
@@ -472,7 +573,33 @@ if UI then
             safeButton(main, 'Report', function() report() end)
             safeButton(main, 'Stop', function() stop() end)
 
-            local ov = tab:Section('Overlay', 'Right')
+            local dep = tab:Section('Deposit', 'Right')
+            safeToggle(dep, 'sms_dep', 'Auto Deposit Fish', CONFIG.AutoDeposit,
+                function(v) CONFIG.AutoDeposit = v end)
+            safeSlider(dep, 'sms_dep_at', 'Deposit At (x)', 1.0, 2.0, CONFIG.DepositAt,
+                function(v)
+                    local n = clampRound(v)
+                    if n then CONFIG.DepositAt = n end
+                end)
+            safeButton(dep, 'Threshold +0.1', function()
+                CONFIG.DepositAt = clampRound(CONFIG.DepositAt + 0.1) or CONFIG.DepositAt
+                note('depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x')
+            end)
+            safeButton(dep, 'Threshold -0.1', function()
+                CONFIG.DepositAt = clampRound(CONFIG.DepositAt - 0.1) or CONFIG.DepositAt
+                note('depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x')
+            end)
+            safeButton(dep, 'Deposit Now (ignore value)', function()
+                local m = readMarket()
+                depositArmed = false
+                tryDeposit(m)
+            end)
+            safeButton(dep, 'Re-arm Deposit', function()
+                depositArmed = true
+                note('deposit re-armed')
+            end)
+
+            local ov = tab:Section('Overlay', 'Left')
             safeToggle(ov, 'sms_market', 'Show Fish Value Overlay', CONFIG.ShowMarket,
                 function(v) CONFIG.ShowMarket = v end)
             safeButton(ov, 'Overlay Higher', function()
@@ -500,7 +627,7 @@ if UI then
 end
 
 local function poll()
-    local function getv(id, name)
+    local function getb(id, name)
         local ok, v = pcall(function() return UI.GetValue(id) end)
         if not ok or type(v) ~= 'boolean' then
             ok, v = pcall(function() return UI.GetValue(name) end)
@@ -508,13 +635,26 @@ local function poll()
         if ok and type(v) == 'boolean' then return v end
         return nil
     end
-    local o = getv('sms_on', 'Auto Fish Pickup')
+    local o = getb('sms_on', 'Auto Fish Pickup')
     if o ~= nil and o ~= CONFIG.Enabled then
         CONFIG.Enabled = o
         if o then arm() end
     end
-    local m = getv('sms_market', 'Show Fish Value Overlay')
+    local m = getb('sms_market', 'Show Fish Value Overlay')
     if m ~= nil then CONFIG.ShowMarket = m end
+    local d = getb('sms_dep', 'Auto Deposit Fish')
+    if d ~= nil then CONFIG.AutoDeposit = d end
+
+    -- slider value: signature unverified, so accept a number and round it
+    local okn, v = pcall(function() return UI.GetValue('sms_dep_at') end)
+    if not okn or type(v) ~= 'number' then
+        local okn2, v2 = pcall(function() return UI.GetValue('Deposit At (x)') end)
+        if okn2 then v = v2 end
+    end
+    if type(v) == 'number' then
+        local n = clampRound(v)
+        if n and n ~= CONFIG.DepositAt then CONFIG.DepositAt = n end
+    end
 end
 
 task.spawn(function()
@@ -532,8 +672,8 @@ end)
 arm()
 local m0, n0 = readMarket()
 note('loaded. plot=' .. tostring(myPlot() and myPlot().Name or 'NIL') ..
-     '  loot=' .. #lootList() .. '  count=' .. tostring(stat.startCount) ..
-     '  perPass=' .. CONFIG.PerPass)
+     '  loot=' .. #lootList() .. '  count=' .. tostring(stat.startCount))
 note('market=' .. tostring(m0) .. 'x  next=' .. tostring(n0) ..
-     '  overlay=' .. tostring(CONFIG.ShowMarket))
+     '  depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x' ..
+     '  depositPart=' .. tostring(depositPart() ~= nil))
 print('[Sell a Million Sushi] running. Stop with: _G.SellAMillionSushi.stop()')
