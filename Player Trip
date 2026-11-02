@@ -1,65 +1,64 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v2.3.0
+  Version: v2.4.0
   Rebindable key fires the trip. Tap Space to get up yourself.
 
-  v2.3.0 - "can you try to make it natural it doesnt force me in a direction as
-  much to ragdoll me"
+  v2.4.0 - "i just dont like how i get flung to trip cant it be natural?"
 
-  v2.2.0 always pitched you FORWARD, dead straight down your look vector, on a
-  t*t curve. That is why it read as a shove: same direction every time, and the
-  curve is fastest at the end so the last few frames snap.
+  WHY IT FELT FLUNG: every version up to v2.3.0 rotated the body about the
+  HumanoidRootPart's OWN CENTRE. The root is 3 studs off the ground, so a
+  rotation about it spins the character in mid-air like a plank on a nail -
+  the head sweeps one way, the feet sweep the other, and the body never
+  actually goes DOWN. That is a spin, not a fall. No amount of curve tuning
+  fixes it, because the pivot point is wrong.
 
-  Three changes, all in the topple:
+  WHAT v2.4.0 DOES: it rotates about a point at the FEET.
+      root.CFrame = CFrame.new(pivot) * tilt * CFrame.new(-pivot) * baseCF
+  where pivot = the root position at trip time, dropped by CFG.pivotDrop
+  studs (2.5 -> roughly ground level for an R6 rig). That composition is a
+  rotation about a world point: root position follows the arc p + R*(p0 - p).
+  So the feet stay put, the body tips over them like a felled tree, and the
+  torso ends up lying on the ground instead of hovering at standing height.
+  There is still NO velocity write anywhere. Gravity still owns the fall once
+  the script releases at 90 degrees.
 
-  1. RANDOM FALL DIRECTION. Each trip rolls a side roll between -CFG.roll and
-     +CFG.roll, so you go over diagonally instead of always straight forward.
-     Same trip key, different tumble every time.
+  BASE IS CAPTURED, NOT LIVE. Each step rebuilds from the CFrame captured at
+  trip time, never from the current one. Composing a rotation about a fixed
+  pivot with the LIVE CFrame would re-apply the rotation every frame and
+  compound it. This was the trap in the old applyTilt.
 
-  2. SMOOTHSTEP CURVE. theta = HALF_PI * t*t*(3-2t). Slow at both ends: the
-     body leans, commits, then eases into the ground instead of snapping the
-     last 20 degrees. That is the "settling" feel a real topple has.
+  CURVE: theta = HALF_PI * t*t*(2-t). Accelerating like a real topple (the
+  lean is slow, the overbalance is not), with a slight bleed off the last few
+  degrees so the landing does not snap.
 
-  3. SLOWER RAMP. CFG.ramp 0.45 -> 0.60 s, so the whole thing reads as losing
-     your footing rather than being thrown.
-
-  Unchanged on purpose: there is still NO velocity write anywhere, and NO auto
-  get-up. After the topple the script writes one final CFrame and then goes
-  completely silent (state 'lying'). Space / the trip key / the Get up button
-  is the only way back up, and only because you asked.
-
-  PROBED THIS SESSION (and it is why a true ragdoll is not available):
-    Motor6D.C0                        -> reads nil, write errors
-    Motor6D.Part0 / Part1 / Enabled   -> Unknown property
-    Humanoid.PlatformStand            -> Unknown property
-    AssemblyAngularVelocity / AngularVelocity / RotVelocity -> nil, unwritable
-    Instance.new                      -> nil (no BallSocketConstraint)
-  So the rotation is the only lever. What this version improves is how that
-  rotation is shaped, not what it is made of.
-
-  ALSO PROBED THIS SESSION, which is why the composite write is safe:
-    root.CFrame = root.CFrame * CFrame.Angles(a, 0, c)   -> ok=true
-    position drift across that write                     -> 0.0000
-    up vector 1.000 -> 0.969, and it restores to 1.000
-
-  KNOWN CONSEQUENCE OF NOT AUTO-RISING: a rotated root CFrame write persists
-  across physics steps in this VM. If the game does not stand you up itself,
-  you stay down until you press Space. That is intended.
+  PROBED EARLIER THIS SESSION (why a true ragdoll is not possible here):
+    Motor6D.C0 / Part0 / Part1 / Enabled -> nil / Unknown property
+    Humanoid.PlatformStand               -> Unknown property
+    Humanoid:ChangeState + Enum.HumanoidStateType -> nil (so FallingDown and
+                                            Physics cannot even be named)
+    AssemblyAngularVelocity / AngularVelocity / RotVelocity -> nil
+    Instance.new                         -> nil (no BallSocketConstraint)
+  Rotation is the only lever. v2.4.0 changes WHERE it pivots, which is the
+  difference between a spin and a fall.
 
   THE CONSTANTS TO TUNE
-    CFG.ramp   = 0.60 s topple (lower = snappier)
-    CFG.roll   = 0.45 max side roll in rad (0 = always straight forward)
-    CFG.settle = 0.35 s to stand up when YOU ask for it
-    CFG.flail  = 0.85 rad limb throw, only if joints are readable (usually 0)
-    CFG.keyVK  = 0x47 the trip key (G)
+    CFG.ramp      = 0.65 s topple (lower = snappier)
+    CFG.pivotDrop = 2.5 studs below the root centre = the pivot at the feet.
+                    Raise toward 3 for a lower, more grounded pivot; lower
+                    toward 1.5 for a pivot nearer the hips.
+    CFG.roll      = 0.30 max side roll in rad (0 = dead straight forward)
+    CFG.settle    = 0.45 s to swing back up when YOU ask for it
+    CFG.flail     = 0.85 rad limb throw, only if joints are readable (usually 0)
+    CFG.keyVK     = 0x47 the trip key (G)
 
-  UNVERIFIED: how it LOOKS in game.
+  UNVERIFIED: how it LOOKS in game. The pivot maths is standard CFrame
+  composition, but the feel is untested.
 
   _G.PlayerTrip.trip() / .getUp() / .stop() / .state() / .bind('G')
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v2.3.0'
+local VERSION = 'v2.4.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -80,9 +79,10 @@ local function track(c)
 end
 
 local CFG = {
-    ramp      = 0.60,
-    roll      = 0.45,
-    settle    = 0.35,
+    ramp      = 0.65,
+    roll      = 0.30,
+    pivotDrop = 2.5,
+    settle    = 0.45,
     flail     = 0.85,
     keyVK     = 0x47,
     keyName   = 'G',
@@ -125,7 +125,8 @@ NAME_OF_VK[0x27] = 'Right'
 
 local state    = 'idle'   -- idle | toppling | lying | rising
 local phaseAt  = 0
-local baseRot  = nil
+local baseCF   = nil      -- full CFrame captured at trip time
+local pivot    = nil      -- world point at the feet
 local rollNow  = 0
 local binding  = false
 local lastTripKey = false
@@ -154,41 +155,30 @@ local function held(vk)
     return ok and v == true
 end
 
--- Rotation only, positioned at the origin. Built with the 12-number form
--- because CFrame.new(Vector3) errors and fromMatrix/fromAxisAngle are nil here.
-local function rotOf(cf)
-    local ok, r, u, b
-    ok = pcall(function()
-        r = cf.RightVector
-        u = cf.UpVector
-        b = cf.LookVector * -1
-    end)
-    if not ok or not r or not u or not b then return nil end
-    return CFrame.new(0, 0, 0,
-        r.X, u.X, b.X,
-        r.Y, u.Y, b.Y,
-        r.Z, u.Z, b.Z)
-end
-
--- theta about the body's own right axis (pitch forward), plus a side roll so
--- the fall is diagonal. Both are applied in the captured basis, so the body
--- goes over relative to how it was standing, not relative to the camera.
+-- Rotation about a WORLD POINT, applied to a captured CFrame.
+-- T(p) * R * T(-p) * cf  ==  rotation of cf about p.
+-- The pivot is the feet, so the body tips over them instead of spinning
+-- about its own middle.
 local function applyTilt(root, theta)
-    if not root or not baseRot then return end
-    local ok, p = pcall(function() return root.Position end)
-    if not ok or not p then return end
+    if not root or not baseCF or not pivot then return end
     local roll = rollNow * (theta / HALF_PI)
-    local ok2 = pcall(function()
-        root.CFrame = CFrame.new(p.X, p.Y, p.Z) * (baseRot * CFrame.Angles(theta, 0, roll))
+    local tilt = CFrame.Angles(theta, 0, roll)
+    local ok = pcall(function()
+        root.CFrame = CFrame.new(pivot.X, pivot.Y, pivot.Z)
+            * tilt
+            * CFrame.new(-pivot.X, -pivot.Y, -pivot.Z)
+            * baseCF
     end)
-    return ok2
+    return ok
 end
 
--- Slow at both ends: lean, commit, settle. This is the whole "natural" part.
+-- Accelerating topple with a soft bleed off the last degrees:
+-- t*t*(2-t) starts slow (the lean), speeds up (the overbalance) and eases
+-- the final few degrees so the landing does not snap.
 local function curve(t)
     if t <= 0 then return 0 end
     if t >= 1 then return 1 end
-    return t * t * (3 - 2 * t)
+    return t * t * (2 - t)
 end
 
 -- Optional limb flop. C0 reads nil on this build, so the capture simply finds
@@ -255,8 +245,12 @@ local function trip()
     local okCf, cf = pcall(function() return root.CFrame end)
     if not okCf or not cf then log('no CFrame'); return false end
 
-    local rot = rotOf(cf)
-    if not rot then log('could not read rotation'); return false end
+    -- pivot position: root centre dropped to the feet
+    local okP, p0 = pcall(function() return cf.Position end)
+    if not okP or not p0 then
+        okP, p0 = pcall(function() return root.Position end)
+    end
+    if not okP or not p0 then log('no position'); return false end
 
     if not captured then
         local n = captureJoints(char)
@@ -266,12 +260,13 @@ local function trip()
     -- different tumble every time: a random side roll, never the same twice
     rollNow = (math.random() * 2 - 1) * CFG.roll
 
-    baseRot = rot
+    baseCF = cf
+    pivot  = Vector3.new(p0.X, p0.Y - CFG.pivotDrop, p0.Z)
     state   = 'toppling'
     phaseAt = os.clock()
 
     setJoints(1)
-    log(string.format('tripping (roll %+.2f rad, %.2fs)', rollNow, CFG.ramp))
+    log(string.format('tripping about the feet (roll %+.2f rad, %.2fs)', rollNow, CFG.ramp))
     return true
 end
 
@@ -321,8 +316,8 @@ track(RunService.Heartbeat:Connect(function(dt)
 
     if state == 'idle' then return end
 
-    if not root or not baseRot then
-        state, baseRot = 'idle', nil
+    if not root or not baseCF then
+        state, baseCF, pivot = 'idle', nil, nil
         return
     end
 
@@ -344,7 +339,7 @@ track(RunService.Heartbeat:Connect(function(dt)
         local t = (now - phaseAt) / CFG.settle
         if t >= 1 then
             applyTilt(root, 0)
-            state, baseRot, rollNow = 'idle', nil, 0
+            state, baseCF, pivot, rollNow = 'idle', nil, nil, 0
             log('up')
         else
             applyTilt(root, HALF_PI * curve(1 - t))
@@ -434,7 +429,7 @@ end
 
 local function stop()
     running = false
-    state, baseRot, binding, rollNow = 'idle', nil, false, 0
+    state, baseCF, pivot, binding, rollNow = 'idle', nil, nil, false, 0
     setJoints(0)
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
@@ -470,5 +465,5 @@ _G[NAME] = {
         return false
     end,
 }
-log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', random diagonal tumble, no auto get-up')
+log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', tips about the feet, no auto get-up')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Player Trip', 3) end)
