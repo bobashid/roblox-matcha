@@ -1,38 +1,48 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v2.0.1
+  Version: v2.0.2
   Rebindable key fires the trip. Tap Space to recover early.
 
-  v2.0.1 IS A COMPILE FIX ONLY.
-  v2.0 could not run at all: its flail setter read
-      if ... then CFG.flail = v captured = false end
-  on one line. Two assignments with no separator is a parse error
-  ("unexpected symbol near 'captured'"), so the whole chunk failed to compile and
-  not even the version print appeared - which looks exactly like "loaded but did
-  nothing". Fixed by putting the two statements on their own lines.
-  Behaviour is otherwise identical to v2.0.
+  TWO FIXES OVER v2.0, both in the limb-flop path only. Nothing else changed.
+
+  1) COMPILE ERROR (that is why v2.0 did nothing at all).
+     v2.0's flail setter read
+         if ... then CFG.flail = v captured = false end
+     on one line. Two assignments with no separator is a parse error, so the
+     whole chunk failed to compile and even the version print never appeared -
+     which looks exactly like "loaded but nothing happened". Now on two lines.
+
+  2) REMOVED AN UNVERIFIED API FROM THE FLOP.
+     v2.0 built each throw as a CFrame and eased it with
+         e.rest * CFrame.new(0,0,0):Lerp(e.throw, amount)
+     CFrame:Lerp has NOT been probed in this VM (fromMatrix and fromAxisAngle
+     are both nil here, so datatype methods do get stripped). If :Lerp were
+     nil the joint write would never happen and the trip would rotate the root
+     but leave the limbs stiff - the exact complaint that produced v2.0.
+     Now the throw is stored as three angles and rebuilt every time with
+     CFrame.Angles, which IS confirmed, and CFrame * CFrame is a pattern
+     already used in the user's own Anti Afk script. Same visual result, no
+     unverified dependency.
 
   WHY v2.0 - "yours didnt feel good", "it should ragdoll me"
   v1.x rotated the HumanoidRootPart only. In this VM that is all a root
   rotation does: the welds carry the limbs with it, so the character tilts as
   one rigid board. Stiff, not a tumble.
 
-  PROBED this session, which is what makes v2.0 possible:
+  PROBED earlier this session, which is what makes the flop possible:
     char children: Head, Torso, Left Arm, Right Arm, Left Leg, Right Leg,
                    HumanoidRootPart   (R6)
     Torso holds SIX Motor6D joints: Neck, Left Shoulder, Right Shoulder,
                    Left Hip, Right Hip, RootJoint
     motor.C0  read  -> ok=true, userdata
     motor.C0  WRITE -> ok=true, err=nil, and the value STICKS on read-back
-  So the joints are writable here. A ragdoll flop is therefore real: throw
-  each limb out by rotating its Motor6D C0, not just the root.
 
-  HOW THE TRIP WORKS NOW
-    1. rotate the root so the body pitches face-down along travel (as before)
+  HOW THE TRIP WORKS
+    1. rotate the root so the body pitches face-down along travel
     2. THROW THE LIMBS: each Motor6D gets a C0 offset with a random flail, so
        arms and legs splay and swing instead of staying in the walk pose
     3. push Velocity along travel and let physics slide you
-    4. recover: joints ease back to their captured rest C0, root eases upright
+    4. recover: joints return to their captured rest C0, root eases upright
   Joint rest poses are CAPTURED on first trip, not hardcoded, so the character
   returns to exactly its own original pose and a custom rig is not broken.
 
@@ -41,7 +51,7 @@
   nil, Enum.HumanoidStateType nil). So the game's own ragdoll ANIMATION cannot
   play - what you get is a joint-driven flop, which is physical, not animated.
 
-  v1.1 FEATURES KEPT
+  FEATURES KEPT
     - REBINDABLE KEY, default G. Click "Rebind key", press the key you want.
       InputBegan gives a Roblox KeyCode here, so it is mapped to a Windows VK
       through the same table the bundled Matcha ImGui uses.
@@ -49,20 +59,20 @@
 
   THE CONSTANTS TO TUNE
     CFG.speed    = 30   studs/s of slide
-    CFG.duration = 0.75 s face-down (longer than v1.x, the flop reads better)
+    CFG.duration = 0.75 s face-down
     CFG.settle   = 0.22 s to ease joints and root back
     CFG.flail    = 0.85 rad maximum limb throw
     CFG.keyVK    = 0x47 the trip key (G)
 
-  Cost: one root CFrame write and up to six C0 writes per physics step, only
-  while a trip is running. C0 is a joint property, not a part transform, so it
-  does not pay the full part-write cost.
+  UNVERIFIED: how the flop LOOKS has not been seen in game. If the body rotates
+  but the arms and legs stay in the walk pose, the joint capture found 0 motors -
+  check the console line "joints captured: N".
 
   _G.PlayerTrip.trip() / .stop() / .state() / .bind('G') / .flail(0.85)
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v2.0.1'
+local VERSION = 'v2.0.2'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -131,7 +141,7 @@ local travel  = nil
 local binding = false
 local lastTripKey = false
 local lastSpace   = false
-local motors  = {}   -- { motor = Motor6D, rest = CFrame, throw = CFrame }
+local motors  = {}   -- { motor = Motor6D, rest = CFrame, ax/ay/az = numbers }
 local captured = false
 
 local function log(m)
@@ -185,9 +195,9 @@ local function flatBasis(dir)
     return right.Unit, up, back
 end
 
--- Capture each joint's rest pose once, and roll a throw per joint. Capturing
--- rather than hardcoding means the character returns to exactly its own pose
--- and a custom rig is not broken by the trip.
+-- Capture each joint's rest pose once, and roll three angles per joint.
+-- Capturing rather than hardcoding means the character returns to exactly its
+-- own pose and a custom rig is not broken by the trip.
 local function captureJoints(char)
     motors = {}
     local torso = char and (char:FindFirstChild('Torso') or char:FindFirstChild('UpperTorso'))
@@ -199,13 +209,12 @@ local function captureJoints(char)
             local ok, c0 = pcall(function() return m.C0 end)
             if ok and c0 and type(c0) == 'userdata' then
                 local mag = CFG.flail * (0.5 + math.random())
-                local ax  = (math.random() - 0.5) * 2
-                local ay  = (math.random() - 0.5) * 2
-                local az  = (math.random() - 0.5) * 2
                 motors[#motors + 1] = {
                     motor = m,
                     rest  = c0,
-                    throw = CFrame.Angles(ax * mag, ay * mag, az * mag),
+                    ax    = (math.random() - 0.5) * 2 * mag,
+                    ay    = (math.random() - 0.5) * 2 * mag,
+                    az    = (math.random() - 0.5) * 2 * mag,
                 }
             end
         end
@@ -214,6 +223,8 @@ local function captureJoints(char)
     return #motors
 end
 
+-- amount 0 = captured rest pose, amount 1 = full flail.
+-- Built with CFrame.Angles every time: no CFrame:Lerp, which is unprobed here.
 local function setJoints(amount)
     for i = 1, #motors do
         local e = motors[i]
@@ -221,7 +232,7 @@ local function setJoints(amount)
         if amount <= 0 then
             target = e.rest
         else
-            target = e.rest * CFrame.new(0, 0, 0):Lerp(e.throw, amount)
+            target = e.rest * CFrame.Angles(e.ax * amount, e.ay * amount, e.az * amount)
         end
         pcall(function() e.motor.C0 = target end)
     end
