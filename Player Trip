@@ -1,19 +1,23 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v2.1.0
-  Rebindable key fires the trip. Tap Space to get up early.
+  Version: v2.2.0
+  Rebindable key fires the trip. Tap Space to get up yourself.
 
-  WHAT CHANGED FROM v2.0.x - "it should be natural ragdoll not forces"
-  v2.0 shoved the character: it wrote root.Velocity = look * 30 + up * 6 every
-  step and snapped the root CFrame to face-down instantly. That is a scripted
-  launch, not a fall.
+  v2.2.0 - "dont make it auto bring me back up let roblox naturally do"
+  v2.1.0 still had two scripted recoveries: a CFG.down timer that fired
+  beginRise() on its own, and a rising phase that eased the body back upright.
+  Both are gone.
 
-  v2.1.0 removes EVERY velocity write. Nothing pushes you. Gravity does the
-  falling. The only thing written is a ROTATION, and only while the body is
-  tipping over: theta ramps 0 -> 90 degrees with a topple curve (t*t, so it
-  accelerates like a body losing its footing) over CFG.ramp seconds. Once the
-  body is down, the script writes NOTHING AT ALL - position and motion are the
-  physics engine's, which is what makes it read as natural.
+  Now the trip has exactly two moments:
+    1. TOPPLE  - theta ramps 0 -> 90 degrees on a t*t curve over CFG.ramp s
+    2. RELEASE - one final write at 90 degrees, then the script stops writing
+                 entirely. State becomes 'lying'. No timer, no auto-stand, no
+                 velocity. Whatever Roblox does with the body from there is
+                 what you get.
+  Space (or the trip key again) gets you up manually; that is the only write
+  after the release, and only because you asked for it.
+
+  There is no velocity write anywhere in this file. Gravity does the falling.
 
   PROBED THIS SESSION, and it is why a true ragdoll is not available:
     Motor6D.Part0 / Part1 / Enabled   -> Unknown property (reads nil, writes error)
@@ -26,34 +30,27 @@
                                          created to let the limbs actually flop
   A real physics ragdoll needs ONE of: joints disabled, PlatformStand, a
   constraint instance, or angular velocity. All four are absent in this VM.
-  What is left is a rotation the body falls out of - which is what this does.
 
-  HOW THE TRIP WORKS
-    1. capture the current rotation once (rotation only, position is never set
-       from a stored value - the root's live Position is read every step)
-    2. toppling: theta = 90deg * (t/ramp)^2, written per step for CFG.ramp s
-    3. down:     zero writes for CFG.down s. You lie there. Gravity owns it.
-    4. rising:   theta eases back to 0 over CFG.settle s, then idle
-
-  The limb flop from v2.0 is kept but is now OPTIONAL and self-disabling: the
-  joints are captured once, and if C0 does not read back as a CFrame the flop
-  simply does not run (console shows "joints captured: 0"). It never errors.
+  KNOWN CONSEQUENCE OF NOT AUTO-RISING: a rotated root CFrame write PERSISTS
+  across physics steps in this VM - the humanoid does not snap the character
+  upright (probed 2026-10-30: up=(1,0,0) still (1,0,0) 0.1 s later). So if the
+  game does not stand you up itself, you will stay down until you press Space.
+  That is the behaviour this version asks for; the console line says which
+  state you are in.
 
   THE CONSTANTS TO TUNE
     CFG.ramp   = 0.45 s to fall over (lower = snappier topple)
-    CFG.down   = 1.10 s lying there before getting up
-    CFG.settle = 0.30 s to stand back up
-    CFG.flail  = 0.85 rad limb throw, only if joints are readable
+    CFG.settle = 0.30 s to stand up when YOU ask for it
+    CFG.flail  = 0.85 rad limb throw, only if joints are readable (usually 0)
     CFG.keyVK  = 0x47 the trip key (G)
 
-  UNVERIFIED: how it LOOKS in game. If the body stays upright, the root write
-  is being rejected - check the console for the trip fired line and tell me.
+  UNVERIFIED: how it LOOKS in game.
 
   _G.PlayerTrip.trip() / .stop() / .state() / .bind('G')
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v2.1.0'
+local VERSION = 'v2.2.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -75,7 +72,6 @@ end
 
 local CFG = {
     ramp      = 0.45,
-    down      = 1.10,
     settle    = 0.30,
     flail     = 0.85,
     keyVK     = 0x47,
@@ -117,9 +113,8 @@ NAME_OF_VK[0x28] = 'Down'
 NAME_OF_VK[0x25] = 'Left'
 NAME_OF_VK[0x27] = 'Right'
 
-local state    = 'idle'   -- idle | toppling | down | rising
+local state    = 'idle'   -- idle | toppling | lying | rising
 local phaseAt  = 0
-local phaseEnd = 0
 local baseRot  = nil
 local binding  = false
 local lastTripKey = false
@@ -176,8 +171,8 @@ local function applyTilt(root, theta)
     return ok2
 end
 
--- Optional limb flop. C0 may read nil in this VM (it did this session), so the
--- capture simply finds nothing and the flop never runs. It cannot error.
+-- Optional limb flop. C0 reads nil on this build, so the capture simply finds
+-- nothing and the flop never runs. It cannot error.
 local function captureJoints(char)
     motors = {}
     local torso = char and (char:FindFirstChild('Torso') or char:FindFirstChild('UpperTorso'))
@@ -217,8 +212,21 @@ local function setJoints(amount)
     end
 end
 
+local function beginRise()
+    if state ~= 'toppling' and state ~= 'lying' then return false end
+    state   = 'rising'
+    phaseAt = os.clock()
+    setJoints(0)
+    log('getting up (you asked)')
+    return true
+end
+
 local function trip()
-    if state ~= 'idle' then return false end
+    if state ~= 'idle' then
+        -- while down, the trip key doubles as "get up"
+        if state == 'lying' or state == 'toppling' then return beginRise() end
+        return false
+    end
 
     local char = lp.Character
     local root = rootOf(char)
@@ -240,23 +248,8 @@ local function trip()
     phaseAt = os.clock()
 
     setJoints(1)
-    log('tripping (gravity fall, no push)')
+    log('tripping (gravity fall, no push, no auto get-up)')
     return true
-end
-
-local function beginDown(root)
-    state     = 'down'
-    phaseAt   = os.clock()
-    phaseEnd  = phaseAt + CFG.down
-    applyTilt(root, HALF_PI)
-end
-
-local function beginRise(root)
-    if state == 'idle' or state == 'rising' then return end
-    state   = 'rising'
-    phaseAt = os.clock()
-    setJoints(0)
-    log('getting up')
 end
 
 local function onInputBegan(e)
@@ -291,38 +284,38 @@ track(RunService.Heartbeat:Connect(function(dt)
     local tripDown = (not binding) and held(CFG.keyVK)
     local tripEdge = tripDown and not lastTripKey
     lastTripKey = tripDown
-    if tripEdge and state == 'idle' then
+    if tripEdge then
         trip()
     end
 
     local spaceDown = held(CFG.recoverVK)
     local spaceEdge = spaceDown and not lastSpace
     lastSpace = spaceDown
-    if spaceEdge and (state == 'toppling' or state == 'down') then
-        beginRise(root)
+    if spaceEdge and (state == 'toppling' or state == 'lying') then
+        beginRise()
         return
     end
 
     if state == 'idle' then return end
+
     if not root or not baseRot then
         state, baseRot = 'idle', nil
         return
     end
 
+    -- LYING: deliberately silent. No CFrame writes, no velocity writes, no
+    -- timer. Roblox owns the body from the moment the topple finishes.
+    if state == 'lying' then return end
+
     if state == 'toppling' then
         local t = (now - phaseAt) / CFG.ramp
         if t >= 1 then
-            beginDown(root)
+            applyTilt(root, HALF_PI)
+            state = 'lying'
+            log('down - script is idle, move or press space to get up')
         else
             -- t*t: slow start, fast finish. This is the whole "fall" curve.
             applyTilt(root, HALF_PI * t * t)
-        end
-
-    elseif state == 'down' then
-        -- Deliberately silent. No CFrame writes, no velocity writes.
-        -- Whatever the physics engine is doing to you is what you get.
-        if now >= phaseEnd then
-            beginRise(root)
         end
 
     elseif state == 'rising' then
@@ -394,6 +387,10 @@ if HAS_UI then
                     if not trip() then log('trip did nothing - see the line above') end
                 end)
 
+                mkButton(sec, 'Get up', function()
+                    if not beginRise() then log('not down right now') end
+                end)
+
                 mkButton(sec, 'Rebind key', function()
                     binding = true
                     log('press the key you want for the trip')
@@ -428,6 +425,7 @@ end
 _G[NAME] = {
     stop    = stop,
     trip    = trip,
+    getUp   = beginRise,
     version = VERSION,
     state   = function() return state end,
     bind    = function(name)
@@ -450,5 +448,5 @@ _G[NAME] = {
         return false
     end,
 }
-log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', gravity fall, space gets up')
+log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', no auto get-up')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Player Trip', 3) end)
