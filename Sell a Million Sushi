@@ -1,30 +1,31 @@
 -- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
--- Version: 2.3.0 -- no teleport; walk to loot, fire only inside server range
+-- Version: 2.4.0 -- never gate firing behind arrival (Humanoid:MoveTo is inert here)
 --
--- MEASURED, NOT GUESSED (2026-11-02):
---   * ONE far loot item fired alone via LootPickup:FireServer({1}, false) at 98 studs
---     returned delta=0 on CurrentCount (1142 -> 1142). The server does NOT accept
---     long-range pickup, even for a single element array.
---   * The user's own 86-pass run at radius 32 / nearest 33m logged landed=0 missed=86
---     with 94 tiers sent. Nothing lands past ~33 studs either.
---   * CONCLUSION: silent cross-map collection is not available on this game. Do not
---     retry it. Teleport was removed at the user's request and is not coming back.
+-- WHY v2.3.0 FIRED ZERO TIMES (the user's own log, 2026-11-02):
+--   passes=23..38   walks=21..37   walkFails=0   tiersSent=0   nearest=33m (never moved)
+--   Humanoid:MoveTo returned successfully 37 times and the character did not move one
+--   stud - nearest loot stayed at EXACTLY 33m across 15 consecutive reports. v2.3.0
+--   only fired when nearest <= Radius (10), so it never fired at all. That is why it
+--   "worked a long time ago and now doesn't": earlier builds had no arrival gate.
 --
--- WHAT THIS DOES INSTEAD: walks you toward the nearest loot using the humanoid's own
---   mover (real engine movement, no CFrame writes, nothing that looks like a teleport),
---   and fires LootPickup only for loot already inside CONFIG.Radius. The game's own
---   5x15x5 client script collects the rest on arrival, which is why CurrentCount rises.
+-- FIX: walking is best-effort and NEVER blocks firing. Every pass fires at the nearest
+--   CONFIG.PerPass loot regardless of distance. Range is a preference, not a gate.
 --
--- CONFIRMED this session:
+-- MEASURED (2026-11-02): ONE far loot item fired alone at 98 studs returned delta=0 on
+--   CurrentCount. So very long range does fail server-side. But the earlier build did
+--   collect, so the honest way to find the real limit is to fire every pass and read
+--   landed vs missed - not to block firing entirely and report nothing.
+--
+-- CONFIRMED:
 --   LootPickup:FireServer(<array of LootTier numbers>, <isDeckHand bool>) - decompiled.
 --   Loot parts are named Loot<n>; there is NO LootTier attribute (tierHits=0).
 --   CurrentCount = LocalPlayer:GetAttribute("CurrentCount") (number).
---   Net Worth in leaderstats reads EMPTY - not used as a witness.
---   CollectionService:GetTagged is nil here - targets come from a descendants walk.
---   firetouchinterest on CollectButton does nothing (two tests, dead end #7).
+--   leaderstats["Net Worth"] reads EMPTY - not used as a witness.
+--   CollectionService:GetTagged is nil here - targets come from a children walk.
+--   firetouchinterest on CollectButton does nothing (dead end #7).
 
 local NAME    = 'SellAMillionSushi'
-local VERSION = '2.3.0'
+local VERSION = '2.4.0'
 print('[Sell a Million Sushi] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -35,29 +36,36 @@ local lp      = Players.LocalPlayer
 
 local CONFIG = {
     Enabled     = false,
-    Radius      = 10,     -- fire only inside this; measured failure at 33m and 98m
-    WalkToLoot  = true,   -- humanoid mover, never a CFrame teleport
-    ArriveAt    = 6,      -- studs that counts as "arrived"
-    PerPass     = 6,
-    PassCooldown = 0.2,
+    PerPass     = 8,      -- tiers fired per LootPickup call
+    BatchSize   = 8,
+    PassCooldown = 0.22,
     OwnPlotOnly = true,
+    TryWalk     = false,  -- MoveTo is inert in this VM; off by default
+    WalkEvery   = 6,      -- only attempt a walk this often when TryWalk is on
 }
 
 local running = true
 local busy    = false
 local stat = {
     passes=0, landed=0, missed=0, tiersSent=0, walks=0,
-    lastDelta=0, lastErr='none',
-    nearCount=0, totalCount=0, nearestDist=-1,
-    startCount=nil, lastCount=nil, walkFails=0,
+    lastDelta=0, lastErr='none', lastLanded='none',
+    totalCount=0, nearestDist=-1,
+    startCount=nil, lastCount=nil,
 }
+
+-- forward declarations: stop() uses these before their bodies appear
+local getHrp, getHum
 
 local function note(s) print('[SMS] ' .. s) end
 
 local function stop()
     running = false
-    local hum = getHum()
-    if hum then pcall(function() hum:MoveTo(hum.Parent.HumanoidRootPart.Position) end) end
+    local hum = getHum and getHum()
+    if hum then
+        local c = hum.Parent
+        local hrp = c and c:FindFirstChild('HumanoidRootPart')
+        if hrp then pcall(function() hum:MoveTo(hrp.Position) end) end
+    end
     _G[NAME] = nil
     print('[Sell a Million Sushi] stopped')
 end
@@ -71,7 +79,7 @@ local function numAttr(n)
     return nil
 end
 
-local function getHrp()
+function getHrp()
     local c
     pcall(function() c = lp.Character end)
     if not c then return nil end
@@ -80,7 +88,7 @@ local function getHrp()
     return r
 end
 
-local function getHum()
+function getHum()
     local c
     pcall(function() c = lp.Character end)
     if not c then return nil end
@@ -128,6 +136,7 @@ local function lootFolders()
     return keep
 end
 
+-- name first, attribute second (v1.1.0's bug was attribute-only)
 local function tierOf(inst)
     if not inst then return nil end
     local t
@@ -149,7 +158,7 @@ local function posOf(inst)
     return nil
 end
 
--- Sorted nearest-first. dist = -1 when the origin could not be read.
+-- Nearest-first. dist = -1 when the origin could not be read.
 local function lootList()
     local out = {}
     local org = origin()
@@ -183,32 +192,14 @@ local function lootList()
     return out
 end
 
--- ---------------- movement (no teleport) ----------------
--- The humanoid's own mover. Real movement, so the engine generates the Touched events
--- the game's 5-stud pickup relies on. Falls back to WalkToPoint when MoveTo is absent.
-local function walkTo(targetPos)
-    local hum = getHum()
-    if not hum or not targetPos then return false end
-    if type(hum.MoveTo) == 'function' then
-        local ok = pcall(function() hum:MoveTo(targetPos) end)
-        if ok then return true end
-    end
-    return (pcall(function() hum.WalkToPoint = targetPos end))
-end
-
-local function distToNearest()
-    local list = lootList()
-    if #list == 0 then return -1 end
-    return list[1].dist
-end
-
 -- ---------------- firing ----------------
 local function fireLoot(tiers)
     local re = RS:FindFirstChild('RemoteEvents')
-    if not re then return false end
+    if not re then return false, 'RemoteEvents missing' end
     local r = re:FindFirstChild('LootPickup')
-    if not r then return false end
-    return (pcall(function() r:FireServer(tiers, false) end))
+    if not r then return false, 'LootPickup missing' end
+    local ok, err = pcall(function() r:FireServer(tiers, false) end)
+    return ok, err
 end
 
 -- Re-verify Parent right before firing: the game destroys parts client-side every 0.05 s.
@@ -223,7 +214,19 @@ local function buildBatch(list, limit)
     return tiers
 end
 
+local function tryWalk(targetPos)
+    local hum = getHum()
+    if not hum or not targetPos then return end
+    stat.walks = stat.walks + 1
+    if type(hum.MoveTo) == 'function' then
+        pcall(function() hum:MoveTo(targetPos) end)
+    else
+        pcall(function() hum.WalkToPoint = targetPos end)
+    end
+end
+
 -- ---------------- pass ----------------
+-- Fires EVERY pass. No arrival gate. That gate is what silently disabled v2.3.0.
 local function pass()
     if busy then return end
     busy = true
@@ -232,38 +235,22 @@ local function pass()
         local list = lootList()
         stat.totalCount = #list
         stat.nearestDist = (#list > 0) and list[1].dist or -1
-        if #list == 0 then stat.nearCount = 0 return end
+        if #list == 0 then return end
 
-        local nearest = list[1]
-
-        -- Out of range: walk toward it. Never fire, never teleport.
-        if nearest.dist > CONFIG.Radius then
-            stat.nearCount = 0
-            if CONFIG.WalkToLoot and nearest.pos then
-                if walkTo(nearest.pos) then
-                    stat.walks = stat.walks + 1
-                else
-                    stat.walkFails = stat.walkFails + 1
-                end
-            end
-            return
+        -- optional best-effort walk; never blocks the fire below
+        if CONFIG.TryWalk and stat.passes % CONFIG.WalkEvery == 0 then
+            tryWalk(list[1].pos)
         end
 
-        -- In range: fire only at loot inside Radius.
-        local inRange = {}
-        for i = 1, #list do
-            local e = list[i]
-            if e.dist >= 0 and e.dist <= CONFIG.Radius then
-                inRange[#inRange + 1] = e
-            end
-        end
-        stat.nearCount = #inRange
-        if #inRange == 0 then return end
-
-        local tiers = buildBatch(inRange, CONFIG.PerPass)
+        local tiers = buildBatch(list, CONFIG.PerPass)
         if #tiers == 0 then return end
-        if fireLoot(tiers) then
+
+        local sent, serr = fireLoot(tiers)
+        if sent then
             stat.tiersSent = stat.tiersSent + #tiers
+            stat.lastErr = 'none'
+        else
+            stat.lastErr = tostring(serr)
         end
     end)
     if not ok then stat.lastErr = tostring(err) end
@@ -274,8 +261,12 @@ local function pass()
         local d = after - before
         stat.lastDelta = d
         stat.lastCount = after
-        if d > 0 then stat.landed = stat.landed + 1
-        else stat.missed = stat.missed + 1 end
+        if d > 0 then
+            stat.landed = stat.landed + 1
+            stat.lastLanded = '+' .. d
+        else
+            stat.missed = stat.missed + 1
+        end
     end
     stat.passes = stat.passes + 1
     busy = false
@@ -287,32 +278,30 @@ local function report()
     local cc = numAttr('CurrentCount')
     if stat.startCount == nil then stat.startCount = cc end
     note('--- REPORT v' .. VERSION .. ' ---')
-    note('radius=' .. CONFIG.Radius .. '  walkToLoot=' .. tostring(CONFIG.WalkToLoot) ..
-         '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly))
+    note('perPass=' .. CONFIG.PerPass .. '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly) ..
+         '  tryWalk=' .. tostring(CONFIG.TryWalk))
     note('lootTotal=' .. #list .. '  nearest=' ..
-         tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm')
+         tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm  (fired regardless)')
     for i = 1, math.min(#list, 5) do
         note('  ' .. list[i].part.Name .. ' d=' .. math.floor(list[i].dist) .. 'm')
     end
     note('CurrentCount ' .. tostring(stat.startCount) .. ' -> ' .. tostring(cc))
     note('passes=' .. stat.passes .. ' landed=' .. stat.landed ..
          ' missed=' .. stat.missed .. ' tiersSent=' .. stat.tiersSent)
-    note('walks=' .. stat.walks .. ' walkFails=' .. stat.walkFails ..
-         ' lastDelta=' .. tostring(stat.lastDelta) ..
+    note('lastDelta=' .. tostring(stat.lastDelta) .. ' lastGain=' .. tostring(stat.lastLanded) ..
          ' lastErr=' .. tostring(stat.lastErr))
-    if stat.passes == 0 then
-        note('VERDICT: not run yet.')
+    if stat.tiersSent == 0 then
+        note('VERDICT: nothing fired - no Loot<n> part found in the plot folders.')
     elseif stat.landed > 0 then
-        note('VERDICT: working. ' .. stat.landed .. ' of ' .. stat.passes ..
-             ' passes paid inside ' .. CONFIG.Radius .. 'm.')
-    elseif stat.walks > 0 then
-        note('VERDICT: nothing in range yet - it is walking you to the loot.')
-        note('         Distance closes, then the game\'s own pickup fires.')
+        note('VERDICT: firing works. ' .. stat.landed .. ' of ' .. stat.passes ..
+             ' passes moved CurrentCount (nearest ' ..
+             tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm).')
     else
-        note('VERDICT: nothing landed and nothing walked. Send this block.')
+        note('VERDICT: fired ' .. stat.tiersSent .. ' tiers, CurrentCount never moved.')
+        note('         Nearest loot is ' ..
+             tostring(#list > 0 and math.floor(list[1].dist) or -1) ..
+             'm - this is the server distance limit, or the plot is not yours.')
     end
-    note('NOTE: cross-map silent pickup measured impossible - single far loot at 98m')
-    note('      returned delta=0, and 86 passes at 33m+ landed=0. Do not retry.')
     note('--- end ---')
 end
 
@@ -333,7 +322,8 @@ end
 local function arm()
     stat.startCount = numAttr('CurrentCount')
     stat.landed, stat.missed, stat.passes = 0, 0, 0
-    stat.tiersSent, stat.walks, stat.walkFails = 0, 0, 0
+    stat.tiersSent, stat.walks, stat.lastDelta = 0, 0, 0
+    stat.lastLanded, stat.lastErr = 'none', 'none'
 end
 
 if UI then
@@ -344,12 +334,13 @@ if UI then
                 CONFIG.Enabled = v
                 if v then arm() end
             end)
-            safeButton(main, 'Radius +5', function()
-                CONFIG.Radius = CONFIG.Radius + 5; note('radius=' .. CONFIG.Radius)
+            safeButton(main, 'Per Pass +4', function()
+                CONFIG.PerPass = CONFIG.PerPass + 4; note('perPass=' .. CONFIG.PerPass)
             end)
-            safeButton(main, 'Radius -5', function()
-                CONFIG.Radius = math.max(5, CONFIG.Radius - 5); note('radius=' .. CONFIG.Radius)
+            safeButton(main, 'Per Pass -4', function()
+                CONFIG.PerPass = math.max(1, CONFIG.PerPass - 4); note('perPass=' .. CONFIG.PerPass)
             end)
+            safeButton(main, 'Fire Once Now', function() pass() end)
             safeButton(main, 'Report', function() report() end)
             safeButton(main, 'Stop', function() stop() end)
         end)
@@ -387,5 +378,5 @@ end)
 arm()
 note('loaded. plot=' .. tostring(myPlot() and myPlot().Name or 'NIL') ..
      '  loot=' .. #lootList() .. '  count=' .. tostring(stat.startCount) ..
-     '  radius=' .. CONFIG.Radius)
+     '  perPass=' .. CONFIG.PerPass)
 print('[Sell a Million Sushi] running. Stop with: _G.SellAMillionSushi.stop()')
