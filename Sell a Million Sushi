@@ -1,12 +1,14 @@
 -- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
--- Version: 2.7.0 -- menu is three toggles and one slider. Nothing else.
+-- Version: 2.8.0 -- three toggles in one section, one slider. Nothing else.
 --
--- v2.7.0 is a MENU change only. Behaviour is identical to v2.6.0:
+-- v2.8.0 changes ONLY the deposit slider range: 1.0 .. 1.5 (was 1.0 .. 2.0),
+-- still snapped to 0.1 steps. Behaviour is identical to v2.7.0.
+--
+-- Menu:
 --   * Auto Fish Pickup   -> toggle
---   * Auto Deposit Fish  -> toggle  +  Deposit At (x) slider (1.0 .. 2.0, 0.1 steps)
+--   * Auto Deposit Fish  -> toggle  +  Deposit At (x) slider (1.0 .. 1.5)
 --   * Fish Value Overlay -> toggle
--- Report and Stop are gone. Each feature has its own off switch, so turning all
--- three toggles off leaves the script loaded but inert; re-run the Hub to unload.
+-- Turning all three off leaves the script loaded but idle; re-run the Hub to unload.
 --
 -- CONFIRMED (probed 2026-11-02):
 --   Market value is readable text on Plot.Restaurant.Interior.KitchenBoard.MarketBoard:
@@ -22,7 +24,7 @@
 --   assuming it worked; the result is printed to the console, not to a menu.
 
 local NAME    = 'SellAMillionSushi'
-local VERSION = '2.7.0'
+local VERSION = '2.8.0'
 print('[Sell a Million Sushi] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -50,11 +52,13 @@ local CONFIG = {
 
     -- deposit
     AutoDeposit  = true,
-    DepositAt    = 1.5,    -- slider: 1.0 .. 2.0 in 0.1 steps
+    DepositAt    = 1.5,    -- slider: 1.0 .. 1.5 in 0.1 steps
     DepositStand = 0.18,
     DepositGap   = 3.0,
     VerifyWait   = 0.45,
 }
+
+local SLIDER_MIN, SLIDER_MAX = 1.0, 1.5
 
 local running  = true
 local busy     = false
@@ -490,8 +494,8 @@ local function clampRound(v)
     local n = tonumber(v)
     if not n then return nil end
     n = math.floor(n * 10 + 0.5) / 10
-    if n < 1.0 then n = 1.0 end
-    if n > 2.0 then n = 2.0 end
+    if n < SLIDER_MIN then n = SLIDER_MIN end
+    if n > SLIDER_MAX then n = SLIDER_MAX end
     return n
 end
 
@@ -521,8 +525,8 @@ if UI then
             end)
             safeToggle(main, 'sms_dep', 'Auto Deposit Fish', CONFIG.AutoDeposit,
                 function(v) CONFIG.AutoDeposit = v end)
-            safeSlider(main, 'sms_dep_at', 'Deposit At (x)', 1.0, 2.0, CONFIG.DepositAt,
-                function(v)
+            safeSlider(main, 'sms_dep_at', 'Deposit At (x)', SLIDER_MIN, SLIDER_MAX,
+                CONFIG.DepositAt, function(v)
                     local n = clampRound(v)
                     if n then CONFIG.DepositAt = n end
                 end)
