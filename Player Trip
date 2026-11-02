@@ -1,64 +1,62 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v2.4.0
-  Rebindable key fires the trip. Tap Space to get up yourself.
+  Version: v2.5.0
+  ONE PRESS, ONE FALL, NO GET-UP.
 
-  v2.4.0 - "i just dont like how i get flung to trip cant it be natural?"
+  v2.5.0 - "just one time click to fall no get up" (user picked option 1:
+  strict one-shot)
 
-  WHY IT FELT FLUNG: every version up to v2.3.0 rotated the body about the
-  HumanoidRootPart's OWN CENTRE. The root is 3 studs off the ground, so a
-  rotation about it spins the character in mid-air like a plank on a nail -
-  the head sweeps one way, the feet sweep the other, and the body never
-  actually goes DOWN. That is a spin, not a fall. No amount of curve tuning
-  fixes it, because the pivot point is wrong.
+  EVERY recovery path is deleted, not disabled:
+    - beginRise()                  gone from the file entirely
+    - the 'rising' state           gone
+    - the Space edge in Heartbeat  gone (space is not special any more)
+    - trip() while down            returns false, does nothing
+    - the 'Get up' menu button     gone
+  After the topple finishes the script writes NOTHING: state is 'lying', the
+  Heartbeat returns immediately every frame, no CFrame, no velocity, no timer.
 
-  WHAT v2.4.0 DOES: it rotates about a point at the FEET.
-      root.CFrame = CFrame.new(pivot) * tilt * CFrame.new(-pivot) * baseCF
-  where pivot = the root position at trip time, dropped by CFG.pivotDrop
-  studs (2.5 -> roughly ground level for an R6 rig). That composition is a
-  rotation about a world point: root position follows the arc p + R*(p0 - p).
-  So the feet stay put, the body tips over them like a felled tree, and the
-  torso ends up lying on the ground instead of hovering at standing height.
-  There is still NO velocity write anywhere. Gravity still owns the fall once
-  the script releases at 90 degrees.
+  THE HONEST CONSEQUENCE, stated before the push and again here: a rotated
+  root CFrame PERSISTS across physics steps in this VM (probed 2026-10-30: an
+  up vector of (1,0,0) was still (1,0,0) 0.1 s later; the humanoid does not
+  snap you upright). So once you are down you stay down until you rejoin.
+  _G.PlayerTrip.stop() does NOT stand you up either - stop() only disconnects
+  and removes the HUD, it never restores the pose. Rejoining is the exit.
+  That is the requested behaviour, not a bug to be fixed later.
 
-  BASE IS CAPTURED, NOT LIVE. Each step rebuilds from the CFrame captured at
-  trip time, never from the current one. Composing a rotation about a fixed
-  pivot with the LIVE CFrame would re-apply the rotation every frame and
-  compound it. This was the trap in the old applyTilt.
+  HOW THE FALL WORKS (unchanged from v2.4.0, which fixed the flung feeling)
+    root.CFrame = CFrame.new(pivot) * tilt * CFrame.new(-pivot) * baseCF
+  The pivot is the root position dropped by CFG.pivotDrop studs, i.e. at the
+  feet, so the body tips over the feet like a felled tree instead of spinning
+  about a point in mid-air (which is what v2.3.0 and earlier did, and why it
+  read as a fling).
+    - baseCF is CAPTURED at trip time and rebuilt from every step. Composing a
+      fixed-pivot rotation onto the LIVE CFrame would re-apply the rotation
+      each frame and compound it.
+    - curve t*t*(2-t): slow lean, fast overbalance, slight bleed at the end.
+    - NO velocity write anywhere. Gravity does the falling.
 
-  CURVE: theta = HALF_PI * t*t*(2-t). Accelerating like a real topple (the
-  lean is slow, the overbalance is not), with a slight bleed off the last few
-  degrees so the landing does not snap.
-
-  PROBED EARLIER THIS SESSION (why a true ragdoll is not possible here):
+  PROBED THIS SESSION (why a true ragdoll is not available here):
     Motor6D.C0 / Part0 / Part1 / Enabled -> nil / Unknown property
     Humanoid.PlatformStand               -> Unknown property
-    Humanoid:ChangeState + Enum.HumanoidStateType -> nil (so FallingDown and
-                                            Physics cannot even be named)
+    Humanoid:ChangeState + Enum.HumanoidStateType -> nil
     AssemblyAngularVelocity / AngularVelocity / RotVelocity -> nil
     Instance.new                         -> nil (no BallSocketConstraint)
-  Rotation is the only lever. v2.4.0 changes WHERE it pivots, which is the
-  difference between a spin and a fall.
+  Rotation is the only lever.
 
   THE CONSTANTS TO TUNE
     CFG.ramp      = 0.65 s topple (lower = snappier)
-    CFG.pivotDrop = 2.5 studs below the root centre = the pivot at the feet.
-                    Raise toward 3 for a lower, more grounded pivot; lower
-                    toward 1.5 for a pivot nearer the hips.
+    CFG.pivotDrop = 2.5 studs below the root centre = pivot at the feet
     CFG.roll      = 0.30 max side roll in rad (0 = dead straight forward)
-    CFG.settle    = 0.45 s to swing back up when YOU ask for it
     CFG.flail     = 0.85 rad limb throw, only if joints are readable (usually 0)
     CFG.keyVK     = 0x47 the trip key (G)
 
-  UNVERIFIED: how it LOOKS in game. The pivot maths is standard CFrame
-  composition, but the feel is untested.
+  UNVERIFIED: how it LOOKS in game.
 
-  _G.PlayerTrip.trip() / .getUp() / .stop() / .state() / .bind('G')
+  _G.PlayerTrip.trip() / .stop() / .state() / .bind('G')
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v2.4.0'
+local VERSION = 'v2.5.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -82,11 +80,9 @@ local CFG = {
     ramp      = 0.65,
     roll      = 0.30,
     pivotDrop = 2.5,
-    settle    = 0.45,
     flail     = 0.85,
     keyVK     = 0x47,
     keyName   = 'G',
-    recoverVK = 0x20,
 }
 
 -- Roblox KeyCode -> Windows virtual-key code, same mapping the bundled
@@ -123,14 +119,13 @@ NAME_OF_VK[0x28] = 'Down'
 NAME_OF_VK[0x25] = 'Left'
 NAME_OF_VK[0x27] = 'Right'
 
-local state    = 'idle'   -- idle | toppling | lying | rising
+local state    = 'idle'   -- idle | toppling | lying   (no 'rising' any more)
 local phaseAt  = 0
 local baseCF   = nil      -- full CFrame captured at trip time
 local pivot    = nil      -- world point at the feet
 local rollNow  = 0
 local binding  = false
 local lastTripKey = false
-local lastSpace   = false
 local motors   = {}
 local captured = false
 
@@ -172,9 +167,7 @@ local function applyTilt(root, theta)
     return ok
 end
 
--- Accelerating topple with a soft bleed off the last degrees:
--- t*t*(2-t) starts slow (the lean), speeds up (the overbalance) and eases
--- the final few degrees so the landing does not snap.
+-- Slow lean, fast overbalance, slight bleed off the last degrees.
 local function curve(t)
     if t <= 0 then return 0 end
     if t >= 1 then return 1 end
@@ -222,19 +215,9 @@ local function setJoints(amount)
     end
 end
 
-local function beginRise()
-    if state ~= 'toppling' and state ~= 'lying' then return false end
-    state   = 'rising'
-    phaseAt = os.clock()
-    setJoints(0)
-    log('getting up (you asked)')
-    return true
-end
-
+-- One shot. If we are not idle, this does NOTHING - there is no get-up path.
 local function trip()
     if state ~= 'idle' then
-        -- while down, the trip key doubles as "get up"
-        if state == 'lying' or state == 'toppling' then return beginRise() end
         return false
     end
 
@@ -245,7 +228,6 @@ local function trip()
     local okCf, cf = pcall(function() return root.CFrame end)
     if not okCf or not cf then log('no CFrame'); return false end
 
-    -- pivot position: root centre dropped to the feet
     local okP, p0 = pcall(function() return cf.Position end)
     if not okP or not p0 then
         okP, p0 = pcall(function() return root.Position end)
@@ -257,16 +239,16 @@ local function trip()
         log('joints captured: ' .. tostring(n))
     end
 
-    -- different tumble every time: a random side roll, never the same twice
     rollNow = (math.random() * 2 - 1) * CFG.roll
 
-    baseCF = cf
-    pivot  = Vector3.new(p0.X, p0.Y - CFG.pivotDrop, p0.Z)
+    baseCF  = cf
+    pivot   = Vector3.new(p0.X, p0.Y - CFG.pivotDrop, p0.Z)
     state   = 'toppling'
     phaseAt = os.clock()
 
     setJoints(1)
-    log(string.format('tripping about the feet (roll %+.2f rad, %.2fs)', rollNow, CFG.ramp))
+    log(string.format('tripping about the feet (roll %+.2f rad, %.2fs) - no get-up',
+        rollNow, CFG.ramp))
     return true
 end
 
@@ -277,10 +259,6 @@ local function onInputBegan(e)
     if type(code) ~= 'number' then return end
     local vk = VK_OF_CODE[code]
     if not vk then return end
-    if vk == CFG.recoverVK then
-        log('space is reserved for getting up - pick another key')
-        return
-    end
     CFG.keyVK   = vk
     CFG.keyName = NAME_OF_VK[vk] or ('VK ' .. tostring(vk))
     binding     = false
@@ -295,9 +273,7 @@ track(RunService.Heartbeat:Connect(function(dt)
     if not running then return end
     if dt <= 0 or dt > 0.5 then dt = 1/60 end
 
-    local char = lp.Character
-    local root = rootOf(char)
-    local now  = os.clock()
+    local now = os.clock()
 
     local tripDown = (not binding) and held(CFG.keyVK)
     local tripEdge = tripDown and not lastTripKey
@@ -306,44 +282,26 @@ track(RunService.Heartbeat:Connect(function(dt)
         trip()
     end
 
-    local spaceDown = held(CFG.recoverVK)
-    local spaceEdge = spaceDown and not lastSpace
-    lastSpace = spaceDown
-    if spaceEdge and (state == 'toppling' or state == 'lying') then
-        beginRise()
-        return
-    end
-
     if state == 'idle' then return end
 
+    -- LYING: permanently silent. No CFrame writes, no velocity writes, no
+    -- timer, no get-up. The body is yours to rejoin out of.
+    if state == 'lying' then return end
+
+    local char = lp.Character
+    local root = rootOf(char)
     if not root or not baseCF then
         state, baseCF, pivot = 'idle', nil, nil
         return
     end
 
-    -- LYING: deliberately silent. No CFrame writes, no velocity writes, no
-    -- timer. Roblox owns the body from the moment the topple finishes.
-    if state == 'lying' then return end
-
-    if state == 'toppling' then
-        local t = (now - phaseAt) / CFG.ramp
-        if t >= 1 then
-            applyTilt(root, HALF_PI)
-            state = 'lying'
-            log('down - script is idle, press space to get up')
-        else
-            applyTilt(root, HALF_PI * curve(t))
-        end
-
-    elseif state == 'rising' then
-        local t = (now - phaseAt) / CFG.settle
-        if t >= 1 then
-            applyTilt(root, 0)
-            state, baseCF, pivot, rollNow = 'idle', nil, nil, 0
-            log('up')
-        else
-            applyTilt(root, HALF_PI * curve(1 - t))
-        end
+    local t = (now - phaseAt) / CFG.ramp
+    if t >= 1 then
+        applyTilt(root, HALF_PI)
+        state = 'lying'
+        log('down - script is idle for good, rejoin to stand up')
+    else
+        applyTilt(root, HALF_PI * curve(t))
     end
 end))
 
@@ -360,7 +318,7 @@ end)
 track(RunService.RenderStepped:Connect(function()
     if not hud then return end
     local k = binding and 'press a key...' or CFG.keyName
-    hud.Text = string.format('[%s] %s | trip key: %s | space = get up | joints %d',
+    hud.Text = string.format('[%s] %s | trip key: %s | one shot | joints %d',
         VERSION, state, k, #motors)
 end))
 
@@ -400,12 +358,8 @@ if HAS_UI then
                 local sec = mkSection(tab, 'Trip')
                 if not sec then return end
 
-                mkButton(sec, 'Trip', function()
-                    if not trip() then log('trip did nothing - see the line above') end
-                end)
-
-                mkButton(sec, 'Get up', function()
-                    if not beginRise() then log('not down right now') end
+                mkButton(sec, 'Trip (one shot)', function()
+                    if not trip() then log('already down - no get-up in this build') end
                 end)
 
                 mkButton(sec, 'Rebind key', function()
@@ -436,13 +390,12 @@ local function stop()
     if hud then pcall(function() hud:Remove() end); hud = nil end
     if HAS_UI then pcall(function() UI.RemoveTab('Player Trip') end) end
     _G[NAME] = nil
-    log('stopped')
+    log('stopped (pose is NOT restored - rejoin if you are down)')
 end
 
 _G[NAME] = {
     stop    = stop,
     trip    = trip,
-    getUp   = beginRise,
     version = VERSION,
     state   = function() return state end,
     bind    = function(name)
@@ -465,5 +418,5 @@ _G[NAME] = {
         return false
     end,
 }
-log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', tips about the feet, no auto get-up')
+log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', ONE SHOT, no get-up')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Player Trip', 3) end)
