@@ -1,7 +1,16 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v2.0
+  Version: v2.0.1
   Rebindable key fires the trip. Tap Space to recover early.
+
+  v2.0.1 IS A COMPILE FIX ONLY.
+  v2.0 could not run at all: its flail setter read
+      if ... then CFG.flail = v captured = false end
+  on one line. Two assignments with no separator is a parse error
+  ("unexpected symbol near 'captured'"), so the whole chunk failed to compile and
+  not even the version print appeared - which looks exactly like "loaded but did
+  nothing". Fixed by putting the two statements on their own lines.
+  Behaviour is otherwise identical to v2.0.
 
   WHY v2.0 - "yours didnt feel good", "it should ragdoll me"
   v1.x rotated the HumanoidRootPart only. In this VM that is all a root
@@ -53,7 +62,7 @@
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v2.0'
+local VERSION = 'v2.0.1'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -447,7 +456,10 @@ _G[NAME] = {
     version = VERSION,
     state   = function() return state end,
     flail   = function(v)
-        if type(v) == 'number' and v > 0 and v < 2 then CFG.flail = v captured = false end
+        if type(v) == 'number' and v > 0 and v < 2 then
+            CFG.flail = v
+            captured  = false
+        end
     end,
     bind    = function(name)
         local up = string.upper(tostring(name or ''))
