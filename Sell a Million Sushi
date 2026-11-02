@@ -1,31 +1,46 @@
 -- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
--- Version: 2.4.0 -- never gate firing behind arrival (Humanoid:MoveTo is inert here)
+-- Version: 3.0.0 -- pickup + chef upgrade + collect + merge + hire + market-gated deposit
 --
--- WHY v2.3.0 FIRED ZERO TIMES (the user's own log, 2026-11-02):
---   passes=23..38   walks=21..37   walkFails=0   tiersSent=0   nearest=33m (never moved)
---   Humanoid:MoveTo returned successfully 37 times and the character did not move one
---   stud - nearest loot stayed at EXACTLY 33m across 15 consecutive reports. v2.3.0
---   only fired when nearest <= Radius (10), so it never fired at all. That is why it
---   "worked a long time ago and now doesn't": earlier builds had no arrival gate.
+-- CONFIRMED BY PROBE (2026-11-02):
 --
--- FIX: walking is best-effort and NEVER blocks firing. Every pass fires at the nearest
---   CONFIG.PerPass loot regardless of distance. Range is a preference, not a gate.
+-- Every button in the plot is a Model containing a Part named "Button" with a
+-- TouchTransmitter named "TouchInterest". There are ZERO TextButtons and ZERO
+-- ProximityPrompts in the plot (textButtons=0, prompts=0), so all of them are 3D
+-- touch parts:
 --
--- MEASURED (2026-11-02): ONE far loot item fired alone at 98 studs returned delta=0 on
---   CurrentCount. So very long range does fail server-side. But the earlier build did
---   collect, so the honest way to find the real limit is to fire every pass and read
---   landed vs missed - not to block firing entirely and report nothing.
+--   Workspace.Plots.<plot>.Buttons.ButtonBuy1     (Script:BuyScript)
+--   Workspace.Plots.<plot>.Buttons.ButtonBuy5     (Script:BuyScript)
+--   Workspace.Plots.<plot>.Buttons.ButtonBuy25    (Script:BuyScript)
+--   Workspace.Plots.<plot>.Buttons.ButtonBuy100   (Script:BuyScript)
+--   Workspace.Plots.<plot>.Buttons.ButtonMerge    (Script:ButtonScript)
+--   Workspace.Plots.<plot>.Sell.UpgradeButton     (UpgradeButtonScript)
+--   Workspace.Plots.<plot>.Sell.CollectButton     (CollectButtonScript)
+--   Workspace.Plots.<plot>.Sell.DepositButton     (DepositButtonScript)
+--   Workspace.Plots.<plot>.GroupReward.CollectButton
 --
--- CONFIRMED:
---   LootPickup:FireServer(<array of LootTier numbers>, <isDeckHand bool>) - decompiled.
---   Loot parts are named Loot<n>; there is NO LootTier attribute (tierHits=0).
---   CurrentCount = LocalPlayer:GetAttribute("CurrentCount") (number).
---   leaderstats["Net Worth"] reads EMPTY - not used as a witness.
---   CollectionService:GetTagged is nil here - targets come from a children walk.
---   firetouchinterest on CollectButton does nothing (dead end #7).
+-- FISH MARKET VALUE is readable text on Plot.Restaurant.Interior.KitchenBoard.
+--   MarketBoard.TextLabel["Price"] = "Fish Value: 1.4x <garbage char>"
+--   Also TextLabel["Next"] = "Updating in 9s", Axis labels 0.5x / 1.0x / 1.5x.
+--   Parsed with (%d+%.?%d*)x -> 1.4. Range is ~0.1x .. 2.0x, matching the slider.
+--
+-- MONEY: LocalPlayer:GetAttribute("NetWorth") is a STRING like "$2.6M".
+--   leaderstats["Net Worth"].Value reads EMPTY, so the ATTRIBUTE is the witness.
+--   CurrentCount (number) is fish on hand, not money.
+--
+-- UNVERIFIED, and why this build is shaped around it:
+--   firetouchinterest on CollectButton was tested twice and did NOTHING (dead end #7).
+--   But the buttons are genuinely touch parts, so the remaining lever is REAL engine
+--   contact. Teleport mode therefore stands the character ON the button part and lets
+--   the engine generate its own Touched event, with firetouchinterest as a second try.
+--   If that also fails, the Report says so instead of pretending.
+--
+-- THE v2.3.0 LESSON THIS BUILD OBEYS: never gate an action behind a value that might be
+--   unreadable. v2.3.0 only fired when nearest loot <= Radius; Humanoid:MoveTo was inert,
+--   the distance never closed, and it fired ZERO times for 38 passes. Here an unreadable
+--   price or market value means "attempt anyway", never "skip silently".
 
 local NAME    = 'SellAMillionSushi'
-local VERSION = '2.4.0'
+local VERSION = '3.0.0'
 print('[Sell a Million Sushi] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -35,49 +50,52 @@ local RS      = game:GetService('ReplicatedStorage')
 local lp      = Players.LocalPlayer
 
 local CONFIG = {
-    Enabled     = false,
-    PerPass     = 8,      -- tiers fired per LootPickup call
-    BatchSize   = 8,
-    PassCooldown = 0.22,
+    -- pickup
+    Pickup      = true,
+    PerPass     = 8,
+    PickupEvery = 0.22,
     OwnPlotOnly = true,
-    TryWalk     = false,  -- MoveTo is inert in this VM; off by default
-    WalkEvery   = 6,      -- only attempt a walk this often when TryWalk is on
+
+    -- automation
+    AutoChef    = true,   -- Sell.UpgradeButton   (priority 1)
+    AutoCollect = true,   -- Sell.CollectButton + GroupReward.CollectButton
+    AutoMerge   = true,   -- Buttons.ButtonMerge
+    AutoHire    = true,   -- Buttons.ButtonBuy1/5/25/100
+    AutoDeposit = true,   -- Sell.DepositButton, gated by MinMarket
+
+    OneAtATime  = true,   -- only ONE button press per cycle
+    MinMarket   = 1.0,    -- slider 0.1 .. 2.0 - deposit only at/above this
+    ActionEvery = 0.35,
+    StandTime   = 0.14,   -- how long to stand on a button
+    Teleport    = true,   -- stand ON the button (user approved teleporting)
+    UseTouch    = true,   -- also firetouchinterest as a second attempt
 }
 
 local running = true
 local busy    = false
+local savedCF = nil
+
 local stat = {
-    passes=0, landed=0, missed=0, tiersSent=0, walks=0,
-    lastDelta=0, lastErr='none', lastLanded='none',
-    totalCount=0, nearestDist=-1,
-    startCount=nil, lastCount=nil,
+    pickupPasses=0, pickupSent=0, pickupLanded=0,
+    actions=0, chef=0, collect=0, merge=0, hire=0, deposit=0,
+    skipped=0, lastErr='none', lastAction='none',
+    market=nil, money=nil, count=nil,
 }
 
--- forward declarations: stop() uses these before their bodies appear
-local getHrp, getHum
+local getHrp, getHum, myPlot, parseMoney, numAttr, moneyOf, marketValue
 
 local function note(s) print('[SMS] ' .. s) end
 
 local function stop()
     running = false
-    local hum = getHum and getHum()
-    if hum then
-        local c = hum.Parent
-        local hrp = c and c:FindFirstChild('HumanoidRootPart')
-        if hrp then pcall(function() hum:MoveTo(hrp.Position) end) end
-    end
+    local hrp = getHrp and getHrp()
+    if hrp and savedCF then pcall(function() hrp.CFrame = savedCF end) end
     _G[NAME] = nil
     print('[Sell a Million Sushi] stopped')
 end
 _G[NAME] = { stop = stop, version = VERSION }
 
--- ---------------- readers ----------------
-local function numAttr(n)
-    local v
-    pcall(function() v = lp:GetAttribute(n) end)
-    if type(v) == 'number' then return v end
-    return nil
-end
+-- ======================= readers =======================
 
 function getHrp()
     local c
@@ -97,17 +115,37 @@ function getHum()
     return h
 end
 
-local function origin()
-    local hrp = getHrp()
-    if not hrp then return nil end
-    local p
-    pcall(function() p = hrp.Position end)
-    if typeof(p) ~= 'Vector3' then return nil end
-    if p.X == 0 and p.Y == 0 and p.Z == 0 then return nil end
-    return p
+function numAttr(n)
+    local v
+    pcall(function() v = lp:GetAttribute(n) end)
+    if type(v) == 'number' then return v end
+    return nil
 end
 
-local function myPlot()
+-- "$2.6M" -> 2600000.  Handles $, commas, K/M/B/T.
+function parseMoney(s)
+    if type(s) == 'number' then return s end
+    if type(s) ~= 'string' then return nil end
+    local clean = string.gsub(s, ',', '')
+    local num, suf = string.match(clean, '([%d%.]+)%s*([KkMmBbTt]?)')
+    if not num then return nil end
+    local n = tonumber(num)
+    if not n then return nil end
+    suf = (suf or ''):upper()
+    if suf == 'K' then return n * 1e3 end
+    if suf == 'M' then return n * 1e6 end
+    if suf == 'B' then return n * 1e9 end
+    if suf == 'T' then return n * 1e12 end
+    return n
+end
+
+function moneyOf()
+    local raw
+    pcall(function() raw = lp:GetAttribute('NetWorth') end)
+    return parseMoney(raw), raw
+end
+
+function myPlot()
     local n
     pcall(function() n = lp:GetAttribute('assignedPlot') end)
     if type(n) ~= 'string' or n == '' then return nil end
@@ -119,24 +157,225 @@ local function myPlot()
     return workspace:FindFirstChild(n)
 end
 
+-- MarketBoard lives at Plot.Restaurant.Interior.KitchenBoard.MarketBoard
+function marketValue()
+    local plot = myPlot()
+    if not plot then return nil end
+    local board
+    local rest = plot:FindFirstChild('Restaurant')
+    local interior = rest and rest:FindFirstChild('Interior')
+    local kb = interior and interior:FindFirstChild('KitchenBoard')
+    if kb then board = kb:FindFirstChild('MarketBoard') end
+    if not board then
+        local ok, desc = pcall(function() return plot:GetDescendants() end)
+        if ok and desc then
+            for i = 1, #desc do
+                if desc[i].Name == 'MarketBoard' then board = desc[i]; break end
+            end
+        end
+    end
+    if not board then return nil end
+    local ok2, kids = pcall(function() return board:GetDescendants() end)
+    if not ok2 or not kids then return nil end
+    for i = 1, #kids do
+        local d = kids[i]
+        if d.Name == 'Price' then
+            local t
+            pcall(function() t = d.Text end)
+            if type(t) == 'string' then
+                local m = string.match(t, '(%d+%.?%d*)%s*[xX]')
+                if m then return tonumber(m) end
+            end
+        end
+    end
+    return nil
+end
+
+-- Price printed on a button's BillboardGui, if it has one.
+local function priceOf(model)
+    if not model then return nil end
+    local bb = model:FindFirstChildOfClass('BillboardGui')
+    if not bb then return nil end
+    local ok, desc = pcall(function() return bb:GetDescendants() end)
+    if not ok or not desc then return nil end
+    for i = 1, #desc do
+        local d = desc[i]
+        local t
+        pcall(function() t = d.Text end)
+        if type(t) == 'string' then
+            local num, suf = string.match(t, '%$([%d%.]+)%s*([KkMmBbTt]?)')
+            if num then return parseMoney(num .. (suf or '')) end
+        end
+    end
+    return nil
+end
+
+-- ======================= buttons =======================
+
+local function buttonPart(model)
+    if not model or not model.Parent then return nil end
+    local p = model:FindFirstChild('Button')
+    if p and p:IsA('BasePart') then return p end
+    return nil
+end
+
+local function plotChild(plot, folderName, childName)
+    local f = plot and plot:FindFirstChild(folderName)
+    if not f then return nil end
+    return f:FindFirstChild(childName)
+end
+
+-- Affordable = price readable and <= money, OR price unreadable (attempt anyway).
+-- The v2.3.0 lesson: an unreadable number must never silently block an action.
+local function affordable(model)
+    local price = priceOf(model)
+    local cash = moneyOf()
+    if price == nil or cash == nil then return true, nil end
+    return (cash >= price), price
+end
+
+local function standOn(part, label)
+    if not part then return false end
+    local hrp = getHrp()
+    if not hrp then return false end
+    if not savedCF then pcall(function() savedCF = hrp.CFrame end) end
+    if CONFIG.Teleport then
+        local p
+        pcall(function() p = part.Position end)
+        if typeof(p) == 'Vector3' then
+            pcall(function() hrp.CFrame = CFrame.new(p.X, p.Y + 3, p.Z) end)
+            task.wait(CONFIG.StandTime)
+        end
+    end
+    if CONFIG.UseTouch and type(firetouchinterest) == 'function' then
+        pcall(firetouchinterest, hrp, part, 0)
+        task.wait(0.04)
+        pcall(firetouchinterest, hrp, part, 1)
+    end
+    task.wait(0.10)
+    if savedCF then pcall(function() hrp.CFrame = savedCF end) end
+    stat.actions = stat.actions + 1
+    stat.lastAction = label
+    return true
+end
+
+-- ======================= priority queue =======================
+-- Order the user asked for: chef upgrade first, then collect, then merge, then hire.
+-- Deposit is last and only when the market is at/above MinMarket.
+
+local function collectTargets(plot)
+    local out = {}
+    local a = plotChild(plot, 'Sell', 'CollectButton')
+    if a then out[#out + 1] = a end
+    local g = plot and plot:FindFirstChild('GroupReward')
+    local b = g and g:FindFirstChild('CollectButton')
+    if b then out[#out + 1] = b end
+    return out
+end
+
+-- Highest affordable hire button: 100 > 25 > 5 > 1.
+local function bestHire(plot)
+    local names = { 'ButtonBuy100', 'ButtonBuy25', 'ButtonBuy5', 'ButtonBuy1' }
+    for i = 1, #names do
+        local m = plotChild(plot, 'Buttons', names[i])
+        if m and buttonPart(m) then
+            local ok = affordable(m)
+            if ok then return m, names[i] end
+        end
+    end
+    return nil
+end
+
+-- Returns model, label, statKey
+local function nextAction()
+    local plot = myPlot()
+    if not plot then return nil end
+    local cash = moneyOf()
+
+    if CONFIG.AutoChef then
+        local m = plotChild(plot, 'Sell', 'UpgradeButton')
+        if m and buttonPart(m) and affordable(m) then
+            return m, 'ChefUpgrade', 'chef'
+        end
+    end
+
+    if CONFIG.AutoCollect then
+        local list = collectTargets(plot)
+        for i = 1, #list do
+            if buttonPart(list[i]) then
+                return list[i], 'Collect' .. i, 'collect'
+            end
+        end
+    end
+
+    if CONFIG.AutoMerge then
+        local m = plotChild(plot, 'Buttons', 'ButtonMerge')
+        if m and buttonPart(m) and affordable(m) then
+            return m, 'Merge', 'merge'
+        end
+    end
+
+    if CONFIG.AutoHire then
+        local m, nm = bestHire(plot)
+        if m then return m, nm, 'hire' end
+    end
+
+    if CONFIG.AutoDeposit then
+        local mv = marketValue()
+        -- unreadable market => do not deposit, because the whole point is the threshold
+        if mv and mv >= CONFIG.MinMarket then
+            local m = plotChild(plot, 'Sell', 'DepositButton')
+            if m and buttonPart(m) then
+                return m, 'Deposit@' .. string.format('%.2f', mv) .. 'x', 'deposit'
+            end
+        end
+    end
+
+    return nil
+end
+
+local function actionCycle()
+    local done = 0
+    local guard = 0
+    while running and CONFIG.Enabled and guard < 8 do
+        guard = guard + 1
+        local model, label, key = nextAction()
+        if not model then break end
+        local part = buttonPart(model)
+        if not part then break end
+        if standOn(part, label) then
+            stat[key] = (stat[key] or 0) + 1
+            done = done + 1
+        end
+        if CONFIG.OneAtATime then break end
+        task.wait(0.06)
+    end
+    if done == 0 then stat.skipped = stat.skipped + 1 end
+    return done
+end
+
+-- ======================= pickup =======================
+
 local function lootFolders()
     local all = {}
     local plots = workspace:FindFirstChild('Plots')
     if plots then
-        for _, p in ipairs(plots:GetChildren()) do
-            local f = p:FindFirstChild('LootSpawned')
+        local i = 1
+        local kids = plots:GetChildren()
+        for i = 1, #kids do
+            local f = kids[i]:FindFirstChild('LootSpawned')
             if f then all[#all + 1] = f end
         end
     end
     if not CONFIG.OwnPlotOnly then return all end
     local mine, keep = myPlot(), {}
-    for _, f in ipairs(all) do
-        if f.Parent == mine then keep[#keep + 1] = f end
+    for i = 1, #all do
+        if all[i].Parent == mine then keep[#keep + 1] = all[i] end
     end
     return keep
 end
 
--- name first, attribute second (v1.1.0's bug was attribute-only)
+-- Name first, attribute second. The LootTier attribute does not exist in this game.
 local function tierOf(inst)
     if not inst then return nil end
     local t
@@ -148,22 +387,13 @@ local function tierOf(inst)
     return nil
 end
 
-local function posOf(inst)
-    if not inst then return nil end
-    local p
-    pcall(function() p = inst.Position end)
-    if typeof(p) == 'Vector3' then return p end
-    pcall(function() p = inst.PrimaryPart and inst.PrimaryPart.Position end)
-    if typeof(p) == 'Vector3' then return p end
-    return nil
-end
-
--- Nearest-first. dist = -1 when the origin could not be read.
 local function lootList()
     local out = {}
-    local org = origin()
-    for _, ff in ipairs(lootFolders()) do
-        for _, c in ipairs(ff:GetChildren()) do
+    local folders = lootFolders()
+    for f = 1, #folders do
+        local kids = folders[f]:GetChildren()
+        for i = 1, #kids do
+            local c = kids[i]
             local part, tier = c, tierOf(c)
             if not tier and c.ClassName == 'Model' then
                 local ok, desc = pcall(function() return c:GetDescendants() end)
@@ -175,137 +405,100 @@ local function lootList()
                 end
             end
             if tier and part and part.Parent then
-                local p = posOf(part)
-                local d = -1
-                if org and p then d = (p - org).Magnitude end
-                out[#out + 1] = { part = part, tier = tier, dist = d, pos = p }
+                out[#out + 1] = { part = part, tier = tier }
             end
         end
-    end
-    if org then
-        table.sort(out, function(a, b)
-            if a.dist < 0 then return false end
-            if b.dist < 0 then return true end
-            return a.dist < b.dist
-        end)
     end
     return out
 end
 
--- ---------------- firing ----------------
 local function fireLoot(tiers)
     local re = RS:FindFirstChild('RemoteEvents')
     if not re then return false, 'RemoteEvents missing' end
     local r = re:FindFirstChild('LootPickup')
     if not r then return false, 'LootPickup missing' end
-    local ok, err = pcall(function() r:FireServer(tiers, false) end)
-    return ok, err
+    return (pcall(function() r:FireServer(tiers, false) end))
 end
 
--- Re-verify Parent right before firing: the game destroys parts client-side every 0.05 s.
-local function buildBatch(list, limit)
-    local tiers = {}
-    for i = 1, math.min(#list, limit) do
-        local e = list[i]
-        if e.part and e.part.Parent then
-            tiers[#tiers + 1] = e.tier
-        end
-    end
-    return tiers
-end
-
-local function tryWalk(targetPos)
-    local hum = getHum()
-    if not hum or not targetPos then return end
-    stat.walks = stat.walks + 1
-    if type(hum.MoveTo) == 'function' then
-        pcall(function() hum:MoveTo(targetPos) end)
-    else
-        pcall(function() hum.WalkToPoint = targetPos end)
-    end
-end
-
--- ---------------- pass ----------------
--- Fires EVERY pass. No arrival gate. That gate is what silently disabled v2.3.0.
-local function pass()
-    if busy then return end
-    busy = true
-    local before = numAttr('CurrentCount')
-    local ok, err = pcall(function()
-        local list = lootList()
-        stat.totalCount = #list
-        stat.nearestDist = (#list > 0) and list[1].dist or -1
-        if #list == 0 then return end
-
-        -- optional best-effort walk; never blocks the fire below
-        if CONFIG.TryWalk and stat.passes % CONFIG.WalkEvery == 0 then
-            tryWalk(list[1].pos)
-        end
-
-        local tiers = buildBatch(list, CONFIG.PerPass)
-        if #tiers == 0 then return end
-
-        local sent, serr = fireLoot(tiers)
-        if sent then
-            stat.tiersSent = stat.tiersSent + #tiers
-            stat.lastErr = 'none'
-        else
-            stat.lastErr = tostring(serr)
-        end
-    end)
-    if not ok then stat.lastErr = tostring(err) end
-
-    task.wait(0.25)
-    local after = numAttr('CurrentCount')
-    if type(before) == 'number' and type(after) == 'number' then
-        local d = after - before
-        stat.lastDelta = d
-        stat.lastCount = after
-        if d > 0 then
-            stat.landed = stat.landed + 1
-            stat.lastLanded = '+' .. d
-        else
-            stat.missed = stat.missed + 1
-        end
-    end
-    stat.passes = stat.passes + 1
-    busy = false
-end
-
--- ---------------- report ----------------
-local function report()
+local function pickupPass()
     local list = lootList()
-    local cc = numAttr('CurrentCount')
-    if stat.startCount == nil then stat.startCount = cc end
-    note('--- REPORT v' .. VERSION .. ' ---')
-    note('perPass=' .. CONFIG.PerPass .. '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly) ..
-         '  tryWalk=' .. tostring(CONFIG.TryWalk))
-    note('lootTotal=' .. #list .. '  nearest=' ..
-         tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm  (fired regardless)')
-    for i = 1, math.min(#list, 5) do
-        note('  ' .. list[i].part.Name .. ' d=' .. math.floor(list[i].dist) .. 'm')
+    if #list == 0 then return 0 end
+    local tiers = {}
+    local limit = math.min(#list, CONFIG.PerPass)
+    for i = 1, limit do
+        local e = list[i]
+        if e.part and e.part.Parent then tiers[#tiers + 1] = e.tier end
     end
-    note('CurrentCount ' .. tostring(stat.startCount) .. ' -> ' .. tostring(cc))
-    note('passes=' .. stat.passes .. ' landed=' .. stat.landed ..
-         ' missed=' .. stat.missed .. ' tiersSent=' .. stat.tiersSent)
-    note('lastDelta=' .. tostring(stat.lastDelta) .. ' lastGain=' .. tostring(stat.lastLanded) ..
-         ' lastErr=' .. tostring(stat.lastErr))
-    if stat.tiersSent == 0 then
-        note('VERDICT: nothing fired - no Loot<n> part found in the plot folders.')
-    elseif stat.landed > 0 then
-        note('VERDICT: firing works. ' .. stat.landed .. ' of ' .. stat.passes ..
-             ' passes moved CurrentCount (nearest ' ..
-             tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm).')
+    if #tiers == 0 then return 0 end
+    local before = numAttr('CurrentCount')
+    local ok, err = fireLoot(tiers)
+    if ok then
+        stat.pickupSent = stat.pickupSent + #tiers
     else
-        note('VERDICT: fired ' .. stat.tiersSent .. ' tiers, CurrentCount never moved.')
-        note('         Nearest loot is ' ..
-             tostring(#list > 0 and math.floor(list[1].dist) or -1) ..
-             'm - this is the server distance limit, or the plot is not yours.')
+        stat.lastErr = tostring(err)
+    end
+    task.wait(0.18)
+    local after = numAttr('CurrentCount')
+    if type(before) == 'number' and type(after) == 'number' and after > before then
+        stat.pickupLanded = stat.pickupLanded + 1
+    end
+    stat.pickupPasses = stat.pickupPasses + 1
+    return #tiers
+end
+
+-- ======================= report =======================
+
+local function report()
+    local mv = marketValue()
+    local cash, raw = moneyOf()
+    local cc = numAttr('CurrentCount')
+    stat.market, stat.money, stat.count = mv, cash, cc
+
+    note('--- REPORT v' .. VERSION .. ' ---')
+    note('plot=' .. tostring(myPlot() and myPlot().Name or 'NIL'))
+    note('market=' .. tostring(mv) .. 'x (raw Price label)  minMarket=' .. CONFIG.MinMarket .. 'x')
+    note('money=' .. tostring(raw) .. ' -> parsed ' .. tostring(cash) ..
+         '  fish=' .. tostring(cc))
+
+    local plot = myPlot()
+    local names = { 'ButtonBuy1', 'ButtonBuy5', 'ButtonBuy25', 'ButtonBuy100', 'ButtonMerge' }
+    for i = 1, #names do
+        local m = plotChild(plot, 'Buttons', names[i])
+        if m then
+            local pr = priceOf(m)
+            local bp = buttonPart(m)
+            note('  ' .. names[i] .. ' price=' .. tostring(pr) ..
+                 ' buttonPart=' .. tostring(bp ~= nil))
+        else
+            note('  ' .. names[i] .. ' MISSING')
+        end
+    end
+    local up = plotChild(plot, 'Sell', 'UpgradeButton')
+    note('  UpgradeButton=' .. tostring(up ~= nil) .. ' price=' ..
+         tostring(priceOf(up)))
+
+    note('pickup: passes=' .. stat.pickupPasses .. ' tiersSent=' .. stat.pickupSent ..
+         ' landedPasses=' .. stat.pickupLanded)
+    note('actions=' .. stat.actions .. ' chef=' .. stat.chef .. ' collect=' .. stat.collect ..
+         ' merge=' .. stat.merge .. ' hire=' .. stat.hire .. ' deposit=' .. stat.deposit)
+    note('skippedCycles=' .. stat.skipped .. ' lastAction=' .. tostring(stat.lastAction) ..
+         ' lastErr=' .. tostring(stat.lastErr))
+
+    if stat.actions == 0 then
+        note('VERDICT: no button was pressed yet. If prices read as nil that is fine -')
+        note('         an unreadable price counts as affordable and still attempts.')
+    else
+        note('VERDICT: pressed ' .. stat.actions .. ' buttons. Compare fish/money above')
+        note('         against the last report to see if they took effect.')
+    end
+    if mv == nil then
+        note('NOTE: market value unreadable - deposit is skipped by design (threshold).')
     end
     note('--- end ---')
 end
 
--- ---------------- menu ----------------
+-- ======================= menu =======================
+
 local function safeToggle(sec, id, label, default, cb)
     if pcall(function() sec:Toggle(id, label, default, cb) end) then return true end
     if pcall(function() sec:Toggle(label, id, default, cb) end) then return true end
@@ -319,30 +512,60 @@ local function safeButton(sec, label, cb)
     return false
 end
 
+local function safeSlider(sec, id, label, min, max, default, cb)
+    if pcall(function() sec:Slider(id, label, min, max, default, cb) end) then return true end
+    if pcall(function() sec:Slider(label, min, max, default, cb) end) then return true end
+    if pcall(function() sec:Slider(id, label, default, min, max, cb) end) then return true end
+    return false
+end
+
 local function arm()
-    stat.startCount = numAttr('CurrentCount')
-    stat.landed, stat.missed, stat.passes = 0, 0, 0
-    stat.tiersSent, stat.walks, stat.lastDelta = 0, 0, 0
-    stat.lastLanded, stat.lastErr = 'none', 'none'
+    stat.pickupPasses, stat.pickupSent, stat.pickupLanded = 0, 0, 0
+    stat.actions, stat.chef, stat.collect, stat.merge, stat.hire, stat.deposit = 0,0,0,0,0,0
+    stat.skipped = 0
 end
 
 if UI then
     pcall(function()
         UI.AddTab('Sell a Million Sushi', function(tab)
-            local main = tab:Section('Auto', 'Left')
-            safeToggle(main, 'sms_on', 'Auto Fish Pickup', CONFIG.Enabled, function(v)
+            local auto = tab:Section('Automation', 'Left')
+            safeToggle(auto, 'sms_on', 'Auto Everything', CONFIG.Enabled, function(v)
                 CONFIG.Enabled = v
                 if v then arm() end
             end)
-            safeButton(main, 'Per Pass +4', function()
+            safeToggle(auto, 'sms_one', 'One Action At A Time', CONFIG.OneAtATime,
+                function(v) CONFIG.OneAtATime = v end)
+            safeToggle(auto, 'sms_chef', 'Auto Upgrade Chef (priority)', CONFIG.AutoChef,
+                function(v) CONFIG.AutoChef = v end)
+            safeToggle(auto, 'sms_collect', 'Auto Collect Money', CONFIG.AutoCollect,
+                function(v) CONFIG.AutoCollect = v end)
+            safeToggle(auto, 'sms_merge', 'Auto Merge', CONFIG.AutoMerge,
+                function(v) CONFIG.AutoMerge = v end)
+            safeToggle(auto, 'sms_hire', 'Auto Hire Fishermen', CONFIG.AutoHire,
+                function(v) CONFIG.AutoHire = v end)
+            safeToggle(auto, 'sms_dep', 'Auto Deposit Fish', CONFIG.AutoDeposit,
+                function(v) CONFIG.AutoDeposit = v end)
+            safeSlider(auto, 'sms_market', 'Min Market Value', 0.1, 2.0, CONFIG.MinMarket,
+                function(v)
+                    local n = tonumber(v)
+                    if n then CONFIG.MinMarket = math.clamp(n, 0.1, 2.0) end
+                end)
+
+            local pick = tab:Section('Pickup', 'Right')
+            safeToggle(pick, 'sms_pick', 'Auto Fish Pickup', CONFIG.Pickup,
+                function(v) CONFIG.Pickup = v end)
+            safeButton(pick, 'Per Pass +4', function()
                 CONFIG.PerPass = CONFIG.PerPass + 4; note('perPass=' .. CONFIG.PerPass)
             end)
-            safeButton(main, 'Per Pass -4', function()
+            safeButton(pick, 'Per Pass -4', function()
                 CONFIG.PerPass = math.max(1, CONFIG.PerPass - 4); note('perPass=' .. CONFIG.PerPass)
             end)
-            safeButton(main, 'Fire Once Now', function() pass() end)
-            safeButton(main, 'Report', function() report() end)
-            safeButton(main, 'Stop', function() stop() end)
+            safeButton(pick, 'Run One Action Now', function()
+                local n = actionCycle()
+                note('one action cycle: pressed=' .. n)
+            end)
+            safeButton(pick, 'Report', function() report() end)
+            safeButton(pick, 'Stop', function() stop() end)
         end)
     end)
 end
@@ -356,27 +579,61 @@ local function poll()
         if ok and type(v) == 'boolean' then return v end
         return nil
     end
-    local o = getv('sms_on', 'Auto Fish Pickup')
-    if o ~= nil and o ~= CONFIG.Enabled then
-        CONFIG.Enabled = o
-        if o then arm() end
+    local map = {
+        { 'sms_on',      'Auto Everything',        'Enabled' },
+        { 'sms_one',     'One Action At A Time',   'OneAtATime' },
+        { 'sms_chef',    'Auto Upgrade Chef (priority)', 'AutoChef' },
+        { 'sms_collect', 'Auto Collect Money',     'AutoCollect' },
+        { 'sms_merge',   'Auto Merge',             'AutoMerge' },
+        { 'sms_hire',    'Auto Hire Fishermen',    'AutoHire' },
+        { 'sms_dep',     'Auto Deposit Fish',      'AutoDeposit' },
+        { 'sms_pick',    'Auto Fish Pickup',       'Pickup' },
+    }
+    for i = 1, #map do
+        local row = map[i]
+        local v = getv(row[1], row[2])
+        if v ~= nil then
+            local was = CONFIG[row[3]]
+            CONFIG[row[3]] = v
+            if row[3] == 'Enabled' and v and not was then arm() end
+        end
     end
 end
+
+-- ======================= loops =======================
 
 task.spawn(function()
     while running do
         poll()
         if CONFIG.Enabled then
-            pass()
-            task.wait(CONFIG.PassCooldown)
+            if not busy then
+                busy = true
+                local ok, err = pcall(actionCycle)
+                if not ok then stat.lastErr = tostring(err) end
+                busy = false
+            end
+            task.wait(CONFIG.ActionEvery)
         else
             task.wait(0.25)
         end
     end
 end)
 
+task.spawn(function()
+    while running do
+        if CONFIG.Pickup and CONFIG.Enabled then
+            local ok, err = pcall(pickupPass)
+            if not ok then stat.lastErr = tostring(err) end
+            task.wait(CONFIG.PickupEvery)
+        else
+            task.wait(0.3)
+        end
+    end
+end)
+
 arm()
 note('loaded. plot=' .. tostring(myPlot() and myPlot().Name or 'NIL') ..
-     '  loot=' .. #lootList() .. '  count=' .. tostring(stat.startCount) ..
-     '  perPass=' .. CONFIG.PerPass)
+     '  market=' .. tostring(marketValue()) .. 'x' ..
+     '  minMarket=' .. CONFIG.MinMarket .. 'x' ..
+     '  money=' .. tostring((moneyOf())))
 print('[Sell a Million Sushi] running. Stop with: _G.SellAMillionSushi.stop()')
