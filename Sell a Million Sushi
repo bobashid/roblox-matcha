@@ -1,13 +1,12 @@
 -- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
--- Version: 2.6.0 -- simple menu: one toggle per feature, slider for the deposit value
+-- Version: 2.7.0 -- menu is three toggles and one slider. Nothing else.
 --
--- v2.6.0 is a MENU change only. Behaviour is identical to v2.5.0:
+-- v2.7.0 is a MENU change only. Behaviour is identical to v2.6.0:
 --   * Auto Fish Pickup   -> toggle
 --   * Auto Deposit Fish  -> toggle  +  Deposit At (x) slider (1.0 .. 2.0, 0.1 steps)
 --   * Fish Value Overlay -> toggle
--- Every helper button (Per Pass +/-, Threshold +/-, Deposit Now, Re-arm, Overlay
--- Higher/Lower, Read Market Now) is gone. Report and Stop remain, because you need a
--- way to read the result and a way to stop it.
+-- Report and Stop are gone. Each feature has its own off switch, so turning all
+-- three toggles off leaves the script loaded but inert; re-run the Hub to unload.
 --
 -- CONFIRMED (probed 2026-11-02):
 --   Market value is readable text on Plot.Restaurant.Interior.KitchenBoard.MarketBoard:
@@ -18,16 +17,12 @@
 --   NetWorth     = LocalPlayer:GetAttribute("NetWorth") (STRING like "$2.6M")
 --   Drawing.new supports Text/Square/Line/Circle/Quad/Triangle/Image
 --
--- WHY v2.3.0 FIRED ZERO TIMES: it gated LootPickup on arrival, Humanoid:MoveTo is inert
---   here, so the distance never closed and tiersSent stayed 0 for 38 passes. Nothing in
---   this build gates on a value that can fail to arrive.
---
--- UNVERIFIED: firetouchinterest on these buttons has never been confirmed to do anything.
---   The deposit therefore measures CurrentCount before and after and reports
---   "took N fish" or "no change" instead of assuming it worked.
+-- UNVERIFIED: firetouchinterest on DepositButton has never been confirmed to work
+--   here. The deposit therefore measures CurrentCount before and after instead of
+--   assuming it worked; the result is printed to the console, not to a menu.
 
 local NAME    = 'SellAMillionSushi'
-local VERSION = '2.6.0'
+local VERSION = '2.7.0'
 print('[Sell a Million Sushi] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -483,51 +478,11 @@ task.spawn(function()
     end
 end)
 
--- ---------------- report ----------------
-local function report()
-    local list = lootList()
-    local cc = numAttr('CurrentCount')
-    local mult, nextTxt = readMarket()
-    if stat.startCount == nil then stat.startCount = cc end
-    note('--- REPORT v' .. VERSION .. ' ---')
-    note('pickup=' .. tostring(CONFIG.Enabled) .. '  overlay=' .. tostring(CONFIG.ShowMarket) ..
-         '  autoDeposit=' .. tostring(CONFIG.AutoDeposit))
-    note('market=' .. tostring(mult) .. 'x  next=' .. tostring(nextTxt) ..
-         '  depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x')
-    note('depositPart=' .. tostring(depositPart() ~= nil) ..
-         '  armed=' .. tostring(depositArmed) ..
-         '  deposits=' .. stat.deposits ..
-         '  lastDeposit=' .. tostring(stat.lastDeposit))
-    note('lootTotal=' .. #list .. '  nearest=' ..
-         tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm')
-    note('CurrentCount ' .. tostring(stat.startCount) .. ' -> ' .. tostring(cc))
-    note('passes=' .. stat.passes .. ' landed=' .. stat.landed ..
-         ' missed=' .. stat.missed .. ' tiersSent=' .. stat.tiersSent)
-    note('lastDelta=' .. tostring(stat.lastDelta) .. ' lastErr=' .. tostring(stat.lastErr))
-    if mult == nil then
-        note('NOTE: market unreadable - deposit cannot trigger.')
-    elseif stat.deposits > 0 then
-        note('VERDICT: deposit worked ' .. stat.deposits .. ' time(s).')
-    elseif stat.lastDeposit ~= 'none' then
-        note('VERDICT: deposit attempted, CurrentCount did not fall.')
-    else
-        note('VERDICT: deposit has not triggered yet (market below ' ..
-             string.format('%.1f', CONFIG.DepositAt) .. 'x).')
-    end
-    note('--- end ---')
-end
-
--- ---------------- menu: one toggle per feature + one slider ----------------
+-- ---------------- menu: three toggles, one slider ----------------
 local function safeToggle(sec, id, label, default, cb)
     if pcall(function() sec:Toggle(id, label, default, cb) end) then return true end
     if pcall(function() sec:Toggle(label, id, default, cb) end) then return true end
     if pcall(function() sec:Toggle(label, default, cb) end) then return true end
-    return false
-end
-
-local function safeButton(sec, label, cb)
-    if pcall(function() sec:Button(label, cb) end) then return true end
-    if pcall(function() sec:Button(label, label, cb) end) then return true end
     return false
 end
 
@@ -573,8 +528,6 @@ if UI then
                 end)
             safeToggle(main, 'sms_market', 'Fish Value Overlay', CONFIG.ShowMarket,
                 function(v) CONFIG.ShowMarket = v end)
-            safeButton(main, 'Report', function() report() end)
-            safeButton(main, 'Stop', function() stop() end)
         end)
     end)
 end
@@ -628,4 +581,4 @@ note('loaded. plot=' .. tostring(myPlot() and myPlot().Name or 'NIL') ..
 note('market=' .. tostring(m0) .. 'x  next=' .. tostring(n0) ..
      '  depositAt=' .. string.format('%.1f', CONFIG.DepositAt) .. 'x' ..
      '  depositPart=' .. tostring(depositPart() ~= nil))
-print('[Sell a Million Sushi] running. Stop with: _G.SellAMillionSushi.stop()')
+print('[Sell a Million Sushi] running. Turn the three toggles off to idle it.')
