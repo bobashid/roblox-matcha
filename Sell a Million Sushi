@@ -1,20 +1,31 @@
 -- Sell a Million Sushi (place 125866884667103) - Matcha LuauVM
--- Version: 2.4.0 -- never gate firing behind arrival (Humanoid:MoveTo is inert here)
+-- Version: 2.4.1 -- v2.4.0 pickup + fish-market multiplier overlay
+--
+-- v2.4.1 adds ONE thing to v2.4.0: an on-screen overlay showing the live fish value
+-- multiplier. Pickup behaviour is byte-identical to v2.4.0.
+--
+-- THE MARKET VALUE IS REAL READABLE TEXT (probed 2026-11-02):
+--   Workspace.Plots.<plot>.Restaurant.Interior.KitchenBoard.MarketBoard
+--   carries a SurfaceGui "MarketGui" with TextLabels:
+--       Title = "Fish Market"
+--       Price = "Fish Value: 1.4x <garbage char>"   <- the live multiplier
+--       Next  = "Updating in 9s"                    <- countdown to the next change
+--   Parsed with string.match(text, '(%d+%.?%d*)%s*[xX]') -> 1.4
+--   No WorldToScreen needed: this is a fixed on-screen Drawing.Text, so it does not
+--   depend on camera projection at all.
+--
+-- Drawing constructors confirmed present in this VM (probe):
+--   Square, Line, Text, Circle, Quad, Triangle, Image - all true.
+--   Drawings are created ONCE and only mutated, never created in the render loop.
 --
 -- WHY v2.3.0 FIRED ZERO TIMES (the user's own log, 2026-11-02):
 --   passes=23..38   walks=21..37   walkFails=0   tiersSent=0   nearest=33m (never moved)
 --   Humanoid:MoveTo returned successfully 37 times and the character did not move one
---   stud - nearest loot stayed at EXACTLY 33m across 15 consecutive reports. v2.3.0
---   only fired when nearest <= Radius (10), so it never fired at all. That is why it
---   "worked a long time ago and now doesn't": earlier builds had no arrival gate.
---
--- FIX: walking is best-effort and NEVER blocks firing. Every pass fires at the nearest
---   CONFIG.PerPass loot regardless of distance. Range is a preference, not a gate.
+--   stud. v2.3.0 only fired when nearest <= Radius (10), so it never fired at all.
 --
 -- MEASURED (2026-11-02): ONE far loot item fired alone at 98 studs returned delta=0 on
---   CurrentCount. So very long range does fail server-side. But the earlier build did
---   collect, so the honest way to find the real limit is to fire every pass and read
---   landed vs missed - not to block firing entirely and report nothing.
+--   CurrentCount. Very long range does fail server-side; fire every pass and read
+--   landed vs missed rather than gating.
 --
 -- CONFIRMED:
 --   LootPickup:FireServer(<array of LootTier numbers>, <isDeckHand bool>) - decompiled.
@@ -25,14 +36,15 @@
 --   firetouchinterest on CollectButton does nothing (dead end #7).
 
 local NAME    = 'SellAMillionSushi'
-local VERSION = '2.4.0'
+local VERSION = '2.4.1'
 print('[Sell a Million Sushi] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 
-local Players = game:GetService('Players')
-local RS      = game:GetService('ReplicatedStorage')
-local lp      = Players.LocalPlayer
+local Players   = game:GetService('Players')
+local RS        = game:GetService('ReplicatedStorage')
+local RunService = game:GetService('RunService')
+local lp        = Players.LocalPlayer
 
 local CONFIG = {
     Enabled     = false,
@@ -41,7 +53,13 @@ local CONFIG = {
     PassCooldown = 0.22,
     OwnPlotOnly = true,
     TryWalk     = false,  -- MoveTo is inert in this VM; off by default
-    WalkEvery   = 6,      -- only attempt a walk this often when TryWalk is on
+    WalkEvery   = 6,
+
+    -- overlay
+    ShowMarket  = true,
+    OverlayX    = 24,
+    OverlayY    = 120,
+    OverlaySize = 22,
 }
 
 local running = true
@@ -54,7 +72,7 @@ local stat = {
 }
 
 -- forward declarations: stop() uses these before their bodies appear
-local getHrp, getHum
+local getHrp, getHum, myPlot, readMarket, overlayLbl, overlaySub
 
 local function note(s) print('[SMS] ' .. s) end
 
@@ -66,6 +84,8 @@ local function stop()
         local hrp = c and c:FindFirstChild('HumanoidRootPart')
         if hrp then pcall(function() hum:MoveTo(hrp.Position) end) end
     end
+    if overlayLbl then pcall(function() overlayLbl:Remove() end) end
+    if overlaySub then pcall(function() overlaySub:Remove() end) end
     _G[NAME] = nil
     print('[Sell a Million Sushi] stopped')
 end
@@ -107,7 +127,7 @@ local function origin()
     return p
 end
 
-local function myPlot()
+function myPlot()
     local n
     pcall(function() n = lp:GetAttribute('assignedPlot') end)
     if type(n) ~= 'string' or n == '' then return nil end
@@ -191,6 +211,108 @@ local function lootList()
     end
     return out
 end
+
+-- ---------------- market reader ----------------
+-- Walks the whole MarketBoard subtree so it works whether the labels sit directly
+-- under the Part or under the SurfaceGui child.
+function readMarket()
+    local plot = myPlot()
+    if not plot then return nil, nil end
+    local board
+    local rest = plot:FindFirstChild('Restaurant')
+    local interior = rest and rest:FindFirstChild('Interior')
+    local kb = interior and interior:FindFirstChild('KitchenBoard')
+    if kb then board = kb:FindFirstChild('MarketBoard') end
+    if not board then return nil, nil end
+
+    local mult, nextTxt
+    local ok, desc = pcall(function() return board:GetDescendants() end)
+    if not ok or not desc then return nil, nil end
+    for i = 1, #desc do
+        local d = desc[i]
+        if d.Name == 'Price' then
+            local t
+            pcall(function() t = d.Text end)
+            if type(t) == 'string' then
+                local m = string.match(t, '(%d+%.?%d*)%s*[xX]')
+                if m then mult = tonumber(m) end
+            end
+        elseif d.Name == 'Next' then
+            local t
+            pcall(function() t = d.Text end)
+            if type(t) == 'string' and #t > 0 then nextTxt = t end
+        end
+    end
+    return mult, nextTxt
+end
+
+-- ---------------- overlay ----------------
+-- Fixed screen position, so no WorldToScreen and no camera dependence.
+-- Drawings are created once here and only mutated in the render loop.
+if Drawing then
+    pcall(function()
+        overlayLbl = Drawing.new('Text')
+        overlayLbl.Size = CONFIG.OverlaySize
+        overlayLbl.Center = false
+        overlayLbl.Outline = true
+        overlayLbl.Visible = false
+        overlayLbl.Color = Color3.fromRGB(255, 225, 90)
+        overlayLbl.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY)
+
+        overlaySub = Drawing.new('Text')
+        overlaySub.Size = CONFIG.OverlaySize - 8
+        overlaySub.Center = false
+        overlaySub.Outline = true
+        overlaySub.Visible = false
+        overlaySub.Color = Color3.fromRGB(190, 190, 190)
+        overlaySub.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY + CONFIG.OverlaySize + 4)
+    end)
+end
+
+local function renderOverlay()
+    if not overlayLbl then return end
+    if not CONFIG.ShowMarket then
+        overlayLbl.Visible = false
+        if overlaySub then overlaySub.Visible = false end
+        return
+    end
+    local mult, nextTxt = readMarket()
+    if mult then
+        overlayLbl.Visible = true
+        overlayLbl.Text = string.format('Fish Value: %.2fx', mult)
+        if mult >= 1.5 then
+            overlayLbl.Color = Color3.fromRGB(120, 255, 140)
+        elseif mult >= 1.0 then
+            overlayLbl.Color = Color3.fromRGB(255, 225, 90)
+        else
+            overlayLbl.Color = Color3.fromRGB(255, 130, 110)
+        end
+        if overlaySub then
+            overlaySub.Visible = (nextTxt ~= nil)
+            if nextTxt then overlaySub.Text = nextTxt end
+        end
+    else
+        overlayLbl.Visible = true
+        overlayLbl.Text = 'Fish Value: ?'
+        overlayLbl.Color = Color3.fromRGB(170, 170, 170)
+        if overlaySub then overlaySub.Visible = false end
+    end
+end
+
+-- Throttled: reading a subtree every frame is waste. ~7 Hz is plenty for a number
+-- that changes every 9 s.
+task.spawn(function()
+    local acc = 0
+    pcall(function()
+        RunService.RenderStepped:Connect(function(dt)
+            if not running then return end
+            acc = acc + dt
+            if acc < 0.15 then return end
+            acc = 0
+            pcall(renderOverlay)
+        end)
+    end)
+end)
 
 -- ---------------- firing ----------------
 local function fireLoot(tiers)
@@ -276,10 +398,13 @@ end
 local function report()
     local list = lootList()
     local cc = numAttr('CurrentCount')
+    local mult, nextTxt = readMarket()
     if stat.startCount == nil then stat.startCount = cc end
     note('--- REPORT v' .. VERSION .. ' ---')
     note('perPass=' .. CONFIG.PerPass .. '  ownPlotOnly=' .. tostring(CONFIG.OwnPlotOnly) ..
          '  tryWalk=' .. tostring(CONFIG.TryWalk))
+    note('market=' .. tostring(mult) .. 'x  next=' .. tostring(nextTxt) ..
+         '  overlay=' .. tostring(CONFIG.ShowMarket))
     note('lootTotal=' .. #list .. '  nearest=' ..
          tostring(#list > 0 and math.floor(list[1].dist) or -1) .. 'm  (fired regardless)')
     for i = 1, math.min(#list, 5) do
@@ -290,6 +415,9 @@ local function report()
          ' missed=' .. stat.missed .. ' tiersSent=' .. stat.tiersSent)
     note('lastDelta=' .. tostring(stat.lastDelta) .. ' lastGain=' .. tostring(stat.lastLanded) ..
          ' lastErr=' .. tostring(stat.lastErr))
+    if mult == nil then
+        note('OVERLAY: market unreadable - check Plot.Restaurant.Interior.KitchenBoard.MarketBoard')
+    end
     if stat.tiersSent == 0 then
         note('VERDICT: nothing fired - no Loot<n> part found in the plot folders.')
     elseif stat.landed > 0 then
@@ -343,6 +471,30 @@ if UI then
             safeButton(main, 'Fire Once Now', function() pass() end)
             safeButton(main, 'Report', function() report() end)
             safeButton(main, 'Stop', function() stop() end)
+
+            local ov = tab:Section('Overlay', 'Right')
+            safeToggle(ov, 'sms_market', 'Show Fish Value Overlay', CONFIG.ShowMarket,
+                function(v) CONFIG.ShowMarket = v end)
+            safeButton(ov, 'Overlay Higher', function()
+                CONFIG.OverlayY = math.max(0, CONFIG.OverlayY - 20)
+                if overlayLbl then overlayLbl.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY) end
+                if overlaySub then
+                    overlaySub.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY + CONFIG.OverlaySize + 4)
+                end
+                note('overlayY=' .. CONFIG.OverlayY)
+            end)
+            safeButton(ov, 'Overlay Lower', function()
+                CONFIG.OverlayY = CONFIG.OverlayY + 20
+                if overlayLbl then overlayLbl.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY) end
+                if overlaySub then
+                    overlaySub.Position = Vector2.new(CONFIG.OverlayX, CONFIG.OverlayY + CONFIG.OverlaySize + 4)
+                end
+                note('overlayY=' .. CONFIG.OverlayY)
+            end)
+            safeButton(ov, 'Read Market Now', function()
+                local m, n = readMarket()
+                note('market=' .. tostring(m) .. 'x  next=' .. tostring(n))
+            end)
         end)
     end)
 end
@@ -361,6 +513,8 @@ local function poll()
         CONFIG.Enabled = o
         if o then arm() end
     end
+    local m = getv('sms_market', 'Show Fish Value Overlay')
+    if m ~= nil then CONFIG.ShowMarket = m end
 end
 
 task.spawn(function()
@@ -376,7 +530,10 @@ task.spawn(function()
 end)
 
 arm()
+local m0, n0 = readMarket()
 note('loaded. plot=' .. tostring(myPlot() and myPlot().Name or 'NIL') ..
      '  loot=' .. #lootList() .. '  count=' .. tostring(stat.startCount) ..
      '  perPass=' .. CONFIG.PerPass)
+note('market=' .. tostring(m0) .. 'x  next=' .. tostring(n0) ..
+     '  overlay=' .. tostring(CONFIG.ShowMarket))
 print('[Sell a Million Sushi] running. Stop with: _G.SellAMillionSushi.stop()')
