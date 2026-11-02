@@ -1,78 +1,59 @@
 --[[
   Player Trip (universal) - Matcha LuauVM
-  Version: v2.0.2
-  Rebindable key fires the trip. Tap Space to recover early.
+  Version: v2.1.0
+  Rebindable key fires the trip. Tap Space to get up early.
 
-  TWO FIXES OVER v2.0, both in the limb-flop path only. Nothing else changed.
+  WHAT CHANGED FROM v2.0.x - "it should be natural ragdoll not forces"
+  v2.0 shoved the character: it wrote root.Velocity = look * 30 + up * 6 every
+  step and snapped the root CFrame to face-down instantly. That is a scripted
+  launch, not a fall.
 
-  1) COMPILE ERROR (that is why v2.0 did nothing at all).
-     v2.0's flail setter read
-         if ... then CFG.flail = v captured = false end
-     on one line. Two assignments with no separator is a parse error, so the
-     whole chunk failed to compile and even the version print never appeared -
-     which looks exactly like "loaded but nothing happened". Now on two lines.
+  v2.1.0 removes EVERY velocity write. Nothing pushes you. Gravity does the
+  falling. The only thing written is a ROTATION, and only while the body is
+  tipping over: theta ramps 0 -> 90 degrees with a topple curve (t*t, so it
+  accelerates like a body losing its footing) over CFG.ramp seconds. Once the
+  body is down, the script writes NOTHING AT ALL - position and motion are the
+  physics engine's, which is what makes it read as natural.
 
-  2) REMOVED AN UNVERIFIED API FROM THE FLOP.
-     v2.0 built each throw as a CFrame and eased it with
-         e.rest * CFrame.new(0,0,0):Lerp(e.throw, amount)
-     CFrame:Lerp has NOT been probed in this VM (fromMatrix and fromAxisAngle
-     are both nil here, so datatype methods do get stripped). If :Lerp were
-     nil the joint write would never happen and the trip would rotate the root
-     but leave the limbs stiff - the exact complaint that produced v2.0.
-     Now the throw is stored as three angles and rebuilt every time with
-     CFrame.Angles, which IS confirmed, and CFrame * CFrame is a pattern
-     already used in the user's own Anti Afk script. Same visual result, no
-     unverified dependency.
-
-  WHY v2.0 - "yours didnt feel good", "it should ragdoll me"
-  v1.x rotated the HumanoidRootPart only. In this VM that is all a root
-  rotation does: the welds carry the limbs with it, so the character tilts as
-  one rigid board. Stiff, not a tumble.
-
-  PROBED earlier this session, which is what makes the flop possible:
-    char children: Head, Torso, Left Arm, Right Arm, Left Leg, Right Leg,
-                   HumanoidRootPart   (R6)
-    Torso holds SIX Motor6D joints: Neck, Left Shoulder, Right Shoulder,
-                   Left Hip, Right Hip, RootJoint
-    motor.C0  read  -> ok=true, userdata
-    motor.C0  WRITE -> ok=true, err=nil, and the value STICKS on read-back
+  PROBED THIS SESSION, and it is why a true ragdoll is not available:
+    Motor6D.Part0 / Part1 / Enabled   -> Unknown property (reads nil, writes error)
+    Motor6D.C0                        -> reads nil, write errors
+                                         ("CFrameMeta expected, got nil")
+    Humanoid.PlatformStand            -> Unknown property
+    AssemblyAngularVelocity / AngularVelocity / RotVelocity -> nil, writes error
+    AssemblyLinearVelocity / Velocity -> readable Vector3 (NOT used here)
+    Instance.new                      -> nil, so no BallSocketConstraint can be
+                                         created to let the limbs actually flop
+  A real physics ragdoll needs ONE of: joints disabled, PlatformStand, a
+  constraint instance, or angular velocity. All four are absent in this VM.
+  What is left is a rotation the body falls out of - which is what this does.
 
   HOW THE TRIP WORKS
-    1. rotate the root so the body pitches face-down along travel
-    2. THROW THE LIMBS: each Motor6D gets a C0 offset with a random flail, so
-       arms and legs splay and swing instead of staying in the walk pose
-    3. push Velocity along travel and let physics slide you
-    4. recover: joints return to their captured rest C0, root eases upright
-  Joint rest poses are CAPTURED on first trip, not hardcoded, so the character
-  returns to exactly its own original pose and a custom rig is not broken.
+    1. capture the current rotation once (rotation only, position is never set
+       from a stored value - the root's live Position is read every step)
+    2. toppling: theta = 90deg * (t/ramp)^2, written per step for CFG.ramp s
+    3. down:     zero writes for CFG.down s. You lie there. Gravity owns it.
+    4. rising:   theta eases back to 0 over CFG.settle s, then idle
 
-  STILL TRUE: there is no Humanoid state machine in this VM (ChangeState,
-  GetState, SetStateEnabled, GetStateEnabled, PlayEmote, LoadAnimation all
-  nil, Enum.HumanoidStateType nil). So the game's own ragdoll ANIMATION cannot
-  play - what you get is a joint-driven flop, which is physical, not animated.
-
-  FEATURES KEPT
-    - REBINDABLE KEY, default G. Click "Rebind key", press the key you want.
-      InputBegan gives a Roblox KeyCode here, so it is mapped to a Windows VK
-      through the same table the bundled Matcha ImGui uses.
-    - SPACE RECOVERS EARLY on a rising edge, instead of waiting out duration.
+  The limb flop from v2.0 is kept but is now OPTIONAL and self-disabling: the
+  joints are captured once, and if C0 does not read back as a CFrame the flop
+  simply does not run (console shows "joints captured: 0"). It never errors.
 
   THE CONSTANTS TO TUNE
-    CFG.speed    = 30   studs/s of slide
-    CFG.duration = 0.75 s face-down
-    CFG.settle   = 0.22 s to ease joints and root back
-    CFG.flail    = 0.85 rad maximum limb throw
-    CFG.keyVK    = 0x47 the trip key (G)
+    CFG.ramp   = 0.45 s to fall over (lower = snappier topple)
+    CFG.down   = 1.10 s lying there before getting up
+    CFG.settle = 0.30 s to stand back up
+    CFG.flail  = 0.85 rad limb throw, only if joints are readable
+    CFG.keyVK  = 0x47 the trip key (G)
 
-  UNVERIFIED: how the flop LOOKS has not been seen in game. If the body rotates
-  but the arms and legs stay in the walk pose, the joint capture found 0 motors -
-  check the console line "joints captured: N".
+  UNVERIFIED: how it LOOKS in game. If the body stays upright, the root write
+  is being rejected - check the console for the trip fired line and tell me.
 
-  _G.PlayerTrip.trip() / .stop() / .state() / .bind('G') / .flail(0.85)
+  _G.PlayerTrip.trip() / .stop() / .state() / .bind('G')
 ]]
 
 local NAME    = 'PlayerTrip'
-local VERSION = 'v2.0.2'
+local VERSION = 'v2.1.0'
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print('[' .. NAME .. '] ' .. VERSION)
@@ -81,6 +62,8 @@ local Players    = game:GetService('Players')
 local RunService = game:GetService('RunService')
 local UIS        = game:GetService('UserInputService')
 local lp         = Players.LocalPlayer
+
+local HALF_PI = math.pi / 2
 
 local running = true
 local conns   = {}
@@ -91,12 +74,12 @@ local function track(c)
 end
 
 local CFG = {
-    speed    = 30,
-    duration = 0.75,
-    settle   = 0.22,
-    flail    = 0.85,
-    keyVK    = 0x47,
-    keyName  = 'G',
+    ramp      = 0.45,
+    down      = 1.10,
+    settle    = 0.30,
+    flail     = 0.85,
+    keyVK     = 0x47,
+    keyName   = 'G',
     recoverVK = 0x20,
 }
 
@@ -134,14 +117,14 @@ NAME_OF_VK[0x28] = 'Down'
 NAME_OF_VK[0x25] = 'Left'
 NAME_OF_VK[0x27] = 'Right'
 
-local state   = 'idle'
-local untilAt = 0
-local basis   = nil
-local travel  = nil
-local binding = false
+local state    = 'idle'   -- idle | toppling | down | rising
+local phaseAt  = 0
+local phaseEnd = 0
+local baseRot  = nil
+local binding  = false
 local lastTripKey = false
 local lastSpace   = false
-local motors  = {}   -- { motor = Motor6D, rest = CFrame, ax/ay/az = numbers }
+local motors   = {}
 local captured = false
 
 local function log(m)
@@ -165,49 +148,47 @@ local function held(vk)
     return ok and v == true
 end
 
-local function makeCFrame(pos, right, up, back)
-    return CFrame.new(
-        pos.X, pos.Y, pos.Z,
-        right.X, up.X, back.X,
-        right.Y, up.Y, back.Y,
-        right.Z, up.Z, back.Z
-    )
+-- Rotation only, positioned at the origin. Built with the 12-number form
+-- because CFrame.new(Vector3) errors and fromMatrix/fromAxisAngle are nil here.
+local function rotOf(cf)
+    local ok, r, u, b
+    ok = pcall(function()
+        r = cf.RightVector
+        u = cf.UpVector
+        b = cf.LookVector * -1
+    end)
+    if not ok or not r or not u or not b then return nil end
+    return CFrame.new(0, 0, 0,
+        r.X, u.X, b.X,
+        r.Y, u.Y, b.Y,
+        r.Z, u.Z, b.Z)
 end
 
-local function uprightBasis(look)
-    local up    = Vector3.new(0, 1, 0)
-    local back  = -look
-    local right = up:Cross(back)
-    if right.Magnitude < 1e-3 then
-        right = Vector3.new(1, 0, 0)
-    else
-        right = right.Unit
-    end
-    return right, up, back
+-- Write rotation about the LIVE position. Position is never restored from a
+-- stored value, so gravity keeps whatever it has already done.
+local function applyTilt(root, theta)
+    if not root or not baseRot then return end
+    local ok, p = pcall(function() return root.Position end)
+    if not ok or not p then return end
+    local ok2 = pcall(function()
+        root.CFrame = CFrame.new(p.X, p.Y, p.Z) * (baseRot * CFrame.Angles(theta, 0, 0))
+    end)
+    return ok2
 end
 
-local function flatBasis(dir)
-    local up    = dir
-    local front = Vector3.new(0, -1, 0)
-    local back  = -front
-    local right = up:Cross(back)
-    if right.Magnitude < 1e-3 then return nil end
-    return right.Unit, up, back
-end
-
--- Capture each joint's rest pose once, and roll three angles per joint.
--- Capturing rather than hardcoding means the character returns to exactly its
--- own pose and a custom rig is not broken by the trip.
+-- Optional limb flop. C0 may read nil in this VM (it did this session), so the
+-- capture simply finds nothing and the flop never runs. It cannot error.
 local function captureJoints(char)
     motors = {}
     local torso = char and (char:FindFirstChild('Torso') or char:FindFirstChild('UpperTorso'))
     if not torso then return 0 end
-    local kids = torso:GetChildren()
+    local ok, kids = pcall(function() return torso:GetChildren() end)
+    if not ok or not kids then return 0 end
     for i = 1, #kids do
         local m = kids[i]
         if m.ClassName == 'Motor6D' then
-            local ok, c0 = pcall(function() return m.C0 end)
-            if ok and c0 and type(c0) == 'userdata' then
+            local okc, c0 = pcall(function() return m.C0 end)
+            if okc and c0 and type(c0) == 'userdata' then
                 local mag = CFG.flail * (0.5 + math.random())
                 motors[#motors + 1] = {
                     motor = m,
@@ -223,8 +204,6 @@ local function captureJoints(char)
     return #motors
 end
 
--- amount 0 = captured rest pose, amount 1 = full flail.
--- Built with CFrame.Angles every time: no CFrame:Lerp, which is unprobed here.
 local function setJoints(amount)
     for i = 1, #motors do
         local e = motors[i]
@@ -248,46 +227,36 @@ local function trip()
     local okCf, cf = pcall(function() return root.CFrame end)
     if not okCf or not cf then log('no CFrame'); return false end
 
+    local rot = rotOf(cf)
+    if not rot then log('could not read rotation'); return false end
+
     if not captured then
         local n = captureJoints(char)
         log('joints captured: ' .. tostring(n))
     end
 
-    local look = cf.LookVector
-    local flat = Vector3.new(look.X, 0, look.Z)
-    if flat.Magnitude < 1e-3 then
-        flat = Vector3.new(0, 0, -1)
-    else
-        flat = flat.Unit
-    end
-
-    local r, u, b = flatBasis(flat)
-    if not r then log('bad basis'); return false end
-
-    basis  = { right = r, up = u, back = b }
-    travel = flat
-    state  = 'tripping'
-    untilAt = os.clock() + CFG.duration
+    baseRot = rot
+    state   = 'toppling'
+    phaseAt = os.clock()
 
     setJoints(1)
-
-    pcall(function()
-        root.Velocity = flat * CFG.speed + Vector3.new(0, 6, 0)
-    end)
-
-    log('trip fired, ' .. string.format('%.0f', CFG.speed) .. ' studs/s')
+    log('tripping (gravity fall, no push)')
     return true
 end
 
-local function beginSettle(root, now)
-    local r, u, b = uprightBasis(travel or Vector3.new(0, 0, -1))
-    basis  = { right = r, up = u, back = b }
-    state  = 'settling'
-    untilAt = now + CFG.settle
+local function beginDown(root)
+    state     = 'down'
+    phaseAt   = os.clock()
+    phaseEnd  = phaseAt + CFG.down
+    applyTilt(root, HALF_PI)
+end
+
+local function beginRise(root)
+    if state == 'idle' or state == 'rising' then return end
+    state   = 'rising'
+    phaseAt = os.clock()
     setJoints(0)
-    if root then
-        pcall(function() root.Velocity = Vector3.new(0, 0, 0) end)
-    end
+    log('getting up')
 end
 
 local function onInputBegan(e)
@@ -298,7 +267,7 @@ local function onInputBegan(e)
     local vk = VK_OF_CODE[code]
     if not vk then return end
     if vk == CFG.recoverVK then
-        log('space is reserved for recover - pick another key')
+        log('space is reserved for getting up - pick another key')
         return
     end
     CFG.keyVK   = vk
@@ -329,40 +298,41 @@ track(RunService.Heartbeat:Connect(function(dt)
     local spaceDown = held(CFG.recoverVK)
     local spaceEdge = spaceDown and not lastSpace
     lastSpace = spaceDown
-    if spaceEdge and state == 'tripping' then
-        if root then beginSettle(root, now) else state = 'idle' end
-        log('recovered early (space)')
+    if spaceEdge and (state == 'toppling' or state == 'down') then
+        beginRise(root)
         return
     end
 
     if state == 'idle' then return end
-
-    if not root or not basis then
-        state, basis, travel = 'idle', nil, nil
+    if not root or not baseRot then
+        state, baseRot = 'idle', nil
         return
     end
 
-    local okP, p = pcall(function() return root.Position end)
-    if not okP or not p then
-        state, basis, travel = 'idle', nil, nil
-        return
-    end
-
-    if state == 'tripping' then
-        if now >= untilAt then
-            beginSettle(root, now)
+    if state == 'toppling' then
+        local t = (now - phaseAt) / CFG.ramp
+        if t >= 1 then
+            beginDown(root)
         else
-            pcall(function()
-                root.CFrame = makeCFrame(p, basis.right, basis.up, basis.back)
-            end)
+            -- t*t: slow start, fast finish. This is the whole "fall" curve.
+            applyTilt(root, HALF_PI * t * t)
         end
-    elseif state == 'settling' then
-        pcall(function()
-            root.CFrame = makeCFrame(p, basis.right, basis.up, basis.back)
-        end)
-        if now >= untilAt then
-            state, basis, travel = 'idle', nil, nil
-            log('recovered')
+
+    elseif state == 'down' then
+        -- Deliberately silent. No CFrame writes, no velocity writes.
+        -- Whatever the physics engine is doing to you is what you get.
+        if now >= phaseEnd then
+            beginRise(root)
+        end
+
+    elseif state == 'rising' then
+        local t = (now - phaseAt) / CFG.settle
+        if t >= 1 then
+            applyTilt(root, 0)
+            state, baseRot = 'idle', nil
+        else
+            local e = 1 - t
+            applyTilt(root, HALF_PI * e * e)
         end
     end
 end))
@@ -380,7 +350,7 @@ end)
 track(RunService.RenderStepped:Connect(function()
     if not hud then return end
     local k = binding and 'press a key...' or CFG.keyName
-    hud.Text = string.format('[%s] %s | trip key: %s | space = recover | joints %d',
+    hud.Text = string.format('[%s] %s | trip key: %s | space = get up | joints %d',
         VERSION, state, k, #motors)
 end))
 
@@ -430,12 +400,6 @@ if HAS_UI then
                     refreshKeyText()
                 end)
 
-                mkButton(sec, 'Re-roll flail', function()
-                    captured = false
-                    local char = lp.Character
-                    if char then log('flail re-rolled: ' .. tostring(captureJoints(char)) .. ' joints') end
-                end)
-
                 local okT, t = pcall(function() return sec:Text('Trip key: ' .. CFG.keyName) end)
                 if okT then keyText = t end
             end)
@@ -451,7 +415,7 @@ end
 
 local function stop()
     running = false
-    state, basis, travel, binding = 'idle', nil, nil, false
+    state, baseRot, binding = 'idle', nil, false
     setJoints(0)
     for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
     conns = {}
@@ -466,12 +430,6 @@ _G[NAME] = {
     trip    = trip,
     version = VERSION,
     state   = function() return state end,
-    flail   = function(v)
-        if type(v) == 'number' and v > 0 and v < 2 then
-            CFG.flail = v
-            captured  = false
-        end
-    end,
     bind    = function(name)
         local up = string.upper(tostring(name or ''))
         if #up == 1 then
@@ -492,5 +450,5 @@ _G[NAME] = {
         return false
     end,
 }
-log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', space recovers, joint flop enabled')
+log(VERSION .. ' loaded - trip key ' .. CFG.keyName .. ', gravity fall, space gets up')
 pcall(function() notify(NAME .. ' ' .. VERSION .. ' loaded', 'Player Trip', 3) end)
