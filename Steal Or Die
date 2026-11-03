@@ -1,43 +1,54 @@
 -- Steal Or Die (place 119925538689885) - Matcha LuauVM
--- Version: 1.0.0 -- item ESP with a toggle per rarity, plus exit ESP
+-- Version: 1.1.0 -- ACTIVE items only, one marker per item, rarity toggles, exit ESP
 --
--- CONFIRMED by probe this session (place 119925538689885, game.Name = 'Ugc'):
---   ReplicatedStorage.LootTemplates  -> 38 templates, names ARE the item keys
---       Phone, Monitor, Bag, DeskFan, Laptop, Headphones, Camera, Watch,
---       Console, Toolbox, Microwave, Painting, Screwdriver, Hammer,
---       BarricadeKit, CoffeeMug, FireExtinguisher, Textbooks, Keyboard,
---       DeskLamp, Tablet, Guitar, RecordPlayer, Projector, GraphicsCard,
---       ServerBlade, LabCase, HardDrive, MiniFridge, Dossier, CryptoWallet,
---       GoldBar, Potions, Spellbook, JackOLantern, CrystalBall, Candelabra,
---       Candy
---   ReplicatedStorage.GameConfig (decompiled) defines the RARITY SET:
---       Rarities = { {name, chance, colour}, ... }, RarityColour[name] = colour,
---       RarityStroke.Secret, rollRarity(), rarityFor(), pickLootKey(),
---       Items[key].fixedRarity / .spawnWeight / .tool / .season,
---       prices per rarity: Common / Uncommon / Rare / Mythic / Legendary,
---       SecretChance = 0.0002 with fixedRarity == "Secret"
---     => the rarity names used by the toggles are those seven strings:
---        Common, Uncommon, Rare, Mythic, Legendary, Secret, and Unknown.
---   Loot items in the world are Parts named 'Item' (288 were present in the
---     lobby under the shop 'Promo Dump Bin' displays). A live in-match item
---     carries NO attributes and no children, so the rarity is read from the
---     nearest ancestor model's text labels, cached per model.
---   workspace.LootItems is a Folder but is EMPTY in the lobby - items only
---     exist during a match, which is why discovery walks the whole workspace.
---   Exit markers: Parts named 'ExitPoint' (parents 'Door' / 'Closet') and
---     Models named 'Exit Sign - Lit' under workspace.ActiveMap.
+-- v1.1.0 - "you got the spawn down but want active items and with a rarity toggle"
+--   v1.0.0 walked the WHOLE workspace for Parts named 'Item'. In the lobby that
+--   found 288 of them - every phone and monitor sitting on the shop displays
+--   under 'Promo Dump Bin'. That is shop stock, not loot. v1.1.0 reads ONLY the
+--   match loot folders, so nothing is boxed in the lobby.
 --
--- NOT USABLE: ReplicatedStorage.ExitSpots holds three CFrameValue children
---   named 'Exit', but CFrameValue.Value reads nil in this VM, so the exits are
---   found by name in the workspace instead.
+--   Also one marker per ITEM now, not per part: a single Phone model has Glass,
+--   Display, FrontCam, Earpiece, Power, VolUp, VolDown, Port children, and v1.0.0
+--   would have boxed every one. The scan takes the model's part named 'Item',
+--   else PrimaryPart, else its first BasePart.
 --
--- UNVERIFIED: the per-rarity COLOURS below for Uncommon / Rare / Mythic are my
---   own picks for the overlay text. Only Common (208,62,58), Legendary
---   (228,184,62) and Secret (228,228,236) came from GameConfig. Colour is
---   cosmetic here; the rarity NAME is what the toggles filter on.
+-- CONFIRMED by probe (2026-11-02, place 119925538689885, game.Name = 'Ugc'):
+--   ReplicatedStorage.LootTemplates -> 38 templates, names ARE the item keys:
+--     Phone, Monitor, Bag, DeskFan, Laptop, Headphones, Camera, Watch, Console,
+--     Toolbox, Microwave, Painting, Screwdriver, Hammer, BarricadeKit, CoffeeMug,
+--     FireExtinguisher, Textbooks, Keyboard, DeskLamp, Tablet, Guitar,
+--     RecordPlayer, Projector, GraphicsCard, ServerBlade, LabCase, HardDrive,
+--     MiniFridge, Dossier, CryptoWallet, GoldBar, Potions, Spellbook,
+--     JackOLantern, CrystalBall, Candelabra, Candy
+--   ReplicatedStorage.GameConfig decompiled in full (635 lines) and defines the
+--     rarity set: Rarities = {{name, chance, colour}}, RarityColour[name],
+--     rollRarity(), rarityFor(), pickLootKey(), Items[key].fixedRarity /
+--     .spawnWeight / .tool / .season, SecretChance = 0.0002.
+--     => the rarity NAMES are exactly:
+--        Common, Uncommon, Rare, Mythic, Legendary, Secret
+--     The ESP adds 'Unknown' as a seventh bucket.
+--   Confirmed colours: Common (208,62,58), Legendary (228,184,62),
+--     Secret stroke (228,228,236). Uncommon / Rare / Mythic colours below are my
+--     own picks - cosmetic only, the toggles filter on the NAME.
+--   workspace.LootItems is the match loot folder: EMPTY in the lobby, populated
+--     during a round. That is the 'active items' source.
+--   Exits: Parts named 'ExitPoint' (parents 'Door' / 'Closet') and Models named
+--     'Exit Sign - Lit' under workspace.ActiveMap.
+--
+-- NOT USABLE: ReplicatedStorage.ExitSpots holds three CFrameValue children named
+--   'Exit' but CFrameValue.Value reads nil in this VM, so exits are found by name
+--   in the workspace instead.
+--
+-- UNVERIFIED: where the rarity STRING actually sits on a live item. A live item
+--   carries no attributes and no children (probed on lobby displays), so this
+--   reads, in order: attributes on the item and up to four ancestors (any key
+--   containing 'rarity'), a StringValue/Value child whose name contains
+--   'rarity', then TextLabels inside the model. Whatever wins is cached per
+--   model for 3 s. If every item shows 'Unknown' in a match, the console line
+--   '[SOD] items=N ...' plus one item's ancestors is what I need to fix it.
 
 local NAME    = 'StealOrDie'
-local VERSION = '1.0.0'
+local VERSION = '1.1.0'
 print('[Steal Or Die] v' .. VERSION)
 
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
@@ -47,6 +58,10 @@ local RunService = game:GetService('RunService')
 local lp         = Players.LocalPlayer
 
 local RARITIES = { 'Common', 'Uncommon', 'Rare', 'Mythic', 'Legendary', 'Secret' }
+
+-- longest / most specific first: 'uncommon' CONTAINS 'common', so Common must be
+-- tested last or every Uncommon would read as Common.
+local MATCH_ORDER = { 'Legendary', 'Mythic', 'Secret', 'Uncommon', 'Rare', 'Common' }
 
 local RCOL = {
     Common    = Color3.fromRGB(208, 62, 58),
@@ -59,10 +74,10 @@ local RCOL = {
 }
 
 local CONFIG = {
-    Items    = true,
-    Exit     = true,
-    MaxDist  = 700,
-    Rarity   = {},
+    Items   = true,
+    Exit    = true,
+    MaxDist = 700,
+    Rarity  = {},
 }
 for i = 1, #RARITIES do CONFIG.Rarity[RARITIES[i]] = true end
 CONFIG.Rarity.Unknown = true
@@ -76,6 +91,9 @@ local function track(c)
 end
 
 local function log(m) print('[SOD] ' .. tostring(m)) end
+
+local itemPool = {}
+local exitPool = {}
 
 local function stop()
     running = false
@@ -96,9 +114,6 @@ end
 _G[NAME] = { stop = stop, version = VERSION }
 
 -- ---------------- drawing pools (created once, only mutated) ----------------
-local itemPool = {}
-local exitPool = {}
-
 local function newSlot()
     local s = { visible = false }
     pcall(function()
@@ -126,16 +141,79 @@ local function hideSlot(s)
     s.visible = false
 end
 
--- ---------------- discovery ----------------
-local targets = {}      -- items
-local exits   = {}      -- exit points
-local modelCache = {}   -- model Address -> { rarity, label, at }
+-- ---------------- helpers ----------------
+local function posOf(inst)
+    if not inst then return nil end
+    local p
+    pcall(function() p = inst.Position end)
+    if typeof(p) == 'Vector3' then return p end
+    local pp
+    pcall(function() pp = inst.PrimaryPart end)
+    if pp then
+        local p2
+        pcall(function() p2 = pp.Position end)
+        if typeof(p2) == 'Vector3' then return p2 end
+    end
+    local cf
+    pcall(function() cf = inst.CFrame end)
+    if typeof(cf) == 'CFrame' then return cf.Position end
+    return nil
+end
 
-local function scanTexts(model)
-    local rarity, label = nil, nil
-    if not model then return nil, nil end
-    local ok, desc = pcall(function() return model:GetDescendants() end)
-    if not ok or not desc then return nil, nil end
+local function isPart(cls)
+    if cls == 'Part' then return true end
+    if cls == 'MeshPart' then return true end
+    if cls == 'UnionOperation' then return true end
+    if cls == 'IntersectOperation' then return true end
+    if cls == 'WedgePart' then return true end
+    return false
+end
+
+-- 'uncommon' contains 'common', so test in MATCH_ORDER, never in RARITIES order
+local function normRarity(s)
+    if type(s) ~= 'string' or #s == 0 then return nil end
+    local low = string.lower(s)
+    for i = 1, #MATCH_ORDER do
+        local r = MATCH_ORDER[i]
+        if string.find(low, string.lower(r), 1, true) then return r end
+    end
+    return nil
+end
+
+-- ---------------- rarity resolution ----------------
+local function rarityFromAttributes(inst)
+    local ok, attrs = pcall(function() return inst:GetAttributes() end)
+    if not ok or not attrs then return nil end
+    for k, v in pairs(attrs) do
+        local kl = string.lower(tostring(k))
+        if string.find(kl, 'rarity', 1, true) or string.find(kl, 'tier', 1, true) then
+            local r = normRarity(tostring(v))
+            if r then return r end
+        end
+    end
+    return nil
+end
+
+local function rarityFromValues(inst)
+    local ok, kids = pcall(function() return inst:GetChildren() end)
+    if not ok or not kids then return nil end
+    for i = 1, #kids do
+        local c = kids[i]
+        local nm
+        pcall(function() nm = c.Name end)
+        if type(nm) == 'string' and string.find(string.lower(nm), 'rarity', 1, true) then
+            local v
+            pcall(function() v = c.Value end)
+            local r = normRarity(tostring(v))
+            if r then return r end
+        end
+    end
+    return nil
+end
+
+local function rarityFromText(inst)
+    local ok, desc = pcall(function() return inst:GetDescendants() end)
+    if not ok or not desc then return nil end
     for i = 1, #desc do
         local d = desc[i]
         local cls
@@ -144,71 +222,192 @@ local function scanTexts(model)
             local t
             pcall(function() t = d.Text end)
             if type(t) == 'string' and #t > 0 then
-                if not rarity then
-                    local low = string.lower(t)
-                    for j = 1, #RARITIES do
-                        if string.find(low, string.lower(RARITIES[j]), 1, true) then
-                            rarity = RARITIES[j]
-                            break
-                        end
-                    end
-                end
-                if not label and #t <= 28 then label = t end
+                local r = normRarity(t)
+                if r then return r end
             end
         end
     end
-    return rarity, label
+    return nil
 end
 
-local function rarityOfModel(model)
-    if not model then return 'Unknown', nil end
-    local key = 'm'
-    pcall(function() key = tostring(model.Address) end)
+local modelCache = {}
+
+local function rarityOf(inst)
+    if not inst then return 'Unknown' end
+    local key = 'x'
+    pcall(function() key = tostring(inst.Address) end)
     local c = modelCache[key]
-    if c and (os.clock() - c.at) < 3 then return c.rarity, c.label end
-    local r, l = scanTexts(model)
-    r = r or 'Unknown'
-    modelCache[key] = { rarity = r, label = l, at = os.clock() }
-    return r, l
+    if c and (os.clock() - c.at) < 3 then return c.rarity end
+
+    local r = rarityFromAttributes(inst)
+    local cur = inst
+    local up = 0
+    while not r and cur and up < 4 do
+        local par
+        pcall(function() par = cur.Parent end)
+        cur = par
+        up = up + 1
+        if cur then
+            r = rarityFromAttributes(cur)
+            if not r then r = rarityFromValues(cur) end
+        end
+    end
+    if not r then r = rarityFromValues(inst) end
+    if not r then r = rarityFromText(inst) end
+
+    local final = r or 'Unknown'
+    modelCache[key] = { rarity = final, at = os.clock() }
+    return final
+end
+
+-- ---------------- item discovery (ACTIVE items only) ----------------
+local ITEM_ROOT_NAMES = { 'LootItems', 'DroppedItems', 'Loot' }
+local targets = {}
+local exits   = {}
+local lastReportCount = -1
+
+local function markerPartOf(child)
+    -- one part per item, never one per decorative sub-part
+    local cls
+    pcall(function() cls = child.ClassName end)
+    if isPart(cls) then return child end
+    if cls ~= 'Model' then return nil end
+
+    local named
+    pcall(function() named = child:FindFirstChild('Item') end)
+    if named then
+        local ncls
+        pcall(function() ncls = named.ClassName end)
+        if isPart(ncls) then return named end
+    end
+
+    local pp
+    pcall(function() pp = child.PrimaryPart end)
+    if pp then
+        local pcls
+        pcall(function() pcls = pp.ClassName end)
+        if isPart(pcls) then return pp end
+    end
+
+    local ok, kids = pcall(function() return child:GetChildren() end)
+    if ok and kids then
+        for i = 1, #kids do
+            local k = kids[i]
+            local kcls
+            pcall(function() kcls = k.ClassName end)
+            if isPart(kcls) then return k end
+        end
+    end
+    return nil
+end
+
+local function collectRoot(inst, items)
+    local ok, kids = pcall(function() return inst:GetChildren() end)
+    if not ok or not kids then return end
+    for i = 1, #kids do
+        local c = kids[i]
+        local cls
+        pcall(function() cls = c.ClassName end)
+        if cls == 'Folder' then
+            local ok2, subs = pcall(function() return c:GetChildren() end)
+            if ok2 and subs then
+                for j = 1, #subs do
+                    local s = subs[j]
+                    local part = markerPartOf(s)
+                    if part then
+                        local p = posOf(part)
+                        if p then
+                            local nm
+                            pcall(function() nm = s.Name end)
+                            items[#items + 1] = {
+                                pos = p, rarity = rarityOf(s), label = tostring(nm or 'Item'),
+                            }
+                        end
+                    end
+                end
+            end
+        else
+            local part = markerPartOf(c)
+            if part then
+                local p = posOf(part)
+                if p then
+                    local nm
+                    pcall(function() nm = c.Name end)
+                    items[#items + 1] = {
+                        pos = p, rarity = rarityOf(c), label = tostring(nm or 'Item'),
+                    }
+                end
+            end
+        end
+    end
+end
+
+local function activeItemRoots()
+    local found, nonEmpty = {}, nil
+    for i = 1, #ITEM_ROOT_NAMES do
+        local f
+        pcall(function() f = workspace:FindFirstChild(ITEM_ROOT_NAMES[i]) end)
+        if f then
+            found[#found + 1] = f
+            local n = 0
+            pcall(function() n = #f:GetChildren() end)
+            if n > 0 and not nonEmpty then nonEmpty = f end
+        end
+    end
+    if nonEmpty then return { nonEmpty } end
+    return found
 end
 
 local function refresh()
     local items, ex = {}, {}
+
+    local roots = activeItemRoots()
+    for i = 1, #roots do
+        if #items < 160 then collectRoot(roots[i], items) end
+    end
+
     local ok, desc = pcall(function() return workspace:GetDescendants() end)
-    if not ok or not desc then return end
-    for i = 1, #desc do
-        local d = desc[i]
-        local n, cls
-        pcall(function() n = d.Name; cls = d.ClassName end)
-        if type(n) == 'string' and cls == 'Part' then
-            local low = string.lower(n)
-            local isItem = (n == 'Item' or n == 'Loot')
-            local isExit = (low == 'exitpoint')
-            if isItem or isExit then
-                local p
-                pcall(function() p = d.Position end)
-                if typeof(p) == 'Vector3' then
-                    if isExit then
-                        ex[#ex + 1] = { pos = p, name = 'EXIT' }
-                    elseif #items < 200 then
-                        local r, l = rarityOfModel(d.Parent)
-                        items[#items + 1] = {
-                            part = d, pos = p, rarity = r,
-                            label = l or n,
-                        }
+    if ok and desc then
+        local exitHits = 0
+        for i = 1, #desc do
+            local d = desc[i]
+            local n, cls
+            pcall(function() n = d.Name end)
+            pcall(function() cls = d.ClassName end)
+            if type(n) == 'string' and exitHits < 40 then
+                local low = string.lower(n)
+                if low == 'exitpoint' then
+                    local p = posOf(d)
+                    if p then
+                        exitHits = exitHits + 1
+                        ex[#ex + 1] = { pos = p }
                     end
-                end
-            elseif cls == 'Model' and string.find(low, 'exit sign', 1, true) then
-                local p
-                pcall(function() p = d.Position end)
-                if typeof(p) == 'Vector3' and #ex < 40 then
-                    ex[#ex + 1] = { pos = p, name = 'EXIT' }
+                elseif cls == 'Model' and string.find(low, 'exit sign', 1, true) then
+                    local p = posOf(d)
+                    if p then
+                        exitHits = exitHits + 1
+                        ex[#ex + 1] = { pos = p }
+                    end
                 end
             end
         end
     end
+
     targets = items
     exits   = ex
+
+    if #items ~= lastReportCount then
+        lastReportCount = #items
+        local tally = {}
+        for i = 1, #items do
+            local r = items[i].rarity
+            tally[r] = (tally[r] or 0) + 1
+        end
+        local parts = {}
+        for r, c in pairs(tally) do parts[#parts + 1] = tostring(r) .. '=' .. tostring(c) end
+        log('items=' .. tostring(#items) .. '  exits=' .. tostring(#ex) ..
+            '  [' .. table.concat(parts, ' ') .. ']')
+    end
 end
 
 -- ---------------- origin ----------------
@@ -226,15 +425,14 @@ local function origin()
 end
 
 -- ---------------- renderer ----------------
-local function drawSlot(s, sp, onScreen, dist, text, col, boxH)
-    if not onScreen then hideSlot(s); return end
+local function drawSlot(s, sp, dist, text, col, boxH)
     if s.box then
         s.box.Visible = true
         local w = math.clamp(1400 / math.max(dist, 20), 6, 34)
         local h = w * (boxH or 1.4)
-        s.box.Size    = Vector2.new(w, h)
+        s.box.Size     = Vector2.new(w, h)
         s.box.Position = Vector2.new(sp.X - w * 0.5, sp.Y - h * 0.5)
-        s.box.Color   = col
+        s.box.Color    = col
     end
     if s.txt then
         s.txt.Visible  = true
@@ -263,7 +461,7 @@ track(RunService.RenderStepped:Connect(function()
                     if s then
                         local txt = t.rarity .. '  ' .. tostring(t.label) ..
                                     '  [' .. string.format('%.0f', d) .. 'm]'
-                        drawSlot(s, sp, true, d, txt, RCOL[t.rarity] or RCOL.Unknown, 1.4)
+                        drawSlot(s, sp, d, txt, RCOL[t.rarity] or RCOL.Unknown, 1.4)
                     end
                 end
             end
@@ -284,7 +482,7 @@ track(RunService.RenderStepped:Connect(function()
                     local s = exitPool[eIdx]
                     if s then
                         local txt = 'EXIT  [' .. string.format('%.0f', d) .. 'm]'
-                        drawSlot(s, sp, true, d, txt, Color3.fromRGB(120, 255, 150), 1.8)
+                        drawSlot(s, sp, d, txt, Color3.fromRGB(120, 255, 150), 1.8)
                     end
                 end
             end
@@ -388,6 +586,5 @@ task.spawn(function()
 end)
 
 pcall(refresh)
-log('items=' .. tostring(#targets) .. ' exits=' .. tostring(#exits) ..
-    '  (LootItems is empty in the lobby - items appear in a match)')
+log('v' .. VERSION .. ' ready - active items only (LootItems), loot=empty in lobby is normal')
 print('[Steal Or Die] running')
