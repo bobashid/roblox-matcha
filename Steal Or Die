@@ -1,0 +1,393 @@
+-- Steal Or Die (place 119925538689885) - Matcha LuauVM
+-- Version: 1.0.0 -- item ESP with a toggle per rarity, plus exit ESP
+--
+-- CONFIRMED by probe this session (place 119925538689885, game.Name = 'Ugc'):
+--   ReplicatedStorage.LootTemplates  -> 38 templates, names ARE the item keys
+--       Phone, Monitor, Bag, DeskFan, Laptop, Headphones, Camera, Watch,
+--       Console, Toolbox, Microwave, Painting, Screwdriver, Hammer,
+--       BarricadeKit, CoffeeMug, FireExtinguisher, Textbooks, Keyboard,
+--       DeskLamp, Tablet, Guitar, RecordPlayer, Projector, GraphicsCard,
+--       ServerBlade, LabCase, HardDrive, MiniFridge, Dossier, CryptoWallet,
+--       GoldBar, Potions, Spellbook, JackOLantern, CrystalBall, Candelabra,
+--       Candy
+--   ReplicatedStorage.GameConfig (decompiled) defines the RARITY SET:
+--       Rarities = { {name, chance, colour}, ... }, RarityColour[name] = colour,
+--       RarityStroke.Secret, rollRarity(), rarityFor(), pickLootKey(),
+--       Items[key].fixedRarity / .spawnWeight / .tool / .season,
+--       prices per rarity: Common / Uncommon / Rare / Mythic / Legendary,
+--       SecretChance = 0.0002 with fixedRarity == "Secret"
+--     => the rarity names used by the toggles are those seven strings:
+--        Common, Uncommon, Rare, Mythic, Legendary, Secret, and Unknown.
+--   Loot items in the world are Parts named 'Item' (288 were present in the
+--     lobby under the shop 'Promo Dump Bin' displays). A live in-match item
+--     carries NO attributes and no children, so the rarity is read from the
+--     nearest ancestor model's text labels, cached per model.
+--   workspace.LootItems is a Folder but is EMPTY in the lobby - items only
+--     exist during a match, which is why discovery walks the whole workspace.
+--   Exit markers: Parts named 'ExitPoint' (parents 'Door' / 'Closet') and
+--     Models named 'Exit Sign - Lit' under workspace.ActiveMap.
+--
+-- NOT USABLE: ReplicatedStorage.ExitSpots holds three CFrameValue children
+--   named 'Exit', but CFrameValue.Value reads nil in this VM, so the exits are
+--   found by name in the workspace instead.
+--
+-- UNVERIFIED: the per-rarity COLOURS below for Uncommon / Rare / Mythic are my
+--   own picks for the overlay text. Only Common (208,62,58), Legendary
+--   (228,184,62) and Secret (228,228,236) came from GameConfig. Colour is
+--   cosmetic here; the rarity NAME is what the toggles filter on.
+
+local NAME    = 'StealOrDie'
+local VERSION = '1.0.0'
+print('[Steal Or Die] v' .. VERSION)
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+
+local Players    = game:GetService('Players')
+local RunService = game:GetService('RunService')
+local lp         = Players.LocalPlayer
+
+local RARITIES = { 'Common', 'Uncommon', 'Rare', 'Mythic', 'Legendary', 'Secret' }
+
+local RCOL = {
+    Common    = Color3.fromRGB(208, 62, 58),
+    Uncommon  = Color3.fromRGB(120, 220, 130),
+    Rare      = Color3.fromRGB(90, 160, 255),
+    Mythic    = Color3.fromRGB(200, 100, 255),
+    Legendary = Color3.fromRGB(228, 184, 62),
+    Secret    = Color3.fromRGB(228, 228, 236),
+    Unknown   = Color3.fromRGB(165, 165, 175),
+}
+
+local CONFIG = {
+    Items    = true,
+    Exit     = true,
+    MaxDist  = 700,
+    Rarity   = {},
+}
+for i = 1, #RARITIES do CONFIG.Rarity[RARITIES[i]] = true end
+CONFIG.Rarity.Unknown = true
+
+local running = true
+local conns   = {}
+
+local function track(c)
+    conns[#conns + 1] = c
+    return c
+end
+
+local function log(m) print('[SOD] ' .. tostring(m)) end
+
+local function stop()
+    running = false
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    for i = 1, #itemPool do
+        pcall(function() itemPool[i].box:Remove() end)
+        pcall(function() itemPool[i].txt:Remove() end)
+    end
+    for i = 1, #exitPool do
+        pcall(function() exitPool[i].box:Remove() end)
+        pcall(function() exitPool[i].txt:Remove() end)
+    end
+    itemPool, exitPool = {}, {}
+    _G[NAME] = nil
+    log('stopped')
+end
+_G[NAME] = { stop = stop, version = VERSION }
+
+-- ---------------- drawing pools (created once, only mutated) ----------------
+local itemPool = {}
+local exitPool = {}
+
+local function newSlot()
+    local s = { visible = false }
+    pcall(function()
+        s.box = Drawing.new('Square')
+        s.box.Thickness = 1
+        s.box.Filled = false
+        s.box.Visible = false
+    end)
+    pcall(function()
+        s.txt = Drawing.new('Text')
+        s.txt.Size = 14
+        s.txt.Center = true
+        s.txt.Outline = true
+        s.txt.Visible = false
+    end)
+    return s
+end
+
+for i = 1, 56 do itemPool[i] = newSlot() end
+for i = 1, 12 do exitPool[i] = newSlot() end
+
+local function hideSlot(s)
+    if s.box then s.box.Visible = false end
+    if s.txt then s.txt.Visible = false end
+    s.visible = false
+end
+
+-- ---------------- discovery ----------------
+local targets = {}      -- items
+local exits   = {}      -- exit points
+local modelCache = {}   -- model Address -> { rarity, label, at }
+
+local function scanTexts(model)
+    local rarity, label = nil, nil
+    if not model then return nil, nil end
+    local ok, desc = pcall(function() return model:GetDescendants() end)
+    if not ok or not desc then return nil, nil end
+    for i = 1, #desc do
+        local d = desc[i]
+        local cls
+        pcall(function() cls = d.ClassName end)
+        if cls == 'TextLabel' or cls == 'TextButton' then
+            local t
+            pcall(function() t = d.Text end)
+            if type(t) == 'string' and #t > 0 then
+                if not rarity then
+                    local low = string.lower(t)
+                    for j = 1, #RARITIES do
+                        if string.find(low, string.lower(RARITIES[j]), 1, true) then
+                            rarity = RARITIES[j]
+                            break
+                        end
+                    end
+                end
+                if not label and #t <= 28 then label = t end
+            end
+        end
+    end
+    return rarity, label
+end
+
+local function rarityOfModel(model)
+    if not model then return 'Unknown', nil end
+    local key = 'm'
+    pcall(function() key = tostring(model.Address) end)
+    local c = modelCache[key]
+    if c and (os.clock() - c.at) < 3 then return c.rarity, c.label end
+    local r, l = scanTexts(model)
+    r = r or 'Unknown'
+    modelCache[key] = { rarity = r, label = l, at = os.clock() }
+    return r, l
+end
+
+local function refresh()
+    local items, ex = {}, {}
+    local ok, desc = pcall(function() return workspace:GetDescendants() end)
+    if not ok or not desc then return end
+    for i = 1, #desc do
+        local d = desc[i]
+        local n, cls
+        pcall(function() n = d.Name; cls = d.ClassName end)
+        if type(n) == 'string' and cls == 'Part' then
+            local low = string.lower(n)
+            local isItem = (n == 'Item' or n == 'Loot')
+            local isExit = (low == 'exitpoint')
+            if isItem or isExit then
+                local p
+                pcall(function() p = d.Position end)
+                if typeof(p) == 'Vector3' then
+                    if isExit then
+                        ex[#ex + 1] = { pos = p, name = 'EXIT' }
+                    elseif #items < 200 then
+                        local r, l = rarityOfModel(d.Parent)
+                        items[#items + 1] = {
+                            part = d, pos = p, rarity = r,
+                            label = l or n,
+                        }
+                    end
+                end
+            elseif cls == 'Model' and string.find(low, 'exit sign', 1, true) then
+                local p
+                pcall(function() p = d.Position end)
+                if typeof(p) == 'Vector3' and #ex < 40 then
+                    ex[#ex + 1] = { pos = p, name = 'EXIT' }
+                end
+            end
+        end
+    end
+    targets = items
+    exits   = ex
+end
+
+-- ---------------- origin ----------------
+local function origin()
+    local c
+    pcall(function() c = lp.Character end)
+    if not c then return nil end
+    local hrp
+    pcall(function() hrp = c:FindFirstChild('HumanoidRootPart') end)
+    if not hrp then return nil end
+    local p
+    pcall(function() p = hrp.Position end)
+    if typeof(p) ~= 'Vector3' then return nil end
+    return p
+end
+
+-- ---------------- renderer ----------------
+local function drawSlot(s, sp, onScreen, dist, text, col, boxH)
+    if not onScreen then hideSlot(s); return end
+    if s.box then
+        s.box.Visible = true
+        local w = math.clamp(1400 / math.max(dist, 20), 6, 34)
+        local h = w * (boxH or 1.4)
+        s.box.Size    = Vector2.new(w, h)
+        s.box.Position = Vector2.new(sp.X - w * 0.5, sp.Y - h * 0.5)
+        s.box.Color   = col
+    end
+    if s.txt then
+        s.txt.Visible  = true
+        s.txt.Text     = text
+        s.txt.Color    = col
+        s.txt.Position = Vector2.new(sp.X, sp.Y + 20)
+    end
+    s.visible = true
+end
+
+track(RunService.RenderStepped:Connect(function()
+    if not running then return end
+
+    local org = origin()
+    local iIdx, eIdx = 0, 0
+
+    if CONFIG.Items and org then
+        for i = 1, #targets do
+            local t = targets[i]
+            local d = (t.pos - org).Magnitude
+            if d <= CONFIG.MaxDist and CONFIG.Rarity[t.rarity] then
+                local sp, on = WorldToScreen(t.pos + Vector3.new(0, 1.2, 0))
+                if on then
+                    iIdx = iIdx + 1
+                    local s = itemPool[iIdx]
+                    if s then
+                        local txt = t.rarity .. '  ' .. tostring(t.label) ..
+                                    '  [' .. string.format('%.0f', d) .. 'm]'
+                        drawSlot(s, sp, true, d, txt, RCOL[t.rarity] or RCOL.Unknown, 1.4)
+                    end
+                end
+            end
+        end
+    end
+    for i = iIdx + 1, #itemPool do
+        if itemPool[i].visible then hideSlot(itemPool[i]) end
+    end
+
+    if CONFIG.Exit and org then
+        for i = 1, #exits do
+            local e = exits[i]
+            local d = (e.pos - org).Magnitude
+            if d <= CONFIG.MaxDist then
+                local sp, on = WorldToScreen(e.pos + Vector3.new(0, 3, 0))
+                if on then
+                    eIdx = eIdx + 1
+                    local s = exitPool[eIdx]
+                    if s then
+                        local txt = 'EXIT  [' .. string.format('%.0f', d) .. 'm]'
+                        drawSlot(s, sp, true, d, txt, Color3.fromRGB(120, 255, 150), 1.8)
+                    end
+                end
+            end
+        end
+    end
+    for i = eIdx + 1, #exitPool do
+        if exitPool[i].visible then hideSlot(exitPool[i]) end
+    end
+end))
+
+-- ---------------- discovery loop ----------------
+task.spawn(function()
+    while running do
+        pcall(refresh)
+        task.wait(1.5)
+    end
+end)
+
+-- ---------------- menu ----------------
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built  = false
+
+local function mkSection(tab, name)
+    for _, side in ipairs({ 'Left', 'Right' }) do
+        local ok, sec = pcall(function() return tab:Section(name, side) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    return nil
+end
+
+local function safeToggle(sec, id, label, default, cb)
+    if pcall(function() sec:Toggle(id, label, default, cb) end) then return true end
+    if pcall(function() sec:Toggle(label, id, default, cb) end) then return true end
+    if pcall(function() sec:Toggle(label, default, cb) end) then return true end
+    return false
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Steal Or Die', function(tab)
+            if built then return end
+            built = true
+            local okB, errB = pcall(function()
+                local main = mkSection(tab, 'ESP')
+                if not main then return end
+
+                safeToggle(main, 'sod_items', 'Item ESP', CONFIG.Items, function(v)
+                    CONFIG.Items = v
+                end)
+                safeToggle(main, 'sod_exit', 'Exit ESP', CONFIG.Exit, function(v)
+                    CONFIG.Exit = v
+                end)
+
+                local rar = mkSection(tab, 'Rarity')
+                if rar then
+                    for i = 1, #RARITIES do
+                        local r = RARITIES[i]
+                        safeToggle(rar, 'sod_r_' .. string.lower(r), r,
+                            CONFIG.Rarity[r], function(v) CONFIG.Rarity[r] = v end)
+                    end
+                    safeToggle(rar, 'sod_r_unknown', 'Unknown',
+                        CONFIG.Rarity.Unknown, function(v) CONFIG.Rarity.Unknown = v end)
+                end
+            end)
+            if not okB then log('menu build error: ' .. tostring(errB)) end
+        end)
+    end)
+    if not ok then
+        HAS_UI = false
+        log('UI.AddTab failed: ' .. tostring(err))
+    end
+end
+
+-- ---------------- poller ----------------
+local function getBool(id, label)
+    if not HAS_UI then return nil end
+    local ok, v = pcall(function() return UI.GetValue(id) end)
+    if ok and type(v) == 'boolean' then return v end
+    ok, v = pcall(function() return UI.GetValue(label) end)
+    if ok and type(v) == 'boolean' then return v end
+    return nil
+end
+
+task.spawn(function()
+    while running do
+        local v = getBool('sod_items', 'Item ESP')
+        if v ~= nil then CONFIG.Items = v end
+        v = getBool('sod_exit', 'Exit ESP')
+        if v ~= nil then CONFIG.Exit = v end
+        for i = 1, #RARITIES do
+            local r = RARITIES[i]
+            local b = getBool('sod_r_' .. string.lower(r), r)
+            if b ~= nil then CONFIG.Rarity[r] = b end
+        end
+        local b = getBool('sod_r_unknown', 'Unknown')
+        if b ~= nil then CONFIG.Rarity.Unknown = b end
+        task.wait(0.15)
+    end
+end)
+
+pcall(refresh)
+log('items=' .. tostring(#targets) .. ' exits=' .. tostring(#exits) ..
+    '  (LootItems is empty in the lobby - items appear in a match)')
+print('[Steal Or Die] running')
