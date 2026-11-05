@@ -1,0 +1,685 @@
+-- Bug Evolution (place 70650894743738) - Matcha LuauVM
+-- Version: 1.0.0 -- orb farm, void orb farm, mob farm, player farm
+--
+-- CONFIRMED by probe this session (place 70650894743738, game.Name = 'Ugc'):
+--   workspace.Orbs      -> 962 Parts, real .Position            (XP orbs)
+--   workspace.VoidOrbs  -> 9 Models named 'VoidOrb', each holding
+--                          Core / Shimmer / Hit parts at one position.
+--                          PrimaryPart reads 'Unreadable_name', so the
+--                          position comes from the 'Hit' part (else Core).
+--   workspace.Bugs      -> 214 Models with HumanoidRootPart + Humanoid and
+--                          attributes BugId / Kind / Zone / HP / MaxHP / XP /
+--                          Coins. Humanoid.Health reads properly (28/28,
+--                          66/66, 43/43, and 0/20 on dead ones).
+--   ReplicatedStorage.Remotes.Attack -> RemoteEvent (exists).
+--   LocalPlayer attributes: Damage, Reach, AttackSpeed, Kills, XP, Level,
+--     Stamina, Alive, TeamId, ... (49 in total)
+--
+-- MEASURED BY THE USER'S OWN SCRIPT (kept from the pasted build):
+--   < 0.10 s held per orb  -> pickups start dropping
+--   0.11 s held per orb    -> ~8-9 pickups/sec
+--   0.44 s held per orb    -> 100% reliable (used for repair passes)
+--
+-- UNVERIFIED - THE ONE THING I COULD NOT PROBE: the payload of
+--   Remotes.Attack. A decompile sweep of StarterPlayer, ReplicatedStorage and
+--   workspace for any script containing 'Attack' returned 0 hits, so the
+--   argument shape is unknown. 'Silent kill (unverified)' therefore fires
+--   Attack:FireServer(<bug model>) and prints whether the bug's Health moved.
+--   It defaults OFF. If it reports 'no change', the hover below still farms.
+--
+-- DESIGN NOTE: all four farms share ONE driver loop and ONE body. Two farms
+--   writing HumanoidRootPart.CFrame at once would fight and jitter, so the
+--   driver picks the highest-priority enabled farm each tick:
+--   Orb > Void Orb > Mob > Player. Turning a farm off hands the body back
+--   immediately; nothing needs a restart.
+
+local NAME    = 'BugEvolution'
+local VERSION = '1.0.0'
+print('[Bug Evolution] v' .. VERSION)
+
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+
+-- game:GetService can return nil in this VM, so every service is resolved
+-- defensively and Workspace falls back to the global.
+local function svc(n)
+    for _ = 1, 4 do
+        local ok, s = pcall(function() return game:GetService(n) end)
+        if ok and s then return s end
+    end
+    local ok2, s2 = pcall(function() return game:FindFirstChild(n) end)
+    if ok2 and s2 then return s2 end
+    return nil
+end
+
+local Players = svc('Players')
+local RS      = svc('ReplicatedStorage')
+local lp      = nil
+if Players then pcall(function() lp = Players.LocalPlayer end) end
+if not lp then pcall(function() lp = game.Players.LocalPlayer end) end
+
+local WS = nil
+pcall(function() WS = workspace end)
+if not WS then WS = svc('Workspace') end
+
+local CONFIG = {
+    -- hold per target, seconds
+    orbHold    = 0.11,   -- measured reliable-ish; 0.10 starts dropping
+    orbSlowHold= 0.44,   -- measured 100% reliable, used for repair passes
+    voidHold   = 0.16,
+    mobHold    = 0.12,
+    playerHold = 0.12,
+
+    orbSettle  = 0.8,
+    maxPasses  = 3,
+    hoverY     = 3.0,    -- studs BELOW the target root = their feet level
+    mobRange   = 400,
+    playerRange= 400,
+    stopKey    = 0x58,   -- X
+    returnHome = true,
+}
+
+local state = {
+    running = true,
+    home    = nil,
+    took    = false,
+    orbDone, voidDone, mobDone, playerDone = 0, 0, 0, 0,
+    silentSent, silentLanded = 0, 0,
+    lastSilentReport = '',
+}
+
+local running = true
+local conns   = {}
+local function track(c) conns[#conns+1] = c return c end
+local function log(m) print('[BE] ' .. tostring(m)) end
+
+-- ---------------- character ----------------
+local function getChar()
+    if not lp then return nil end
+    local c
+    pcall(function() c = lp.Character end)
+    return c
+end
+
+local function getRoot()
+    local c = getChar()
+    if not c then return nil end
+    local r
+    pcall(function() r = c:FindFirstChild('HumanoidRootPart') end)
+    return r
+end
+
+local function getHum()
+    local c = getChar()
+    if not c then return nil end
+    local h
+    pcall(function() h = c:FindFirstChildOfClass('Humanoid') end)
+    return h
+end
+
+local function alive()
+    local h = getHum()
+    if not h then return false end
+    local hp
+    pcall(function() hp = h.Health end)
+    return type(hp) == 'number' and hp > 0
+end
+
+local function posOf(inst)
+    if not inst then return nil end
+    local p
+    pcall(function() p = inst.Position end)
+    if typeof(p) == 'Vector3' then return p end
+    local pp
+    pcall(function() pp = inst.PrimaryPart end)
+    if pp then
+        local p2
+        pcall(function() p2 = pp.Position end)
+        if typeof(p2) == 'Vector3' then return p2 end
+    end
+    return nil
+end
+
+-- write the body to a world position; every farm goes through here so the
+-- single-driver rule cannot be broken by accident
+local function goTo(p)
+    local r = getRoot()
+    if not r or not p then return false end
+    if not state.home then
+        local hp
+        pcall(function() hp = r.Position end)
+        if typeof(hp) == 'Vector3' then state.home = hp end
+    end
+    local ok = pcall(function() r.CFrame = CFrame.new(p.X, p.Y, p.Z) end)
+    if ok then state.took = true end
+    return ok
+end
+
+local function goHome()
+    if not CONFIG.returnHome or not state.home then return end
+    local r = getRoot()
+    if r then pcall(function() r.CFrame = CFrame.new(state.home.X, state.home.Y, state.home.Z) end) end
+end
+
+-- ---------------- orb farm ----------------
+local orbList, orbIdx, orbPass = {}, 1, 1
+local orbSlow = {}          -- position key -> true, orb survived a normal hold
+
+local function orbKey(p)
+    return string.format('%.1f:%.1f:%.1f', p.X, p.Y, p.Z)
+end
+
+local function scanOrbs()
+    local f
+    pcall(function() f = WS:FindFirstChild('Orbs') end)
+    if not f then return {} end
+    local out = {}
+    local ok, kids = pcall(function() return f:GetChildren() end)
+    if not ok or not kids then return {} end
+    local org = posOf(getRoot())
+    for i = 1, #kids do
+        local c = kids[i]
+        local p = posOf(c)
+        if p then
+            local d = org and (p - org).Magnitude or 0
+            out[#out + 1] = { part = c, pos = p, dist = d, key = orbKey(p) }
+        end
+    end
+    if org then
+        table.sort(out, function(a, b) return a.dist < b.dist end)
+    end
+    return out
+end
+
+local function orbStep()
+    if #orbList == 0 or orbIdx > #orbList then
+        if orbPass > 1 then
+            -- a full pass finished without a single live orb: done
+            local any = false
+            for i = 1, #orbList do
+                local o = orbList[i]
+                local par
+                pcall(function() par = o.part.Parent end)
+                if par ~= nil then any = true break end
+            end
+            if not any then
+                log(string.format('orbs: finished, collected %d', state.orbDone))
+                CONFIG.orbFarm = false
+                if UI_TOGGLES and UI_TOGGLES.orb then
+                    pcall(function() UI_TOGGLES.orb:SetValue(false) end)
+                end
+                return
+            end
+            if orbPass > CONFIG.maxPasses then
+                log(string.format('orbs: stopping after %d passes, collected %d', CONFIG.maxPasses, state.orbDone))
+                CONFIG.orbFarm = false
+                if UI_TOGGLES and UI_TOGGLES.orb then
+                    pcall(function() UI_TOGGLES.orb:SetValue(false) end)
+                end
+                return
+            end
+            orbPass = orbPass + 1
+            log('orbs: repair pass ' .. orbPass)
+        end
+        orbList = scanOrbs()
+        orbIdx = 1
+        if #orbList == 0 then task.wait(0.5) return end
+        if orbPass == 1 then log('orbs: ' .. #orbList .. ' tracked') end
+    end
+
+    local o = orbList[orbIdx]
+    orbIdx = orbIdx + 1
+
+    local par
+    pcall(function() par = o.part.Parent end)
+    if par == nil then
+        state.orbDone = state.orbDone + 1
+        return   -- already gone, no wait needed
+    end
+
+    if not alive() then task.wait(0.3) return end
+    goTo(o.pos)
+
+    local hold = orbSlow[o.key] and CONFIG.orbSlowHold or CONFIG.orbHold
+    task.wait(hold)
+
+    pcall(function() par = o.part.Parent end)
+    if par == nil then
+        state.orbDone = state.orbDone + 1
+    else
+        orbSlow[o.key] = true
+    end
+end
+
+-- ---------------- void orb farm ----------------
+local voidList, voidIdx = {}, 1
+
+local function voidPos(model)
+    local p
+    pcall(function() p = model:FindFirstChild('Hit') end)
+    if p then local q = posOf(p) if q then return q end end
+    pcall(function() p = model:FindFirstChild('Core') end)
+    if p then local q = posOf(p) if q then return q end end
+    pcall(function() p = model:FindFirstChild('Shimmer') end)
+    if p then local q = posOf(p) if q then return q end end
+    return posOf(model)
+end
+
+local function scanVoid()
+    local f
+    pcall(function() f = WS:FindFirstChild('VoidOrbs') end)
+    if not f then return {} end
+    local out = {}
+    local ok, kids = pcall(function() return f:GetChildren() end)
+    if not ok or not kids then return {} end
+    for i = 1, #kids do
+        local c = kids[i]
+        local p = voidPos(c)
+        if p then out[#out + 1] = { model = c, pos = p } end
+    end
+    return out
+end
+
+local function voidStep()
+    if #voidList == 0 or voidIdx > #voidList then
+        voidList = scanVoid()
+        voidIdx = 1
+        if #voidList == 0 then
+            log('void: no VoidOrbs right now')
+            task.wait(1)
+            return
+        end
+    end
+    local e = voidList[voidIdx]
+    voidIdx = voidIdx + 1
+    local par
+    pcall(function() par = e.model.Parent end)
+    if par == nil then
+        state.voidDone = state.voidDone + 1
+        return
+    end
+    if not alive() then task.wait(0.3) return end
+    goTo(e.pos)
+    task.wait(CONFIG.voidHold)
+    pcall(function() par = e.model.Parent end)
+    if par == nil then state.voidDone = state.voidDone + 1 end
+end
+
+-- ---------------- mob farm ----------------
+local mobList, mobIdx, mobScanAt = {}, 1, 0
+
+local function scanMobs()
+    local f
+    pcall(function() f = WS:FindFirstChild('Bugs') end)
+    if not f then return {} end
+    local out = {}
+    local ok, kids = pcall(function() return f:GetChildren() end)
+    if not ok or not kids then return {} end
+    local org = posOf(getRoot())
+    for i = 1, #kids do
+        local m = kids[i]
+        local hum, root
+        pcall(function() hum = m:FindFirstChildOfClass('Humanoid') end)
+        pcall(function() root = m:FindFirstChild('HumanoidRootPart') end)
+        if hum and root then
+            local hp, mx
+            pcall(function() hp = hum.Health; mx = hum.MaxHealth end)
+            if type(hp) == 'number' and hp > 0 and (type(mx) ~= 'number' or mx > 0) then
+                local p
+                pcall(function() p = root.Position end)
+                if typeof(p) == 'Vector3' then
+                    local d = org and (p - org).Magnitude or 0
+                    out[#out + 1] = { model = m, hum = hum, pos = p, dist = d }
+                end
+            end
+        end
+    end
+    if org then
+        table.sort(out, function(a, b) return a.dist < b.dist end)
+    end
+    return out
+end
+
+-- UNVERIFIED: the payload of Remotes.Attack is unknown (see header). One
+-- argument, the bug model, is the most common shape; the result is measured by
+-- reading the bug's Health back and printing whether it moved.
+local function trySilentKill(mob)
+    if not CONFIG.silentKill then return end
+    local rem
+    pcall(function() rem = RS:FindFirstChild('Remotes') end)
+    if not rem then return end
+    local atk
+    pcall(function() atk = rem:FindFirstChild('Attack') end)
+    if not atk then return end
+
+    local before
+    pcall(function() before = mob.hum and mob.hum.Health end)
+    local ok = pcall(function() atk:FireServer(mob.model) end)
+    state.silentSent = state.silentSent + 1
+    if not ok then return end
+
+    task.wait(0.08)
+    local after
+    pcall(function() after = mob.hum and mob.hum.Health end)
+    if type(before) == 'number' and type(after) == 'number' and after < before then
+        state.silentLanded = state.silentLanded + 1
+    end
+    local rep = string.format('silent: sent %d landed %d', state.silentSent, state.silentLanded)
+    if rep ~= state.lastSilentReport then
+        state.lastSilentReport = rep
+        log(rep)
+    end
+end
+
+local function mobStep()
+    local now = os.clock()
+    if now >= mobScanAt or #mobList == 0 then
+        mobScanAt = now + 1.0
+        mobList = scanMobs()
+        mobIdx = 1
+        if #mobList == 0 then
+            log('mobs: none alive right now')
+            task.wait(0.6)
+            return
+        end
+    end
+    local e = mobList[mobIdx]
+    mobIdx = mobIdx + 1
+    if mobIdx > #mobList then mobIdx = 1 end
+
+    local par, hp
+    pcall(function() par = e.model.Parent end)
+    pcall(function() hp = e.hum and e.hum.Health end)
+    if par == nil or type(hp) ~= 'number' or hp <= 0 then return end
+
+    if not alive() then task.wait(0.3) return end
+
+    -- hover at the mob's feet so melee reach covers it without standing inside
+    goTo(e.pos - Vector3.new(0, CONFIG.hoverY, 0))
+    if CONFIG.silentKill then
+        trySilentKill(e)
+    else
+        task.wait(CONFIG.mobHold)
+    end
+    state.mobDone = state.mobDone + 1
+end
+
+-- ---------------- player farm ----------------
+local playerList, playerIdx, playerScanAt = {}, 1, 0
+
+local function scanPlayers()
+    if not Players then return {} end
+    local out = {}
+    local list
+    local ok = pcall(function() list = Players:GetPlayers() end)
+    if not ok or not list or #list == 0 then
+        pcall(function() list = Players:GetChildren() end)
+    end
+    if not list then return {} end
+
+    local myTeam
+    pcall(function() myTeam = lp.Team end)
+    local myTeamId
+    pcall(function() myTeamId = lp:GetAttribute('TeamId') end)
+    local org = posOf(getRoot())
+    local myName
+    pcall(function() myName = lp.Name end)
+
+    for i = 1, #list do
+        local plr = list[i]
+        local nm
+        pcall(function() nm = plr.Name end)
+        if nm and nm ~= myName then
+            local ch
+            pcall(function() ch = plr.Character end)
+            if ch then
+                local hum, root
+                pcall(function() hum = ch:FindFirstChildOfClass('Humanoid') end)
+                pcall(function() root = ch:FindFirstChild('HumanoidRootPart') end)
+                local sameTeam = false
+                if myTeam then
+                    local t
+                    pcall(function() t = plr.Team end)
+                    sameTeam = (t ~= nil and t == myTeam)
+                elseif myTeamId ~= nil then
+                    local tid
+                    pcall(function() tid = plr:GetAttribute('TeamId') end)
+                    sameTeam = (tid ~= nil and tid == myTeamId)
+                end
+                if hum and root and not sameTeam then
+                    local hp
+                    pcall(function() hp = hum.Health end)
+                    if type(hp) == 'number' and hp > 0 then
+                        local p
+                        pcall(function() p = root.Position end)
+                        if typeof(p) == 'Vector3' then
+                            local d = org and (p - org).Magnitude or 0
+                            out[#out + 1] = { plr = plr, pos = p, dist = d, name = nm }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if org then
+        table.sort(out, function(a, b) return a.dist < b.dist end)
+    end
+    return out
+end
+
+local function playerStep()
+    local now = os.clock()
+    if now >= playerScanAt or #playerList == 0 then
+        playerScanAt = now + 0.6
+        playerList = scanPlayers()
+        playerIdx = 1
+        if #playerList == 0 then
+            task.wait(0.5)
+            return
+        end
+    end
+    local e = playerList[playerIdx]
+    playerIdx = playerIdx + 1
+    if playerIdx > #playerList then playerIdx = 1 end
+
+    if not alive() then task.wait(0.3) return end
+    goTo(e.pos - Vector3.new(0, CONFIG.hoverY, 0))
+    task.wait(CONFIG.playerHold)
+    state.playerDone = state.playerDone + 1
+end
+
+-- ---------------- driver (one body, one owner) ----------------
+task.spawn(function()
+    while running do
+        if not WS then task.wait(0.5) else
+            local did = false
+            if CONFIG.orbFarm then
+                pcall(orbStep) did = true
+            elseif CONFIG.voidFarm then
+                pcall(voidStep) did = true
+            elseif CONFIG.mobFarm then
+                pcall(mobStep) did = true
+            elseif CONFIG.playerFarm then
+                pcall(playerStep) did = true
+            end
+            if not did then task.wait(0.2) end
+        end
+    end
+end)
+
+-- stop key
+pcall(function()
+    task.spawn(function()
+        while running do
+            if type(iskeypressed) == 'function' then
+                local ok, down = pcall(iskeypressed, CONFIG.stopKey)
+                if ok and down then
+                    CONFIG.orbFarm, CONFIG.voidFarm = false, false
+                    CONFIG.mobFarm, CONFIG.playerFarm = false, false
+                    goHome()
+                    log('stopped (X)')
+                end
+            end
+            task.wait(0.15)
+        end
+    end)
+end)
+
+-- ---------------- menu ----------------
+local HAS_UI = type(UI) == 'table' and type(UI.AddTab) == 'function'
+local built = false
+local UI_TOGGLES = {}
+
+local function mkSection(tab, name)
+    for _, side in ipairs({ 'Left', 'Right' }) do
+        local ok, sec = pcall(function() return tab:Section(name, side) end)
+        if ok and sec ~= nil then return sec end
+    end
+    local ok, sec = pcall(function() return tab:Section(name) end)
+    if ok and sec ~= nil then return sec end
+    return nil
+end
+
+-- id first (the confirmed live order), then the two older ladders
+local function mkToggle(sec, id, label, default, cb)
+    if not sec then return nil end
+    local ok, w = pcall(function() return sec:Toggle(id, label, default, cb) end)
+    if ok and w ~= nil then return w end
+    ok, w = pcall(function() return sec:Toggle(label, id, default, cb) end)
+    if ok and w ~= nil then return w end
+    ok, w = pcall(function() return sec:Toggle(label, default, cb) end)
+    if ok and w ~= nil then return w end
+    return nil
+end
+
+local function mkButton(sec, label, cb)
+    if not sec then return end
+    if pcall(function() sec:Button(label, cb) end) then return end
+    pcall(function() sec:Button(label, label, cb) end)
+end
+
+local function mkSlider(sec, id, label, min, max, default, cb)
+    if not sec then return end
+    if pcall(function() sec:SliderInt(id, label, min, max, default, cb) end) then return end
+    if pcall(function() sec:SliderInt(label, id, min, max, default, cb) end) then return end
+    pcall(function() sec:SliderInt(label, min, max, default, cb) end)
+end
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab('Bug Evolution', function(tab)
+            if built then return end
+            built = true
+            local okB, errB = pcall(function()
+                local main = mkSection(tab, 'Farms')
+                if main then
+                    UI_TOGGLES.orb = mkToggle(main, 'be_orb', 'Orb Farm', false, function(v)
+                        CONFIG.orbFarm = v == true
+                        if CONFIG.orbFarm then
+                            orbList, orbIdx, orbPass, orbSlow = {}, 1, 1, {}
+                        end
+                    end)
+                    UI_TOGGLES.void = mkToggle(main, 'be_void', 'Void Orb Farm', false, function(v)
+                        CONFIG.voidFarm = v == true
+                        if CONFIG.voidFarm then voidList, voidIdx = {}, 1 end
+                    end)
+                    UI_TOGGLES.mob = mkToggle(main, 'be_mob', 'Mob Farm', false, function(v)
+                        CONFIG.mobFarm = v == true
+                        if CONFIG.mobFarm then mobList, mobIdx, mobScanAt = {}, 1, 0 end
+                    end)
+                    UI_TOGGLES.player = mkToggle(main, 'be_player', 'Player Farm', false, function(v)
+                        CONFIG.playerFarm = v == true
+                        if CONFIG.playerFarm then playerList, playerIdx, playerScanAt = {}, 1, 0 end
+                    end)
+                    mkButton(main, 'Stop + go home', function()
+                        CONFIG.orbFarm, CONFIG.voidFarm = false, false
+                        CONFIG.mobFarm, CONFIG.playerFarm = false, false
+                        goHome()
+                        for _, w in pairs(UI_TOGGLES) do pcall(function() w:SetValue(false) end) end
+                        log('stopped + returned home')
+                    end)
+                end
+
+                local mobs = mkSection(tab, 'Mobs')
+                if mobs then
+                    mkToggle(mobs, 'be_silent', 'Silent kill (unverified)', false, function(v)
+                        CONFIG.silentKill = v == true
+                        if CONFIG.silentKill then
+                            log('silent kill ON - watch for [BE] silent: sent/landed in the console')
+                        end
+                    end)
+                    mkSlider(mobs, 'be_hover', 'Hover below target (studs)', 0, 8, 3, function(v)
+                        local n = tonumber(v)
+                        if n then CONFIG.hoverY = n end
+                    end)
+                    local txt = mobs.Text or mobs.Tip
+                    if type(txt) == 'function' then
+                        pcall(function() txt(mobs, 'Hover puts you at the target\'s feet, inside melee reach.') end)
+                        pcall(function() txt(mobs, 'Silent kill sends Remotes.Attack with one argument (the bug) - the payload was not readable, so if it lands 0 the hover is what farms.') end)
+                        pcall(function() txt(mobs, 'Priority while several are on: Orb > Void > Mob > Player.') end)
+                    end
+                end
+            end)
+            if not okB then log('menu build error: ' .. tostring(errB)) end
+        end)
+    end)
+    if not ok then
+        HAS_UI = false
+        log('UI.AddTab failed: ' .. tostring(err))
+    end
+end
+
+-- poller: the widget getter is authoritative once it answers
+local function getBool(id, label)
+    if not HAS_UI then return nil end
+    local ok, v = pcall(function() return UI.GetValue(id) end)
+    if ok and type(v) == 'boolean' then return v end
+    ok, v = pcall(function() return UI.GetValue(label) end)
+    if ok and type(v) == 'boolean' then return v end
+    return nil
+end
+
+pcall(function()
+    task.spawn(function()
+        while running do
+            local v = getBool('be_orb', 'Orb Farm')
+            if v ~= nil then CONFIG.orbFarm = v end
+            v = getBool('be_void', 'Void Orb Farm')
+            if v ~= nil then CONFIG.voidFarm = v end
+            v = getBool('be_mob', 'Mob Farm')
+            if v ~= nil then CONFIG.mobFarm = v end
+            v = getBool('be_player', 'Player Farm')
+            if v ~= nil then CONFIG.playerFarm = v end
+            v = getBool('be_silent', 'Silent kill (unverified)')
+            if v ~= nil then CONFIG.silentKill = v end
+            task.wait(0.15)
+        end
+    end)
+end)
+
+-- ---------------- stop ----------------
+local function stop()
+    running = false
+    state.running = false
+    CONFIG.orbFarm, CONFIG.voidFarm = false, false
+    CONFIG.mobFarm, CONFIG.playerFarm = false, false
+    goHome()
+    for i = 1, #conns do pcall(function() conns[i]:Disconnect() end) end
+    conns = {}
+    if HAS_UI then pcall(function() UI.RemoveTab('Bug Evolution') end) end
+    _G[NAME] = nil
+    log('stopped')
+end
+
+_G[NAME] = {
+    stop = stop,
+    version = VERSION,
+    config = CONFIG,
+    stats = state,
+    goHome = goHome,
+    scanOrbs = scanOrbs,
+    scanMobs = scanMobs,
+    scanPlayers = scanPlayers,
+}
+
+log('loaded. Orbs/VoidOrbs/Bugs read on demand; nothing starts until a toggle is on. X stops.')
+pcall(function() notify('Bug Evolution ' .. VERSION, 'Orb / Void / Mob / Player farms ready', 4) end)
