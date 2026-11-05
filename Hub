@@ -7,6 +7,8 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v3.9: Bug Evolution pinned by place id 70650894743738 (orb / void orb /
+--       mob + player farm, kill+eat).
 -- v3.8: Steal Or Die pinned by place id 119925538689885 (game.Name is 'Ugc').
 -- v3.7: Sell a Million Sushi pinned by place id 125866884667103 (game.Name is 'Ugc').
 -- v3.6: Restaurant Tycoon 3 v6.13.0 - barista / cook prompts are skipped, only the tray is used.
@@ -33,7 +35,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v3.8'
+local VERSION = 'v3.9'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -64,6 +66,7 @@ local PLACES = {
     [85646026816836]  = 'Plunder PVP',
     [125866884667103] = 'Sell a Million Sushi',
     [119925538689885] = 'Steal Or Die',
+    [70650894743738]  = 'Bug Evolution',
 }
 
 -- file name + the names/aliases this place might show up as.
@@ -71,6 +74,7 @@ local PLACES = {
 local SCRIPTS = {
     { file = '+1 Upgrade Per Kill',          keys = { '1upgradeperkill', 'upgradeperkill' } },
     { file = 'Age Evolution Tycoon',         keys = { 'ageevolutiontycoon', 'ageevolution' } },
+    { file = 'Bug Evolution',                keys = { 'bugevolution', 'bugevo' } },
     { file = 'Build And Kill Zombies',       keys = { 'buildandkillzombies', 'killzombies' } },
     { file = 'Chop A Forest',                keys = { 'chopaforest', 'chopforest' } },
     { file = 'Clean Everything',             keys = { 'cleaneverything' } },
