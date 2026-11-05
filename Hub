@@ -7,6 +7,7 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v4.0: Pet Simulator 99 pinned by place id 8737899170 (auto tap coins/gems).
 -- v3.9: Bug Evolution pinned by place id 70650894743738 (orb / void orb /
 --       mob + player farm, kill+eat).
 -- v3.8: Steal Or Die pinned by place id 119925538689885 (game.Name is 'Ugc').
@@ -35,7 +36,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v3.9'
+local VERSION = 'v4.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -67,6 +68,7 @@ local PLACES = {
     [125866884667103] = 'Sell a Million Sushi',
     [119925538689885] = 'Steal Or Die',
     [70650894743738]  = 'Bug Evolution',
+    [8737899170]      = 'Pet Simulator 99',
 }
 
 -- file name + the names/aliases this place might show up as.
@@ -85,6 +87,7 @@ local SCRIPTS = {
     { file = 'Hike For Eggs',                keys = { 'hikeforeggs' } },
     { file = 'Merge Block Arena',            keys = { 'mergeblockarena', 'mergeblock' } },
     { file = 'Merge Block Arena Weapons',    keys = { 'mergeblockarenaweapons', 'mergeweapons' } },
+    { file = 'Pet Simulator 99',             keys = { 'petsimulator99', 'petsim99', 'ps99' } },
     { file = 'Piano Rhythm Tiles',           keys = { 'pianorhythmtiles', 'pianotiles' } },
     { file = 'Plunder PVP',                  keys = { 'plunderpvp', 'plunder' } },
     { file = 'PRISON LIFE TRIGGERBOT',       keys = { 'prisonlifetriggerbot', 'triggerbot' } },
