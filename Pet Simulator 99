@@ -1,0 +1,190 @@
+--[[
+  Game:       Pet Simulator 99
+  Place IDs:  8737899170
+  Version:    v1.0
+  Features:   one toggle - auto tap: fires a touch on every coin / gem in
+              range every tick, no movement
+  Controls:   menu tab "PS99"; one toggle. No keybinds, no stop key.
+  Needs:      Matcha Pro (firetouchinterest)
+  Confirmed:  nothing - this game was not probed
+  UNVERIFIED: coin / gem names contain "coin", "gem" or "diamond"
+              the server accepts a touch fired from a distance
+              pickups are collected by touch at all (could be prompt/remote)
+]]
+
+local VERSION = "1.0"
+local NAME    = "PS99Tap"
+if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
+print("[PS99 Tap] v" .. VERSION)
+
+local Players = game:GetService("Players")
+local lp      = Players.LocalPlayer
+
+local CONFIG = {
+    range   = 80,      -- studs: "near me"
+    tick    = 0.05,    -- tap cadence
+    maxKids = 250,     -- skip monster child lists so a tick cannot stall
+    words   = { "coin", "gem", "diamond" },
+}
+
+local running = true
+local tapping = false
+local taps    = 0
+local built   = false
+local HAS_UI  = type(UI) == "table" and type(UI.AddTab) == "function"
+
+local function getRoot()
+    local char = lp.Character
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function wanted(name)
+    local s = string.lower(tostring(name))
+    for i = 1, #CONFIG.words do
+        if string.find(s, CONFIG.words[i], 1, true) then return true end
+    end
+    return false
+end
+
+local function tapPass()
+    local hrp = getRoot()
+    if not hrp then return 0 end
+    if type(firetouchinterest) ~= "function" then return 0 end
+
+    local my = hrp.Position
+    local n = 0
+
+    local function check(inst)
+        if not inst then return end
+        if not wanted(inst.Name) then return end
+        local ok, p = pcall(function() return inst.Position end)
+        if not ok or p == nil then return end
+        local ok2, d = pcall(function() return (p - my).Magnitude end)
+        if not ok2 or type(d) ~= "number" or d > CONFIG.range then return end
+        pcall(firetouchinterest, hrp, inst, 0)
+        pcall(firetouchinterest, hrp, inst, 1)
+        n = n + 1
+    end
+
+    local okT, tops = pcall(function() return workspace:GetChildren() end)
+    if not okT or not tops then return 0 end
+
+    for i = 1, #tops do
+        local top = tops[i]
+        check(top)
+        local ok1, kids = pcall(function() return top:GetChildren() end)
+        if ok1 and kids and #kids <= CONFIG.maxKids then
+            for j = 1, #kids do
+                local k = kids[j]
+                check(k)
+                local ok2, gk = pcall(function() return k:GetChildren() end)
+                if ok2 and gk and #gk <= CONFIG.maxKids then
+                    for g = 1, #gk do check(gk[g]) end
+                end
+            end
+        end
+    end
+    return n
+end
+
+task.spawn(function()
+    while running do
+        if tapping then
+            local n = 0
+            pcall(function() n = tapPass() end)
+            taps = taps + n
+            task.wait(CONFIG.tick)
+        else
+            task.wait(0.1)
+        end
+    end
+end)
+
+local function firstBool(...)
+    for i = 1, select("#", ...) do
+        local v = select(i, ...)
+        if type(v) == "boolean" then return v end
+    end
+    return nil
+end
+
+local getterWorks = false
+
+local function applyTap(...)
+    if getterWorks then return end
+    local v = firstBool(...)
+    if v == nil then return end
+    tapping = v
+    print("[PS99 Tap] auto tap = " .. tostring(v) .. " (total taps " .. taps .. ")")
+end
+
+local function buildTab(tab)
+    if built then return end
+    built = true
+    local ok, err = pcall(function()
+        local sec = nil
+        local sides = { "Left", "Right" }
+        for i = 1, #sides do
+            local okS, s = pcall(function() return tab:Section("Auto Tap", sides[i]) end)
+            if okS and s ~= nil then sec = s break end
+        end
+        if not sec then
+            local okS, s = pcall(function() return tab:Section("Auto Tap") end)
+            if okS then sec = s end
+        end
+        if not sec then return end
+
+        local cb = function(...) applyTap(...) end
+        local tries = {
+            function() sec:Toggle("ps_tap", "Auto Tap", false, cb) end,
+            function() sec:Toggle("Auto Tap", "ps_tap", false, cb) end,
+            function() sec:Toggle("Auto Tap", false, cb) end,
+        }
+        local made = false
+        for i = 1, #tries do
+            if pcall(tries[i]) then made = true break end
+        end
+        if not made then warn("[PS99 Tap] toggle failed") end
+    end)
+    if not ok then warn("[PS99 Tap] build error: " .. tostring(err)) end
+    print("[PS99 Tap] tab built")
+end
+
+task.spawn(function()
+    while running do
+        if HAS_UI then
+            local ok, v = pcall(function() return UI.GetValue("ps_tap") end)
+            if ok and type(v) == "boolean" then
+                getterWorks = true
+                if tapping ~= v then
+                    tapping = v
+                    print("[PS99 Tap] auto tap = " .. tostring(v))
+                end
+            end
+        end
+        task.wait(0.1)
+    end
+end)
+
+if HAS_UI then
+    local ok, err = pcall(function()
+        UI.AddTab("PS99", function(tab)
+            pcall(buildTab, tab)
+        end)
+    end)
+    if not ok then warn("[PS99 Tap] UI.AddTab failed: " .. tostring(err)) end
+else
+    print("[PS99 Tap] no UI in this build - nothing starts")
+end
+
+local function stop()
+    running = false
+    tapping = false
+    if HAS_UI then pcall(function() UI.RemoveTab("PS99") end) end
+    _G[NAME] = nil
+    print("[PS99 Tap] stopped - total taps " .. taps)
+end
+
+_G[NAME] = { stop = stop, version = VERSION, tap = tapPass }
+print("[PS99 Tap] v" .. VERSION .. " loaded")
