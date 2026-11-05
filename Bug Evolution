@@ -1,20 +1,22 @@
 --[[
   Game:       Bug Evolution
   Place IDs:  70650894743738
-  Version:    v4.3
-  Features:   orb farm toggle (one pass), void orb loop toggle, mob farm,
-              player farm, Y distance hover, kill + eat via attack remote
+  Version:    v4.7
+  Features:   orb + void orb run together under one arbiter, void first;
+              orb pass is resumable (one orb per tick) so a void orb can cut
+              in and the pass continues; mob/player farm resumes when idle;
+              Y distance 0-15 + below/above; kill + eat via attack remote,
+              both always on
   Controls:   menu tab "Bug Farm"; toggles/sliders only; X stops everything
-  Needs:      Matcha Pro / fire* globals not required (remotes only)
-  Confirmed:  Orbs children are Parts with .Position
-              VoidOrbs children are Models -> position from Hit/Core part
-              Humanoid.Health / MaxHealth are NOT writable; TakeDamage is nil
-              AssemblyLinearVelocity / Velocity writable; Sit/PlatformStand not
-              Remotes.Attack is a RemoteEvent (payload shape unverified)
-  UNVERIFIED: eat = same remote as attack, fired at the body (user-stated)
+  Confirmed:  VoidOrbs children are Models -> position from Hit/Core part
+              Humanoid.Health / MaxHealth not writable, TakeDamage nil
+              AssemblyLinearVelocity / Velocity writable
+              Remotes.Attack is a RemoteEvent
+  UNVERIFIED: the Attack payload shape - all three shapes are fired each tick
+              the arbiter priority order is a user request, not a probe
 ]]
 
-local VERSION = "4.3"
+local VERSION = "4.7"
 local NAME    = "BugEvoFarm"
 if _G[NAME] and _G[NAME].stop then pcall(_G[NAME].stop) end
 print("[Bug Farm] v" .. VERSION)
@@ -32,30 +34,36 @@ local CONFIG = {
     maxRepairs  = 2,
     stopKey     = 0x58,
     returnHome  = true,
-
-    rescan      = 0.40,
+    rescan      = 0.35,
     maxRange    = 600,
-    attackEvery = 0.30,
-    eatEvery    = 0.25,
+    attackEvery = 0.15,
     corpseLife  = 8,
     voidIdle    = 0.5,
+    voidWatch   = 0.30,
+    voidTries   = 2,
     yMax        = 15,
 }
 
-local running = true
-local home    = nil
-local built   = false
-local target  = nil
-local lastScan, lastAttack, lastEat = 0, 0, 0
+local running    = true
+local home       = nil
+local target     = nil
 local anchorConn = nil
-local armed   = { orbs = false }
-local orbsLatch = false
+local built      = false
+local armedOrbs  = false
+local orbsLatch  = false
+local mobPaused  = false
+local lastScan, lastAttack = 0, 0
+local corpses    = {}
+local voidTried  = setmetatable({}, { __mode = "k" })
+local orbList, orbIdx, orbGone, orbRound, orbTotal = {}, 1, 0, 0, 0
 
-local flags = { mobs = false, players = false, eat = true, freeze = true,
-                orbs = false, voidorbs = false }
+local function clearOrbRun()
+    orbList, orbIdx, orbGone, orbRound, orbTotal = {}, 1, 0, 0, 0
+end
+
+local flags = { orbs = false, voidorbs = false, mobs = false, players = false,
+                freeze = true }
 local CFG   = { dist = 8, below = true }
-
-local corpses = {}
 
 local HAS_UI = type(UI) == "table" and type(UI.AddTab) == "function"
 
@@ -78,7 +86,6 @@ local function posOf(inst)
     return nil
 end
 
--- Model-safe position: prefer Hit / Core / Shimmer, else any direct part
 local function partPos(inst)
     local p = posOf(inst)
     if p then return p end
@@ -128,7 +135,6 @@ local function mkSection(tab, name)
     end
     local ok, sec = pcall(function() return tab:Section(name) end)
     if ok and sec ~= nil then return sec end
-    warn("[Bug Farm] section failed: " .. name)
     return nil
 end
 
@@ -146,7 +152,6 @@ local function mkToggle(sec, label, id, default, apply)
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
     end
-    warn("[Bug Farm] toggle failed: " .. label)
     return false
 end
 
@@ -166,36 +171,27 @@ local function mkSlider(sec, label, id, min, max, default, apply)
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
     end
-    warn("[Bug Farm] slider failed: " .. label)
     return false
 end
 
-local function registerToggle(key, id, name)
-    TOGGLES[#TOGGLES + 1] = { key = key, id = id, name = name }
+local function registerToggle(key, id)
+    TOGGLES[#TOGGLES + 1] = { key = key, id = id }
 end
 
--- the attack remote is resolved once and reused for kill AND eat ------
+-- attack: always on, no toggle, all three shapes ----------------------
 
-local attackRemote = nil
+local remotesFolder = RS:FindFirstChild("Remotes")
+local attackRem = remotesFolder and remotesFolder:FindFirstChild("Attack")
 
-local function getAttackRemote()
-    if attackRemote then return attackRemote end
-    local r = RS:FindFirstChild("Remotes")
-    attackRemote = r and r:FindFirstChild("Attack")
-    return attackRemote
-end
-
-local function fireAttack(model, hum)
-    local rem = getAttackRemote()
-    if not rem then return false end
-    local ok1 = pcall(function() rem:FireServer(hum) end)
-    if not ok1 then
-        pcall(function() rem:FireServer(model) end)
-    end
+local function fireAttack(model, hum, root)
+    if not attackRem then return false end
+    if hum then pcall(function() attackRem:FireServer(hum) end) end
+    if model then pcall(function() attackRem:FireServer(model) end) end
+    if root then pcall(function() attackRem:FireServer(root) end) end
     return true
 end
 
--- orb cycles ----------------------------------------------------------
+-- targets -------------------------------------------------------------
 
 local function collectFrom(folderName)
     local folder = workspace:FindFirstChild(folderName)
@@ -213,36 +209,13 @@ local function collectFrom(folderName)
     return out
 end
 
-local function sweep(list, hold, alive)
-    local n = 0
+local function nextVoid()
+    local list = collectFrom("VoidOrbs")
     for i = 1, #list do
-        if not alive() then break end
         local e = list[i]
-        if e.inst.Parent ~= nil then
-            local hrp, hum = getRig()
-            if hrp and (not hum or hum.Health > 0) then
-                hrp.CFrame = CFrame.new(e.pos.X, e.pos.Y, e.pos.Z)
-                n = n + 1
-                task.wait(hold)
-            else
-                task.wait(0.3)
-            end
-        end
+        if (voidTried[e.inst] or 0) < CONFIG.voidTries then return e end
     end
-    return n
-end
-
-local function holdOrb(e, alive)
-    local t0 = os.clock()
-    while e.inst.Parent ~= nil and os.clock() - t0 < CONFIG.retryHold do
-        if not alive() then return false end
-        local hrp, hum = getRig()
-        if not hrp or (hum and hum.Health <= 0) then return false end
-        local p = partPos(e.inst) or e.pos
-        hrp.CFrame = CFrame.new(p.X, p.Y, p.Z)
-        task.wait()
-    end
-    return e.inst.Parent == nil
+    return nil
 end
 
 local function goHome()
@@ -251,113 +224,114 @@ local function goHome()
     if hrp then hrp.CFrame = CFrame.new(home.X, home.Y, home.Z) end
 end
 
-local function orbCycle(folderName, hold, alive)
-    local list = collectFrom(folderName)
-    local total = #list
-    if total == 0 then return 0, 0, 0 end
-
-    sweep(list, hold, alive)
-    if not alive() then return total, 0, total end
-    task.wait(CONFIG.settle)
-
-    local gone = 0
-    for i = 1, total do
-        if list[i].inst.Parent == nil then gone = gone + 1 end
-    end
-
-    for round = 1, CONFIG.maxRepairs do
-        if not alive() then break end
-        local left = {}
-        for i = 1, total do
-            if list[i].inst.Parent ~= nil then left[#left + 1] = list[i] end
-        end
-        if #left == 0 then break end
-        print("[Bug Farm] repair round", round, "left:", #left)
-        for i = 1, #left do
-            if not alive() then break end
-            if holdOrb(left[i], alive) then gone = gone + 1 end
-        end
-        if not alive() then break end
-        task.wait(0.3)
-    end
-
-    local left = 0
-    for i = 1, total do
-        if list[i].inst.Parent == nil then left = left + 1 end
-    end
-    return total, gone, left
-end
-
 local function mobActive()
     return flags.mobs or flags.players
 end
 
--- orb worker ----------------------------------------------------------
+-- body arbiter: VOID > ORBS > MOBS, one owner per tick ----------------
 
 task.spawn(function()
-    local prevOrbs, prevVoid = false, false
+    local prevOrbs = false
     local voidIdleLogged = false
 
     while running do
         if flags.orbs and not prevOrbs then
-            armed.orbs = true
-            print("[Bug Farm] orbs armed")
+            clearOrbRun()
+            orbList = collectFrom("Orbs")
+            orbTotal = #orbList
+            armedOrbs = (orbTotal > 0)
+            print("[Bug Farm] orbs armed:", orbTotal)
         end
-        if flags.voidorbs and not prevVoid then
-            print("[Bug Farm] void orb loop on")
-            ntf("Void orb loop on - X to stop")
-        end
-        if prevVoid and not flags.voidorbs then
-            if not (flags.orbs or mobActive()) then pcall(goHome) end
-        end
-        prevOrbs, prevVoid = flags.orbs, flags.voidorbs
+        if not flags.orbs then armedOrbs = false end
+        prevOrbs = flags.orbs
 
-        if mobActive() then
-            task.wait(0.2)
+        local ran = false
 
-        elseif flags.voidorbs then
-            local hrp = getRig()
-            if not home and hrp then home = hrp.Position end
-            local alive = function() return running and flags.voidorbs end
-            local total, gone, left = orbCycle("VoidOrbs", CONFIG.voidHold, alive)
-            if total == 0 then
-                if not voidIdleLogged then
-                    print("[Bug Farm] no void orbs right now - waiting")
-                    voidIdleLogged = true
+        -- 1. void orbs outrank everything, including a pass in flight
+        if flags.voidorbs then
+            local e = nextVoid()
+            if e then
+                mobPaused = true
+                local hrp = getRig()
+                if hrp then hrp.CFrame = CFrame.new(e.pos.X, e.pos.Y, e.pos.Z) end
+                task.wait(CONFIG.voidHold)
+                if e.inst.Parent ~= nil then
+                    local p = partPos(e.inst) or e.pos
+                    local h2 = getRig()
+                    if h2 then h2.CFrame = CFrame.new(p.X, p.Y, p.Z) end
+                    task.wait(CONFIG.retryHold)
                 end
-                task.wait(CONFIG.voidIdle)
-            else
+                voidTried[e.inst] = (voidTried[e.inst] or 0) + 1
+                print("[Bug Farm] void priority:",
+                      e.inst.Parent == nil and "grabbed" or "missed",
+                      "tries", voidTried[e.inst])
                 voidIdleLogged = false
-                print("[Bug Farm] void cycle:", gone, "/", total, "left", left)
-                task.wait(0.2)
+                ran = true
+            elseif not voidIdleLogged and not armedOrbs and not mobActive() then
+                print("[Bug Farm] no void orbs right now - waiting")
+                voidIdleLogged = true
             end
-
-        elseif flags.orbs and armed.orbs then
-            armed.orbs = false
-            local hrp = getRig()
-            if not home and hrp then home = hrp.Position end
-            local alive = function() return running and flags.orbs end
-            local total, gone, left = orbCycle("Orbs", CONFIG.orbHold, alive)
-
-            if flags.orbs then
-                print("[Bug Farm] orb pass:", gone, "/", total, "left", left)
-                ntf("Orbs: " .. gone .. "/" .. total)
-                flags.orbs = false
-                orbsLatch = true
-                if HAS_UI then pcall(function() UI.SetValue("be_orbs", false) end) end
-                if not flags.voidorbs then pcall(goHome) end
-            else
-                print("[Bug Farm] orb pass cancelled:", gone, "/", total)
-                if not flags.voidorbs then pcall(goHome) end
-            end
-
-        else
-            task.wait(0.2)
         end
+
+        -- 2. one orb per tick from the standing pass, then repair rounds
+        if not ran and armedOrbs then
+            if orbIdx > #orbList then
+                if orbRound >= CONFIG.maxRepairs then
+                    print("[Bug Farm] orbs done:", orbGone, "/", orbTotal)
+                    ntf("Orbs: " .. orbGone .. "/" .. orbTotal)
+                    armedOrbs = false
+                    flags.orbs = false
+                    orbsLatch = true
+                    if HAS_UI then pcall(function() UI.SetValue("be_orbs", false) end) end
+                    clearOrbRun()
+                    if not flags.voidorbs and not mobActive() then pcall(goHome) end
+                else
+                    orbRound = orbRound + 1
+                    task.wait(CONFIG.settle)
+                    local left = {}
+                    for i = 1, #orbList do
+                        if orbList[i].inst.Parent ~= nil then left[#left + 1] = orbList[i] end
+                    end
+                    orbList, orbIdx = left, 1
+                    print("[Bug Farm] repair round", orbRound, "left:", #left)
+                    if #left == 0 then
+                        print("[Bug Farm] orbs done:", orbGone, "/", orbTotal)
+                        ntf("Orbs: " .. orbGone .. "/" .. orbTotal)
+                        armedOrbs = false
+                        flags.orbs = false
+                        orbsLatch = true
+                        if HAS_UI then pcall(function() UI.SetValue("be_orbs", false) end) end
+                        clearOrbRun()
+                        if not flags.voidorbs and not mobActive() then pcall(goHome) end
+                    end
+                end
+            else
+                local e = orbList[orbIdx]
+                orbIdx = orbIdx + 1
+                if e.inst.Parent ~= nil then
+                    mobPaused = true
+                    local hrp, hum = getRig()
+                    if hrp and (not hum or hum.Health > 0) then
+                        hrp.CFrame = CFrame.new(e.pos.X, e.pos.Y, e.pos.Z)
+                        task.wait(CONFIG.orbHold)
+                        if e.inst.Parent == nil then orbGone = orbGone + 1 end
+                    end
+                else
+                    orbGone = orbGone + 1
+                end
+                ran = true
+            end
+        end
+
+        -- 3. nothing pending: hand the body back to the mob farm
+        if not ran and not armedOrbs and not (flags.voidorbs and nextVoid()) then
+            mobPaused = false
+        end
+        if not ran then task.wait(0.15) end
     end
 end)
 
--- mob targets ---------------------------------------------------------
+-- mob scanning --------------------------------------------------------
 
 local function isPlayerModel(m)
     for _, pl in ipairs(Players:GetPlayers()) do
@@ -370,55 +344,54 @@ local function isPlayerModel(m)
     return false
 end
 
-local function addCorpse(model, hum)
+local function addCorpse(model, hum, root)
     for i = 1, #corpses do
         if corpses[i].model == model then return end
     end
-    corpses[#corpses + 1] = { model = model, hum = hum, born = os.clock() }
+    corpses[#corpses + 1] = { model = model, hum = hum, root = root, born = os.clock() }
 end
 
-local function consider(m, list, my)
+local function consider(m, out, my)
     if not m or m == lp.Character then return end
-    local h = m:FindFirstChild("Humanoid")
-    if not h then return end
+    local hum = m:FindFirstChild("Humanoid")
+    if not hum then return end
+    local root = m:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
     local hp = 1
-    local okh, hv = pcall(function() return h.Health end)
+    local okh, hv = pcall(function() return hum.Health end)
     if okh and type(hv) == "number" then hp = hv end
+
     if hp <= 0 then
-        if flags.eat then addCorpse(m, h) end
+        addCorpse(m, hum, root)
         return
     end
-    local r = m:FindFirstChild("HumanoidRootPart")
-    if not r then return end
-    local p = posOf(r)
+
+    local p = posOf(root)
     if not p then return end
     local d = (p - my).Magnitude
     if d > CONFIG.maxRange then return end
-    list[#list + 1] = { model = m, hum = h, root = r, dist = d, isPlayer = isPlayerModel(m) }
+    out[#out + 1] = { model = m, hum = hum, root = root, dist = d,
+                      isPlayer = isPlayerModel(m) }
 end
 
 local function scanTargets()
     local hrp = getRig()
     local my = hrp and hrp.Position or Vector3.new(0, 0, 0)
-    local list = {}
+    local out = {}
 
     local bugs = workspace:FindFirstChild("Bugs")
     if bugs then
-        for _, c in ipairs(bugs:GetChildren()) do
-            if c.ClassName == "Model" then consider(c, list, my) end
+        for _, m in ipairs(bugs:GetChildren()) do
+            if m.ClassName == "Model" then consider(m, out, my) end
         end
     end
-    for _, c in ipairs(workspace:GetChildren()) do
-        if c.ClassName == "Model" then
-            consider(c, list, my)
-        elseif c.ClassName == "Folder" and c ~= bugs then
-            for _, cc in ipairs(c:GetChildren()) do
-                if cc.ClassName == "Model" then consider(cc, list, my) end
-            end
-        end
+    for _, m in ipairs(workspace:GetChildren()) do
+        if m.ClassName == "Model" then consider(m, out, my) end
     end
-    table.sort(list, function(a, b) return a.dist < b.dist end)
-    return list
+
+    table.sort(out, function(a, b) return a.dist < b.dist end)
+    return out
 end
 
 local function pickTarget(list)
@@ -433,7 +406,7 @@ local function pickTarget(list)
     return nil
 end
 
--- anchor --------------------------------------------------------------
+-- anchor: every frame -------------------------------------------------
 
 local function targetY(p)
     if CFG.below then return p.Y - CFG.dist end
@@ -442,6 +415,7 @@ end
 
 local function anchorStep()
     if not mobActive() then return end
+    if mobPaused then return end
     local t = target
     if not t then return end
     local hrp = getRig()
@@ -470,7 +444,7 @@ do
         end
     end
     if not connected then
-        print("[Bug Farm] no RenderStepped/Heartbeat - using a task loop")
+        print("[Bug Farm] no RenderStepped/Heartbeat - task loop instead")
         task.spawn(function()
             while running do
                 pcall(anchorStep)
@@ -480,48 +454,13 @@ do
     end
 end
 
--- kill: attack always on while the mob farm runs ---------------------
-
-local function attackTarget(t)
-    local hum = t.hum
-    if not hum or not hum.Parent then return end
-
-    local hp = nil
-    local okh, hv = pcall(function() return hum.Health end)
-    if okh and type(hv) == "number" then hp = hv end
-
-    if hp ~= nil and hp <= 0 then
-        if flags.eat then addCorpse(t.model, hum) end
-        return
-    end
-
-    fireAttack(t.model, hum)
-end
-
--- eat: same remote, fired at the body ---------------------------------
-
-local function eatBodies()
-    local now = os.clock()
-    local i = 1
-    while i <= #corpses do
-        local c = corpses[i]
-        local dead = c.model == nil or c.model.Parent == nil
-        local expired = (now - c.born) > CONFIG.corpseLife
-        if dead or expired then
-            table.remove(corpses, i)
-        else
-            fireAttack(c.model, c.hum)
-            i = i + 1
-        end
-    end
-end
-
--- scan loop -----------------------------------------------------------
+-- main loop: target + attack (unconditional) --------------------------
 
 task.spawn(function()
     while running do
         if mobActive() then
             local now = os.clock()
+
             if now - lastScan >= CONFIG.rescan or target == nil then
                 target = pickTarget(scanTargets())
                 lastScan = now
@@ -529,32 +468,45 @@ task.spawn(function()
             if target and (target.root.Parent == nil or target.hum.Parent == nil) then
                 target = nil
             end
-            if target and now - lastAttack >= CONFIG.attackEvery then
-                lastAttack = now
-                attackTarget(target)
+
+            if target and not mobPaused then
+                if now - lastAttack >= CONFIG.attackEvery then
+                    lastAttack = now
+                    fireAttack(target.model, target.hum, target.root)
+                end
+                pcall(anchorStep)
             end
         else
             target = nil
-        end
-        task.wait(0.1)
-    end
-end)
-
-task.spawn(function()
-    while running do
-        if flags.eat then
-            if os.clock() - lastEat >= CONFIG.eatEvery then
-                lastEat = os.clock()
-                pcall(eatBodies)
-            end
-        else
-            corpses = {}
         end
         task.wait(0.05)
     end
 end)
 
--- getter poller with the orbs latch -----------------------------------
+-- eat: same remote, fired at the body, no toggle ----------------------
+
+task.spawn(function()
+    while running do
+        if #corpses > 0 then
+            local now = os.clock()
+            local i = 1
+            while i <= #corpses do
+                local c = corpses[i]
+                local gone = c.model == nil or c.model.Parent == nil
+                local expired = (now - c.born) > CONFIG.corpseLife
+                if gone or expired then
+                    table.remove(corpses, i)
+                else
+                    fireAttack(c.model, c.hum, c.root)
+                    i = i + 1
+                end
+            end
+        end
+        task.wait(0.25)
+    end
+end)
+
+-- getter poller (with the orbs latch) ---------------------------------
 
 task.spawn(function()
     while running do
@@ -563,12 +515,7 @@ task.spawn(function()
                 local t = TOGGLES[i]
                 local val = nil
                 local ok1, v1 = pcall(function() return UI.GetValue(t.id) end)
-                if ok1 and type(v1) == "boolean" then
-                    val = v1
-                else
-                    local ok2, v2 = pcall(function() return UI.GetValue(t.name) end)
-                    if ok2 and type(v2) == "boolean" then val = v2 end
-                end
+                if ok1 and type(v1) == "boolean" then val = v1 end
                 if val ~= nil then
                     if t.key == "orbs" and orbsLatch then
                         if val == false then orbsLatch = false end
@@ -595,6 +542,9 @@ task.spawn(function()
         pcall(function() down = iskeypressed(CONFIG.stopKey) end)
         if down and not wasDown then
             running = false
+            mobPaused = false
+            armedOrbs = false
+            clearOrbRun()
             flags.mobs, flags.players = false, false
             flags.orbs, flags.voidorbs = false, false
             corpses = {}
@@ -628,19 +578,20 @@ local function buildTab(tab)
         local orbSec = mkSection(tab, "Orbs")
         if orbSec then
             mkToggle(orbSec, "Orbs", "be_orbs", false, setFlag("orbs"))
-            registerToggle("orbs", "be_orbs", "Orbs")
+            registerToggle("orbs", "be_orbs")
             mkToggle(orbSec, "Void Orbs (loop)", "be_voidorbs", false, setFlag("voidorbs"))
-            registerToggle("voidorbs", "be_voidorbs", "Void Orbs (loop)")
-            pcall(function() orbSec:Text("Orbs: one pass, then switches itself off.") end)
-            pcall(function() orbSec:Text("Void orbs: repeats until switched off.") end)
+            registerToggle("voidorbs", "be_voidorbs")
+            pcall(function() orbSec:Text("Orbs: one pass, resumable, then off.") end)
+            pcall(function() orbSec:Text("Void orbs: repeats, and always cut in first.") end)
+            pcall(function() orbSec:Text("Both can run at once.") end)
         end
 
         local mobSec = mkSection(tab, "Mob Farm")
         if mobSec then
             mkToggle(mobSec, "Farm Mobs", "be_mobs", false, setFlag("mobs"))
-            registerToggle("mobs", "be_mobs", "Farm Mobs")
+            registerToggle("mobs", "be_mobs")
             mkToggle(mobSec, "Farm Players", "be_players", false, setFlag("players"))
-            registerToggle("players", "be_players", "Farm Players")
+            registerToggle("players", "be_players")
 
             mkSlider(mobSec, "Y Distance", "be_dist", 0, CONFIG.yMax, CFG.dist, function(v)
                 CFG.dist = v
@@ -648,19 +599,11 @@ local function buildTab(tab)
             end)
             mkToggle(mobSec, "Below Target", "be_below", true, function(v)
                 CFG.below = v
-                print("[Bug Farm] below = " .. tostring(v))
             end)
             mkToggle(mobSec, "Freeze Velocity", "be_freeze", true, setFlag("freeze"))
-            registerToggle("freeze", "be_freeze", "Freeze Velocity")
-            pcall(function() mobSec:Text("Distance 0-15, side picks below/above.") end)
-            pcall(function() mobSec:Text("Attack + eat always on with farm.") end)
-        end
-
-        local eatSec = mkSection(tab, "Kill / Eat")
-        if eatSec then
-            mkToggle(eatSec, "Eat Bodies", "be_eat", true, setFlag("eat"))
-            registerToggle("eat", "be_eat", "Eat Bodies")
-            pcall(function() eatSec:Text("Same remote as attack, fired at the body.") end)
+            registerToggle("freeze", "be_freeze")
+            pcall(function() mobSec:Text("Distance 0-15. Attack + eat always on.") end)
+            pcall(function() mobSec:Text("Pauses while orbs are pending.") end)
         end
 
         local misc = mkSection(tab, "Misc")
@@ -669,7 +612,6 @@ local function buildTab(tab)
         end
     end)
     if not ok then warn("[Bug Farm] build error: " .. tostring(err)) end
-    print("[Bug Farm] tab widgets built")
 end
 
 if HAS_UI then
@@ -687,6 +629,9 @@ end
 
 local function stop()
     running = false
+    mobPaused = false
+    armedOrbs = false
+    clearOrbRun()
     flags.mobs, flags.players = false, false
     flags.orbs, flags.voidorbs = false, false
     corpses = {}
@@ -698,5 +643,4 @@ local function stop()
 end
 
 _G[NAME] = { stop = stop, version = VERSION }
-
 print("[Bug Farm] v" .. VERSION .. " loaded - X to stop")
