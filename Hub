@@ -7,6 +7,8 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v4.1: ABOVE pinned by place id 124357835578554 (berry harvest + whole-map
+--       pickup, game.Name is 'Ugc').
 -- v4.0: Pet Simulator 99 pinned by place id 8737899170 (auto tap coins/gems).
 -- v3.9: Bug Evolution pinned by place id 70650894743738 (orb / void orb /
 --       mob + player farm, kill+eat).
@@ -36,7 +38,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.0'
+local VERSION = 'v4.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -47,6 +49,7 @@ local BASE = 'https://raw.githubusercontent.com/bobashid/roblox-matcha/refs/head
 
 -- place id -> file name. Wins over name matching. Add lines as you learn ids.
 local PLACES = {
+    [124357835578554] = 'ABOVE',
     [96469185605358]  = 'Age Evolution Tycoon',
     [113273588963037] = '+1 Upgrade Per Kill',
     [125310131519813] = 'Feed A Mosquito',
@@ -74,6 +77,7 @@ local PLACES = {
 -- file name + the names/aliases this place might show up as.
 -- keys are normalised: lowercase, letters and digits only.
 local SCRIPTS = {
+    { file = 'ABOVE',                        keys = { 'above', 'aboveberries' } },
     { file = '+1 Upgrade Per Kill',          keys = { '1upgradeperkill', 'upgradeperkill' } },
     { file = 'Age Evolution Tycoon',         keys = { 'ageevolutiontycoon', 'ageevolution' } },
     { file = 'Bug Evolution',                keys = { 'bugevolution', 'bugevo' } },
