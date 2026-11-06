@@ -1,12 +1,15 @@
 -- ABOVE
--- VERSION 3.0.0
+-- VERSION 5.0.0
 -- place 124357835578554 (game.Name reports "Ugc")
--- One toggle: harvests every ripe BerryBush on the island, then offers every
--- berry on the map to the pickup remote on every tick. Remotes only.
--- No teleport, no key presses, no Drawing, no ESP.
+-- One toggle. Walks your character onto each ripe BerryBush, fires
+-- RequestHarvest there, then onto each dropped berry, fires RequestPickup
+-- there, and puts you back where you started when nothing is left.
+-- Both remotes are range-checked by the server (proven: a 51-stud harvest
+-- changed nothing), so a warp is the only way to farm beyond arm's length.
+-- No keys, no Drawing, no ESP. Stop = switch the toggle off.
 
 local NAME = "AboveBerries"
-local VERSION = "3.0.0"
+local VERSION = "5.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -18,83 +21,53 @@ local function svc(name)
     return game:FindFirstChild(name)
 end
 
+local Players = svc("Players")
 local RS = svc("ReplicatedStorage")
 
 local CFG = {
     on = false,
-    interval = 0.10,
-    rescanEvery = 2,
-    perPass = 80,
-    maxPickupsPerTick = 400,
+    interval = 0.15,
+    perTick = 1,
+    reachY = 3,
+    nearStuds = 8,
+    pickupTries = 3,
+    idleReturn = 3,
+}
+
+local PART = {
+    Part = true,
+    MeshPart = true,
+    UnionOperation = true,
+    WedgePart = true,
+    CornerWedgePart = true,
 }
 
 local running = true
 local built = false
-local cursor = 1
-local pass = 0
-
-local drops = {}
-local stats = { harvests = 0, pickups = 0, fires = 0, bushes = 0, dropsNow = 0 }
+local homeCF = nil
+local lastWarp = 0
+local idleSince = 0
+local stats = { bushes = 0, ripe = 0, harvest = 0, pickup = 0, warps = 0, back = 0 }
 local lastStatus = 0
 
 local function log(msg)
     print("[ABOVE] " .. tostring(msg))
 end
 
-local function getIslands()
-    local out = {}
+local function getRoot()
+    if not Players then return nil end
+    local lp = Players.LocalPlayer
+    if not lp then return nil end
+    local ch = lp.Character
+    if not ch then return nil end
+    return ch:FindFirstChild("HumanoidRootPart")
+end
+
+local function getIsland()
     for i, d in ipairs(workspace:GetChildren()) do
-        if string.sub(d.Name, 1, 7) == "Island_" then
-            out[#out + 1] = d
-        end
+        if string.sub(d.Name, 1, 7) == "Island_" then return d end
     end
-    return out
-end
-
-local function collectBushes()
-    local out = {}
-    for i, isl in ipairs(getIslands()) do
-        local nodes = isl:FindFirstChild("Nodes")
-        if nodes then
-            for k, n in ipairs(nodes:GetChildren()) do
-                if n.Name == "BerryBush" then
-                    out[#out + 1] = n
-                end
-            end
-        end
-    end
-    return out
-end
-
-local function numAttr(obj, key)
-    if not obj then return nil end
-    local ok, v = pcall(function() return obj:GetAttribute(key) end)
-    if ok and type(v) == "number" then return v end
     return nil
-end
-
-local function boolAttr(obj, key)
-    if not obj then return nil end
-    local ok, v = pcall(function() return obj:GetAttribute(key) end)
-    if ok and type(v) == "boolean" then return v end
-    return nil
-end
-
-local function isRipe(bush)
-    local hb = bush:FindFirstChild("HB")
-    local r = boolAttr(hb, "Ripe")
-    if r ~= nil then return r end
-    local t = numAttr(hb, "BushFruitTransparency")
-    if t ~= nil then return t < 0.5 end
-    local ber = bush:FindFirstChild("Berries")
-    local p = ber and ber:GetChildren()[1]
-    if p then
-        local t2 = numAttr(p, "BushFruitTransparency")
-        if t2 ~= nil then return t2 < 0.5 end
-        local ok, tr = pcall(function() return p.Transparency end)
-        if ok and type(tr) == "number" then return tr < 0.5 end
-    end
-    return false
 end
 
 local function remote(name)
@@ -104,123 +77,184 @@ local function remote(name)
     return r:FindFirstChild(name)
 end
 
-local function fire(ev, payload)
-    if not ev or not payload then return false end
-    stats.fires = stats.fires + 1
-    local ok = pcall(function() ev:FireServer(payload) end)
-    return ok
+local function numAttr(o, k)
+    if not o then return nil end
+    local ok, v = pcall(function() return o:GetAttribute(k) end)
+    if ok and type(v) == "number" then return v end
+    return nil
 end
 
-local CLASSES = {
-    Part = true,
-    MeshPart = true,
-    UnionOperation = true,
-    WedgePart = true,
-    CornerWedgePart = true,
-}
-
--- A dropped berry stays under Nodes.<BerryBush>.Berries as a MeshPart named
--- Icosphere.* after it falls, so "not under Nodes" cannot be the reject rule.
--- Reject prefabs, placement ghosts, previews and characters instead.
-local function isBerryPart(d)
-    if not CLASSES[d.ClassName] then return false end
-    local low = string.lower(d.Name)
-    local named = string.find(low, "berry", 1, true) ~= nil
-    local ico = string.sub(low, 1, 9) == "icosphere"
-    if not (named or ico) then return false end
-    local p = d
-    local inBerries = false
-    for i = 1, 14 do
-        if not p or p == workspace then break end
-        local lnm = string.lower(p.Name)
-        if string.find(lnm, "placement", 1, true) then return false end
-        if string.find(lnm, "ghost", 1, true) then return false end
-        if string.find(lnm, "preview", 1, true) then return false end
-        if lnm == "berries" then inBerries = true end
-        if p:FindFirstChild("Humanoid") then return false end
-        p = p.Parent
-    end
-    if named then return true end
-    return inBerries
+local function posOf(o)
+    if not o then return nil end
+    local ok, p = pcall(function() return o.Position end)
+    if ok and p then return p end
+    return nil
 end
 
-local function scanDrops()
-    local out = {}
-    pcall(function()
-        for i, d in ipairs(workspace:GetDescendants()) do
-            if isBerryPart(d) then
-                out[#out + 1] = d
+local function isRipe(hb)
+    if not hb then return false end
+    local ok, v = pcall(function() return hb:GetAttribute("Ripe") end)
+    if ok and type(v) == "boolean" then return v end
+    local bush = hb.Parent
+    if bush then
+        local ber = bush:FindFirstChild("Berries")
+        if ber then
+            local p = ber:GetChildren()[1]
+            if p then
+                local ok2, t = pcall(function() return p.Transparency end)
+                if ok2 and type(t) == "number" then return t < 0.5 end
             end
         end
-    end)
+    end
+    return false
+end
+
+local function collectRipe(ppos)
+    local isl = getIsland()
+    if not isl then return nil, {}, 0 end
+    local nodes = isl:FindFirstChild("Nodes")
+    if not nodes then return isl, {}, 0 end
+    local list = {}
+    local total = 0
+    for i, n in ipairs(nodes:GetChildren()) do
+        if n.Name == "BerryBush" then
+            total = total + 1
+            local hb = n:FindFirstChild("HB")
+            if hb and isRipe(hb) then
+                local p = posOf(hb)
+                local d = p and (p - ppos).Magnitude or math.huge
+                list[#list + 1] = { hb = hb, pos = p, d = d }
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.d < b.d end)
+    return isl, list, total
+end
+
+-- A loose berry is a BasePart carrying a numeric "Count" attribute (that is
+-- what the game's own LooseCountController reads). Decoration rocks share the
+-- Icosphere mesh name, so the name alone must never be the test.
+local function considerDrop(p, ppos, out, seen)
+    if not p or not PART[p.ClassName] then return end
+    local c = numAttr(p, "Count")
+    if not c or c < 1 then return end
+    local key = nil
+    local okn, nm = pcall(function() return p:GetFullName() end)
+    if okn and type(nm) == "string" then key = nm end
+    if not key or seen[key] then return end
+    seen[key] = true
+    local pos = posOf(p)
+    local d = pos and (pos - ppos).Magnitude or math.huge
+    out[#out + 1] = { part = p, pos = pos, d = d }
+end
+
+local function collectDrops(isl, ppos)
+    local out = {}
+    local seen = {}
+    if isl then
+        local items = isl:FindFirstChild("Items")
+        if items then
+            for i, c in ipairs(items:GetChildren()) do
+                if PART[c.ClassName] then
+                    considerDrop(c, ppos, out, seen)
+                else
+                    for k, g in ipairs(c:GetChildren()) do
+                        considerDrop(g, ppos, out, seen)
+                    end
+                end
+            end
+        end
+    end
+    local guard = 0
+    for i, c in ipairs(workspace:GetChildren()) do
+        if guard > 400 then break end
+        guard = guard + 1
+        considerDrop(c, ppos, out, seen)
+    end
+    table.sort(out, function(a, b) return a.d < b.d end)
     return out
 end
 
-local function doHarvest()
-    local bushes = collectBushes()
-    stats.bushes = #bushes
-    if #bushes < 1 then return end
-    if cursor > #bushes then cursor = 1 end
-    local ev = remote("RequestHarvest")
-    if not ev then return end
-    local fired = 0
-    local checked = 0
-    while checked < CFG.perPass and fired < CFG.perPass do
-        local bush = bushes[cursor]
-        cursor = cursor + 1
-        if cursor > #bushes then cursor = 1 end
-        checked = checked + 1
-        if bush and bush.Parent and isRipe(bush) then
-            local hb = bush:FindFirstChild("HB") or bush
-            if fire(ev, hb) then
-                fired = fired + 1
-                stats.harvests = stats.harvests + 1
-            end
-        end
-    end
+local function warpTo(pos, rp, lift)
+    if not pos or not rp then return false end
+    local now = os.clock()
+    if now - lastWarp < 0.05 then return false end
+    lastWarp = now
+    local ok = pcall(function()
+        rp.CFrame = CFrame.new(pos.X, pos.Y + (lift or CFG.reachY), pos.Z)
+    end)
+    if ok then stats.warps = stats.warps + 1 end
+    return ok
 end
 
--- No distance test and no cursor rotation: every berry on the map is offered
--- to the pickup remote on every tick, so nothing waits its turn.
-local function doPickup()
-    if #drops < 1 then return end
-    local ev = remote("RequestPickup")
-    if not ev then return end
-    local n = 0
-    for i = 1, #drops do
-        if n >= CFG.maxPickupsPerTick then break end
-        local d = drops[i]
-        if d and d.Parent then
-            n = n + 1
-            if fire(ev, d) then
-                stats.pickups = stats.pickups + 1
-            end
-        end
-    end
+local function saveHome(rp)
+    if homeCF or not rp then return end
+    local ok, cf = pcall(function() return rp.CFrame end)
+    if ok and cf then homeCF = cf end
+end
+
+local function goHome(rp)
+    if not homeCF or not rp then return end
+    pcall(function() rp.CFrame = homeCF end)
+    homeCF = nil
+    stats.back = stats.back + 1
+end
+
+local function fire(ev, arg)
+    if not ev or not arg then return false end
+    local ok = pcall(function() ev:FireServer(arg) end)
+    return ok
 end
 
 local function tick()
-    pass = pass + 1
-    if CFG.on then
-        doHarvest()
-        if pass % CFG.rescanEvery == 0 or #drops < 1 then
-            drops = scanDrops()
-            stats.dropsNow = #drops
-        end
-        doPickup()
-    else
-        drops = {}
-        stats.dropsNow = 0
-        cursor = 1
+    local rp = getRoot()
+    if not rp then return end
+    local ppos = posOf(rp)
+    if not ppos then return end
+
+    local evH = remote("RequestHarvest")
+    local evP = remote("RequestPickup")
+    local isl, list, total = collectRipe(ppos)
+    stats.bushes = total or 0
+    stats.ripe = #list
+
+    if #list == 0 then
+        if homeCF and os.clock() - idleSince > CFG.idleReturn then goHome(rp) end
+        idleSince = os.clock()
+        return
     end
+
+    idleSince = os.clock()
+    saveHome(rp)
+
+    local done = 0
+    for i, e in ipairs(list) do
+        if done >= CFG.perTick then break end
+        done = done + 1
+        if e.hb and e.hb.Parent and e.pos then
+            if e.d > CFG.nearStuds then warpTo(e.pos, rp) end
+            if fire(evH, e.hb) then stats.harvest = stats.harvest + 1 end
+
+            local drops = collectDrops(isl, e.pos)
+            for k, d in ipairs(drops) do
+                if d.pos then
+                    if d.d > CFG.nearStuds then warpTo(d.pos, rp, 2) end
+                    for t = 1, CFG.pickupTries do
+                        if fire(evP, d.part) then stats.pickup = stats.pickup + 1 end
+                    end
+                end
+            end
+        end
+    end
+
     local now = os.clock()
     if now - lastStatus > 10 then
         lastStatus = now
         log("bushes " .. tostring(stats.bushes)
-            .. " | harvest fires " .. tostring(stats.harvests)
-            .. " | berries on map " .. tostring(stats.dropsNow)
-            .. " | pickup fires " .. tostring(stats.pickups)
-            .. " | total fires " .. tostring(stats.fires))
+            .. " | ripe " .. tostring(stats.ripe)
+            .. " | harvest " .. tostring(stats.harvest)
+            .. " | pickups " .. tostring(stats.pickup)
+            .. " | warps " .. tostring(stats.warps))
     end
 end
 
@@ -246,23 +280,9 @@ local function buildMenu()
             pcall(function()
                 local sec = tab:Section("Berries", "Left")
                 if sec then
-                    sec:Toggle("ab_on", "Auto Harvest + Instant Pickup", false, function(v)
+                    sec:Toggle("ab_on", "Auto Harvest (berries)", false, function(v)
                         CFG.on = v
                     end)
-                    sec:Spacing()
-                    sec:Button("Reset counters", function()
-                        stats.harvests = 0
-                        stats.pickups = 0
-                        stats.fires = 0
-                        log("counters reset")
-                    end)
-                end
-                local info = tab:Section("Info", "Right")
-                if info then
-                    info:Text("Harvests every ripe bush.")
-                    info:Text("Picks up every berry on the")
-                    info:Text("map, no distance check.")
-                    info:Text("No teleport, no keys.")
                 end
             end)
         end)
@@ -274,7 +294,11 @@ end
 
 local function stop()
     running = false
-    drops = {}
+    local rp = getRoot()
+    if homeCF and rp then
+        pcall(function() rp.CFrame = homeCF end)
+        homeCF = nil
+    end
     local M = _G.UI
     if M and M.RemoveTab then
         pcall(function() M.RemoveTab("ABOVE Berries") end)
@@ -294,11 +318,16 @@ end)
 
 task.spawn(function()
     while running do
-        local ok, err = pcall(tick)
-        if not ok then
-            log("tick error " .. tostring(err))
-        end
         pcall(pollWidgets)
+        if CFG.on then
+            local ok, err = pcall(tick)
+            if not ok then
+                log("tick error " .. tostring(err))
+            end
+        else
+            local rp = getRoot()
+            if homeCF and rp then goHome(rp) end
+        end
         task.wait(CFG.interval)
     end
 end)
