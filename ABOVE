@@ -1,1 +1,307 @@
-...same content...
+-- ABOVE
+-- VERSION 3.0.0
+-- place 124357835578554 (game.Name reports "Ugc")
+-- One toggle: harvests every ripe BerryBush on the island, then offers every
+-- berry on the map to the pickup remote on every tick. Remotes only.
+-- No teleport, no key presses, no Drawing, no ESP.
+
+local NAME = "AboveBerries"
+local VERSION = "3.0.0"
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+
+local function svc(name)
+    local ok, s = pcall(function() return game:GetService(name) end)
+    if ok and s then return s end
+    return game:FindFirstChild(name)
+end
+
+local RS = svc("ReplicatedStorage")
+
+local CFG = {
+    on = false,
+    interval = 0.10,
+    rescanEvery = 2,
+    perPass = 80,
+    maxPickupsPerTick = 400,
+}
+
+local running = true
+local built = false
+local cursor = 1
+local pass = 0
+
+local drops = {}
+local stats = { harvests = 0, pickups = 0, fires = 0, bushes = 0, dropsNow = 0 }
+local lastStatus = 0
+
+local function log(msg)
+    print("[ABOVE] " .. tostring(msg))
+end
+
+local function getIslands()
+    local out = {}
+    for i, d in ipairs(workspace:GetChildren()) do
+        if string.sub(d.Name, 1, 7) == "Island_" then
+            out[#out + 1] = d
+        end
+    end
+    return out
+end
+
+local function collectBushes()
+    local out = {}
+    for i, isl in ipairs(getIslands()) do
+        local nodes = isl:FindFirstChild("Nodes")
+        if nodes then
+            for k, n in ipairs(nodes:GetChildren()) do
+                if n.Name == "BerryBush" then
+                    out[#out + 1] = n
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function numAttr(obj, key)
+    if not obj then return nil end
+    local ok, v = pcall(function() return obj:GetAttribute(key) end)
+    if ok and type(v) == "number" then return v end
+    return nil
+end
+
+local function boolAttr(obj, key)
+    if not obj then return nil end
+    local ok, v = pcall(function() return obj:GetAttribute(key) end)
+    if ok and type(v) == "boolean" then return v end
+    return nil
+end
+
+local function isRipe(bush)
+    local hb = bush:FindFirstChild("HB")
+    local r = boolAttr(hb, "Ripe")
+    if r ~= nil then return r end
+    local t = numAttr(hb, "BushFruitTransparency")
+    if t ~= nil then return t < 0.5 end
+    local ber = bush:FindFirstChild("Berries")
+    local p = ber and ber:GetChildren()[1]
+    if p then
+        local t2 = numAttr(p, "BushFruitTransparency")
+        if t2 ~= nil then return t2 < 0.5 end
+        local ok, tr = pcall(function() return p.Transparency end)
+        if ok and type(tr) == "number" then return tr < 0.5 end
+    end
+    return false
+end
+
+local function remote(name)
+    if not RS then return nil end
+    local r = RS:FindFirstChild("Remotes")
+    if not r then return nil end
+    return r:FindFirstChild(name)
+end
+
+local function fire(ev, payload)
+    if not ev or not payload then return false end
+    stats.fires = stats.fires + 1
+    local ok = pcall(function() ev:FireServer(payload) end)
+    return ok
+end
+
+local CLASSES = {
+    Part = true,
+    MeshPart = true,
+    UnionOperation = true,
+    WedgePart = true,
+    CornerWedgePart = true,
+}
+
+-- A dropped berry stays under Nodes.<BerryBush>.Berries as a MeshPart named
+-- Icosphere.* after it falls, so "not under Nodes" cannot be the reject rule.
+-- Reject prefabs, placement ghosts, previews and characters instead.
+local function isBerryPart(d)
+    if not CLASSES[d.ClassName] then return false end
+    local low = string.lower(d.Name)
+    local named = string.find(low, "berry", 1, true) ~= nil
+    local ico = string.sub(low, 1, 9) == "icosphere"
+    if not (named or ico) then return false end
+    local p = d
+    local inBerries = false
+    for i = 1, 14 do
+        if not p or p == workspace then break end
+        local lnm = string.lower(p.Name)
+        if string.find(lnm, "placement", 1, true) then return false end
+        if string.find(lnm, "ghost", 1, true) then return false end
+        if string.find(lnm, "preview", 1, true) then return false end
+        if lnm == "berries" then inBerries = true end
+        if p:FindFirstChild("Humanoid") then return false end
+        p = p.Parent
+    end
+    if named then return true end
+    return inBerries
+end
+
+local function scanDrops()
+    local out = {}
+    pcall(function()
+        for i, d in ipairs(workspace:GetDescendants()) do
+            if isBerryPart(d) then
+                out[#out + 1] = d
+            end
+        end
+    end)
+    return out
+end
+
+local function doHarvest()
+    local bushes = collectBushes()
+    stats.bushes = #bushes
+    if #bushes < 1 then return end
+    if cursor > #bushes then cursor = 1 end
+    local ev = remote("RequestHarvest")
+    if not ev then return end
+    local fired = 0
+    local checked = 0
+    while checked < CFG.perPass and fired < CFG.perPass do
+        local bush = bushes[cursor]
+        cursor = cursor + 1
+        if cursor > #bushes then cursor = 1 end
+        checked = checked + 1
+        if bush and bush.Parent and isRipe(bush) then
+            local hb = bush:FindFirstChild("HB") or bush
+            if fire(ev, hb) then
+                fired = fired + 1
+                stats.harvests = stats.harvests + 1
+            end
+        end
+    end
+end
+
+-- No distance test and no cursor rotation: every berry on the map is offered
+-- to the pickup remote on every tick, so nothing waits its turn.
+local function doPickup()
+    if #drops < 1 then return end
+    local ev = remote("RequestPickup")
+    if not ev then return end
+    local n = 0
+    for i = 1, #drops do
+        if n >= CFG.maxPickupsPerTick then break end
+        local d = drops[i]
+        if d and d.Parent then
+            n = n + 1
+            if fire(ev, d) then
+                stats.pickups = stats.pickups + 1
+            end
+        end
+    end
+end
+
+local function tick()
+    pass = pass + 1
+    if CFG.on then
+        doHarvest()
+        if pass % CFG.rescanEvery == 0 or #drops < 1 then
+            drops = scanDrops()
+            stats.dropsNow = #drops
+        end
+        doPickup()
+    else
+        drops = {}
+        stats.dropsNow = 0
+        cursor = 1
+    end
+    local now = os.clock()
+    if now - lastStatus > 10 then
+        lastStatus = now
+        log("bushes " .. tostring(stats.bushes)
+            .. " | harvest fires " .. tostring(stats.harvests)
+            .. " | berries on map " .. tostring(stats.dropsNow)
+            .. " | pickup fires " .. tostring(stats.pickups)
+            .. " | total fires " .. tostring(stats.fires))
+    end
+end
+
+local function pollWidgets()
+    local M = _G.UI
+    if not M or not M.GetValue then return end
+    local ok, v = pcall(function() return M.GetValue("ab_on") end)
+    if ok and type(v) == "boolean" then
+        CFG.on = v
+    end
+end
+
+local function buildMenu()
+    local M = _G.UI
+    if not M or not M.AddTab then
+        log("UI not found - toggle unavailable")
+        return
+    end
+    local ok = pcall(function()
+        M.AddTab("ABOVE Berries", function(tab)
+            if built then return end
+            built = true
+            pcall(function()
+                local sec = tab:Section("Berries", "Left")
+                if sec then
+                    sec:Toggle("ab_on", "Auto Harvest + Instant Pickup", false, function(v)
+                        CFG.on = v
+                    end)
+                    sec:Spacing()
+                    sec:Button("Reset counters", function()
+                        stats.harvests = 0
+                        stats.pickups = 0
+                        stats.fires = 0
+                        log("counters reset")
+                    end)
+                end
+                local info = tab:Section("Info", "Right")
+                if info then
+                    info:Text("Harvests every ripe bush.")
+                    info:Text("Picks up every berry on the")
+                    info:Text("map, no distance check.")
+                    info:Text("No teleport, no keys.")
+                end
+            end)
+        end)
+    end)
+    if not ok then
+        log("AddTab failed")
+    end
+end
+
+local function stop()
+    running = false
+    drops = {}
+    local M = _G.UI
+    if M and M.RemoveTab then
+        pcall(function() M.RemoveTab("ABOVE Berries") end)
+    end
+    _G[NAME] = nil
+    log("stopped")
+end
+
+task.spawn(function()
+    local waited = 0
+    while running and not (_G.UI and _G.UI.AddTab) and waited < 15 do
+        task.wait(0.5)
+        waited = waited + 0.5
+    end
+    buildMenu()
+end)
+
+task.spawn(function()
+    while running do
+        local ok, err = pcall(tick)
+        if not ok then
+            log("tick error " .. tostring(err))
+        end
+        pcall(pollWidgets)
+        task.wait(CFG.interval)
+    end
+end)
+
+_G[NAME] = { stop = stop, version = VERSION }
+log("v" .. VERSION .. " loaded on place " .. tostring(game.PlaceId))
