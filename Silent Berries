@@ -1,0 +1,333 @@
+-- Silent Berries
+-- VERSION 4.0.0
+-- place 124357835578554 (game.Name reports "Ugc")
+-- One toggle. Visits each ripe BerryBush, fires RequestHarvest on its HB from
+-- inside range, picks up the berries that bush drops, then returns you to where
+-- you started. No keys, no Drawing, no ESP, no stop key.
+--
+-- Why it visits bushes: the server range-checks RequestHarvest. A probe fired it
+-- from 48 studs and the bush's 12 berries were untouched; fired on the spot it
+-- harvested. There is no range-free harvest, so the script has to be there.
+
+local NAME = "SilentBerries"
+local VERSION = "4.0.0"
+
+if _G[NAME] and _G[NAME].stop then
+    pcall(_G[NAME].stop)
+end
+
+local function svc(name)
+    local ok, s = pcall(function() return game:GetService(name) end)
+    if ok and s then return s end
+    return game:FindFirstChild(name)
+end
+
+local Players = svc("Players")
+local RS = svc("ReplicatedStorage")
+
+local CFG = {
+    on = false,
+    interval = 0.05,
+    perVisit = 3,
+    pickupTries = 3,
+    settle = 0.06,
+}
+
+local running = true
+local built = false
+local startPos = nil
+local visits = 0
+local stats = { harvest = 0, pickup = 0, ripe = 0, failed = 0 }
+local lastStatus = 0
+local ripenessReady = false
+
+local function log(msg)
+    print("[SilentBerries] " .. tostring(msg))
+end
+
+local function remotes()
+    if not RS then return nil, nil end
+    local r = RS:FindFirstChild("Remotes")
+    if not r then return nil, nil end
+    return r:FindFirstChild("RequestHarvest"), r:FindFirstChild("RequestPickup")
+end
+
+local function getIsland()
+    for i, d in ipairs(workspace:GetChildren()) do
+        if string.sub(d.Name, 1, 7) == "Island_" then
+            return d
+        end
+    end
+    return nil
+end
+
+local function root()
+    if not Players then return nil end
+    local lp = Players.LocalPlayer
+    if not lp then return nil end
+    local ch = lp.Character
+    if not ch then return nil end
+    return ch:FindFirstChild("HumanoidRootPart")
+end
+
+local function moveTo(pos)
+    local r = root()
+    if not r or not pos then return false end
+    local ok = pcall(function()
+        r.CFrame = CFrame.new(pos.X, pos.Y + 4, pos.Z)
+    end)
+    return ok
+end
+
+local function bushRipe(bush)
+    local hb = bush:FindFirstChild("HB")
+    if not hb then return false, nil end
+    local ok, v = pcall(function() return hb:GetAttribute("Ripe") end)
+    if ok and type(v) == "boolean" then
+        ripenessReady = true
+        return v, hb
+    end
+    -- fallback: a ripe bush shows its berries (transparency 0)
+    local ber = bush:FindFirstChild("Berries")
+    if ber then
+        for i, c in ipairs(ber:GetChildren()) do
+            local ok2, t = pcall(function() return c.Transparency end)
+            if ok2 and type(t) == "number" then
+                return t < 0.5, hb
+            end
+        end
+    end
+    return false, hb
+end
+
+local function collectRipe()
+    local out = {}
+    local isl = getIsland()
+    if not isl then return out end
+    local nodes = isl:FindFirstChild("Nodes")
+    if not nodes then return out end
+    for i, n in ipairs(nodes:GetChildren()) do
+        if n.Name == "BerryBush" then
+            local ripe, hb = bushRipe(n)
+            if ripe and hb then
+                out[#out + 1] = { bush = n, hb = hb }
+            end
+        end
+    end
+    return out
+end
+
+local CLASSES = { Part = true, MeshPart = true, UnionOperation = true, WedgePart = true }
+
+local function isUnder(p, name, limit)
+    local guard = 0
+    while p and p ~= workspace and guard < limit do
+        if p.Name == name then return true end
+        p = p.Parent
+        guard = guard + 1
+    end
+    return false
+end
+
+local function rejectDrop(d)
+    if isUnder(d, "Nodes", 12) then return true end
+    if isUnder(d, "PlacementGhost", 12) then return true end
+    if isUnder(d, "Prefabs", 12) then return true end
+    if isUnder(d, "Camera", 12) then return true end
+    return false
+end
+
+local function berryName(d)
+    local lower = string.lower(d.Name)
+    if string.find(lower, "berry", 1, true) then return true end
+    if string.sub(lower, 1, 9) == "icosphere" then return true end
+    return false
+end
+
+local function pickupNear(pos, radius)
+    local ev = select(2, remotes())
+    if not ev or not pos then return 0 end
+    local found = 0
+    local r2 = radius * radius
+    for i, d in ipairs(workspace:GetDescendants()) do
+        if CLASSES[d.ClassName] and berryName(d) and not rejectDrop(d) then
+            local ok, p = pcall(function() return d.Position end)
+            if ok and p then
+                local dx = p.X - pos.X
+                local dy = p.Y - pos.Y
+                local dz = p.Z - pos.Z
+                if dx * dx + dy * dy + dz * dz <= r2 then
+                    found = found + 1
+                    for t = 1, CFG.pickupTries do
+                        pcall(function() ev:FireServer(d) end)
+                        stats.pickup = stats.pickup + 1
+                    end
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function visit(entry)
+    if not entry or not entry.hb then return false end
+    local okPos, hbPos = pcall(function() return entry.hb.Position end)
+    if not okPos or not hbPos then return false end
+    local ev = remotes()
+    if not ev then return false end
+    if not moveTo(hbPos) then return false end
+    task.wait(CFG.settle)
+    local fired = 0
+    for i = 1, CFG.perVisit do
+        local ok = pcall(function() ev:FireServer(entry.hb) end)
+        if ok then
+            fired = fired + 1
+            stats.harvest = stats.harvest + 1
+        end
+    end
+    pickupNear(hbPos, 40)
+    visits = visits + 1
+    return fired > 0
+end
+
+local function returnHome()
+    if not startPos then return end
+    local r = root()
+    if not r then return end
+    pcall(function()
+        r.CFrame = CFrame.new(startPos.X, startPos.Y + 3, startPos.Z)
+    end)
+end
+
+local function tick()
+    local r = root()
+    if not r then return end
+    if not startPos then
+        local ok, p = pcall(function() return r.Position end)
+        if ok and p then startPos = p end
+    end
+
+    local ripe = collectRipe()
+    stats.ripe = #ripe
+    if #ripe < 1 then
+        returnHome()
+        return
+    end
+
+    local done = 0
+    for i, entry in ipairs(ripe) do
+        if not running or not CFG.on then break end
+        if visit(entry) then
+            done = done + 1
+        else
+            stats.failed = stats.failed + 1
+        end
+        if done >= 3 then break end
+        task.wait(CFG.interval)
+    end
+
+    if done < 1 then
+        returnHome()
+    end
+end
+
+local function poll()
+    local M = _G.UI
+    if not M or not M.GetValue then return end
+    local ok, v = pcall(function() return M.GetValue("sb_on") end)
+    if ok and type(v) == "boolean" then
+        CFG.on = v
+    end
+end
+
+local function buildMenu()
+    local M = _G.UI
+    if not M or not M.AddTab then
+        log("UI not found - toggle unavailable")
+        return
+    end
+    pcall(function()
+        M.AddTab("Silent Berries", function(tab)
+            if built then return end
+            built = true
+            pcall(function()
+                local sec = tab:Section("Berries", "Left")
+                if sec then
+                    sec:Toggle("sb_on", "Auto Harvest + Pickup (berries)", false, function(v)
+                        CFG.on = v
+                    end)
+                    sec:Spacing()
+                    sec:Button("Set home to here", function()
+                        local r = root()
+                        if r then
+                            startPos = r.Position
+                            log("home set")
+                        end
+                    end)
+                    sec:Button("Reset counters", function()
+                        stats.harvest = 0
+                        stats.pickup = 0
+                        stats.failed = 0
+                        log("counters reset")
+                    end)
+                end
+                local info = tab:Section("Info", "Right")
+                if info then
+                    info:Text("Visits each ripe bush, harvests,")
+                    info:Text("picks up nearby berries, then")
+                    info:Text("returns you home.")
+                    info:Text("Harvest is range-checked by the")
+                    info:Text("server, so a visit is required.")
+                end
+            end)
+        end)
+    end)
+end
+
+local function stop()
+    running = false
+    local M = _G.UI
+    if M and M.RemoveTab then
+        pcall(function() M.RemoveTab("Silent Berries") end)
+    end
+    _G[NAME] = nil
+    log("stopped")
+end
+
+task.spawn(function()
+    local waited = 0
+    while running and not (_G.UI and _G.UI.AddTab) and waited < 15 do
+        task.wait(0.5)
+        waited = waited + 0.5
+    end
+    buildMenu()
+end)
+
+task.spawn(function()
+    while running do
+        pcall(poll)
+        if CFG.on then
+            local ok, err = pcall(tick)
+            if not ok then
+                log("tick error " .. tostring(err))
+            end
+            local now = os.clock()
+            if now - lastStatus > 10 then
+                lastStatus = now
+                log("ripe " .. tostring(stats.ripe)
+                    .. " | visits " .. tostring(visits)
+                    .. " | harvest " .. tostring(stats.harvest)
+                    .. " | pickup " .. tostring(stats.pickup)
+                    .. " | fail " .. tostring(stats.failed))
+            end
+        else
+            if startPos then returnHome() end
+            stats.ripe = 0
+            visits = 0
+        end
+        task.wait(CFG.interval)
+    end
+end)
+
+_G[NAME] = { stop = stop, version = VERSION }
+log("v" .. VERSION .. " loaded on place " .. tostring(game.PlaceId))
