@@ -7,6 +7,8 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v4.2: ABOVE v5.1.0 - warp harvest + warp pickup, loose berries found by the
+--       Count attribute (CollectionService tags are nil in this VM).
 -- v4.1: ABOVE pinned by place id 124357835578554 (berry harvest + whole-map
 --       pickup, game.Name is 'Ugc').
 -- v4.0: Pet Simulator 99 pinned by place id 8737899170 (auto tap coins/gems).
@@ -38,7 +40,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.1'
+local VERSION = 'v4.2'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
