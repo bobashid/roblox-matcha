@@ -1,15 +1,20 @@
 -- ABOVE
--- VERSION 5.0.0
+-- VERSION 5.1.0
 -- place 124357835578554 (game.Name reports "Ugc")
--- One toggle. Walks your character onto each ripe BerryBush, fires
--- RequestHarvest there, then onto each dropped berry, fires RequestPickup
--- there, and puts you back where you started when nothing is left.
--- Both remotes are range-checked by the server (proven: a 51-stud harvest
--- changed nothing), so a warp is the only way to farm beyond arm's length.
--- No keys, no Drawing, no ESP. Stop = switch the toggle off.
+-- One toggle, "Auto Harvest (berries)":
+--   * finds every ripe BerryBush (HB:Ripe == true), warps onto it and fires
+--     RequestHarvest with that bush's HB (the call shape you gave me)
+--   * finds every loose berry (a BasePart carrying a numeric "Count"
+--     attribute - the game's own LooseCountController reads exactly that;
+--     CollectionService tags are nil in this VM) and fires RequestPickup
+--     on it from within reach
+--   * warps you back to where you started once nothing is left
+-- Both remotes are range-checked by the server, so standing still can never
+-- farm past arm's length. No keys, no Drawing, no ESP.
+-- Stop = switch the toggle off.
 
 local NAME = "AboveBerries"
-local VERSION = "5.0.0"
+local VERSION = "5.1.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -27,10 +32,12 @@ local RS = svc("ReplicatedStorage")
 local CFG = {
     on = false,
     interval = 0.15,
-    perTick = 1,
+    rescanTicks = 4,
+    bushPerTick = 1,
+    pickupPerTick = 6,
     reachY = 3,
-    nearStuds = 8,
-    pickupTries = 3,
+    nearStuds = 6,
+    warpGap = 0.05,
     idleReturn = 3,
 }
 
@@ -42,12 +49,21 @@ local PART = {
     CornerWedgePart = true,
 }
 
+local SKIPNAME = {
+    Nodes = true,
+    Decoration = true,
+    PlacementGhost = true,
+    Prefabs = true,
+}
+
 local running = true
 local built = false
 local homeCF = nil
 local lastWarp = 0
 local idleSince = 0
-local stats = { bushes = 0, ripe = 0, harvest = 0, pickup = 0, warps = 0, back = 0 }
+local ticks = 0
+local drops = {}
+local stats = { bushes = 0, ripe = 0, harvest = 0, pickup = 0, warps = 0, back = 0, drops = 0 }
 local lastStatus = 0
 
 local function log(msg)
@@ -84,6 +100,13 @@ local function numAttr(o, k)
     return nil
 end
 
+local function boolAttr(o, k)
+    if not o then return nil end
+    local ok, v = pcall(function() return o:GetAttribute(k) end)
+    if ok and type(v) == "boolean" then return v end
+    return nil
+end
+
 local function posOf(o)
     if not o then return nil end
     local ok, p = pcall(function() return o.Position end)
@@ -92,17 +115,16 @@ local function posOf(o)
 end
 
 local function isRipe(hb)
-    if not hb then return false end
-    local ok, v = pcall(function() return hb:GetAttribute("Ripe") end)
-    if ok and type(v) == "boolean" then return v end
-    local bush = hb.Parent
+    local r = boolAttr(hb, "Ripe")
+    if r ~= nil then return r end
+    local bush = hb and hb.Parent
     if bush then
         local ber = bush:FindFirstChild("Berries")
         if ber then
             local p = ber:GetChildren()[1]
             if p then
-                local ok2, t = pcall(function() return p.Transparency end)
-                if ok2 and type(t) == "number" then return t < 0.5 end
+                local ok, t = pcall(function() return p.Transparency end)
+                if ok and type(t) == "number" then return t < 0.5 end
             end
         end
     end
@@ -122,7 +144,8 @@ local function collectRipe(ppos)
             local hb = n:FindFirstChild("HB")
             if hb and isRipe(hb) then
                 local p = posOf(hb)
-                local d = p and (p - ppos).Magnitude or math.huge
+                local d = math.huge
+                if p then d = (p - ppos).Magnitude end
                 list[#list + 1] = { hb = hb, pos = p, d = d }
             end
         end
@@ -131,54 +154,55 @@ local function collectRipe(ppos)
     return isl, list, total
 end
 
--- A loose berry is a BasePart carrying a numeric "Count" attribute (that is
--- what the game's own LooseCountController reads). Decoration rocks share the
--- Icosphere mesh name, so the name alone must never be the test.
-local function considerDrop(p, ppos, out, seen)
-    if not p or not PART[p.ClassName] then return end
-    local c = numAttr(p, "Count")
-    if not c or c < 1 then return end
-    local key = nil
-    local okn, nm = pcall(function() return p:GetFullName() end)
-    if okn and type(nm) == "string" then key = nm end
-    if not key or seen[key] then return end
-    seen[key] = true
-    local pos = posOf(p)
-    local d = pos and (pos - ppos).Magnitude or math.huge
-    out[#out + 1] = { part = p, pos = pos, d = d }
+local function skipped(d)
+    local p = d
+    for i = 1, 8 do
+        if not p or p == workspace then return false end
+        if SKIPNAME[p.Name] then return true end
+        if string.find(p.Name, "Rock", 1, true) then return true end
+        p = p.Parent
+    end
+    return false
 end
 
-local function collectDrops(isl, ppos)
+local function looksLoose(d)
+    local low = string.lower(d.Name)
+    if string.find(low, "berry", 1, true) then return true end
+    return string.sub(low, 1, 9) == "icosphere"
+end
+
+-- A loose berry is a BasePart with a numeric Count attribute. Name alone is
+-- useless: decoration rocks are MeshParts named Icosphere / Icosphere.001
+-- under Workspace.Hub.Decoration.Rock 2.
+local function scanLoose()
     local out = {}
     local seen = {}
-    if isl then
-        local items = isl:FindFirstChild("Items")
-        if items then
-            for i, c in ipairs(items:GetChildren()) do
-                if PART[c.ClassName] then
-                    considerDrop(c, ppos, out, seen)
-                else
-                    for k, g in ipairs(c:GetChildren()) do
-                        considerDrop(g, ppos, out, seen)
+    local checked = 0
+    pcall(function()
+        for i, d in ipairs(workspace:GetDescendants()) do
+            if checked >= 200 then break end
+            if PART[d.ClassName] and looksLoose(d) and not skipped(d) then
+                checked = checked + 1
+                local c = numAttr(d, "Count")
+                if c and c >= 1 then
+                    local key = nil
+                    local okn, nm = pcall(function() return d:GetFullName() end)
+                    if okn and type(nm) == "string" then key = nm end
+                    if key and not seen[key] then
+                        seen[key] = true
+                        out[#out + 1] = { part = d, pos = posOf(d) }
                     end
                 end
             end
         end
-    end
-    local guard = 0
-    for i, c in ipairs(workspace:GetChildren()) do
-        if guard > 400 then break end
-        guard = guard + 1
-        considerDrop(c, ppos, out, seen)
-    end
-    table.sort(out, function(a, b) return a.d < b.d end)
+    end)
     return out
 end
 
 local function warpTo(pos, rp, lift)
     if not pos or not rp then return false end
     local now = os.clock()
-    if now - lastWarp < 0.05 then return false end
+    if now - lastWarp < CFG.warpGap then return false end
     lastWarp = now
     local ok = pcall(function()
         rp.CFrame = CFrame.new(pos.X, pos.Y + (lift or CFG.reachY), pos.Z)
@@ -211,38 +235,50 @@ local function tick()
     if not rp then return end
     local ppos = posOf(rp)
     if not ppos then return end
+    ticks = ticks + 1
 
-    local evH = remote("RequestHarvest")
-    local evP = remote("RequestPickup")
     local isl, list, total = collectRipe(ppos)
     stats.bushes = total or 0
     stats.ripe = #list
 
-    if #list == 0 then
-        if homeCF and os.clock() - idleSince > CFG.idleReturn then goHome(rp) end
-        idleSince = os.clock()
-        return
+    if ticks % CFG.rescanTicks == 1 then
+        drops = scanLoose()
+        stats.drops = #drops
     end
 
-    idleSince = os.clock()
-    saveHome(rp)
+    local busy = false
+    if #list > 0 then busy = true end
+    if #drops > 0 then busy = true end
 
-    local done = 0
-    for i, e in ipairs(list) do
-        if done >= CFG.perTick then break end
-        done = done + 1
-        if e.hb and e.hb.Parent and e.pos then
-            if e.d > CFG.nearStuds then warpTo(e.pos, rp) end
-            if fire(evH, e.hb) then stats.harvest = stats.harvest + 1 end
+    if not busy then
+        if homeCF and os.clock() - idleSince > CFG.idleReturn then goHome(rp) end
+        idleSince = os.clock()
+    else
+        idleSince = os.clock()
+        saveHome(rp)
 
-            local drops = collectDrops(isl, e.pos)
-            for k, d in ipairs(drops) do
-                if d.pos then
-                    if d.d > CFG.nearStuds then warpTo(d.pos, rp, 2) end
-                    for t = 1, CFG.pickupTries do
-                        if fire(evP, d.part) then stats.pickup = stats.pickup + 1 end
-                    end
+        local evH = remote("RequestHarvest")
+        local done = 0
+        for i, e in ipairs(list) do
+            if done >= CFG.bushPerTick then break end
+            done = done + 1
+            if e.hb and e.hb.Parent and e.pos then
+                if e.d > CFG.nearStuds then warpTo(e.pos, rp) end
+                if fire(evH, e.hb) then stats.harvest = stats.harvest + 1 end
+            end
+        end
+
+        local evP = remote("RequestPickup")
+        local fired = 0
+        for i, d in ipairs(drops) do
+            if fired >= CFG.pickupPerTick then break end
+            if d.part and d.part.Parent then
+                fired = fired + 1
+                local p = d.pos or posOf(d.part)
+                if p then
+                    if (p - ppos).Magnitude > CFG.nearStuds then warpTo(p, rp, 2) end
                 end
+                if fire(evP, d.part) then stats.pickup = stats.pickup + 1 end
             end
         end
     end
@@ -253,6 +289,7 @@ local function tick()
         log("bushes " .. tostring(stats.bushes)
             .. " | ripe " .. tostring(stats.ripe)
             .. " | harvest " .. tostring(stats.harvest)
+            .. " | drops " .. tostring(stats.drops)
             .. " | pickups " .. tostring(stats.pickup)
             .. " | warps " .. tostring(stats.warps))
     end
@@ -283,6 +320,7 @@ local function buildMenu()
                     sec:Toggle("ab_on", "Auto Harvest (berries)", false, function(v)
                         CFG.on = v
                     end)
+                    sec:Tip("Warps to each ripe bush and berry, then back.")
                 end
             end)
         end)
@@ -299,6 +337,7 @@ local function stop()
         pcall(function() rp.CFrame = homeCF end)
         homeCF = nil
     end
+    drops = {}
     local M = _G.UI
     if M and M.RemoveTab then
         pcall(function() M.RemoveTab("ABOVE Berries") end)
