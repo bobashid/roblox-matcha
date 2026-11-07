@@ -7,9 +7,12 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
--- v4.3: ABOVE v7.3.1 - two toggles (TP berry farm / silent berry farm), every
---       harvest fire verified by re-reading Ripe, pickup uses the item's
---       EntityId string and only takes ItemId 'Berries'.
+-- v4.4: ABOVE v9.0.0 - one toggle, silent berry farm that only runs while you
+--       are seated in the cart (IronRailcart.Rider == your UserId). Faster fire
+--       gap, verification moved off the hot path, pickup in its own loop, and
+--       pickup takes only ItemId 'Berries'.
+-- v4.3: ABOVE v7.3.1 - two toggles (TP / silent), every harvest fire verified by
+--       re-reading Ripe, pickup uses the item's EntityId string.
 -- v4.2: ABOVE v5.1.0 - warp harvest + warp pickup, loose berries found by the
 --       Count attribute (CollectionService tags are nil in this VM).
 -- v4.1: ABOVE pinned by place id 124357835578554 (berry harvest + whole-map
@@ -43,7 +46,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.3'
+local VERSION = 'v4.4'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
