@@ -1,44 +1,48 @@
 -- ABOVE
--- VERSION 9.0.0
+-- VERSION 9.1.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 --
 -- Silent berry farmer for ABOVE. ONE toggle, nothing else in the menu.
 --
 -- Runs ONLY while you are seated in the cart. Sit in it and it farms every ripe
--- berry bush within 17 studs, picks up the berries that drop, and follows you as
--- the cart moves. Step out and it pauses itself. It never teleports you, never
--- writes a CFrame, and never presses a key.
+-- berry bush within 17 studs, picks up the berries that drop, and follows you.
+-- Step out and it pauses. It never teleports you, never writes a CFrame, never
+-- presses a key.
 --
 -- Seated check: IronRailcart has no Seat/VehicleSeat. Boarding (its HB's
 -- ProximityPrompt) sets cart attribute Rider = <your UserId>, and that is the
--- only reliable signal - Humanoid.Sit and Humanoid.SeatPart read nil, no SeatWeld
--- appears, char.Parent stays Workspace, and distance to the cart is useless
--- because standing next to it is 1.4 studs too.
+-- only reliable signal - Humanoid.Sit / SeatPart read nil, no SeatWeld appears,
+-- char.Parent stays Workspace, distance to the cart is useless (1.4 studs while
+-- merely standing beside it).
+--
+-- Island identity (v9.1.0 fix): leaving the island and coming back gives you a
+-- NEW Nodes folder under the SAME island name, so keying the cache on the name
+-- left it holding dead bush instances and the farm went silent. The cache is now
+-- keyed on Nodes.Address (measured 1459067867248) and a change triggers a full
+-- rebuild.
 --
 -- Speed, all measured in game (place 124357835578554):
---   * RequestHarvest reach is 18 studs from HumanoidRootPart. 17.54 harvested,
---     18.07 did not, silently. RADIUS = 17.
---   * The server drops bursts. 20 fires at 0.05 s -> 19 landed (95%) = 19/s.
---     30 fires at 0.02 s -> 26 landed (87%) = 43/s. Lower gap is MORE total
---     berries per second even though fewer land, so GAP = 0.02 and every miss
---     is retried. 0.01 is not measured and is not used.
---   * A fire is not a harvest, so nothing is ever assumed: each fire is parked
---     with a due time and re-read 0.3 s later. No blocking wait in the pass.
---   * RequestPickup takes the item's EntityId STRING, not the Part. Firing the
---     Part is accepted and silently ignored.
+--   * Reach is 18 studs from HumanoidRootPart. 17.54 harvested, 18.07 did not.
+--   * Server drops bursts: 0.05 s gap -> 95%, 0.02 s -> 87%, and 20 fires in a
+--     SINGLE frame -> 38% (so it processes ~7-8 per frame). Bursting per frame is
+--     not worth it; GAP = 0.01 with verification is the better route.
+--   * The real ceiling is NOT the fire rate: the island holds ~2032 bushes but
+--     only ~69 sit inside 17 studs, so a cluster is gone in about a second and
+--     the farm then waits for regrow. Regrow re-checks are therefore the thing
+--     that decides responsiveness: 60 checks per 0.15 s instead of 40 per 0.25 s.
+--   * A fire is not a harvest, so each fire is parked with a due time and re-read
+--     0.3 s later. No blocking wait in the pass.
+--   * RequestPickup takes the item's EntityId STRING, not the Part.
 --   * Pickup collects ONLY ItemId "Berries". BerryPie / BerryJam / BerryBushSeed
 --     and ground berries are left alone.
---   * No ProximityPrompt exists on any bush or loose item. All 167 prompts in the
---     workspace are on Blocks machines, HUB and Carts.
---   * Bush count grows: 1036 -> 1401 in one session. The cache rebuilds when the
---     live count changes, or new bushes stay invisible forever.
+--   * No ProximityPrompt exists on any bush or loose item.
 --
--- Four loops, so nothing starves anything: menu, harvest, pickup, toggle poller.
+-- Four loops: menu, harvest, pickup, toggle poller.
 --
 -- Stop = switch the toggle off. There is no stop key.
 
 local NAME = "AboveBerries"
-local VERSION = "9.0.0"
+local VERSION = "9.1.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -47,14 +51,14 @@ end
 -- ---- constants (measured, do not guess these) ----
 
 local RADIUS = 17
-local GAP = 0.02
+local GAP = 0.01
 local VERIFY_AFTER = 0.3
 local MAX_TRIES = 3
 local PICK_GAP = 0.08
 local PICK_BATCH = 6
 local PICK_TRIES = 2
-local RECHECK_BATCH = 40
-local RECHECK_EVERY = 0.25
+local RECHECK_BATCH = 60
+local RECHECK_EVERY = 0.15
 local COUNT_EVERY = 10
 local ISLAND_EVERY = 1.0
 local BUSY_WAIT = 0.01
@@ -85,6 +89,7 @@ local inCart = false
 local seeded = false
 local bushCache = nil
 local cacheIsland = nil
+local islandAddr = nil
 local pending = {}
 local done = {}
 local verifyQueue = {}
@@ -96,7 +101,7 @@ local lastCount = 0
 local lastIsland = 0
 local cachedIsland = nil
 local cachedCarts = nil
-local stats = { ok = 0, miss = 0, fired = 0, picked = 0, rebuilds = 0, paused = 0 }
+local stats = { ok = 0, miss = 0, fired = 0, picked = 0, rebuilds = 0, resets = 0, paused = 0 }
 
 local function log(msg)
     print("[ABOVE Berries] " .. tostring(msg))
@@ -122,8 +127,26 @@ local function posOf(o)
     return nil
 end
 
+local function nodesOf(isl)
+    if not isl then return nil end
+    local nodes = nil
+    pcall(function() nodes = isl:FindFirstChild("Nodes") end)
+    return nodes
+end
+
+local function nodesAddress(isl)
+    local nodes = nodesOf(isl)
+    if not nodes then return nil end
+    local ok, a = pcall(function() return nodes.Address end)
+    if ok and a ~= nil then return tostring(a) end
+    return nil
+end
+
 local function getIsland()
-    if cachedIsland and cachedIsland.Parent then return cachedIsland end
+    if cachedIsland and cachedIsland.Parent and cachedIsland:FindFirstChild("Nodes") then
+        return cachedIsland
+    end
+    cachedIsland = nil
     local found = nil
     pcall(function()
         for _, d in ipairs(workspace:GetChildren()) do
@@ -183,8 +206,7 @@ end
 
 local function bushCount(isl)
     local n = 0
-    local nodes = nil
-    pcall(function() nodes = isl:FindFirstChild("Nodes") end)
+    local nodes = nodesOf(isl)
     if not nodes then return 0 end
     pcall(function()
         for _, c in ipairs(nodes:GetChildren()) do
@@ -198,8 +220,7 @@ end
 
 local function buildCache(isl)
     local out = {}
-    local nodes = nil
-    pcall(function() nodes = isl:FindFirstChild("Nodes") end)
+    local nodes = nodesOf(isl)
     if not nodes then return out end
     pcall(function()
         for _, n in ipairs(nodes:GetChildren()) do
@@ -217,22 +238,48 @@ local function buildCache(isl)
     return out
 end
 
+local function clearLists()
+    pending = {}
+    done = {}
+    verifyQueue = {}
+    doneIdx = 1
+    pickIdx = 1
+    seeded = false
+end
+
+-- full rebuild: the island was replaced, so every cached instance is dead
+local function hardReset(isl)
+    local was = islandAddr
+    bushCache = nil
+    cacheIsland = nil
+    clearLists()
+    cachedIsland = isl
+    islandAddr = nodesAddress(isl)
+    refreshCarts(isl)
+    stats.resets = stats.resets + 1
+    if was ~= nil then
+        log("island changed (nodes addr " .. tostring(was) .. " -> "
+            .. tostring(islandAddr) .. ") - rebuilt from scratch")
+    end
+end
+
 local function ensureCache(isl)
     local nm = tostring(isl.Name)
     if bushCache and cacheIsland == nm and #bushCache > 0 then
+        local probes = math.min(10, #bushCache)
         local alive = 0
-        local probes = math.min(3, #bushCache)
         for i = 1, probes do
             local e = bushCache[i]
             if e.hb and e.hb.Parent then
                 alive = alive + 1
             end
         end
-        if alive > 0 then return bushCache end
+        if alive >= math.floor(probes * 0.8) then return bushCache end
     end
     bushCache = buildCache(isl)
     cacheIsland = nm
-    seeded = false
+    islandAddr = nodesAddress(isl)
+    clearLists()
     log("bush cache built: " .. tostring(#bushCache) .. " bush(es)")
     return bushCache
 end
@@ -245,10 +292,7 @@ local function isRipe(hb)
 end
 
 local function seedLists(cache)
-    pending = {}
-    done = {}
-    verifyQueue = {}
-    doneIdx = 1
+    clearLists()
     for i = 1, #cache do
         local e = cache[i]
         e.tries = 0
@@ -290,8 +334,6 @@ local function regrowCheck()
 end
 
 -- ---- verification: a fire is not a harvest ----
--- Fires are parked with a due time and resolved on a later pass, so a pass never
--- stops to wait. This is the whole reason the loop stays busy.
 
 local function resolveVerify()
     if #verifyQueue == 0 then return end
@@ -505,6 +547,7 @@ local function printStats()
         .. " | queued " .. tostring(#pending)
         .. " | verifying " .. tostring(#verifyQueue)
         .. " | done pool " .. tostring(#done)
+        .. " | resets " .. tostring(stats.resets)
         .. " | in cart " .. tostring(inCart))
 end
 
@@ -576,11 +619,20 @@ task.spawn(function()
             seeded = false
             task.wait(0.2)
         else
+            local isl = getIsland()
+
+            -- island identity: a reload keeps the name but changes Nodes
+            if isl then
+                local addr = nodesAddress(isl)
+                if addr ~= nil and addr ~= islandAddr then
+                    hardReset(isl)
+                end
+            end
+
             local now = os.clock()
             if now - lastIsland > ISLAND_EVERY or cachedCarts == nil then
                 lastIsland = now
-                local isl0 = getIsland()
-                refreshCarts(isl0)
+                refreshCarts(isl)
             end
 
             local cart = getSeatCart()
@@ -597,7 +649,6 @@ task.spawn(function()
                     log("in the cart (" .. tostring(cart.Name) .. ") - farming")
                 end
 
-                local isl = getIsland()
                 if not isl then
                     task.wait(0.5)
                 else
@@ -610,7 +661,7 @@ task.spawn(function()
                                 .. " -> " .. tostring(live) .. "), rebuilding")
                             bushCache = nil
                             cacheIsland = nil
-                            seeded = false
+                            clearLists()
                             stats.rebuilds = stats.rebuilds + 1
                         end
                     end
@@ -650,7 +701,7 @@ task.spawn(function()
     end
 end)
 
--- ---- loop 3: pickup (independent, so a long harvest pass cannot starve it) ----
+-- ---- loop 3: pickup ----
 
 task.spawn(function()
     while running do
