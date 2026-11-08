@@ -7,6 +7,8 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v4.5: ABOVE v9.1.0 - island reload fix (cache keyed on Nodes.Address, not the
+--       island name), faster regrow re-checks, 0.01 s fire gap.
 -- v4.4: ABOVE v9.0.0 - one toggle, silent berry farm that only runs while you
 --       are seated in the cart (IronRailcart.Rider == your UserId). Faster fire
 --       gap, verification moved off the hot path, pickup in its own loop, and
@@ -46,7 +48,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.4'
+local VERSION = 'v4.5'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
