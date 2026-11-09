@@ -1,53 +1,50 @@
 -- ABOVE
--- VERSION 10.0.0
+-- VERSION 11.0.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 --
--- Berry farmer for ABOVE. TWO toggles, nothing else in the menu.
+-- Berry farmer for ABOVE. TWO toggles, plus a berries/sec overlay.
 --
 --   Rail Cart Berry Farm  - runs while you are SEATED IN THE CART.
 --   Conveyor Berry Farm   - runs while you have been STANDING ON A CONVEYOR for
 --                           3 seconds, and stops the moment you leave it.
 --
--- Either gate turns the same farm on. Both do exactly the same work: harvest
--- every ripe berry bush within 17 studs, and pick up the berries that drop.
--- No teleport, no CFrame write, no key press. Stop = switch the toggle off.
+-- Either gate turns the same farm on. Both harvest every ripe berry bush within
+-- 17 studs and pick up the berries that drop. No teleport, no CFrame write, no
+-- key press. Stop = switch the toggle off.
+--
+-- OVERLAY: a Drawing-based panel at the top of the screen showing berries picked
+-- per second over a rolling 5 s window, and the running total. There is no
+-- Instance.new in this VM, so it is drawn with Drawing.Square + Drawing.Text.
+-- The big number is 46 px so it is readable at a glance.
 --
 -- Seated check: IronRailcart has no Seat/VehicleSeat. Boarding (its HB's
 -- ProximityPrompt) sets cart attribute Rider = <your UserId>. Humanoid.Sit and
 -- Humanoid.SeatPart read nil, no SeatWeld appears, char.Parent stays Workspace,
 -- and distance to the cart is useless (1.4 studs while merely standing beside it).
 --
--- Conveyor check (measured in game): a conveyor is a plain Part named "Conveyor"
--- (264 of them) plus "ConveyorCorner" (4) and "ConveyorCornerLeft" (8), each
--- 3.0 x 0.7 x 3.0 - exactly one 3-stud grid cell - with MachineId = "Conveyor",
--- CellKey and Cells attributes, top surface at y + 0.35. There is no raycast in
--- this VM (workspace:Raycast is an inert stub), so standing on one is detected by
--- geometry: the HumanoidRootPart must be inside the part's XZ footprint plus a
--- 1.5-stud margin, and within 1.5 studs below to 6 studs above its top face.
---
--- Island identity: leaving and returning creates a NEW Nodes folder under the
--- SAME island name, so the cache is keyed on Nodes.Address (measured
--- 1459067867248) and a change triggers a full rebuild.
+-- Conveyor check (measured): a conveyor is a plain Part named "Conveyor" (264)
+-- plus "ConveyorCorner" (4) and "ConveyorCornerLeft" (8), each 3.0 x 0.7 x 3.0 -
+-- exactly one 3-stud grid cell - with MachineId = "Conveyor", top face at
+-- y + 0.35. There is no raycast in this VM (workspace:Raycast is an inert stub),
+-- so standing on one is a geometry test against cached position + half extents.
 --
 -- Speed, all measured in game (place 124357835578554):
---   * Reach is 18 studs from HumanoidRootPart. 17.54 harvested, 18.07 did not.
---   * Server drops bursts: 0.05 s gap -> 95%, 0.02 s -> 87%, and 20 fires in a
---     SINGLE frame -> 38% (so it processes ~7-8 per frame). Per-frame bursting is
---     worse than serial firing; GAP = 0.01 with verification is used instead.
---   * The real ceiling is NOT the fire rate: a 2032-bush island had only ~69
---     bushes inside 17 studs, so a cluster is gone in about a second and the farm
---     then waits for regrow. Regrow re-checks are what decide responsiveness.
---   * A fire is not a harvest, so each fire is parked with a due time and re-read
---     0.3 s later. No blocking wait in the pass.
+--   * Harvest reach is 18 studs from HumanoidRootPart. 17.54 harvested, 18.07 not.
+--   * Server drops bursts: 0.05 s -> 95%, 0.02 s -> 87%, 20 in one frame -> 38%
+--     (so it processes ~7-8 per frame). Serial firing beats per-frame bursting.
+--   * The harvest ceiling is regrow, not fire rate: ~2000 bushes exist but only
+--     ~69 sit inside 17 studs, so a cluster is gone in about a second.
 --   * RequestPickup takes the item's EntityId STRING, not the Part.
+--   * Pickup used to do 2 sequential fires per item at 0.08 s, which capped it at
+--     about 6 items per second. It now fires ONE shot per item at 0.05 s across
+--     up to 24 items per pass, and survivors are simply re-scanned next pass.
 --   * Pickup collects ONLY ItemId "Berries". BerryPie / BerryJam / BerryBushSeed
 --     and ground berries are left alone.
---   * No ProximityPrompt exists on any bush or loose item.
 --
--- Four loops: menu, harvest, pickup, toggle poller.
+-- Five loops: menu, harvest, pickup, overlay, toggle poller.
 
 local NAME = "AboveBerries"
-local VERSION = "10.0.0"
+local VERSION = "11.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -59,9 +56,16 @@ local RADIUS = 17
 local GAP = 0.01
 local VERIFY_AFTER = 0.3
 local MAX_TRIES = 3
-local PICK_GAP = 0.08
-local PICK_BATCH = 6
-local PICK_TRIES = 2
+
+local PICK_GAP = 0.05
+local PICK_BATCH = 24
+local PICK_VERIFY = 0.35
+local PICK_WAIT = 0.05
+
+local RATE_WINDOW = 5
+local OVERLAY_W = 360
+local OVERLAY_H = 124
+
 local RECHECK_BATCH = 60
 local RECHECK_EVERY = 0.15
 local COUNT_EVERY = 10
@@ -71,7 +75,6 @@ local CONV_MARGIN = 1.5
 local CONV_UP = 6
 local BUSY_WAIT = 0.01
 local IDLE_WAIT = 0.10
-local PICK_WAIT = 0.10
 local GATE_WAIT = 0.15
 
 local PICK_ITEM_ID = "Berries"
@@ -104,6 +107,9 @@ local islandAddr = nil
 local pending = {}
 local done = {}
 local verifyQueue = {}
+local pickVerify = {}
+local berryEvents = {}
+local totalBerries = 0
 local doneIdx = 1
 local pickIdx = 1
 local lastStatus = 0
@@ -181,7 +187,7 @@ local function remote(name)
     return nil
 end
 
--- ---- gate 1: seated in the cart (IronRailcart.Rider == your UserId) ----
+-- ---- gate 1: seated in the cart ----
 
 local function refreshCarts(isl)
     cachedCarts = nil
@@ -214,7 +220,6 @@ local function getSeatCart()
 end
 
 -- ---- gate 2: standing on a conveyor ----
--- Cached once per island: position + half extents. No property reads per check.
 
 local function buildConveyors(isl)
     local out = {}
@@ -262,6 +267,137 @@ local function onConveyor()
     return false
 end
 
+-- ---- berry counter ----
+
+local function addBerries(n)
+    if n == nil or n <= 0 then return end
+    totalBerries = totalBerries + n
+    berryEvents[#berryEvents + 1] = { t = os.clock(), n = n }
+end
+
+local function berriesPerSec()
+    local now = os.clock()
+    local keep = {}
+    local sum = 0
+    for i = 1, #berryEvents do
+        local e = berryEvents[i]
+        if now - e.t <= RATE_WINDOW then
+            keep[#keep + 1] = e
+            sum = sum + e.n
+        end
+    end
+    berryEvents = keep
+    return sum / RATE_WINDOW
+end
+
+local function countOf(c)
+    if c == nil then return 0 end
+    local n = nil
+    pcall(function() n = c:GetAttribute("Count") end)
+    if type(n) == "number" and n >= 1 then return math.floor(n) end
+    return 1
+end
+
+-- a pickup only counts once the item has actually left the folder
+local function resolvePickVerify()
+    if #pickVerify == 0 then return end
+    local now = os.clock()
+    local keep = {}
+    for i = 1, #pickVerify do
+        local v = pickVerify[i]
+        if v.due > now then
+            keep[#keep + 1] = v
+        else
+            local gone = false
+            pcall(function() gone = (v.part == nil) or (v.part.Parent == nil) end)
+            if gone then
+                addBerries(v.n)
+            end
+        end
+    end
+    pickVerify = keep
+end
+
+-- ---- overlay (Drawing only - there is no Instance.new in this VM) ----
+
+local ov = { bg = nil, title = nil, big = nil, sub = nil, ok = false }
+
+local function destroyOverlay()
+    if ov.bg then pcall(function() ov.bg:Remove() end) ov.bg = nil end
+    if ov.title then pcall(function() ov.title:Remove() end) ov.title = nil end
+    if ov.big then pcall(function() ov.big:Remove() end) ov.big = nil end
+    if ov.sub then pcall(function() ov.sub:Remove() end) ov.sub = nil end
+    ov.ok = false
+end
+
+local function buildOverlay()
+    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
+        log("Drawing unavailable - counter overlay disabled")
+        return
+    end
+    local vx, vy = 20, 16
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        local vs = cam.ViewportSize
+        vx = math.floor((vs.X - OVERLAY_W) / 2)
+        if vx < 0 then vx = 0 end
+        vy = 16
+    end)
+    local ok = pcall(function()
+        ov.bg = Drawing.new("Square")
+        ov.bg.Filled = true
+        ov.bg.Color = Color3.fromRGB(16, 18, 26)
+        ov.bg.Transparency = 0.35
+        ov.bg.Size = Vector2.new(OVERLAY_W, OVERLAY_H)
+        ov.bg.Position = Vector2.new(vx, vy)
+        ov.bg.Visible = true
+
+        ov.title = Drawing.new("Text")
+        ov.title.Text = "BERRIES PICKED / SEC"
+        ov.title.Size = 18
+        ov.title.Color = Color3.fromRGB(140, 225, 155)
+        ov.title.Outline = true
+        ov.title.Center = false
+        ov.title.Position = Vector2.new(vx + 18, vy + 10)
+        ov.title.Visible = true
+
+        ov.big = Drawing.new("Text")
+        ov.big.Text = "0.0"
+        ov.big.Size = 46
+        ov.big.Color = Color3.fromRGB(255, 255, 255)
+        ov.big.Outline = true
+        ov.big.Center = false
+        ov.big.Position = Vector2.new(vx + 16, vy + 32)
+        ov.big.Visible = true
+
+        ov.sub = Drawing.new("Text")
+        ov.sub.Text = "total 0"
+        ov.sub.Size = 18
+        ov.sub.Color = Color3.fromRGB(185, 192, 210)
+        ov.sub.Outline = true
+        ov.sub.Center = false
+        ov.sub.Position = Vector2.new(vx + 18, vy + 92)
+        ov.sub.Visible = true
+
+        ov.ok = true
+    end)
+    if not ov.ok then
+        destroyOverlay()
+        log("overlay build failed - farming continues without it")
+    else
+        log("overlay ready")
+    end
+end
+
+local function updateOverlay()
+    if not ov.ok then return end
+    local rate = berriesPerSec()
+    pcall(function()
+        ov.big.Text = string.format("%.1f", rate)
+        ov.sub.Text = "total " .. tostring(totalBerries)
+    end)
+end
+
 -- ---- bush cache ----
 
 local function bushCount(isl)
@@ -302,6 +438,7 @@ local function clearLists()
     pending = {}
     done = {}
     verifyQueue = {}
+    pickVerify = {}
     doneIdx = 1
     pickIdx = 1
     seeded = false
@@ -474,7 +611,10 @@ local function harvestPass(ev)
     return fired
 end
 
--- ---- pickup: ONLY the bush's own item ----
+-- ---- pickup: ONE shot per item, survivors re-scanned next pass ----
+-- The old build did two sequential fires per item at 0.08 s, which capped it at
+-- roughly 6 items/sec no matter how many berries were on the ground. Firing one
+-- shot each across up to 24 items at 0.05 s removes that cap.
 
 local function isBushBerry(c)
     if c == nil then return false end
@@ -487,6 +627,8 @@ local function isBushBerry(c)
 end
 
 local function collectLoose()
+    resolvePickVerify()
+
     local isl = getIsland()
     if not isl then return end
     local items = nil
@@ -501,7 +643,9 @@ local function collectLoose()
             if isBushBerry(c) then
                 local eid = nil
                 pcall(function() eid = c:GetAttribute("EntityId") end)
-                targets[#targets + 1] = { part = c, eid = eid }
+                if eid ~= nil then
+                    targets[#targets + 1] = { part = c, eid = eid }
+                end
             end
         end
     end)
@@ -513,7 +657,8 @@ local function collectLoose()
         pickIdx = 1
     end
 
-    for k = 1, PICK_BATCH do
+    local shots = math.min(#targets, PICK_BATCH)
+    for k = 1, shots do
         if not running or activeMode == nil then return end
         local i = pickIdx
         if i > #targets then
@@ -521,18 +666,14 @@ local function collectLoose()
         end
         local t = targets[i]
         pickIdx = i + 1
-        if t.eid ~= nil then
-            for tryN = 1, PICK_TRIES do
-                if t.part.Parent == nil then break end
-                pcall(function() ev:FireServer(t.eid) end)
-                stats.picked = stats.picked + 1
-                task.wait(PICK_GAP)
-            end
-        else
-            pcall(function() ev:FireServer(t.part) end)
-            stats.picked = stats.picked + 1
-            task.wait(PICK_GAP)
-        end
+        pcall(function() ev:FireServer(t.eid) end)
+        pickVerify[#pickVerify + 1] = {
+            part = t.part,
+            n = countOf(t.part),
+            due = os.clock() + PICK_VERIFY,
+        }
+        stats.picked = stats.picked + 1
+        task.wait(PICK_GAP)
     end
 end
 
@@ -604,6 +745,8 @@ local function printStats()
         .. " | missed+retried " .. tostring(stats.miss)
         .. " | harvest fires " .. tostring(stats.fired)
         .. " | pickup fires " .. tostring(stats.picked)
+        .. " | berries " .. tostring(totalBerries)
+        .. " | rate " .. string.format("%.1f", berriesPerSec()) .. "/s"
         .. " | queued " .. tostring(#pending)
         .. " | verifying " .. tostring(#verifyQueue)
         .. " | done pool " .. tostring(#done)
@@ -659,6 +802,7 @@ local function stop()
     running = false
     CFG.cart = false
     CFG.conv = false
+    destroyOverlay()
     local M = _G.UI
     if M and type(M.RemoveTab) == "function" then
         pcall(function() M.RemoveTab("ABOVE Berries") end)
@@ -667,7 +811,7 @@ local function stop()
     log("stopped")
 end
 
--- ---- loop 1: menu ----
+-- ---- loop 1: menu + overlay ----
 
 task.spawn(function()
     local waited = 0
@@ -676,9 +820,19 @@ task.spawn(function()
         waited = waited + 0.5
     end
     buildMenu()
+    buildOverlay()
 end)
 
--- ---- loop 2: gates + harvest ----
+-- ---- loop 2: overlay refresh ----
+
+task.spawn(function()
+    while running do
+        pcall(updateOverlay)
+        task.wait(0.2)
+    end
+end)
+
+-- ---- loop 3: gates + harvest ----
 
 task.spawn(function()
     while running do
@@ -710,7 +864,6 @@ task.spawn(function()
                 end
             end
 
-            -- which gate is satisfied right now?
             local mode = nil
             if CFG.cart and getSeatCart() ~= nil then
                 mode = "rail cart"
@@ -794,7 +947,7 @@ task.spawn(function()
     end
 end)
 
--- ---- loop 3: pickup ----
+-- ---- loop 4: pickup ----
 
 task.spawn(function()
     while running do
@@ -805,12 +958,12 @@ task.spawn(function()
             end
             task.wait(PICK_WAIT)
         else
-            task.wait(0.25)
+            task.wait(0.2)
         end
     end
 end)
 
--- ---- loop 4: toggle poller ----
+-- ---- loop 5: toggle poller ----
 
 task.spawn(function()
     while running do
