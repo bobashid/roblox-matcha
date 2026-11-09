@@ -1,5 +1,5 @@
 -- ABOVE
--- VERSION 11.0.0
+-- VERSION 11.1.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 --
 -- Berry farmer for ABOVE. TWO toggles, plus a berries/sec overlay.
@@ -9,13 +9,24 @@
 --                           3 seconds, and stops the moment you leave it.
 --
 -- Either gate turns the same farm on. Both harvest every ripe berry bush within
--- 17 studs and pick up the berries that drop. No teleport, no CFrame write, no
--- key press. Stop = switch the toggle off.
+-- 17 studs and pick up any loose berries. No teleport, no CFrame write, no key
+-- press. Stop = switch the toggle off.
 --
--- OVERLAY: a Drawing-based panel at the top of the screen showing berries picked
--- per second over a rolling 5 s window, and the running total. There is no
--- Instance.new in this VM, so it is drawn with Drawing.Square + Drawing.Text.
--- The big number is 46 px so it is readable at a glance.
+-- OVERLAY (v11.1.0 fix): it counts HARVESTS, not pickups. Measured: after 1122
+-- verified harvests, <island>.Items still held only Coal/IronIngot/Stone/Wood
+-- and ZERO Berries - RequestHarvest does not drop loose berries, the yield goes
+-- to server-side inventory. A pickup-based counter therefore sat at 0.0 forever
+-- and looked broken. The big number is now verified harvests/sec over a rolling
+-- 5 s window; loose pickups are still counted separately in the sub line.
+-- The overlay is also built at load instead of behind the menu wait, and
+-- re-asserts Visible on every refresh.
+--
+-- Fire gap (v11.1.0 fix), all measured:
+--   * 0.05 s -> 95% land, 19 harvests/s.
+--   * 0.02 s -> 87% land, ~43 harvests/s.  <-- BEST, used here.
+--   * 0.01 s -> 14.4% land (user's live log: 1122 harvested / 7790 fires).
+--     The drop is NOT linear; it falls off a cliff below 0.02. Never go below it.
+--   * 20 fires in a single frame -> 38% (server processes ~7-8 per frame).
 --
 -- Seated check: IronRailcart has no Seat/VehicleSeat. Boarding (its HB's
 -- ProximityPrompt) sets cart attribute Rider = <your UserId>. Humanoid.Sit and
@@ -28,23 +39,14 @@
 -- y + 0.35. There is no raycast in this VM (workspace:Raycast is an inert stub),
 -- so standing on one is a geometry test against cached position + half extents.
 --
--- Speed, all measured in game (place 124357835578554):
---   * Harvest reach is 18 studs from HumanoidRootPart. 17.54 harvested, 18.07 not.
---   * Server drops bursts: 0.05 s -> 95%, 0.02 s -> 87%, 20 in one frame -> 38%
---     (so it processes ~7-8 per frame). Serial firing beats per-frame bursting.
---   * The harvest ceiling is regrow, not fire rate: ~2000 bushes exist but only
---     ~69 sit inside 17 studs, so a cluster is gone in about a second.
---   * RequestPickup takes the item's EntityId STRING, not the Part.
---   * Pickup used to do 2 sequential fires per item at 0.08 s, which capped it at
---     about 6 items per second. It now fires ONE shot per item at 0.05 s across
---     up to 24 items per pass, and survivors are simply re-scanned next pass.
---   * Pickup collects ONLY ItemId "Berries". BerryPie / BerryJam / BerryBushSeed
---     and ground berries are left alone.
+-- Island identity: leaving and returning creates a NEW Nodes folder under the
+-- SAME island name, so the cache is keyed on Nodes.Address (measured
+-- 1459067867248) and a change triggers a full rebuild.
 --
--- Five loops: menu, harvest, pickup, overlay, toggle poller.
+-- Six loops: menu, overlay, harvest, pickup, toggle poller, overlay builder.
 
 local NAME = "AboveBerries"
-local VERSION = "11.0.0"
+local VERSION = "11.1.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -53,7 +55,7 @@ end
 -- ---- constants (measured, do not guess these) ----
 
 local RADIUS = 17
-local GAP = 0.01
+local GAP = 0.02
 local VERIFY_AFTER = 0.3
 local MAX_TRIES = 3
 
@@ -63,8 +65,8 @@ local PICK_VERIFY = 0.35
 local PICK_WAIT = 0.05
 
 local RATE_WINDOW = 5
-local OVERLAY_W = 360
-local OVERLAY_H = 124
+local OVERLAY_W = 380
+local OVERLAY_H = 128
 
 local RECHECK_BATCH = 60
 local RECHECK_EVERY = 0.15
@@ -108,8 +110,9 @@ local pending = {}
 local done = {}
 local verifyQueue = {}
 local pickVerify = {}
-local berryEvents = {}
-local totalBerries = 0
+local rateEvents = {}
+local totalHarvest = 0
+local totalPicked = 0
 local doneIdx = 1
 local pickIdx = 1
 local lastStatus = 0
@@ -267,26 +270,25 @@ local function onConveyor()
     return false
 end
 
--- ---- berry counter ----
+-- ---- rate counter (counts HARVESTS - pickups alone stay at zero here) ----
 
-local function addBerries(n)
+local function addRate(n)
     if n == nil or n <= 0 then return end
-    totalBerries = totalBerries + n
-    berryEvents[#berryEvents + 1] = { t = os.clock(), n = n }
+    rateEvents[#rateEvents + 1] = { t = os.clock(), n = n }
 end
 
-local function berriesPerSec()
+local function perSecond()
     local now = os.clock()
     local keep = {}
     local sum = 0
-    for i = 1, #berryEvents do
-        local e = berryEvents[i]
+    for i = 1, #rateEvents do
+        local e = rateEvents[i]
         if now - e.t <= RATE_WINDOW then
             keep[#keep + 1] = e
             sum = sum + e.n
         end
     end
-    berryEvents = keep
+    rateEvents = keep
     return sum / RATE_WINDOW
 end
 
@@ -298,7 +300,6 @@ local function countOf(c)
     return 1
 end
 
--- a pickup only counts once the item has actually left the folder
 local function resolvePickVerify()
     if #pickVerify == 0 then return end
     local now = os.clock()
@@ -311,7 +312,8 @@ local function resolvePickVerify()
             local gone = false
             pcall(function() gone = (v.part == nil) or (v.part.Parent == nil) end)
             if gone then
-                addBerries(v.n)
+                totalPicked = totalPicked + v.n
+                addRate(v.n)
             end
         end
     end
@@ -330,19 +332,24 @@ local function destroyOverlay()
     ov.ok = false
 end
 
-local function buildOverlay()
-    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
-        log("Drawing unavailable - counter overlay disabled")
-        return
-    end
+local function overlayOrigin()
     local vx, vy = 20, 16
     pcall(function()
-        local cam = workspace.CurrentCamera
-        local vs = cam.ViewportSize
+        local vs = workspace.CurrentCamera.ViewportSize
         vx = math.floor((vs.X - OVERLAY_W) / 2)
         if vx < 0 then vx = 0 end
         vy = 16
     end)
+    return vx, vy
+end
+
+local function buildOverlay()
+    if ov.ok then return end
+    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
+        log("Drawing unavailable - counter overlay disabled")
+        return
+    end
+    local vx, vy = overlayOrigin()
     local ok = pcall(function()
         ov.bg = Drawing.new("Square")
         ov.bg.Filled = true
@@ -353,7 +360,7 @@ local function buildOverlay()
         ov.bg.Visible = true
 
         ov.title = Drawing.new("Text")
-        ov.title.Text = "BERRIES PICKED / SEC"
+        ov.title.Text = "BERRIES HARVESTED / SEC"
         ov.title.Size = 18
         ov.title.Color = Color3.fromRGB(140, 225, 155)
         ov.title.Outline = true
@@ -363,7 +370,7 @@ local function buildOverlay()
 
         ov.big = Drawing.new("Text")
         ov.big.Text = "0.0"
-        ov.big.Size = 46
+        ov.big.Size = 48
         ov.big.Color = Color3.fromRGB(255, 255, 255)
         ov.big.Outline = true
         ov.big.Center = false
@@ -371,12 +378,12 @@ local function buildOverlay()
         ov.big.Visible = true
 
         ov.sub = Drawing.new("Text")
-        ov.sub.Text = "total 0"
+        ov.sub.Text = "harvested 0  |  picked 0"
         ov.sub.Size = 18
         ov.sub.Color = Color3.fromRGB(185, 192, 210)
         ov.sub.Outline = true
         ov.sub.Center = false
-        ov.sub.Position = Vector2.new(vx + 18, vy + 92)
+        ov.sub.Position = Vector2.new(vx + 18, vy + 94)
         ov.sub.Visible = true
 
         ov.ok = true
@@ -385,16 +392,24 @@ local function buildOverlay()
         destroyOverlay()
         log("overlay build failed - farming continues without it")
     else
-        log("overlay ready")
+        log("overlay ready at " .. tostring(vx) .. "," .. tostring(vy))
     end
 end
 
 local function updateOverlay()
-    if not ov.ok then return end
-    local rate = berriesPerSec()
+    if not ov.ok then
+        buildOverlay()
+        return
+    end
+    local rate = perSecond()
     pcall(function()
         ov.big.Text = string.format("%.1f", rate)
-        ov.sub.Text = "total " .. tostring(totalBerries)
+        ov.sub.Text = "harvested " .. tostring(totalHarvest)
+            .. "  |  picked " .. tostring(totalPicked)
+        ov.big.Visible = true
+        ov.sub.Visible = true
+        ov.title.Visible = true
+        ov.bg.Visible = true
     end)
 end
 
@@ -561,6 +576,10 @@ local function resolveVerify()
     verifyQueue = keep
     stats.ok = stats.ok + okN
     stats.miss = stats.miss + missN
+    if okN > 0 then
+        totalHarvest = totalHarvest + okN
+        addRate(okN)
+    end
     if okN + missN > 0 then
         log("verified " .. tostring(okN) .. " ok, " .. tostring(missN)
             .. " retry | queued " .. tostring(#pending)
@@ -611,10 +630,7 @@ local function harvestPass(ev)
     return fired
 end
 
--- ---- pickup: ONE shot per item, survivors re-scanned next pass ----
--- The old build did two sequential fires per item at 0.08 s, which capped it at
--- roughly 6 items/sec no matter how many berries were on the ground. Firing one
--- shot each across up to 24 items at 0.05 s removes that cap.
+-- ---- pickup: one shot per item, survivors re-scanned next pass ----
 
 local function isBushBerry(c)
     if c == nil then return false end
@@ -744,13 +760,14 @@ local function printStats()
     log("stats: harvested " .. tostring(stats.ok)
         .. " | missed+retried " .. tostring(stats.miss)
         .. " | harvest fires " .. tostring(stats.fired)
+        .. " | land rate "
+        .. (stats.fired > 0 and string.format("%.0f%%", (stats.ok / stats.fired) * 100) or "n/a")
         .. " | pickup fires " .. tostring(stats.picked)
-        .. " | berries " .. tostring(totalBerries)
-        .. " | rate " .. string.format("%.1f", berriesPerSec()) .. "/s"
+        .. " | harvested total " .. tostring(totalHarvest)
+        .. " | picked total " .. tostring(totalPicked)
+        .. " | rate " .. string.format("%.1f", perSecond()) .. "/s"
         .. " | queued " .. tostring(#pending)
-        .. " | verifying " .. tostring(#verifyQueue)
         .. " | done pool " .. tostring(#done)
-        .. " | resets " .. tostring(stats.resets)
         .. " | gate " .. tostring(activeMode))
 end
 
@@ -811,7 +828,7 @@ local function stop()
     log("stopped")
 end
 
--- ---- loop 1: menu + overlay ----
+-- ---- loop 1: menu (overlay is built separately so it never waits on the UI) ----
 
 task.spawn(function()
     local waited = 0
@@ -820,7 +837,6 @@ task.spawn(function()
         waited = waited + 0.5
     end
     buildMenu()
-    buildOverlay()
 end)
 
 -- ---- loop 2: overlay refresh ----
@@ -969,6 +985,16 @@ task.spawn(function()
     while running do
         pcall(pollToggles)
         task.wait(0.15)
+    end
+end)
+
+-- ---- loop 6: overlay builder (independent of the menu) ----
+
+task.spawn(function()
+    task.wait(0.5)
+    while running and not ov.ok do
+        pcall(buildOverlay)
+        task.wait(1.0)
     end
 end)
 
