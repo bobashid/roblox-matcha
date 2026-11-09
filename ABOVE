@@ -1,56 +1,48 @@
 -- ABOVE
--- VERSION 11.2.0
+-- VERSION 12.0.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 --
--- Berry farmer for ABOVE. TWO toggles, plus a berries/sec overlay.
+-- Berry farmer for ABOVE. ONE toggle (Rail Cart Berry Farm) + a berries/sec
+-- overlay. Based on the v9.1.0 cart build the user confirmed working; the
+-- conveyor gate has been removed entirely.
 --
---   Rail Cart Berry Farm  - runs while you are SEATED IN THE CART.
---   Conveyor Berry Farm   - runs while you have been STANDING ON A CONVEYOR for
---                           3 seconds, and stops the moment you leave it.
+-- Runs ONLY while you are SEATED IN THE CART. Sit in it and it farms every ripe
+-- berry bush within 17 studs, picks up loose berries, and follows you. Step out
+-- and it pauses. It never teleports you, never writes a CFrame, never presses a key.
 --
--- Either gate turns the same farm on. Both harvest every ripe berry bush within
--- 17 studs and pick up any loose berries. No teleport, no CFrame write, no key
--- press. Stop = switch the toggle off.
---
--- v11.2.0 FIXES (both found by probe, not guesswork):
---   1. SERVICES ARE NOW RESOLVED LAZILY. The old build did
---      RS = svc("ReplicatedStorage") ONCE at load. game:GetService can return
---      nil intermittently in this VM, so a single unlucky load left RS nil
---      forever, remote("RequestHarvest") returned nil, harvestPass was never
---      called, and the farm reported "harvest fires 0" with 135 ripe bushes in
---      range - with no error anywhere. remote() now re-resolves with a 3-route
---      fallback (GetService -> FindFirstChild -> walk game children by
---      ClassName) and warns ONCE if it still cannot find it.
---   2. THE CART GATE ALSO CHECKS DISTANCE. The cart's Rider attribute is NOT
---      cleared when you get off - measured Rider still set while 38.9 studs
---      away - so Rider alone made the gate claim "rail cart" while you were
---      nowhere near it. Seated now means Rider == your UserId AND within 10
---      studs of the cart's HB.
---
--- OVERLAY: counts verified HARVESTS, not pickups. Measured: after 1122
--- verified harvests, <island>.Items still held only Coal/IronIngot/Stone/Wood
--- and ZERO Berries - RequestHarvest does not drop loose berries, the yield goes
--- to server-side inventory. A pickup-based counter sat at 0.0 forever.
---
--- Fire gap, all measured: 0.05 s -> 95%; 0.02 s -> 87% (~43/s, best);
--- 0.01 s -> 14.4% (cliff, never go below 0.02); 20 in one frame -> 38%.
+-- ============================ WHY THIS IS FAST ============================
+-- Measured land rate for RequestHarvest, same spot, same 17-stud reach:
+--     0.05 s  -> 95%   = ~19 harvests/sec
+--     0.02 s  -> 87%   = ~43 harvests/sec   <-- USED HERE
+--     0.01 s  -> 14%   = ~14 harvests/sec   <-- v9.1.0 shipped this. It is the
+--                                              SLOW one: the drop falls off a
+--                                              cliff below 0.02, it is not linear.
+--     20 in one frame -> 38% (server processes ~7-8 per frame; bursting is worse)
+-- So GAP = 0.02 is roughly 3x the throughput of the old 0.01 build.
+-- The 10-second stats line prints the live land rate so this can never hide.
+-- ==========================================================================
 --
 -- Seated check: IronRailcart has no Seat/VehicleSeat. Boarding (its HB's
 -- ProximityPrompt) sets cart attribute Rider = <your UserId>. Humanoid.Sit and
 -- Humanoid.SeatPart read nil, no SeatWeld appears, char.Parent stays Workspace.
+-- Rider is NOT cleared when you dismount (measured still set 38.9 studs away),
+-- so seated also requires being within CART_MAX_DIST of the cart's HB.
 --
--- Conveyor check: a conveyor is a plain Part named "Conveyor" (264) plus
--- "ConveyorCorner" (4) and "ConveyorCornerLeft" (8), each 3.0 x 0.7 x 3.0 with
--- MachineId = "Conveyor", top face at y + 0.35. No raycast exists in this VM,
--- so standing on one is a geometry test on cached position + half extents.
+-- Services are resolved LAZILY, never cached as nil. game:GetService can return
+-- nil intermittently in this VM; a load-time nil used to leave RS nil forever,
+-- which silently disabled every remote call (harvest fires 0, no error).
 --
--- Island identity: a reload creates a NEW Nodes folder under the SAME island
--- name, so the cache is keyed on Nodes.Address and rebuilt on change.
+-- Island identity: leaving and returning creates a NEW Nodes folder under the
+-- SAME island name, so the cache is keyed on Nodes.Address and rebuilt on change.
 --
--- Six loops: menu, overlay, harvest, pickup, toggle poller, overlay builder.
+-- OVERLAY: counts verified HARVESTS, not pickups - RequestHarvest drops no loose
+-- berries (after 1122 harvests the Items folder held only Coal/IronIngot/Stone/
+-- Wood), so a pickup counter sat at 0.0 forever.
+--
+-- Stop = switch the toggle off. There is no stop key.
 
 local NAME = "AboveBerries"
-local VERSION = "11.2.0"
+local VERSION = "12.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -68,29 +60,23 @@ local PICK_BATCH = 24
 local PICK_VERIFY = 0.35
 local PICK_WAIT = 0.05
 
-local CART_MAX_DIST = 10
-local CONV_DELAY = 3
-local CONV_MARGIN = 1.5
-local CONV_UP = 6
+local CART_MAX_DIST = 12
 
 local RATE_WINDOW = 5
 local OVERLAY_W = 380
 local OVERLAY_H = 128
 
-local RECHECK_BATCH = 60
+local RECHECK_BATCH = 80
 local RECHECK_EVERY = 0.15
 local COUNT_EVERY = 10
 local ISLAND_EVERY = 1.0
 local BUSY_WAIT = 0.01
 local IDLE_WAIT = 0.10
-local GATE_WAIT = 0.15
+local CART_WAIT = 0.25
 
 local PICK_ITEM_ID = "Berries"
-local CONV_PREFIX = "Conveyor"
 
--- ---- lazy service resolution ----
--- NEVER cache a nil: GetService can return nil intermittently in this VM and a
--- cached nil kills every remote call for the life of the script.
+-- ---- lazy service resolution (never cache a nil) ----
 
 local RS = nil
 local PlayersSvc = nil
@@ -125,13 +111,11 @@ end
 
 -- ---- state ----
 
-local CFG = { cart = false, conv = false }
+local CFG = { on = false }
 
 local running = true
 local built = false
-local activeMode = nil
-local convSince = nil
-local conveyorCache = nil
+local inCart = false
 local seeded = false
 local bushCache = nil
 local cacheIsland = nil
@@ -153,7 +137,7 @@ local cachedIsland = nil
 local cachedCarts = nil
 local warnedHarvest = false
 local warnedPickup = false
-local stats = { ok = 0, miss = 0, fired = 0, picked = 0, rebuilds = 0, resets = 0, pauses = 0 }
+local stats = { ok = 0, miss = 0, fired = 0, picked = 0, rebuilds = 0, resets = 0, paused = 0 }
 
 local function log(msg)
     print("[ABOVE Berries] " .. tostring(msg))
@@ -222,9 +206,7 @@ local function remote(name)
     return nil
 end
 
--- ---- gate 1: seated in the cart ----
--- Rider alone is NOT enough: it stays set after you dismount (measured still
--- set while 38.9 studs away), so a distance check is required too.
+-- ---- seated check: IronRailcart.Rider + distance ----
 
 local function refreshCarts(isl)
     cachedCarts = nil
@@ -275,54 +257,6 @@ local function seatedInCart()
     local d = cartDistance(c)
     if d == nil then return true end
     return d <= CART_MAX_DIST
-end
-
--- ---- gate 2: standing on a conveyor ----
-
-local function buildConveyors(isl)
-    local out = {}
-    local blocks = nil
-    pcall(function() blocks = isl:FindFirstChild("Blocks") end)
-    if not blocks then return out end
-    pcall(function()
-        for _, c in ipairs(blocks:GetChildren()) do
-            local nm = tostring(c.Name)
-            if string.sub(nm, 1, #CONV_PREFIX) == CONV_PREFIX then
-                local q = posOf(c)
-                local sz = nil
-                pcall(function() sz = c.Size end)
-                if q and sz then
-                    out[#out + 1] = {
-                        x = q.X, y = q.Y, z = q.Z,
-                        hx = sz.X / 2, hy = sz.Y / 2, hz = sz.Z / 2,
-                    }
-                end
-            end
-        end
-    end)
-    return out
-end
-
-local function onConveyor()
-    if not conveyorCache or #conveyorCache == 0 then return false end
-    local q = posOf(getRoot())
-    if not q then return false end
-    for i = 1, #conveyorCache do
-        local c = conveyorCache[i]
-        local dx = q.X - c.x
-        if dx < 0 then dx = -dx end
-        if dx <= c.hx + CONV_MARGIN then
-            local dz = q.Z - c.z
-            if dz < 0 then dz = -dz end
-            if dz <= c.hz + CONV_MARGIN then
-                local top = c.y + c.hy
-                if q.Y >= top - CONV_MARGIN and q.Y <= top + CONV_UP then
-                    return true
-                end
-            end
-        end
-    end
-    return false
 end
 
 -- ---- rate counter (counts HARVESTS - pickups alone stay at zero here) ----
@@ -518,7 +452,6 @@ local function hardReset(isl)
     local was = islandAddr
     bushCache = nil
     cacheIsland = nil
-    conveyorCache = nil
     clearLists()
     cachedIsland = isl
     islandAddr = nodesAddress(isl)
@@ -658,7 +591,7 @@ local function harvestPass(ev)
         if e.hb ~= nil and e.hb.Parent ~= nil then
             local dx, dy, dz = e.x - cx, e.y - cy, e.z - cz
             if dx * dx + dy * dy + dz * dz <= r2 then
-                if running and activeMode ~= nil then
+                if running and CFG.on then
                     pcall(function() ev:FireServer(e.hb) end)
                     verifyQueue[#verifyQueue + 1] = { e = e, due = os.clock() + VERIFY_AFTER }
                     stats.fired = stats.fired + 1
@@ -685,7 +618,7 @@ local function harvestPass(ev)
     return fired
 end
 
--- ---- pickup: one shot per item, survivors re-scanned next pass ----
+-- ---- pickup: ONLY the bush's own item ----
 
 local function isBushBerry(c)
     if c == nil then return false end
@@ -736,7 +669,7 @@ local function collectLoose()
 
     local shots = math.min(#targets, PICK_BATCH)
     for k = 1, shots do
-        if not running or activeMode == nil then return end
+        if not running or not CFG.on or not inCart then return end
         local i = pickIdx
         if i > #targets then
             i = 1
@@ -830,7 +763,7 @@ local function printStats()
         .. " | queued " .. tostring(#pending)
         .. " | done pool " .. tostring(#done)
         .. " | RS " .. tostring(getRS() ~= nil)
-        .. " | gate " .. tostring(activeMode))
+        .. " | in cart " .. tostring(inCart))
 end
 
 local function buildMenu()
@@ -846,22 +779,12 @@ local function buildMenu()
             local okb, err = pcall(function()
                 local sec = mkSection(tab, "Farm")
                 if sec then
-                    mkToggle(sec, "Rail Cart Berry Farm", "ab_cart", false, function(v)
-                        CFG.cart = v
-                        cbWorks.cart = true
+                    mkToggle(sec, "Rail Cart Berry Farm", "ab_on", false, function(v)
+                        CFG.on = v
+                        cbWorks.on = true
                         log("rail cart berry farm " .. (v and "ON" or "OFF"))
                     end)
-                    registerToggle("cart", "ab_cart")
-
-                    mkToggle(sec, "Conveyor Berry Farm", "ab_conv", false, function(v)
-                        CFG.conv = v
-                        cbWorks.conv = true
-                        if not v then
-                            convSince = nil
-                        end
-                        log("conveyor berry farm " .. (v and "ON" or "OFF"))
-                    end)
-                    registerToggle("conv", "ab_conv")
+                    registerToggle("on", "ab_on")
                 end
             end)
             if not okb then
@@ -879,8 +802,7 @@ end
 
 local function stop()
     running = false
-    CFG.cart = false
-    CFG.conv = false
+    CFG.on = false
     destroyOverlay()
     local M = _G.UI
     if M and type(M.RemoveTab) == "function" then
@@ -910,16 +832,15 @@ task.spawn(function()
     end
 end)
 
--- ---- loop 3: gates + harvest ----
+-- ---- loop 3: cart gate + harvest ----
 
 task.spawn(function()
     while running do
-        if not CFG.cart and not CFG.conv then
-            if activeMode then
-                activeMode = nil
-                log("all farms off - paused")
+        if not CFG.on then
+            if inCart then
+                inCart = false
+                log("toggle off - paused")
             end
-            convSince = nil
             seeded = false
             task.wait(0.2)
         else
@@ -936,41 +857,19 @@ task.spawn(function()
             if now - lastIsland > ISLAND_EVERY or cachedCarts == nil then
                 lastIsland = now
                 refreshCarts(isl)
-                if conveyorCache == nil and isl then
-                    conveyorCache = buildConveyors(isl)
-                    log("conveyor cache: " .. tostring(#conveyorCache) .. " part(s)")
-                end
             end
 
-            local mode = nil
-            if CFG.cart and seatedInCart() then
-                mode = "rail cart"
-            end
-            if mode == nil and CFG.conv then
-                if onConveyor() then
-                    if convSince == nil then
-                        convSince = now
-                        log("on a conveyor - arming (" .. tostring(CONV_DELAY) .. "s)")
-                    elseif now - convSince >= CONV_DELAY then
-                        mode = "conveyor"
-                    end
-                elseif convSince ~= nil then
-                    convSince = nil
-                    log("left the conveyor - disarmed")
+            if not seatedInCart() then
+                if inCart then
+                    inCart = false
+                    stats.paused = stats.paused + 1
+                    log("not in the cart - farm paused")
                 end
-            end
-
-            if mode == nil then
-                if activeMode then
-                    activeMode = nil
-                    stats.pauses = stats.pauses + 1
-                    log("farm paused")
-                end
-                task.wait(GATE_WAIT)
+                task.wait(CART_WAIT)
             else
-                if activeMode ~= mode then
-                    activeMode = mode
-                    log("farming (" .. mode .. ")")
+                if not inCart then
+                    inCart = true
+                    log("in the cart - farming")
                 end
 
                 if not isl then
@@ -1034,14 +933,14 @@ end)
 
 task.spawn(function()
     while running do
-        if activeMode ~= nil then
+        if CFG.on and inCart then
             local okp, errp = pcall(collectLoose)
             if not okp then
                 log("pickup error: " .. tostring(errp))
             end
             task.wait(PICK_WAIT)
         else
-            task.wait(0.2)
+            task.wait(0.25)
         end
     end
 end)
