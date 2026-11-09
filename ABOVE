@@ -1,35 +1,42 @@
 -- ABOVE
--- VERSION 9.1.0
+-- VERSION 10.0.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 --
--- Silent berry farmer for ABOVE. ONE toggle, nothing else in the menu.
+-- Berry farmer for ABOVE. TWO toggles, nothing else in the menu.
 --
--- Runs ONLY while you are seated in the cart. Sit in it and it farms every ripe
--- berry bush within 17 studs, picks up the berries that drop, and follows you.
--- Step out and it pauses. It never teleports you, never writes a CFrame, never
--- presses a key.
+--   Rail Cart Berry Farm  - runs while you are SEATED IN THE CART.
+--   Conveyor Berry Farm   - runs while you have been STANDING ON A CONVEYOR for
+--                           3 seconds, and stops the moment you leave it.
+--
+-- Either gate turns the same farm on. Both do exactly the same work: harvest
+-- every ripe berry bush within 17 studs, and pick up the berries that drop.
+-- No teleport, no CFrame write, no key press. Stop = switch the toggle off.
 --
 -- Seated check: IronRailcart has no Seat/VehicleSeat. Boarding (its HB's
--- ProximityPrompt) sets cart attribute Rider = <your UserId>, and that is the
--- only reliable signal - Humanoid.Sit / SeatPart read nil, no SeatWeld appears,
--- char.Parent stays Workspace, distance to the cart is useless (1.4 studs while
--- merely standing beside it).
+-- ProximityPrompt) sets cart attribute Rider = <your UserId>. Humanoid.Sit and
+-- Humanoid.SeatPart read nil, no SeatWeld appears, char.Parent stays Workspace,
+-- and distance to the cart is useless (1.4 studs while merely standing beside it).
 --
--- Island identity (v9.1.0 fix): leaving the island and coming back gives you a
--- NEW Nodes folder under the SAME island name, so keying the cache on the name
--- left it holding dead bush instances and the farm went silent. The cache is now
--- keyed on Nodes.Address (measured 1459067867248) and a change triggers a full
--- rebuild.
+-- Conveyor check (measured in game): a conveyor is a plain Part named "Conveyor"
+-- (264 of them) plus "ConveyorCorner" (4) and "ConveyorCornerLeft" (8), each
+-- 3.0 x 0.7 x 3.0 - exactly one 3-stud grid cell - with MachineId = "Conveyor",
+-- CellKey and Cells attributes, top surface at y + 0.35. There is no raycast in
+-- this VM (workspace:Raycast is an inert stub), so standing on one is detected by
+-- geometry: the HumanoidRootPart must be inside the part's XZ footprint plus a
+-- 1.5-stud margin, and within 1.5 studs below to 6 studs above its top face.
+--
+-- Island identity: leaving and returning creates a NEW Nodes folder under the
+-- SAME island name, so the cache is keyed on Nodes.Address (measured
+-- 1459067867248) and a change triggers a full rebuild.
 --
 -- Speed, all measured in game (place 124357835578554):
 --   * Reach is 18 studs from HumanoidRootPart. 17.54 harvested, 18.07 did not.
 --   * Server drops bursts: 0.05 s gap -> 95%, 0.02 s -> 87%, and 20 fires in a
---     SINGLE frame -> 38% (so it processes ~7-8 per frame). Bursting per frame is
---     not worth it; GAP = 0.01 with verification is the better route.
---   * The real ceiling is NOT the fire rate: the island holds ~2032 bushes but
---     only ~69 sit inside 17 studs, so a cluster is gone in about a second and
---     the farm then waits for regrow. Regrow re-checks are therefore the thing
---     that decides responsiveness: 60 checks per 0.15 s instead of 40 per 0.25 s.
+--     SINGLE frame -> 38% (so it processes ~7-8 per frame). Per-frame bursting is
+--     worse than serial firing; GAP = 0.01 with verification is used instead.
+--   * The real ceiling is NOT the fire rate: a 2032-bush island had only ~69
+--     bushes inside 17 studs, so a cluster is gone in about a second and the farm
+--     then waits for regrow. Regrow re-checks are what decide responsiveness.
 --   * A fire is not a harvest, so each fire is parked with a due time and re-read
 --     0.3 s later. No blocking wait in the pass.
 --   * RequestPickup takes the item's EntityId STRING, not the Part.
@@ -38,11 +45,9 @@
 --   * No ProximityPrompt exists on any bush or loose item.
 --
 -- Four loops: menu, harvest, pickup, toggle poller.
---
--- Stop = switch the toggle off. There is no stop key.
 
 local NAME = "AboveBerries"
-local VERSION = "9.1.0"
+local VERSION = "10.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -61,12 +66,16 @@ local RECHECK_BATCH = 60
 local RECHECK_EVERY = 0.15
 local COUNT_EVERY = 10
 local ISLAND_EVERY = 1.0
+local CONV_DELAY = 3
+local CONV_MARGIN = 1.5
+local CONV_UP = 6
 local BUSY_WAIT = 0.01
 local IDLE_WAIT = 0.10
 local PICK_WAIT = 0.10
-local CART_WAIT = 0.25
+local GATE_WAIT = 0.15
 
 local PICK_ITEM_ID = "Berries"
+local CONV_PREFIX = "Conveyor"
 
 -- ---- services ----
 
@@ -81,11 +90,13 @@ local RS = svc("ReplicatedStorage")
 
 -- ---- state ----
 
-local CFG = { on = false }
+local CFG = { cart = false, conv = false }
 
 local running = true
 local built = false
-local inCart = false
+local activeMode = nil
+local convSince = nil
+local conveyorCache = nil
 local seeded = false
 local bushCache = nil
 local cacheIsland = nil
@@ -101,7 +112,7 @@ local lastCount = 0
 local lastIsland = 0
 local cachedIsland = nil
 local cachedCarts = nil
-local stats = { ok = 0, miss = 0, fired = 0, picked = 0, rebuilds = 0, resets = 0, paused = 0 }
+local stats = { ok = 0, miss = 0, fired = 0, picked = 0, rebuilds = 0, resets = 0, pauses = 0 }
 
 local function log(msg)
     print("[ABOVE Berries] " .. tostring(msg))
@@ -170,7 +181,7 @@ local function remote(name)
     return nil
 end
 
--- ---- seated check: IronRailcart.Rider == your UserId ----
+-- ---- gate 1: seated in the cart (IronRailcart.Rider == your UserId) ----
 
 local function refreshCarts(isl)
     cachedCarts = nil
@@ -200,6 +211,55 @@ local function getSeatCart()
         end
     end)
     return found
+end
+
+-- ---- gate 2: standing on a conveyor ----
+-- Cached once per island: position + half extents. No property reads per check.
+
+local function buildConveyors(isl)
+    local out = {}
+    local blocks = nil
+    pcall(function() blocks = isl:FindFirstChild("Blocks") end)
+    if not blocks then return out end
+    pcall(function()
+        for _, c in ipairs(blocks:GetChildren()) do
+            local nm = tostring(c.Name)
+            if string.sub(nm, 1, #CONV_PREFIX) == CONV_PREFIX then
+                local q = posOf(c)
+                local sz = nil
+                pcall(function() sz = c.Size end)
+                if q and sz then
+                    out[#out + 1] = {
+                        x = q.X, y = q.Y, z = q.Z,
+                        hx = sz.X / 2, hy = sz.Y / 2, hz = sz.Z / 2,
+                    }
+                end
+            end
+        end
+    end)
+    return out
+end
+
+local function onConveyor()
+    if not conveyorCache or #conveyorCache == 0 then return false end
+    local q = posOf(getRoot())
+    if not q then return false end
+    for i = 1, #conveyorCache do
+        local c = conveyorCache[i]
+        local dx = q.X - c.x
+        if dx < 0 then dx = -dx end
+        if dx <= c.hx + CONV_MARGIN then
+            local dz = q.Z - c.z
+            if dz < 0 then dz = -dz end
+            if dz <= c.hz + CONV_MARGIN then
+                local top = c.y + c.hy
+                if q.Y >= top - CONV_MARGIN and q.Y <= top + CONV_UP then
+                    return true
+                end
+            end
+        end
+    end
+    return false
 end
 
 -- ---- bush cache ----
@@ -247,11 +307,11 @@ local function clearLists()
     seeded = false
 end
 
--- full rebuild: the island was replaced, so every cached instance is dead
 local function hardReset(isl)
     local was = islandAddr
     bushCache = nil
     cacheIsland = nil
+    conveyorCache = nil
     clearLists()
     cachedIsland = isl
     islandAddr = nodesAddress(isl)
@@ -387,7 +447,7 @@ local function harvestPass(ev)
         if e.hb ~= nil and e.hb.Parent ~= nil then
             local dx, dy, dz = e.x - cx, e.y - cy, e.z - cz
             if dx * dx + dy * dy + dz * dz <= r2 then
-                if running and CFG.on then
+                if running and activeMode ~= nil then
                     pcall(function() ev:FireServer(e.hb) end)
                     verifyQueue[#verifyQueue + 1] = { e = e, due = os.clock() + VERIFY_AFTER }
                     stats.fired = stats.fired + 1
@@ -454,7 +514,7 @@ local function collectLoose()
     end
 
     for k = 1, PICK_BATCH do
-        if not running or not CFG.on or not inCart then return end
+        if not running or activeMode == nil then return end
         local i = pickIdx
         if i > #targets then
             i = 1
@@ -548,7 +608,7 @@ local function printStats()
         .. " | verifying " .. tostring(#verifyQueue)
         .. " | done pool " .. tostring(#done)
         .. " | resets " .. tostring(stats.resets)
-        .. " | in cart " .. tostring(inCart))
+        .. " | gate " .. tostring(activeMode))
 end
 
 local function buildMenu()
@@ -564,12 +624,22 @@ local function buildMenu()
             local okb, err = pcall(function()
                 local sec = mkSection(tab, "Farm")
                 if sec then
-                    mkToggle(sec, "Silent Berry Farm (in cart)", "ab_on", false, function(v)
-                        CFG.on = v
-                        cbWorks.on = true
-                        log("silent berry farm " .. (v and "ON" or "OFF"))
+                    mkToggle(sec, "Rail Cart Berry Farm", "ab_cart", false, function(v)
+                        CFG.cart = v
+                        cbWorks.cart = true
+                        log("rail cart berry farm " .. (v and "ON" or "OFF"))
                     end)
-                    registerToggle("on", "ab_on")
+                    registerToggle("cart", "ab_cart")
+
+                    mkToggle(sec, "Conveyor Berry Farm", "ab_conv", false, function(v)
+                        CFG.conv = v
+                        cbWorks.conv = true
+                        if not v then
+                            convSince = nil
+                        end
+                        log("conveyor berry farm " .. (v and "ON" or "OFF"))
+                    end)
+                    registerToggle("conv", "ab_conv")
                 end
             end)
             if not okb then
@@ -587,7 +657,8 @@ end
 
 local function stop()
     running = false
-    CFG.on = false
+    CFG.cart = false
+    CFG.conv = false
     local M = _G.UI
     if M and type(M.RemoveTab) == "function" then
         pcall(function() M.RemoveTab("ABOVE Berries") end)
@@ -607,21 +678,21 @@ task.spawn(function()
     buildMenu()
 end)
 
--- ---- loop 2: harvest ----
+-- ---- loop 2: gates + harvest ----
 
 task.spawn(function()
     while running do
-        if not CFG.on then
-            if inCart then
-                inCart = false
-                log("toggle off - paused")
+        if not CFG.cart and not CFG.conv then
+            if activeMode then
+                activeMode = nil
+                log("all farms off - paused")
             end
+            convSince = nil
             seeded = false
             task.wait(0.2)
         else
             local isl = getIsland()
 
-            -- island identity: a reload keeps the name but changes Nodes
             if isl then
                 local addr = nodesAddress(isl)
                 if addr ~= nil and addr ~= islandAddr then
@@ -633,20 +704,42 @@ task.spawn(function()
             if now - lastIsland > ISLAND_EVERY or cachedCarts == nil then
                 lastIsland = now
                 refreshCarts(isl)
+                if conveyorCache == nil and isl then
+                    conveyorCache = buildConveyors(isl)
+                    log("conveyor cache: " .. tostring(#conveyorCache) .. " part(s)")
+                end
             end
 
-            local cart = getSeatCart()
-            if cart == nil then
-                if inCart then
-                    inCart = false
-                    stats.paused = stats.paused + 1
-                    log("not in the cart - farm paused")
+            -- which gate is satisfied right now?
+            local mode = nil
+            if CFG.cart and getSeatCart() ~= nil then
+                mode = "rail cart"
+            end
+            if mode == nil and CFG.conv then
+                if onConveyor() then
+                    if convSince == nil then
+                        convSince = now
+                        log("on a conveyor - arming (" .. tostring(CONV_DELAY) .. "s)")
+                    elseif now - convSince >= CONV_DELAY then
+                        mode = "conveyor"
+                    end
+                elseif convSince ~= nil then
+                    convSince = nil
+                    log("left the conveyor - disarmed")
                 end
-                task.wait(CART_WAIT)
+            end
+
+            if mode == nil then
+                if activeMode then
+                    activeMode = nil
+                    stats.pauses = stats.pauses + 1
+                    log("farm paused")
+                end
+                task.wait(GATE_WAIT)
             else
-                if not inCart then
-                    inCart = true
-                    log("in the cart (" .. tostring(cart.Name) .. ") - farming")
+                if activeMode ~= mode then
+                    activeMode = mode
+                    log("farming (" .. mode .. ")")
                 end
 
                 if not isl then
@@ -705,7 +798,7 @@ end)
 
 task.spawn(function()
     while running do
-        if CFG.on and inCart then
+        if activeMode ~= nil then
             local okp, errp = pcall(collectLoose)
             if not okp then
                 log("pickup error: " .. tostring(errp))
