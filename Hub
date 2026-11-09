@@ -7,6 +7,9 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v4.7: ABOVE v11.0.0 - faster berry pickup (one shot per item across 24 items
+--       at 0.05 s instead of 2 sequential fires at 0.08 s) plus a Drawing
+--       berries-picked-per-second overlay.
 -- v4.6: ABOVE v10.0.0 - two toggles: Rail Cart Berry Farm (cart Rider gate) and
 --       Conveyor Berry Farm (standing on a conveyor for 3 s, stops on leaving).
 -- v4.5: ABOVE v9.1.0 - island reload fix (cache keyed on Nodes.Address, not the
@@ -48,7 +51,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.6'
+local VERSION = 'v4.7'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
