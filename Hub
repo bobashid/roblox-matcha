@@ -7,13 +7,12 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
--- v4.9: ABOVE v11.2.0 - lazy service resolution (a cached nil ReplicatedStorage
---       killed every remote call silently) and the cart gate now also checks
---       distance, because Rider persists after you dismount.
--- v4.8: ABOVE v11.1.0 - overlay counts HARVESTS not pickups, and the fire gap is
---       back to 0.02 s because 0.01 s only landed 14%.
+-- v5.0: ABOVE v12.0.0 - cart-only build (conveyor gate removed), fire gap 0.02 s
+--       which is ~3x the throughput of the old 0.01 s, lazy service resolution.
+-- v4.9: ABOVE v11.2.0 - lazy services, cart gate distance check.
+-- v4.8: ABOVE v11.1.0 - overlay counts HARVESTS not pickups, 0.02 s fire gap.
 -- v4.7: ABOVE v11.0.0 - faster berry pickup plus a Drawing berries/sec overlay.
--- v4.6: ABOVE v10.0.0 - two toggles: Rail Cart Berry Farm and Conveyor Berry Farm.
+-- v4.6: ABOVE v10.0.0 - rail cart + conveyor toggles.
 -- v4.5: ABOVE v9.1.0 - island reload fix (cache keyed on Nodes.Address).
 -- v4.4: ABOVE v9.0.0 - one toggle, silent berry farm gated on the cart.
 -- v4.3: ABOVE v7.3.1 - two toggles (TP / silent), verified harvest, EntityId pickup.
@@ -47,7 +46,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.9'
+local VERSION = 'v5.0'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
