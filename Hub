@@ -7,6 +7,9 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v4.8: ABOVE v11.1.0 - overlay counts HARVESTS not pickups (RequestHarvest
+--       drops no loose berries, so a pickup counter sat at 0 forever), and the
+--       fire gap is back to 0.02 s because 0.01 s only landed 14%.
 -- v4.7: ABOVE v11.0.0 - faster berry pickup (one shot per item across 24 items
 --       at 0.05 s instead of 2 sequential fires at 0.08 s) plus a Drawing
 --       berries-picked-per-second overlay.
@@ -51,7 +54,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.7'
+local VERSION = 'v4.8'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
