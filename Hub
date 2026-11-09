@@ -7,12 +7,12 @@
 --
 -- Manual load: _G.Hub.load('Dogs')
 --
+-- v4.6: ABOVE v10.0.0 - two toggles: Rail Cart Berry Farm (cart Rider gate) and
+--       Conveyor Berry Farm (standing on a conveyor for 3 s, stops on leaving).
 -- v4.5: ABOVE v9.1.0 - island reload fix (cache keyed on Nodes.Address, not the
 --       island name), faster regrow re-checks, 0.01 s fire gap.
--- v4.4: ABOVE v9.0.0 - one toggle, silent berry farm that only runs while you
---       are seated in the cart (IronRailcart.Rider == your UserId). Faster fire
---       gap, verification moved off the hot path, pickup in its own loop, and
---       pickup takes only ItemId 'Berries'.
+-- v4.4: ABOVE v9.0.0 - one toggle, silent berry farm gated on the cart, faster
+--       fire gap, verification off the hot path, pickup in its own loop.
 -- v4.3: ABOVE v7.3.1 - two toggles (TP / silent), every harvest fire verified by
 --       re-reading Ripe, pickup uses the item's EntityId string.
 -- v4.2: ABOVE v5.1.0 - warp harvest + warp pickup, loose berries found by the
@@ -48,7 +48,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v4.5'
+local VERSION = 'v4.6'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
