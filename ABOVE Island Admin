@@ -1,5 +1,5 @@
 -- ABOVE Island Admin
--- VERSION 7.5.0
+-- VERSION 7.5.1
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
 -- Gives Helper to everyone who liked your island (the guest book signatures),
@@ -16,6 +16,11 @@
 -- the ones that scrolled out. CanvasPosition / CanvasSize read nil in this VM, so
 -- the list cannot be scrolled programmatically.
 --
+-- v7.5.1 FIX: v7.5.0 shipped a PARSE ERROR - `bookInfo.named = bookInfo.named + 1`
+-- and `names[#names + 1] = nm` were jammed on one line with no separator, so the
+-- chunk never compiled and the script did nothing at all. Split onto two lines.
+-- This is the "two assignments on one line" bug already in learned/errors.md.
+--
 -- v7.5.0:
 --   1. known ACCUMULATES and is persisted to above_likers.txt, so names survive
 --      a reload instead of being re-discovered every execute.
@@ -26,7 +31,7 @@
 -- ======================================================================
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "7.5.0"
+local VERSION = "7.5.1"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -52,7 +57,9 @@ local function resolveService(svcName)
     local found = nil
     pcall(function()
         for _, d in ipairs(game:GetChildren()) do
-            if found == nil and tostring(d.ClassName) == svcName then found = d end
+            if found == nil and tostring(d.ClassName) == svcName then
+                found = d
+            end
         end
     end)
     return found
@@ -102,7 +109,6 @@ local queued = nil
 local pool = {}
 local renderConn = nil
 local wsWarned = false
-local gapWarned = false
 local lastPass = ""
 local lastTagLog = 0
 local lastHeader = -1
@@ -258,7 +264,6 @@ local function readHeader(cg)
     return n
 end
 
--- every ScrollingFrame under CanvasGroup, de-duped by Address
 local function collectSheets(cg)
     local sheets, keys = {}, {}
     local function add(sf)
@@ -303,14 +308,16 @@ local function scrapeGuestBook()
     local names = {}
 
     if #sheets == 0 then
-        -- fallback: plain Frame children of the CanvasGroup
         pcall(function()
             for _, f in ipairs(cg:GetChildren()) do
                 if tostring(f.ClassName) == "Frame" then
                     bookInfo.rows = bookInfo.rows + 1
                     bookInfo.frames = bookInfo.frames + 1
                     local nm = nameFromEntry(f)
-                    if nm then bookInfo.named = bookInfo.named + 1 names[#names + 1] = nm end
+                    if nm then
+                        bookInfo.named = bookInfo.named + 1
+                        names[#names + 1] = nm
+                    end
                 end
             end
         end)
