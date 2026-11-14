@@ -1,38 +1,37 @@
 -- ABOVE Island Admin
--- VERSION 4.1.0
+-- VERSION 4.2.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
--- also seen on place 88152437007055 (same game, different place)
+-- also seen on 88152437007055 (same game, different place)
 --
 -- Co-op island permission panel.
 --
 -- ===================== THE ROLE CALL (confirmed) =====================
 -- RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
--- Measured live by firing each candidate and watching PlayerGui.AboveAlert:
+-- Measured live via PlayerGui.AboveAlert:
 --   ("Helper", uid)            -> unchanged
---   ("SetRole", uid, "Helper") -> alert CHANGED: "<name> is now Helper"   OK
+--   ("SetRole", uid, "Helper") -> "<name> is now Helper"   OK
 --   (uid, "Helper")            -> unchanged
--- Role keys from Shared.Config.PermissionConfig:
---   RoleOrder = Visitor, Helper, Builder, TrustedBuilder
--- "Visitor" removes elevated access.
+-- Role keys (Shared.Config.PermissionConfig): Visitor, Helper, Builder,
+-- TrustedBuilder. "Visitor" removes elevated access.
 -- ====================================================================
 --
--- v4.1.0 FIX: only one player in a server of four was ever getting a SetRole
--- call. Cause: the `granted` table was never cleared, so every player already
--- touched by an earlier press, by the auto loop or by the likers button was
--- skipped forever. Measured symptom: roster showed 4 players / 3 LIKED, but only
--- one SetRole line was logged.
---   * An explicit Give/Take press now CLEARS `granted` first - a button press
---     means "all of them, now".
---   * `granted` is kept only for the AUTOMATIC paths (auto-on-join, auto-likers),
---     which is what it was for.
---   * Every skip is logged, and the summary line always prints "sent N of M".
---   * Gap between role calls raised 0.2 -> 0.35 s (burst dropping is real on this
---     server for RequestHarvest; assume the same for role calls).
+-- v4.2.0 FIX - why give/take only ever hit ONE player:
+--   The button callback looped and called task.wait(ROLE_GAP) between targets.
+--   A yield inside the UI button callback kills the rest of the loop, so the first
+--   target fired and everything after it was lost - and because the loop died, the
+--   "sent N of M" summary never printed either. That missing summary line was the
+--   tell.
+--   Fix: BUTTONS NO LONGER DO THE WORK. A press only queues a job
+--   (queued = { role = ..., force = true }) and returns immediately. A background
+--   task.spawn loop drains the queue, where yielding is safe. Nothing yields
+--   inside a widget callback any more.
+--
+-- v4.1.0: `granted` is cleared on every explicit press, so a press means "all of
+-- them, now". It is kept only for the automatic paths.
 --
 -- GUEST BOOK: PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame, one Frame per
 -- signature. First direct-child TextLabel is the name, second is "<n>h ago"; the
--- VIP / FRIEND tag is nested so it is never picked up. Measured 47 Frames with the
--- header reading "47". Rescanned on a timer so the count follows new signatures.
+-- VIP / FRIEND tag is nested so it is never picked up. Rescanned on a timer.
 -- RemoteEvent.OnClientEvent is nil in this VM, so the GUI is the only source.
 --
 -- Roles only apply to players IN YOUR SERVER, so the guest book is a match list.
@@ -40,7 +39,7 @@
 -- Stop = switch the toggle off / press stop. There is no stop key.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "4.1.0"
+local VERSION = "4.2.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -108,6 +107,7 @@ local bookSet = {}
 local bookEntries = {}
 local bookUnique = {}
 local lastCount = -1
+local queued = nil
 local stats = { set = 0, failed = 0, matched = 0 }
 local warnedAction = false
 
@@ -168,7 +168,7 @@ local function readAlert()
     return t
 end
 
--- ---- role set: ("SetRole", userId, roleName) ----
+-- ---- role set ----
 
 local function setRole(roleKey, userId, label)
     local ev = remote("RequestFriendAction")
@@ -204,25 +204,18 @@ local function testRoleCall()
         log("no other player in server to test against")
         return
     end
-    local before = readAlert()
-    log("alert before = " .. tostring(before))
-    setRole(ROLE, target.uid, target.name)
-    task.wait(1.3)
-    local after = readAlert()
-    log("alert after  = " .. tostring(after))
-    if after ~= before then
-        log("ACCEPTED - alert changed")
-    else
-        log("no change - refused, or already " .. ROLE)
-    end
+    log("alert before = " .. tostring(readAlert()))
+    queued = { kind = "one", role = ROLE, uid = target.uid, name = target.name }
+    log("queued test call for " .. target.name)
 end
 
--- explicit press: force = clear the guard and hit everyone
+-- runs in the worker loop, never in a widget callback
 local function applyToAll(roleKey, force)
     local me = myUserId()
     local list = listPlayers()
     if force then granted = {} end
     local n, skipped = 0, 0
+    log("running " .. roleKey .. " over " .. tostring(#list) .. " player(s)")
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me then
@@ -365,6 +358,7 @@ local function grantLikers(force)
     local me = myUserId()
     local list = listPlayers()
     local n, skipped = 0, 0
+    log("running likers grant over " .. tostring(#list) .. " player(s)")
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me and isLiker(pl) then
@@ -425,6 +419,7 @@ local function mkToggle(sec, label, id, default, apply)
     return false
 end
 
+-- buttons ONLY queue; they never yield
 local function mkButton(sec, label, cb)
     if not sec then return false end
     if pcall(function() sec:Button(label, cb) end) then return true end
@@ -452,17 +447,21 @@ local function buildMenu()
                 local sec = mkSection(tab, "Roles")
                 if sec then
                     mkButton(sec, "Give " .. ROLE .. " to everyone", function()
-                        applyToAll(ROLE, true)
+                        queued = { kind = "all", role = ROLE, force = true }
                     end)
                     mkButton(sec, "Take " .. ROLE .. " from everyone", function()
-                        applyToAll(BASE_ROLE, true)
+                        queued = { kind = "all", role = BASE_ROLE, force = true }
                     end)
-                    mkButton(sec, "Test role call (reads alert)", testRoleCall)
+                    mkButton(sec, "Test role call (reads alert)", function()
+                        queued = { kind = "test" }
+                    end)
                     mkToggle(sec, "Auto-grant " .. ROLE .. " to all who join", "ia_auto", false, function(v)
                         CFG.autoAll = v
                         log("auto-grant all " .. (v and "ON" or "OFF"))
                     end)
-                    mkButton(sec, "Print who is in server", printRoster)
+                    mkButton(sec, "Print who is in server", function()
+                        queued = { kind = "roster" }
+                    end)
                     mkButton(sec, "Reset granted list", function()
                         granted = {}
                         log("granted list cleared")
@@ -472,16 +471,18 @@ local function buildMenu()
                 local gb = mkSection(tab, "Guest Book")
                 if gb then
                     mkButton(gb, "Rescan guest book now", function()
-                        rescan(false)
+                        queued = { kind = "rescan" }
                     end)
-                    mkButton(gb, "Print guest book names", printBook)
+                    mkButton(gb, "Print guest book names", function()
+                        queued = { kind = "book" }
+                    end)
                     mkToggle(gb, "Auto-grant to guest book likers", "ia_likers", false, function(v)
                         CFG.autoLikers = v
                         if v then rescan(true) end
                         log("auto-grant to likers " .. (v and "ON" or "OFF"))
                     end)
                     mkButton(gb, "Grant to likers in server now", function()
-                        grantLikers(true)
+                        queued = { kind = "likers", force = true }
                     end)
                     mkText(gb, "Rescans every " .. tostring(RESCAN_EVERY) .. "s.")
                 end
@@ -529,18 +530,40 @@ task.spawn(function()
     end
 end)
 
+-- worker: drains the queue so nothing yields inside a widget callback
 task.spawn(function()
     while running do
-        if CFG.autoLikers then
-            local ok, err = pcall(grantLikers, false)
-            if not ok then log("liker pass error: " .. tostring(err)) end
-            task.wait(AUTO_DELAY)
-        elseif CFG.autoAll then
-            local ok, err = pcall(applyToAll, ROLE, false)
-            if not ok then log("auto pass error: " .. tostring(err)) end
-            task.wait(AUTO_DELAY)
+        local job = queued
+        if job then
+            queued = nil
+            local ok, err = pcall(function()
+                if job.kind == "all" then
+                    applyToAll(job.role, job.force)
+                elseif job.kind == "likers" then
+                    grantLikers(job.force)
+                elseif job.kind == "test" then
+                    testRoleCall()
+                elseif job.kind == "roster" then
+                    printRoster()
+                elseif job.kind == "rescan" then
+                    rescan(false)
+                elseif job.kind == "book" then
+                    printBook()
+                end
+            end)
+            if not ok then log("job error: " .. tostring(err)) end
         else
-            task.wait(0.25)
+            if CFG.autoLikers then
+                local ok, err = pcall(grantLikers, false)
+                if not ok then log("liker pass error: " .. tostring(err)) end
+                task.wait(AUTO_DELAY)
+            elseif CFG.autoAll then
+                local ok, err = pcall(applyToAll, ROLE, false)
+                if not ok then log("auto pass error: " .. tostring(err)) end
+                task.wait(AUTO_DELAY)
+            else
+                task.wait(0.2)
+            end
         end
     end
 end)
@@ -549,14 +572,13 @@ _G[NAME] = {
     stop = stop,
     version = VERSION,
     setRole = setRole,
-    giveAll = function() return applyToAll(ROLE, true) end,
-    takeAll = function() return applyToAll(BASE_ROLE, true) end,
-    roster = printRoster,
-    scrape = function() return rescan(false) end,
-    book = printBook,
-    grantLikers = function() return grantLikers(true) end,
+    giveAll = function() queued = { kind = "all", role = ROLE, force = true } end,
+    takeAll = function() queued = { kind = "all", role = BASE_ROLE, force = true } end,
+    roster = function() queued = { kind = "roster" } end,
+    scrape = function() queued = { kind = "rescan" } end,
+    book = function() queued = { kind = "book" } end,
+    grantLikers = function() queued = { kind = "likers", force = true } end,
     isLiker = isLiker,
-    testRole = testRoleCall,
     alert = readAlert,
     entries = function() return bookEntries end,
 }
