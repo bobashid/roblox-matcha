@@ -1,59 +1,33 @@
 -- ABOVE Island Admin
--- VERSION 4.2.0
--- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
--- also seen on 88152437007055 (same game, different place)
+-- VERSION 5.0.0
+-- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
--- Co-op island permission panel.
+-- Gives Helper to everyone who liked your island (the guest book signatures).
 --
--- ===================== THE ROLE CALL (confirmed) =====================
--- RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
--- Measured live via PlayerGui.AboveAlert:
---   ("Helper", uid)            -> unchanged
---   ("SetRole", uid, "Helper") -> "<name> is now Helper"   OK
---   (uid, "Helper")            -> unchanged
--- Role keys (Shared.Config.PermissionConfig): Visitor, Helper, Builder,
--- TrustedBuilder. "Visitor" removes elevated access.
--- ====================================================================
+-- Role call: RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
+--   Roles: Visitor, Helper, Builder, TrustedBuilder. "Visitor" = no access.
 --
--- v4.2.0 FIX - why give/take only ever hit ONE player:
---   The button callback looped and called task.wait(ROLE_GAP) between targets.
---   A yield inside the UI button callback kills the rest of the loop, so the first
---   target fired and everything after it was lost - and because the loop died, the
---   "sent N of M" summary never printed either. That missing summary line was the
---   tell.
---   Fix: BUTTONS NO LONGER DO THE WORK. A press only queues a job
---   (queued = { role = ..., force = true }) and returns immediately. A background
---   task.spawn loop drains the queue, where yielding is safe. Nothing yields
---   inside a widget callback any more.
+-- The guest book list only exists in PlayerGui.AboveGuestBook, so open the book
+-- once after loading; the script then reads it every 3 s.
 --
--- v4.1.0: `granted` is cleared on every explicit press, so a press means "all of
--- them, now". It is kept only for the automatic paths.
---
--- GUEST BOOK: PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame, one Frame per
--- signature. First direct-child TextLabel is the name, second is "<n>h ago"; the
--- VIP / FRIEND tag is nested so it is never picked up. Rescanned on a timer.
--- RemoteEvent.OnClientEvent is nil in this VM, so the GUI is the only source.
---
--- Roles only apply to players IN YOUR SERVER, so the guest book is a match list.
---
--- Stop = switch the toggle off / press stop. There is no stop key.
+-- Roles only apply to players IN YOUR SERVER, so this matches guest book names
+-- against whoever is present. Loading it after they already liked still works:
+-- enabling the toggle runs a full pass over everyone currently in server.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "4.2.0"
+local VERSION = "5.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
 end
 
--- ---- constants ----
-
 local ROLE = "Helper"
 local BASE_ROLE = "Visitor"
-local AUTO_DELAY = 2.0
 local RESCAN_EVERY = 3.0
+local GRANT_EVERY = 2.0
 local ROLE_GAP = 0.35
 
--- ---- lazy service resolution (never cache a nil) ----
+-- ---- services (resolved lazily; never cache a nil) ----
 
 local RS = nil
 local PlayersSvc = nil
@@ -98,18 +72,15 @@ end
 
 -- ---- state ----
 
-local CFG = { autoAll = false, autoLikers = false }
+local CFG = { auto = false }
 
 local running = true
 local built = false
 local granted = {}
 local bookSet = {}
-local bookEntries = {}
-local bookUnique = {}
-local lastCount = -1
+local known = {}
 local queued = nil
-local stats = { set = 0, failed = 0, matched = 0 }
-local warnedAction = false
+local lastCount = -1
 
 local function log(msg)
     print("[ABOVE Admin] " .. tostring(msg))
@@ -146,114 +117,19 @@ local function listPlayers()
     return out
 end
 
--- ---- alert witness ----
-
-local function readAlert()
-    local P = getPlayers()
-    if not P then return nil end
-    local lp = nil
-    pcall(function() lp = P.LocalPlayer end)
-    if not lp then return nil end
-    local pg = nil
-    pcall(function() pg = lp:FindFirstChild("PlayerGui") end)
-    if not pg then return nil end
-    local a = nil
-    pcall(function() a = pg:FindFirstChild("AboveAlert") end)
-    if not a then return nil end
-    local t = nil
-    pcall(function()
-        local tl = a:FindFirstChildOfClass("TextLabel")
-        if tl then t = tl.Text end
-    end)
-    return t
-end
-
 -- ---- role set ----
 
 local function setRole(roleKey, userId, label)
     local ev = remote("RequestFriendAction")
-    if not ev then
-        if not warnedAction then
-            warnedAction = true
-            log("RequestFriendAction not resolvable - will keep retrying")
-        end
-        return false
-    end
+    if not ev then return false end
     local ok = pcall(function() ev:FireServer("SetRole", userId, roleKey) end)
     if ok then
-        stats.set = stats.set + 1
-        log("SetRole " .. roleKey .. " -> " .. tostring(label) .. " (" .. tostring(userId) .. ")")
-    else
-        stats.failed = stats.failed + 1
-        log("FAILED " .. roleKey .. " -> " .. tostring(label))
+        log(roleKey .. " -> " .. tostring(label))
     end
     return ok
 end
 
-local function testRoleCall()
-    local me = myUserId()
-    local list = listPlayers()
-    local target = nil
-    for i = 1, #list do
-        if list[i].uid ~= me then
-            target = list[i]
-            break
-        end
-    end
-    if not target then
-        log("no other player in server to test against")
-        return
-    end
-    log("alert before = " .. tostring(readAlert()))
-    queued = { kind = "one", role = ROLE, uid = target.uid, name = target.name }
-    log("queued test call for " .. target.name)
-end
-
--- runs in the worker loop, never in a widget callback
-local function applyToAll(roleKey, force)
-    local me = myUserId()
-    local list = listPlayers()
-    if force then granted = {} end
-    local n, skipped = 0, 0
-    log("running " .. roleKey .. " over " .. tostring(#list) .. " player(s)")
-    for i = 1, #list do
-        local pl = list[i]
-        if pl.uid ~= me then
-            if force or not granted[tostring(pl.uid)] then
-                granted[tostring(pl.uid)] = true
-                setRole(roleKey, pl.uid, pl.name)
-                n = n + 1
-                task.wait(ROLE_GAP)
-            else
-                skipped = skipped + 1
-                log("skip " .. pl.name .. " - already sent this session")
-            end
-        end
-    end
-    log("sent " .. roleKey .. " to " .. tostring(n) .. " of " .. tostring(#list)
-        .. " in server" .. (skipped > 0 and (", skipped " .. tostring(skipped)) or ""))
-    return n
-end
-
-local function printRoster()
-    local me = myUserId()
-    local list = listPlayers()
-    log("in server (" .. tostring(#list) .. "):")
-    for i = 1, #list do
-        local pl = list[i]
-        local liked = "no"
-        if bookSet[string.lower(pl.name)] or (pl.display and bookSet[string.lower(pl.display)]) then
-            liked = "LIKED"
-        end
-        log("  " .. pl.name .. " (" .. tostring(pl.uid) .. ")"
-            .. (pl.display and (" [" .. pl.display .. "]") or "")
-            .. " guestbook=" .. liked
-            .. (granted[tostring(pl.uid)] and " sent" or "")
-            .. (pl.uid == me and "  <- you" or ""))
-    end
-end
-
--- ---- guest book scrape ----
+-- ---- guest book ----
 
 local function nameFromEntry(f)
     for _, d in ipairs(f:GetChildren()) do
@@ -273,61 +149,49 @@ end
 
 local function scrapeGuestBook()
     local P = getPlayers()
-    if not P then return {}, {} end
+    if not P then return {} end
     local lp = nil
     pcall(function() lp = P.LocalPlayer end)
-    if not lp then return {}, {} end
+    if not lp then return {} end
     local pg = nil
     pcall(function() pg = lp:FindFirstChild("PlayerGui") end)
-    if not pg then return {}, {} end
+    if not pg then return {} end
     local gb = nil
     pcall(function() gb = pg:FindFirstChild("AboveGuestBook") end)
-    if not gb then return {}, {} end
+    if not gb then return {} end
     local cg = nil
     pcall(function() cg = gb:FindFirstChild("CanvasGroup") end)
-    if not cg then return {}, {} end
+    if not cg then return {} end
     local sf = nil
     pcall(function() sf = cg:FindFirstChild("ScrollingFrame") end)
-    if not sf then return {}, {} end
+    if not sf then return {} end
 
-    local entries = {}
-    local unique, seen = {}, {}
+    local names = {}
     pcall(function()
         for _, f in ipairs(sf:GetChildren()) do
             if tostring(f.ClassName) == "Frame" then
                 local nm = nameFromEntry(f)
-                if nm then
-                    entries[#entries + 1] = nm
-                    local k = string.lower(nm)
-                    if not seen[k] then
-                        seen[k] = true
-                        unique[#unique + 1] = nm
-                    end
-                end
+                if nm then names[#names + 1] = nm end
             end
         end
     end)
-    return entries, unique
+    return names
 end
 
-local function rescan(silent)
-    local entries, unique = scrapeGuestBook()
-    if #entries == 0 then
-        if not silent then log("guest book not open - open it in game") end
-        return 0
-    end
-    bookEntries = entries
-    bookUnique = unique
+local function rescan()
+    local names = scrapeGuestBook()
+    if #names == 0 then return 0 end
     bookSet = {}
-    for i = 1, #unique do
-        bookSet[string.lower(unique[i])] = unique[i]
+    for i = 1, #names do
+        local k = string.lower(names[i])
+        bookSet[k] = names[i]
+        if not known[k] then
+            known[k] = true
+            log("new liker: " .. names[i])
+        end
     end
-    if #entries ~= lastCount then
-        lastCount = #entries
-        log("guest book: " .. tostring(#entries) .. " entries, "
-            .. tostring(#unique) .. " unique name(s)")
-    end
-    return #entries
+    lastCount = #names
+    return #names
 end
 
 local function isLiker(pl)
@@ -337,45 +201,43 @@ local function isLiker(pl)
     return false
 end
 
-local function printBook()
-    if #bookEntries == 0 then
-        log("guest book empty - open the book in game")
-        return
-    end
-    log("entries (" .. tostring(#bookEntries) .. "), unique (" .. tostring(#bookUnique) .. "):")
-    for i = 1, #bookEntries do
-        log("  " .. tostring(i) .. ". " .. bookEntries[i])
-    end
-end
+-- ---- actions (run in the worker, never in a widget callback) ----
 
-local function grantLikers(force)
-    if #bookEntries == 0 then rescan(true) end
-    if #bookEntries == 0 then
-        log("no guest book set - open the book first")
-        return 0
-    end
-    if force then granted = {} end
+local function grantLikers()
     local me = myUserId()
     local list = listPlayers()
-    local n, skipped = 0, 0
-    log("running likers grant over " .. tostring(#list) .. " player(s)")
+    local n = 0
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me and isLiker(pl) then
-            if force or not granted[tostring(pl.uid)] then
+            if not granted[tostring(pl.uid)] then
                 granted[tostring(pl.uid)] = true
                 setRole(ROLE, pl.uid, pl.name)
-                stats.matched = stats.matched + 1
                 n = n + 1
                 task.wait(ROLE_GAP)
-            else
-                skipped = skipped + 1
             end
         end
     end
-    log("likers: sent " .. tostring(n) .. " of " .. tostring(#list)
-        .. " in server" .. (skipped > 0 and (", skipped " .. tostring(skipped)) or ""))
     return n
+end
+
+local function giveAll()
+    granted = {}
+    return grantLikers()
+end
+
+-- everyone in server, liked or not
+local function takeAll()
+    local me = myUserId()
+    local list = listPlayers()
+    for i = 1, #list do
+        local pl = list[i]
+        if pl.uid ~= me then
+            setRole(BASE_ROLE, pl.uid, pl.name)
+            granted[tostring(pl.uid)] = nil
+            task.wait(ROLE_GAP)
+        end
+    end
 end
 
 -- ---- menu ----
@@ -397,7 +259,6 @@ local function mkSection(tab, name)
     end
     local ok2, sec2 = pcall(function() return tab:Section(name) end)
     if ok2 and sec2 ~= nil then return sec2 end
-    warn("[ABOVE Admin] section failed: " .. tostring(name))
     return nil
 end
 
@@ -415,95 +276,55 @@ local function mkToggle(sec, label, id, default, apply)
     for i = 1, #tries do
         if pcall(tries[i]) then return true end
     end
-    warn("[ABOVE Admin] toggle failed: " .. tostring(label))
     return false
 end
 
--- buttons ONLY queue; they never yield
 local function mkButton(sec, label, cb)
     if not sec then return false end
     if pcall(function() sec:Button(label, cb) end) then return true end
     if pcall(function() sec:Button(label, label .. "_btn", cb) end) then return true end
-    warn("[ABOVE Admin] button failed: " .. tostring(label))
     return false
-end
-
-local function mkText(sec, line)
-    if not sec then return end
-    pcall(function() sec:Text(line) end)
 end
 
 local function buildMenu()
     local M = _G.UI
     if not M or type(M.AddTab) ~= "function" then
-        log("UI not found - use the console (_G.AboveIslandAdmin)")
+        log("UI not found")
         return
     end
     local ok = pcall(function()
         M.AddTab("Island Admin", function(tab)
             if built then return end
             built = true
-            local okb, err = pcall(function()
-                local sec = mkSection(tab, "Roles")
+            pcall(function()
+                local sec = mkSection(tab, "Permissions")
                 if sec then
-                    mkButton(sec, "Give " .. ROLE .. " to everyone", function()
-                        queued = { kind = "all", role = ROLE, force = true }
+                    mkToggle(sec, "Auto-grant " .. ROLE .. " to likers", "ia_auto", false, function(v)
+                        CFG.auto = v
+                        if v then
+                            log("auto-grant ON")
+                            queued = { kind = "give" }
+                        else
+                            log("auto-grant OFF")
+                        end
                     end)
-                    mkButton(sec, "Take " .. ROLE .. " from everyone", function()
-                        queued = { kind = "all", role = BASE_ROLE, force = true }
+                    mkButton(sec, "Give " .. ROLE .. " to all liked", function()
+                        queued = { kind = "give" }
                     end)
-                    mkButton(sec, "Test role call (reads alert)", function()
-                        queued = { kind = "test" }
+                    mkButton(sec, "Take " .. ROLE .. " (everyone to " .. BASE_ROLE .. ")", function()
+                        queued = { kind = "take" }
                     end)
-                    mkToggle(sec, "Auto-grant " .. ROLE .. " to all who join", "ia_auto", false, function(v)
-                        CFG.autoAll = v
-                        log("auto-grant all " .. (v and "ON" or "OFF"))
-                    end)
-                    mkButton(sec, "Print who is in server", function()
-                        queued = { kind = "roster" }
-                    end)
-                    mkButton(sec, "Reset granted list", function()
-                        granted = {}
-                        log("granted list cleared")
-                    end)
-                end
-
-                local gb = mkSection(tab, "Guest Book")
-                if gb then
-                    mkButton(gb, "Rescan guest book now", function()
-                        queued = { kind = "rescan" }
-                    end)
-                    mkButton(gb, "Print guest book names", function()
-                        queued = { kind = "book" }
-                    end)
-                    mkToggle(gb, "Auto-grant to guest book likers", "ia_likers", false, function(v)
-                        CFG.autoLikers = v
-                        if v then rescan(true) end
-                        log("auto-grant to likers " .. (v and "ON" or "OFF"))
-                    end)
-                    mkButton(gb, "Grant to likers in server now", function()
-                        queued = { kind = "likers", force = true }
-                    end)
-                    mkText(gb, "Rescans every " .. tostring(RESCAN_EVERY) .. "s.")
                 end
             end)
-            if not okb then
-                warn("[ABOVE Admin] build error: " .. tostring(err))
-            end
-            log("tab widgets built")
         end)
     end)
-    if not ok then
-        warn("[ABOVE Admin] AddTab failed")
-    end
 end
 
 -- ---- stop ----
 
 local function stop()
     running = false
-    CFG.autoAll = false
-    CFG.autoLikers = false
+    CFG.auto = false
     local M = _G.UI
     if M and type(M.RemoveTab) == "function" then
         pcall(function() M.RemoveTab("Island Admin") end)
@@ -525,45 +346,26 @@ end)
 
 task.spawn(function()
     while running do
-        pcall(rescan, true)
+        pcall(rescan)
         task.wait(RESCAN_EVERY)
     end
 end)
 
--- worker: drains the queue so nothing yields inside a widget callback
 task.spawn(function()
     while running do
         local job = queued
         if job then
             queued = nil
-            local ok, err = pcall(function()
-                if job.kind == "all" then
-                    applyToAll(job.role, job.force)
-                elseif job.kind == "likers" then
-                    grantLikers(job.force)
-                elseif job.kind == "test" then
-                    testRoleCall()
-                elseif job.kind == "roster" then
-                    printRoster()
-                elseif job.kind == "rescan" then
-                    rescan(false)
-                elseif job.kind == "book" then
-                    printBook()
-                end
-            end)
-            if not ok then log("job error: " .. tostring(err)) end
-        else
-            if CFG.autoLikers then
-                local ok, err = pcall(grantLikers, false)
-                if not ok then log("liker pass error: " .. tostring(err)) end
-                task.wait(AUTO_DELAY)
-            elseif CFG.autoAll then
-                local ok, err = pcall(applyToAll, ROLE, false)
-                if not ok then log("auto pass error: " .. tostring(err)) end
-                task.wait(AUTO_DELAY)
-            else
-                task.wait(0.2)
+            if job.kind == "give" then
+                pcall(giveAll)
+            elseif job.kind == "take" then
+                pcall(takeAll)
             end
+        elseif CFG.auto then
+            pcall(grantLikers)
+            task.wait(GRANT_EVERY)
+        else
+            task.wait(0.2)
         end
     end
 end)
@@ -571,17 +373,7 @@ end)
 _G[NAME] = {
     stop = stop,
     version = VERSION,
-    setRole = setRole,
-    giveAll = function() queued = { kind = "all", role = ROLE, force = true } end,
-    takeAll = function() queued = { kind = "all", role = BASE_ROLE, force = true } end,
-    roster = function() queued = { kind = "roster" } end,
-    scrape = function() queued = { kind = "rescan" } end,
-    book = function() queued = { kind = "book" } end,
-    grantLikers = function() queued = { kind = "likers", force = true } end,
-    isLiker = isLiker,
-    alert = readAlert,
-    entries = function() return bookEntries end,
+    give = function() queued = { kind = "give" } end,
+    take = function() queued = { kind = "take" } end,
 }
-log("v" .. VERSION .. " loaded on place " .. tostring(game.PlaceId)
-    .. " | RS=" .. tostring(getRS() ~= nil)
-    .. " | players=" .. tostring(#listPlayers()))
+log("v" .. VERSION .. " loaded - open the guest book once so it can read your likers")
