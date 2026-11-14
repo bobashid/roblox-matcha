@@ -1,25 +1,34 @@
 -- ABOVE Island Admin
--- VERSION 6.0.0
+-- VERSION 7.0.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
 -- Gives Helper to everyone who liked your island (the guest book signatures),
--- and draws a nametag with each player's role above their head.
+-- and draws each player's ROLE only above their head.
 --
 -- Role call: RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
 --   Roles: Visitor, Helper, Builder, TrustedBuilder. "Visitor" = no access.
 --
 -- Nametag roles come from what THIS script has set (myRoles). The real role list
--- is only delivered through server->client events, and RemoteEvent.OnClientEvent
--- is nil in this VM, so a role set by anyone else reads as "?" rather than a guess.
+-- only arrives through server->client events, and RemoteEvent.OnClientEvent is nil
+-- in this VM, so a role set by anyone else reads as "?" rather than a guess.
+--
+-- v7.0.0 fixes:
+--   * Nametags: the RenderStepped connect was guarded by type(RenderStepped)=="table".
+--     If the signal is not a plain table that guard bailed out and the renderer was
+--     never connected - silent, no tags, no error. Now it just pcalls the connect
+--     and reports whether it worked.
+--   * Tag text is the ROLE only, no name, size 20.
+--   * Auto-grant logs what it saw each pass when Debug is on, so "did it find
+--     likers" is answerable.
+--   * Debug lives in its own subsection.
 --
 -- The guest book list only exists in PlayerGui.AboveGuestBook, so open the book
 -- once after loading; the script then reads it every 3 s.
 --
--- Roles only apply to players IN YOUR SERVER, so this matches guest book names
--- against whoever is present. Enabling the toggle runs a full pass immediately.
+-- Roles only apply to players IN YOUR SERVER. Enabling the toggle runs a full pass.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "6.0.0"
+local VERSION = "7.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -84,7 +93,7 @@ end
 
 -- ---- state ----
 
-local CFG = { auto = false, tags = false }
+local CFG = { auto = false, tags = false, debug = false }
 
 local running = true
 local built = false
@@ -95,9 +104,15 @@ local known = {}
 local queued = nil
 local pool = {}
 local renderConn = nil
+local wsWarned = false
+local lastPass = ""
 
 local function log(msg)
     print("[ABOVE Admin] " .. tostring(msg))
+end
+
+local function dbg(msg)
+    if CFG.debug then log("[dbg] " .. tostring(msg)) end
 end
 
 -- ---- players ----
@@ -195,7 +210,10 @@ end
 
 local function rescan()
     local names = scrapeGuestBook()
-    if #names == 0 then return 0 end
+    if #names == 0 then
+        dbg("guest book not readable (open it in game)")
+        return 0
+    end
     bookSet = {}
     for i = 1, #names do
         local k = string.lower(names[i])
@@ -205,6 +223,7 @@ local function rescan()
             log("new liker: " .. names[i])
         end
     end
+    dbg("guest book entries: " .. tostring(#names))
     return #names
 end
 
@@ -215,20 +234,29 @@ local function isLiker(pl)
     return false
 end
 
--- ---- actions (run in the worker, never in a widget callback) ----
+-- ---- actions (worker only, never a widget callback) ----
 
 local function grantLikers()
     local me = myUserId()
     local list = listPlayers()
+    local likers, sent = 0, 0
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me and isLiker(pl) then
+            likers = likers + 1
             if not granted[tostring(pl.uid)] then
                 granted[tostring(pl.uid)] = true
                 setRole(ROLE, pl.uid, pl.name)
+                sent = sent + 1
                 task.wait(ROLE_GAP)
             end
         end
+    end
+    local pass = "server=" .. tostring(#list) .. " likers=" .. tostring(likers)
+        .. " sent=" .. tostring(sent) .. " book=" .. tostring(#known)
+    if pass ~= lastPass then
+        lastPass = pass
+        dbg(pass)
     end
 end
 
@@ -254,12 +282,18 @@ end
 
 local function ensurePool()
     if #pool > 0 then return true end
-    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then return false end
+    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then
+        log("Drawing unavailable - nametags off")
+        return false
+    end
     for i = 1, TAG_POOL do
         local ok, t = pcall(function() return Drawing.new("Text") end)
-        if not ok or t == nil then return false end
+        if not ok or t == nil then
+            log("Drawing.new(Text) failed - nametags off")
+            return false
+        end
         pcall(function()
-            t.Size = 16
+            t.Size = 20
             t.Outline = true
             t.Center = true
             t.Visible = false
@@ -267,6 +301,7 @@ local function ensurePool()
         end)
         pool[i] = t
     end
+    dbg("tag pool built: " .. tostring(#pool))
     return true
 end
 
@@ -284,7 +319,7 @@ local function renderTags()
     if not ensurePool() then return end
     local me = myUserId()
     local list = listPlayers()
-    local used = 0
+    local used, offscreen = 0, 0
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me and used < TAG_POOL then
@@ -309,7 +344,7 @@ local function renderTags()
                     local tag = pool[used]
                     local role = myRoles[tostring(pl.uid)] or "?"
                     pcall(function()
-                        tag.Text = tostring(pl.name) .. "  [" .. role .. "]"
+                        tag.Text = "[" .. role .. "]"
                         tag.Position = sp
                         tag.Visible = true
                         if role == ROLE then
@@ -320,6 +355,8 @@ local function renderTags()
                             tag.Color = Color3.fromRGB(255, 220, 120)
                         end
                     end)
+                else
+                    offscreen = offscreen + 1
                 end
             end
         end
@@ -327,18 +364,30 @@ local function renderTags()
     for i = used + 1, #pool do
         pcall(function() pool[i].Visible = false end)
     end
+    if used == 0 and offscreen > 0 and not wsWarned then
+        wsWarned = true
+        log("WorldToScreen returned nothing usable - nametags may not render")
+    end
 end
 
 local function startRender()
     local run = getRun()
-    if not run or type(run.RenderStepped) ~= "table" then return end
+    if not run then
+        log("RunService unavailable - nametags off")
+        return
+    end
     if renderConn then return end
     local ok, c = pcall(function()
         return run.RenderStepped:Connect(function()
             pcall(renderTags)
         end)
     end)
-    if ok then renderConn = c end
+    if ok and c ~= nil then
+        renderConn = c
+        log("nametag renderer connected")
+    else
+        log("nametag renderer FAILED to connect - nametags will not draw")
+    end
 end
 
 -- ---- menu ----
@@ -387,6 +436,25 @@ local function mkButton(sec, label, cb)
     return false
 end
 
+local function printState()
+    local me = myUserId()
+    local list = listPlayers()
+    local likers = 0
+    for i = 1, #list do
+        if list[i].uid ~= me and isLiker(list[i]) then likers = likers + 1 end
+    end
+    local roleCount = 0
+    for _ in pairs(myRoles) do roleCount = roleCount + 1 end
+    log("--- state ---")
+    log("server players: " .. tostring(#list))
+    log("guest book names: " .. tostring(#known))
+    log("likers in server: " .. tostring(likers))
+    log("roles set this session: " .. tostring(roleCount))
+    log("tag pool: " .. tostring(#pool) .. " | renderer: " .. tostring(renderConn ~= nil))
+    log("auto: " .. tostring(CFG.auto) .. " | tags: " .. tostring(CFG.tags))
+    log("--- end ---")
+end
+
 local function buildMenu()
     local M = _G.UI
     if not M or type(M.AddTab) ~= "function" then
@@ -402,12 +470,8 @@ local function buildMenu()
                 if sec then
                     mkToggle(sec, "Auto-grant " .. ROLE .. " to likers", "ia_auto", false, function(v)
                         CFG.auto = v
-                        if v then
-                            log("auto-grant ON")
-                            queued = { kind = "give" }
-                        else
-                            log("auto-grant OFF")
-                        end
+                        log("auto-grant " .. (v and "ON" or "OFF"))
+                        if v then queued = { kind = "give" } end
                     end)
                     mkButton(sec, "Give " .. ROLE .. " to all liked", function()
                         queued = { kind = "give" }
@@ -423,6 +487,20 @@ local function buildMenu()
                         CFG.tags = v
                         if not v then hideAll() end
                         log("role nametags " .. (v and "ON" or "OFF"))
+                    end)
+                end
+
+                local dbgSec = mkSection(tab, "Debug")
+                if dbgSec then
+                    mkToggle(dbgSec, "Debug logging", "ia_dbg", false, function(v)
+                        CFG.debug = v
+                        log("debug " .. (v and "ON" or "OFF"))
+                    end)
+                    mkButton(dbgSec, "Print state", function()
+                        queued = { kind = "state" }
+                    end)
+                    mkButton(dbgSec, "Rescan guest book", function()
+                        queued = { kind = "rescan" }
                     end)
                 end
             end)
@@ -481,6 +559,10 @@ task.spawn(function()
                 pcall(giveAll)
             elseif job.kind == "take" then
                 pcall(takeAll)
+            elseif job.kind == "state" then
+                pcall(printState)
+            elseif job.kind == "rescan" then
+                pcall(rescan)
             end
         elseif CFG.auto then
             pcall(grantLikers)
@@ -496,5 +578,6 @@ _G[NAME] = {
     version = VERSION,
     give = function() queued = { kind = "give" } end,
     take = function() queued = { kind = "take" } end,
+    state = function() queued = { kind = "state" } end,
 }
 log("v" .. VERSION .. " loaded - open the guest book once so it can read your likers")
