@@ -1,5 +1,5 @@
 -- ABOVE Island Admin
--- VERSION 1.1.0
+-- VERSION 1.2.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 -- also seen on place 88152437007055 (same game, different place)
 --
@@ -8,25 +8,27 @@
 -- Role changes use the same remote and shape the game's own Friends panel uses:
 --   RequestFriendAction:FireServer(<roleKey>, <userId>)
 -- The role name IS the first argument. There is no "SetRole" action.
--- The game's UI only builds role buttons for players in your server, and the
--- Owner role is deliberately unclickable, so this never touches an Owner.
+-- Owner is deliberately unclickable in the game's UI, so this never touches one.
 --
--- GUEST BOOK: the game has RequestGuestBookLike and GuestBookOpened remotes plus
--- a Blocks.GuestBook part with a GuestBookHearts BillboardGui. The like list is
--- therefore SERVER data - it is not readable from the workspace. Press
--- "Capture guest book" and open the book in game; the script hooks
--- GuestBookOpened.OnClientEvent and prints whatever the server sends back so the
--- payload shape can be read. Auto-grant to likers stays OFF until that shape is
--- known, because guessing it would fire role changes at the wrong ids.
+-- GUEST BOOK (measured):
+--   * Blocks.GuestBook is a Part with MachineId=GuestBook, CellKey=0,0,-13,
+--     HP=150. The game reuses the MACHINE remotes for it, so opening it is
+--     RequestLoadFuel:FireServer(<cellKey>) - confirmed firing with the cell key.
+--   * GuestBookOpened is the server's reply and carries the list.
+--   * Firing RequestLoadFuel from across the island produced NO GuestBookOpened,
+--     so it is RANGE-CHECKED like RequestHarvest. You must be standing at the
+--     book for the server to answer. Press "Capture guest book" while next to it.
+--   * The like list is server data. Nothing in the workspace holds it, so it
+--     cannot be read - it has to be captured from GuestBookOpened.
 --
--- Other permission remotes present in this build: RequestPermissionSummary,
+-- Other permission remotes in this build: RequestPermissionSummary,
 -- PermissionSummary, RequestPermissionToggle, FriendRoleChanged, FriendList,
 -- RequestFriendList, FavoriteResult, PromptFavorite.
 --
 -- Stop = switch the toggle off / press stop. There is no stop key.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "1.1.0"
+local VERSION = "1.2.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -37,6 +39,7 @@ end
 local ROLE = "Helper"
 local BASE_ROLE = "Visitor"
 local AUTO_DELAY = 2.0
+local GB_RANGE = 20
 
 -- ---- lazy service resolution (never cache a nil) ----
 
@@ -88,7 +91,7 @@ local CFG = { auto = false }
 local running = true
 local built = false
 local granted = {}
-local guestBook = {}
+local guestEntries = {}
 local conns = {}
 local stats = { set = 0, failed = 0, gbEvents = 0 }
 local warnedAction = false
@@ -110,6 +113,27 @@ local function myUserId()
     return uid
 end
 
+local function getRoot()
+    local P = getPlayers()
+    if not P then return nil end
+    local lp = nil
+    pcall(function() lp = P.LocalPlayer end)
+    if not lp then return nil end
+    local ch = nil
+    pcall(function() ch = lp.Character end)
+    if not ch then return nil end
+    local rp = nil
+    pcall(function() rp = ch:FindFirstChild("HumanoidRootPart") end)
+    return rp
+end
+
+local function posOf(o)
+    if not o then return nil end
+    local ok, p = pcall(function() return o.Position end)
+    if ok and p then return p end
+    return nil
+end
+
 local function listPlayers()
     local out = {}
     local P = getPlayers()
@@ -125,6 +149,20 @@ local function listPlayers()
         end
     end)
     return out
+end
+
+local function getIsland()
+    local found = nil
+    pcall(function()
+        for _, d in ipairs(workspace:GetChildren()) do
+            if found == nil and string.sub(d.Name, 1, 7) == "Island_" then
+                if d:FindFirstChild("Nodes") then
+                    found = d
+                end
+            end
+        end
+    end)
+    return found
 end
 
 -- ---- role set ----
@@ -179,7 +217,43 @@ local function printRoster()
     end
 end
 
--- ---- guest book capture (server-sent data; nothing to read from workspace) ----
+-- ---- guest book ----
+
+local function findGuestBook()
+    local isl = getIsland()
+    if not isl then return nil end
+    local blocks = nil
+    pcall(function() blocks = isl:FindFirstChild("Blocks") end)
+    if not blocks then return nil end
+    local gb = nil
+    pcall(function() gb = blocks:FindFirstChild("GuestBook") end)
+    return gb
+end
+
+local function guestBookDistance()
+    local gb = findGuestBook()
+    local rp = getRoot()
+    local a, b = posOf(gb), posOf(rp)
+    if not a or not b then return nil end
+    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- collect anything that looks like an entry out of the payload
+local function harvestEntries(v, depth)
+    if depth > 3 or type(v) ~= "table" then return end
+    local uid = v.userId or v.UserId or v.id or v.playerId
+    if type(uid) == "number" then
+        guestEntries[#guestEntries + 1] = {
+            uid = uid,
+            name = tostring(v.name or v.displayName or v.username or uid),
+        }
+        return
+    end
+    for _, vv in pairs(v) do
+        harvestEntries(vv, depth + 1)
+    end
+end
 
 local function hookGuestBook()
     local ev = remote("GuestBookOpened")
@@ -191,53 +265,88 @@ local function hookGuestBook()
         local c = ev.OnClientEvent:Connect(function(...)
             stats.gbEvents = stats.gbEvents + 1
             local n = select('#', ...)
-            log("GuestBookOpened payload, " .. tostring(n) .. " arg(s):")
+            log("GuestBookOpened, " .. tostring(n) .. " arg(s):")
             for i = 1, n do
                 local v = select(i, ...)
-                local tv = type(v)
-                if tv == "table" then
-                    local parts = {}
-                    local count = 0
+                if type(v) == "table" then
+                    local parts, cnt = {}, 0
                     for k, vv in pairs(v) do
-                        count = count + 1
-                        if count <= 20 then
+                        cnt = cnt + 1
+                        if cnt <= 25 then
                             parts[#parts + 1] = tostring(k) .. "=" .. tostring(vv)
                         end
                     end
-                    log("  arg" .. tostring(i) .. " table(" .. tostring(count) .. "): "
+                    log("  arg" .. tostring(i) .. " table(" .. tostring(cnt) .. "): "
                         .. table.concat(parts, ", "))
+                    harvestEntries(v, 0)
                 else
-                    log("  arg" .. tostring(i) .. " " .. tv .. " = " .. tostring(v))
+                    log("  arg" .. tostring(i) .. " " .. type(v) .. " = " .. tostring(v))
                 end
             end
         end)
         conns[#conns + 1] = c
     end)
-    if ok then
-        log("hooked GuestBookOpened - now open the guest book in game")
-    end
+    if ok then log("hooked GuestBookOpened") end
     return ok
 end
 
-local function fireGuestBookLike()
-    local ev = remote("RequestGuestBookLike")
-    if not ev then
-        log("RequestGuestBookLike remote not found")
-        return
+local function openGuestBook()
+    local gb = findGuestBook()
+    if not gb then
+        log("Blocks.GuestBook not found")
+        return false
     end
-    pcall(function() ev:FireServer() end)
-    log("fired RequestGuestBookLike (no args)")
+    local cell = nil
+    pcall(function() cell = gb:GetAttribute("CellKey") end)
+    if cell == nil then
+        pcall(function() cell = gb:GetAttribute("Cells") end)
+    end
+    if cell == nil then
+        log("GuestBook has no CellKey attribute")
+        return false
+    end
+    local d = guestBookDistance()
+    log("guest book cell=" .. tostring(cell)
+        .. (d and (" dist=" .. string.format("%.1f", d)) or ""))
+    if d ~= nil and d > GB_RANGE then
+        log("TOO FAR - the server range-checks this. Stand at the book and press again.")
+        return false
+    end
+    local ev = remote("RequestLoadFuel")
+    if not ev then
+        log("RequestLoadFuel remote not found")
+        return false
+    end
+    local ok = pcall(function() ev:FireServer(cell) end)
+    log("fired RequestLoadFuel(" .. tostring(cell) .. ") ok=" .. tostring(ok))
+    return ok
+end
+
+local function captureGuestBook()
+    hookGuestBook()
+    openGuestBook()
 end
 
 local function printGuestBook()
-    if #guestBook == 0 then
-        log("guest book empty - press 'Capture guest book' then open the book in game")
+    if #guestEntries == 0 then
+        log("no entries captured yet - stand at the book, press 'Capture guest book', then open it")
         return
     end
-    log("captured guest book entries (" .. tostring(#guestBook) .. "):")
-    for i = 1, #guestBook do
-        log("  " .. tostring(guestBook[i]))
+    local seen = {}
+    local n = 0
+    log("captured entries (" .. tostring(#guestEntries) .. "):")
+    for i = 1, #guestEntries do
+        local e = guestEntries[i]
+        local key = tostring(e.uid)
+        if not seen[key] then
+            seen[key] = true
+            n = n + 1
+            if n <= 40 then
+                log("  " .. e.name .. " (" .. key .. ")")
+            end
+        end
     end
+    log("unique=" .. tostring(n))
 end
 
 -- ---- menu ----
@@ -326,21 +435,23 @@ local function buildMenu()
 
                 local gb = mkSection(tab, "Guest Book")
                 if gb then
-                    mkButton(gb, "Capture guest book", function()
-                        hookGuestBook()
-                        fireGuestBookLike()
+                    mkButton(gb, "Capture guest book", captureGuestBook)
+                    mkButton(gb, "Print captured entries", printGuestBook)
+                    mkButton(gb, "Grant " .. ROLE .. " to captured entries", function()
+                        local me = myUserId()
+                        local n = 0
+                        for i = 1, #guestEntries do
+                            local e = guestEntries[i]
+                            if e.uid ~= me then
+                                setRole(ROLE, e.uid, e.name)
+                                n = n + 1
+                                task.wait(0.15)
+                            end
+                        end
+                        log("granted " .. tostring(n) .. " captured entr(ies)")
                     end)
-                    mkButton(gb, "Print captured guest book", printGuestBook)
-                    mkText(gb, "Likes are server data - open")
-                    mkText(gb, "the book in game after capture.")
-                end
-
-                local info = mkSection(tab, "Info")
-                if info then
-                    mkText(info, "Give: " .. ROLE)
-                    mkText(info, "Take: " .. BASE_ROLE)
-                    mkText(info, "Shape: (role, userId)")
-                    mkText(info, "Owner is never touched.")
+                    mkText(gb, "Stand AT the book - server")
+                    mkText(gb, "range-checks the open call.")
                 end
             end)
             if not okb then
@@ -403,9 +514,11 @@ _G[NAME] = {
     giveAll = function() return applyToAll(ROLE, false, true) end,
     takeAll = function() return applyToAll(BASE_ROLE, false, true) end,
     roster = printRoster,
-    capture = hookGuestBook,
+    capture = captureGuestBook,
     book = printGuestBook,
+    entries = function() return guestEntries end,
 }
 log("v" .. VERSION .. " loaded on place " .. tostring(game.PlaceId)
     .. " | RS=" .. tostring(getRS() ~= nil)
-    .. " | players=" .. tostring(#listPlayers()))
+    .. " | players=" .. tostring(#listPlayers())
+    .. " | bookDist=" .. tostring(guestBookDistance()))
