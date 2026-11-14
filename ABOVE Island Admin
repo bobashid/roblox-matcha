@@ -1,32 +1,32 @@
 -- ABOVE Island Admin
--- VERSION 1.0.0
+-- VERSION 1.1.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
+-- also seen on place 88152437007055 (same game, different place)
 --
--- Co-op island permission panel. Grants a role to the players who are IN YOUR
--- SERVER, using the same remote and the same argument shape the game's own
--- Friends panel uses.
+-- Co-op island permission panel.
 --
--- What the game actually does (read from PlayerScripts.Client.Controllers.FriendsController):
---   * RequestFriendAction is a RemoteEvent fired as  :FireServer(<roleOrAction>, <userId>)
---     - the role name IS the first argument. It is NOT ("SetRole", userId, role).
---   * The game's own role buttons are only built for players whose group is
---     "InServer", i.e. people currently in your server. That is the access model,
---     and this script keeps to it: it only ever sends userIds it read from the
---     live player list. It never pushes a role onto an offline or arbitrary id.
---   * The Owner role is deliberately unchangeable in the game's UI (no click
---     handler, AutoButtonColor = false). This script skips the Owner too.
---   * Role keys come from Shared.Config.Permission.RoleOrder / RoleLabels.
---     ROLE below is the key that is fired, not the display label.
---   * Other remotes present: RequestFriendList and FriendList (both RemoteEvent),
---     RequestIslandInvite. There is no RequestPermissionSync in this build.
+-- Role changes use the same remote and shape the game's own Friends panel uses:
+--   RequestFriendAction:FireServer(<roleKey>, <userId>)
+-- The role name IS the first argument. There is no "SetRole" action.
+-- The game's UI only builds role buttons for players in your server, and the
+-- Owner role is deliberately unclickable, so this never touches an Owner.
 --
--- If you are not the island Owner, the server is the thing that decides - this
--- script only presses the same button you could press by hand.
+-- GUEST BOOK: the game has RequestGuestBookLike and GuestBookOpened remotes plus
+-- a Blocks.GuestBook part with a GuestBookHearts BillboardGui. The like list is
+-- therefore SERVER data - it is not readable from the workspace. Press
+-- "Capture guest book" and open the book in game; the script hooks
+-- GuestBookOpened.OnClientEvent and prints whatever the server sends back so the
+-- payload shape can be read. Auto-grant to likers stays OFF until that shape is
+-- known, because guessing it would fire role changes at the wrong ids.
+--
+-- Other permission remotes present in this build: RequestPermissionSummary,
+-- PermissionSummary, RequestPermissionToggle, FriendRoleChanged, FriendList,
+-- RequestFriendList, FavoriteResult, PromptFavorite.
 --
 -- Stop = switch the toggle off / press stop. There is no stop key.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -35,6 +35,7 @@ end
 -- ---- constants ----
 
 local ROLE = "Helper"
+local BASE_ROLE = "Visitor"
 local AUTO_DELAY = 2.0
 
 -- ---- lazy service resolution (never cache a nil) ----
@@ -87,15 +88,16 @@ local CFG = { auto = false }
 local running = true
 local built = false
 local granted = {}
-local roles = {}
-local stats = { granted = 0, failed = 0, rounds = 0 }
+local guestBook = {}
+local conns = {}
+local stats = { set = 0, failed = 0, gbEvents = 0 }
 local warnedAction = false
 
 local function log(msg)
     print("[ABOVE Admin] " .. tostring(msg))
 end
 
--- ---- player list ----
+-- ---- players ----
 
 local function myUserId()
     local P = getPlayers()
@@ -114,8 +116,7 @@ local function listPlayers()
     if not P then return out end
     pcall(function()
         for _, pl in ipairs(P:GetPlayers()) do
-            local uid = nil
-            local nm = nil
+            local uid, nm = nil, nil
             pcall(function() uid = pl.UserId end)
             pcall(function() nm = pl.Name end)
             if uid ~= nil and nm ~= nil then
@@ -126,9 +127,9 @@ local function listPlayers()
     return out
 end
 
--- ---- grant ----
+-- ---- role set ----
 
-local function grantRole(userId, label)
+local function setRole(roleKey, userId, label)
     local ev = remote("RequestFriendAction")
     if not ev then
         if not warnedAction then
@@ -137,34 +138,33 @@ local function grantRole(userId, label)
         end
         return false
     end
-    local ok = pcall(function() ev:FireServer(ROLE, userId) end)
+    local ok = pcall(function() ev:FireServer(roleKey, userId) end)
     if ok then
-        stats.granted = stats.granted + 1
-        log("fired " .. ROLE .. " -> " .. tostring(label) .. " (" .. tostring(userId) .. ")")
+        stats.set = stats.set + 1
+        log(roleKey .. " -> " .. tostring(label) .. " (" .. tostring(userId) .. ")")
     else
         stats.failed = stats.failed + 1
-        log("fire FAILED for " .. tostring(label) .. " (" .. tostring(userId) .. ")")
+        log("FAILED " .. roleKey .. " -> " .. tostring(label))
     end
     return ok
 end
 
--- everyone in the server except me; Owner is skipped by the game itself
-local function grantEveryone(force)
+local function applyToAll(roleKey, onlyUngranted, force)
     local me = myUserId()
     local list = listPlayers()
     local n = 0
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me then
-            if force or not granted[tostring(pl.uid)] then
+            if force or not onlyUngranted or not granted[tostring(pl.uid)] then
                 granted[tostring(pl.uid)] = true
-                grantRole(pl.uid, pl.name)
+                setRole(roleKey, pl.uid, pl.name)
                 n = n + 1
                 task.wait(0.15)
             end
         end
     end
-    log("granted " .. tostring(n) .. " player(s) this pass, " .. tostring(#list) .. " in server")
+    log(roleKey .. " sent to " .. tostring(n) .. " of " .. tostring(#list) .. " in server")
     return n
 end
 
@@ -174,10 +174,69 @@ local function printRoster()
     log("in server (" .. tostring(#list) .. "):")
     for i = 1, #list do
         local pl = list[i]
-        local tag = (pl.uid == me) and "  <- you" or ""
-        local role = roles[tostring(pl.uid)]
         log("  " .. pl.name .. " (" .. tostring(pl.uid) .. ")"
-            .. (role and ("  role=" .. tostring(role)) or "") .. tag)
+            .. (pl.uid == me and "  <- you" or ""))
+    end
+end
+
+-- ---- guest book capture (server-sent data; nothing to read from workspace) ----
+
+local function hookGuestBook()
+    local ev = remote("GuestBookOpened")
+    if not ev then
+        log("GuestBookOpened remote not found")
+        return false
+    end
+    local ok = pcall(function()
+        local c = ev.OnClientEvent:Connect(function(...)
+            stats.gbEvents = stats.gbEvents + 1
+            local n = select('#', ...)
+            log("GuestBookOpened payload, " .. tostring(n) .. " arg(s):")
+            for i = 1, n do
+                local v = select(i, ...)
+                local tv = type(v)
+                if tv == "table" then
+                    local parts = {}
+                    local count = 0
+                    for k, vv in pairs(v) do
+                        count = count + 1
+                        if count <= 20 then
+                            parts[#parts + 1] = tostring(k) .. "=" .. tostring(vv)
+                        end
+                    end
+                    log("  arg" .. tostring(i) .. " table(" .. tostring(count) .. "): "
+                        .. table.concat(parts, ", "))
+                else
+                    log("  arg" .. tostring(i) .. " " .. tv .. " = " .. tostring(v))
+                end
+            end
+        end)
+        conns[#conns + 1] = c
+    end)
+    if ok then
+        log("hooked GuestBookOpened - now open the guest book in game")
+    end
+    return ok
+end
+
+local function fireGuestBookLike()
+    local ev = remote("RequestGuestBookLike")
+    if not ev then
+        log("RequestGuestBookLike remote not found")
+        return
+    end
+    pcall(function() ev:FireServer() end)
+    log("fired RequestGuestBookLike (no args)")
+end
+
+local function printGuestBook()
+    if #guestBook == 0 then
+        log("guest book empty - press 'Capture guest book' then open the book in game")
+        return
+    end
+    log("captured guest book entries (" .. tostring(#guestBook) .. "):")
+    for i = 1, #guestBook do
+        log("  " .. tostring(guestBook[i]))
     end
 end
 
@@ -238,7 +297,7 @@ end
 local function buildMenu()
     local M = _G.UI
     if not M or type(M.AddTab) ~= "function" then
-        log("UI not found - the auto toggle is unavailable, use the console")
+        log("UI not found - use the console (_G.AboveIslandAdmin)")
         return
     end
     local ok = pcall(function()
@@ -246,15 +305,17 @@ local function buildMenu()
             if built then return end
             built = true
             local okb, err = pcall(function()
-                local sec = mkSection(tab, "Permissions")
+                local sec = mkSection(tab, "Roles")
                 if sec then
+                    mkButton(sec, "Give " .. ROLE .. " to everyone", function()
+                        applyToAll(ROLE, false, true)
+                    end)
+                    mkButton(sec, "Take " .. ROLE .. " from everyone", function()
+                        applyToAll(BASE_ROLE, false, true)
+                    end)
                     mkToggle(sec, "Auto-grant " .. ROLE .. " on join", "ia_auto", false, function(v)
                         CFG.auto = v
                         log("auto-grant " .. (v and "ON" or "OFF"))
-                    end)
-                    mkButton(sec, "Grant " .. ROLE .. " to everyone in server", function()
-                        local n = grantEveryone(true)
-                        log("done - " .. tostring(n) .. " sent")
                     end)
                     mkButton(sec, "Print who is in server", printRoster)
                     mkButton(sec, "Reset granted list", function()
@@ -263,11 +324,22 @@ local function buildMenu()
                     end)
                 end
 
+                local gb = mkSection(tab, "Guest Book")
+                if gb then
+                    mkButton(gb, "Capture guest book", function()
+                        hookGuestBook()
+                        fireGuestBookLike()
+                    end)
+                    mkButton(gb, "Print captured guest book", printGuestBook)
+                    mkText(gb, "Likes are server data - open")
+                    mkText(gb, "the book in game after capture.")
+                end
+
                 local info = mkSection(tab, "Info")
                 if info then
-                    mkText(info, "Role fired: " .. ROLE)
+                    mkText(info, "Give: " .. ROLE)
+                    mkText(info, "Take: " .. BASE_ROLE)
                     mkText(info, "Shape: (role, userId)")
-                    mkText(info, "Only players in your server.")
                     mkText(info, "Owner is never touched.")
                 end
             end)
@@ -287,6 +359,10 @@ end
 local function stop()
     running = false
     CFG.auto = false
+    for i = 1, #conns do
+        pcall(function() conns[i]:Disconnect() end)
+    end
+    conns = {}
     local M = _G.UI
     if M and type(M.RemoveTab) == "function" then
         pcall(function() M.RemoveTab("Island Admin") end)
@@ -309,11 +385,10 @@ end)
 task.spawn(function()
     while running do
         if CFG.auto then
-            local ok, err = pcall(grantEveryone, false)
+            local ok, err = pcall(applyToAll, ROLE, true, false)
             if not ok then
                 log("auto pass error: " .. tostring(err))
             end
-            stats.rounds = stats.rounds + 1
             task.wait(AUTO_DELAY)
         else
             task.wait(0.25)
@@ -321,7 +396,16 @@ task.spawn(function()
     end
 end)
 
-_G[NAME] = { stop = stop, version = VERSION, grant = grantRole, roster = printRoster }
+_G[NAME] = {
+    stop = stop,
+    version = VERSION,
+    setRole = setRole,
+    giveAll = function() return applyToAll(ROLE, false, true) end,
+    takeAll = function() return applyToAll(BASE_ROLE, false, true) end,
+    roster = printRoster,
+    capture = hookGuestBook,
+    book = printGuestBook,
+}
 log("v" .. VERSION .. " loaded on place " .. tostring(game.PlaceId)
     .. " | RS=" .. tostring(getRS() ~= nil)
     .. " | players=" .. tostring(#listPlayers()))
