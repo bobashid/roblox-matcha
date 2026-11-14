@@ -1,5 +1,5 @@
 -- ABOVE Island Admin
--- VERSION 7.5.1
+-- VERSION 7.6.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
 -- Gives Helper to everyone who liked your island (the guest book signatures),
@@ -8,30 +8,34 @@
 -- Role call: RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
 --   Roles: Visitor, Helper, Builder, TrustedBuilder.
 --
--- ===================== WHY THE COUNT LAGS =====================
--- Measured: the guest book ScrollingFrame holds only PART of the list at any
--- moment. It read 66 rows when the header said 68, then 69 rows when the header
--- said 72. rows == frames == named every pass, so the parser was never dropping
--- anything - rows are destroyed as the list scrolls and a fresh scan cannot see
--- the ones that scrolled out. CanvasPosition / CanvasSize read nil in this VM, so
--- the list cannot be scrolled programmatically.
+-- ===================== HOW THE GUEST BOOK ACTUALLY BEHAVES =====================
+-- The book GUI is a FROZEN SNAPSHOT. Measured: firing the open call
+-- RequestLoadFuel("0,0,-13") twice changed nothing (rows=100 header=107 before,
+-- after1 and after2 identical). CanvasPosition / CanvasSize read nil so it cannot
+-- be scrolled. RemoteEvent.OnClientEvent is nil so the server push cannot be
+-- received. The ONLY way to refresh it is to close and reopen the book in game.
 --
--- v7.5.1 FIX: v7.5.0 shipped a PARSE ERROR - `bookInfo.named = bookInfo.named + 1`
--- and `names[#names + 1] = nm` were jammed on one line with no separator, so the
--- chunk never compiled and the script did nothing at all. Split onto two lines.
--- This is the "two assignments on one line" bug already in learned/errors.md.
+-- Measured shape: the ScrollingFrame renders 100 entry Frames while the header
+-- reads "107 likes" - 7 are never built into the tree and are unreadable.
 --
--- v7.5.0:
---   1. known ACCUMULATES and is persisted to above_likers.txt, so names survive
---      a reload instead of being re-discovered every execute.
---   2. roblox_user_<id> entries are matched by USERID, which survives a rename.
---   3. Every ScrollingFrame under CanvasGroup is scraped (not just the first),
---      with a fallback to plain Frame children.
---   4. First scan logs one summary line instead of 66 "new liker" lines.
+-- v7.6.0 - the important fix:
+--   The old build UNIONED every scan into `known` and persisted it, so the set
+--   grew to 194 names against 107 real likes. 87 of those were not likers at all,
+--   and isLiker() would have granted Helper to them. Now each successful scan
+--   REPLACES the set: it can never hold more names than the book showed. An empty
+--   read (book closed) keeps the previous set instead of wiping it.
+--   Save file moved to above_likers2.txt so the polluted 194 is orphaned and never
+--   loaded again.
+--
+-- Roles set outside this script are UNREADABLE in this VM: no Role attribute
+-- anywhere, nothing on the player object, Friends panel TextButton.Text is nil,
+-- and OnClientEvent is nil. So nametags only know roles THIS script fired. Press
+-- "Sync roles" to re-fire SetRole at everyone in server who liked - that populates
+-- the tags. It does announce "<name> is now Helper" on screen.
 -- ======================================================================
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "7.5.1"
+local VERSION = "7.6.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -43,7 +47,7 @@ local RESCAN_EVERY = 3.0
 local GRANT_EVERY = 2.0
 local ROLE_GAP = 0.35
 local TAG_POOL = 32
-local SAVE_FILE = "above_likers.txt"
+local SAVE_FILE = "above_likers2.txt"
 
 -- ---- services ----
 
@@ -105,10 +109,12 @@ local known = {}
 local knownIds = {}
 local knownCount = 0
 local firstScan = true
+local restoredCount = 0
 local queued = nil
 local pool = {}
 local renderConn = nil
 local wsWarned = false
+local gapWarned = false
 local lastPass = ""
 local lastTagLog = 0
 local lastHeader = -1
@@ -154,7 +160,7 @@ local function listPlayers()
     return out
 end
 
--- ---- known set: names + ids, persisted ----
+-- ---- liker set ----
 
 local function uidFromPseudo(nm)
     local n = string.match(string.lower(tostring(nm)), "^roblox_user_(%d+)$")
@@ -162,21 +168,20 @@ local function uidFromPseudo(nm)
     return nil
 end
 
-local function addKnown(nm)
-    if type(nm) ~= "string" or nm == "" then return false end
-    local k = string.lower(nm)
-    if known[k] then return false end
-    known[k] = nm
-    knownCount = knownCount + 1
-    local id = uidFromPseudo(nm)
-    if id then knownIds[id] = true end
-    return true
+local function rebuildIds()
+    knownIds = {}
+    for k, nm in pairs(known) do
+        local id = uidFromPseudo(nm)
+        if id then knownIds[id] = true end
+    end
 end
 
 local function saveKnown()
     if type(writefile) ~= "function" then return end
     local lines = {}
-    for _, v in pairs(known) do lines[#lines + 1] = v end
+    for k, v in pairs(known) do
+        lines[#lines + 1] = v
+    end
     pcall(function() writefile(SAVE_FILE, table.concat(lines, "\n")) end)
 end
 
@@ -187,8 +192,16 @@ local function loadKnown()
     local n = 0
     for line in string.gmatch(data, "[^\r\n]+") do
         local nm = line:gsub("^%s+", ""):gsub("%s+$", "")
-        if nm ~= "" and addKnown(nm) then n = n + 1 end
+        if nm ~= "" then
+            local k = string.lower(nm)
+            if not known[k] then
+                known[k] = nm
+                n = n + 1
+            end
+        end
     end
+    knownCount = n
+    rebuildIds()
     return n
 end
 
@@ -345,38 +358,53 @@ end
 local function rescan()
     local names = scrapeGuestBook()
     if #names == 0 then
-        dbg("guest book not readable")
+        dbg("guest book not readable - keeping previous set")
         return 0
     end
-    local added = 0
+
+    local fresh, freshCount, added = {}, 0, 0
     for i = 1, #names do
-        if addKnown(names[i]) then
-            added = added + 1
-            if not firstScan then log("new liker: " .. names[i]) end
+        local nm = names[i]
+        local k = string.lower(nm)
+        if not fresh[k] then
+            fresh[k] = nm
+            freshCount = freshCount + 1
+            if not firstScan and not known[k] then
+                added = added + 1
+                log("new liker: " .. nm)
+            end
         end
     end
-    if added > 0 then saveKnown() end
+
+    local wasCount = knownCount
+    known = fresh
+    knownCount = freshCount
+    rebuildIds()
+    saveKnown()
 
     if firstScan then
         firstScan = false
-        log("guest book loaded: " .. tostring(knownCount) .. " liker(s) known")
+        log("guest book loaded: " .. tostring(knownCount) .. " liker(s)")
+    elseif added == 0 and wasCount ~= knownCount then
+        log("guest book set changed: " .. tostring(wasCount) .. " -> " .. tostring(knownCount))
     end
 
     dbg("book sheets=" .. tostring(bookInfo.sheets)
         .. " rows=" .. tostring(bookInfo.rows)
         .. " header=" .. tostring(bookInfo.header)
-        .. " known=" .. tostring(knownCount))
+        .. " likers=" .. tostring(knownCount))
 
     if bookInfo.header > 0 and bookInfo.header ~= lastHeader then
         lastHeader = bookInfo.header
-        if knownCount < bookInfo.header then
-            log("book shows " .. tostring(bookInfo.header) .. " likes, "
-                .. tostring(knownCount) .. " known - scroll the book once to capture the rest")
-        else
-            log("book shows " .. tostring(bookInfo.header) .. " likes, all captured")
+        log("snapshot: " .. tostring(bookInfo.header) .. " likes, "
+            .. tostring(knownCount) .. " readable in the book")
+        if bookInfo.header > knownCount and not gapWarned then
+            gapWarned = true
+            log("the book only renders " .. tostring(bookInfo.rows) .. " of "
+                .. tostring(bookInfo.header) .. " - reopen the book in game to refresh")
         end
     end
-    return #names
+    return knownCount
 end
 
 local function isLiker(pl)
@@ -435,6 +463,23 @@ local function takeAll()
             task.wait(ROLE_GAP)
         end
     end
+end
+
+-- re-fire SetRole at likers in server so myRoles fills and nametags display.
+-- Needed because roles set outside this script are unreadable in this VM.
+local function syncRoles()
+    local me = myUserId()
+    local list = listPlayers()
+    local n = 0
+    for i = 1, #list do
+        local pl = list[i]
+        if pl.uid ~= me and isLiker(pl) then
+            setRole(ROLE, pl.uid, pl.name)
+            n = n + 1
+            task.wait(ROLE_GAP)
+        end
+    end
+    log("sync: re-sent " .. tostring(n) .. " role(s) for nametags")
 end
 
 -- ---- role nametags ----
@@ -601,12 +646,11 @@ local function printState()
         if list[i].uid ~= me and isLiker(list[i]) then likers = likers + 1 end
     end
     local roleCount = 0
-    for _ in pairs(myRoles) do roleCount = roleCount + 1 end
+    for k in pairs(myRoles) do roleCount = roleCount + 1 end
     log("--- state ---")
     log("server players: " .. tostring(#list))
-    log("book sheets: " .. tostring(bookInfo.sheets) .. " rows: " .. tostring(bookInfo.rows)
-        .. " header: " .. tostring(bookInfo.header))
-    log("known names: " .. tostring(knownCount))
+    log("book rows: " .. tostring(bookInfo.rows) .. " | header: " .. tostring(bookInfo.header))
+    log("likers known: " .. tostring(knownCount) .. " | restored: " .. tostring(restoredCount))
     log("likers in server: " .. tostring(likers))
     log("roles set this session: " .. tostring(roleCount))
     log("tags drawn: " .. tostring(tagInfo.drawn) .. " | with known role: " .. tostring(tagInfo.known))
@@ -637,6 +681,9 @@ local function buildMenu()
                     end)
                     mkButton(sec, "Take " .. ROLE .. " (everyone to " .. BASE_ROLE .. ")", function()
                         queued = { kind = "take" }
+                    end)
+                    mkButton(sec, "Sync roles (re-fire to likers)", function()
+                        queued = { kind = "sync" }
                     end)
                 end
 
@@ -728,10 +775,16 @@ task.spawn(function()
         local job = queued
         if job then
             queued = nil
-            if job.kind == "give" then pcall(giveAll)
-            elseif job.kind == "take" then pcall(takeAll)
-            elseif job.kind == "state" then pcall(printState)
-            elseif job.kind == "rescan" then pcall(rescan)
+            if job.kind == "give" then
+                pcall(giveAll)
+            elseif job.kind == "take" then
+                pcall(takeAll)
+            elseif job.kind == "sync" then
+                pcall(syncRoles)
+            elseif job.kind == "state" then
+                pcall(printState)
+            elseif job.kind == "rescan" then
+                pcall(rescan)
             end
         elseif CFG.auto then
             pcall(grantLikers)
@@ -742,13 +795,14 @@ task.spawn(function()
     end
 end)
 
-local restored = loadKnown()
+restoredCount = loadKnown()
 
 _G[NAME] = {
     stop = stop,
     version = VERSION,
     give = function() queued = { kind = "give" } end,
     take = function() queued = { kind = "take" } end,
+    sync = function() queued = { kind = "sync" } end,
     state = function() queued = { kind = "state" } end,
 }
-log("v" .. VERSION .. " loaded - " .. tostring(restored) .. " liker(s) restored from disk")
+log("v" .. VERSION .. " loaded - " .. tostring(restoredCount) .. " liker(s) restored")
