@@ -1,49 +1,46 @@
 -- ABOVE Island Admin
--- VERSION 4.0.0
+-- VERSION 4.1.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 -- also seen on place 88152437007055 (same game, different place)
 --
 -- Co-op island permission panel.
 --
--- ===================== THE ROLE CALL (v4.0.0, CORRECTED) =====================
+-- ===================== THE ROLE CALL (confirmed) =====================
 -- RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
+-- Measured live by firing each candidate and watching PlayerGui.AboveAlert:
+--   ("Helper", uid)            -> unchanged
+--   ("SetRole", uid, "Helper") -> alert CHANGED: "<name> is now Helper"   OK
+--   (uid, "Helper")            -> unchanged
+-- Role keys from Shared.Config.PermissionConfig:
+--   RoleOrder = Visitor, Helper, Builder, TrustedBuilder
+-- "Visitor" removes elevated access.
+-- ====================================================================
 --
--- This is the user's ORIGINAL line, and it is correct. I had "corrected" it to
--- FireServer(<roleName>, <userId>) by inferring from the Invite/Join/Unban buttons
--- in FriendsController, which use a 2-argument (action, userId) form. Roles are a
--- different 3-argument form. Measured live against pablospinin (7029466972) by
--- firing each candidate and watching PlayerGui.AboveAlert:
+-- v4.1.0 FIX: only one player in a server of four was ever getting a SetRole
+-- call. Cause: the `granted` table was never cleared, so every player already
+-- touched by an earlier press, by the auto loop or by the likers button was
+-- skipped forever. Measured symptom: roster showed 4 players / 3 LIKED, but only
+-- one SetRole line was logged.
+--   * An explicit Give/Take press now CLEARS `granted` first - a button press
+--     means "all of them, now".
+--   * `granted` is kept only for the AUTOMATIC paths (auto-on-join, auto-likers),
+--     which is what it was for.
+--   * Every skip is logged, and the summary line always prints "sent N of M".
+--   * Gap between role calls raised 0.2 -> 0.35 s (burst dropping is real on this
+--     server for RequestHarvest; assume the same for role calls).
 --
---   A  ("Helper", uid)             -> alert unchanged
---   B  ("SetRole", uid, "Helper")  -> alert CHANGED: "levi is now Helper"   OK
---   C  (uid, "Helper")             -> alert unchanged
+-- GUEST BOOK: PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame, one Frame per
+-- signature. First direct-child TextLabel is the name, second is "<n>h ago"; the
+-- VIP / FRIEND tag is nested so it is never picked up. Measured 47 Frames with the
+-- header reading "47". Rescanned on a timer so the count follows new signatures.
+-- RemoteEvent.OnClientEvent is nil in this VM, so the GUI is the only source.
 --
--- Role keys are confirmed from Shared.Config.PermissionConfig:
---   Roles / RoleOrder = Visitor, Helper, Builder, TrustedBuilder
--- "Visitor" is the correct key to REMOVE elevated access.
---
--- The alert is the witness: AboveAlert shows "<name> is now <Role>", so a role
--- change is verifiable without guessing.
--- ============================================================================
---
--- GUEST BOOK (measured):
---   * PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame holds one Frame per
---     signature. The FIRST direct-child TextLabel is the name, the SECOND is
---     "<n>h ago". The VIP / FRIEND tag is nested, so it is never picked up.
---   * Measured 47 child Frames with the header reading "47" - so entries == likes.
---   * The list is re-scraped on a timer, so the count follows new signatures
---     without pressing anything.
---   * RemoteEvent.OnClientEvent is nil in this VM, so the server payload cannot be
---     hooked; the GUI is the only readable source.
---
--- Roles only apply to players IN YOUR SERVER, so the guest book is a MATCH LIST:
--- scrape names, then grant to anyone in server whose username or display name is
--- in that set.
+-- Roles only apply to players IN YOUR SERVER, so the guest book is a match list.
 --
 -- Stop = switch the toggle off / press stop. There is no stop key.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "4.0.0"
+local VERSION = "4.1.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -55,6 +52,7 @@ local ROLE = "Helper"
 local BASE_ROLE = "Visitor"
 local AUTO_DELAY = 2.0
 local RESCAN_EVERY = 3.0
+local ROLE_GAP = 0.35
 
 -- ---- lazy service resolution (never cache a nil) ----
 
@@ -215,14 +213,16 @@ local function testRoleCall()
     if after ~= before then
         log("ACCEPTED - alert changed")
     else
-        log("no change - refused or already " .. ROLE)
+        log("no change - refused, or already " .. ROLE)
     end
 end
 
+-- explicit press: force = clear the guard and hit everyone
 local function applyToAll(roleKey, force)
     local me = myUserId()
     local list = listPlayers()
-    local n = 0
+    if force then granted = {} end
+    local n, skipped = 0, 0
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me then
@@ -230,11 +230,15 @@ local function applyToAll(roleKey, force)
                 granted[tostring(pl.uid)] = true
                 setRole(roleKey, pl.uid, pl.name)
                 n = n + 1
-                task.wait(0.2)
+                task.wait(ROLE_GAP)
+            else
+                skipped = skipped + 1
+                log("skip " .. pl.name .. " - already sent this session")
             end
         end
     end
-    log(roleKey .. " sent to " .. tostring(n) .. " of " .. tostring(#list) .. " in server")
+    log("sent " .. roleKey .. " to " .. tostring(n) .. " of " .. tostring(#list)
+        .. " in server" .. (skipped > 0 and (", skipped " .. tostring(skipped)) or ""))
     return n
 end
 
@@ -251,11 +255,12 @@ local function printRoster()
         log("  " .. pl.name .. " (" .. tostring(pl.uid) .. ")"
             .. (pl.display and (" [" .. pl.display .. "]") or "")
             .. " guestbook=" .. liked
+            .. (granted[tostring(pl.uid)] and " sent" or "")
             .. (pl.uid == me and "  <- you" or ""))
     end
 end
 
--- ---- guest book scrape: structural, entry-accurate ----
+-- ---- guest book scrape ----
 
 local function nameFromEntry(f)
     for _, d in ipairs(f:GetChildren()) do
@@ -312,7 +317,6 @@ local function scrapeGuestBook()
     return entries, unique
 end
 
--- quiet rescan: only logs when the count actually moves
 local function rescan(silent)
     local entries, unique = scrapeGuestBook()
     if #entries == 0 then
@@ -351,28 +355,32 @@ local function printBook()
     end
 end
 
-local function grantLikers()
+local function grantLikers(force)
     if #bookEntries == 0 then rescan(true) end
     if #bookEntries == 0 then
         log("no guest book set - open the book first")
         return 0
     end
+    if force then granted = {} end
     local me = myUserId()
     local list = listPlayers()
-    local n = 0
+    local n, skipped = 0, 0
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me and isLiker(pl) then
-            if not granted[tostring(pl.uid)] then
+            if force or not granted[tostring(pl.uid)] then
                 granted[tostring(pl.uid)] = true
                 setRole(ROLE, pl.uid, pl.name)
                 stats.matched = stats.matched + 1
                 n = n + 1
-                task.wait(0.2)
+                task.wait(ROLE_GAP)
+            else
+                skipped = skipped + 1
             end
         end
     end
-    log("likers granted this pass: " .. tostring(n) .. " (of " .. tostring(#list) .. " in server)")
+    log("likers: sent " .. tostring(n) .. " of " .. tostring(#list)
+        .. " in server" .. (skipped > 0 and (", skipped " .. tostring(skipped)) or ""))
     return n
 end
 
@@ -473,7 +481,7 @@ local function buildMenu()
                         log("auto-grant to likers " .. (v and "ON" or "OFF"))
                     end)
                     mkButton(gb, "Grant to likers in server now", function()
-                        grantLikers()
+                        grantLikers(true)
                     end)
                     mkText(gb, "Rescans every " .. tostring(RESCAN_EVERY) .. "s.")
                 end
@@ -514,7 +522,6 @@ task.spawn(function()
     buildMenu()
 end)
 
--- keep the guest book count live
 task.spawn(function()
     while running do
         pcall(rescan, true)
@@ -525,7 +532,7 @@ end)
 task.spawn(function()
     while running do
         if CFG.autoLikers then
-            local ok, err = pcall(grantLikers)
+            local ok, err = pcall(grantLikers, false)
             if not ok then log("liker pass error: " .. tostring(err)) end
             task.wait(AUTO_DELAY)
         elseif CFG.autoAll then
@@ -547,7 +554,7 @@ _G[NAME] = {
     roster = printRoster,
     scrape = function() return rescan(false) end,
     book = printBook,
-    grantLikers = grantLikers,
+    grantLikers = function() return grantLikers(true) end,
     isLiker = isLiker,
     testRole = testRoleCall,
     alert = readAlert,
