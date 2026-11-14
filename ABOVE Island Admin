@@ -1,37 +1,40 @@
 -- ABOVE Island Admin
--- VERSION 3.2.0
+-- VERSION 4.0.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 -- also seen on place 88152437007055 (same game, different place)
 --
 -- Co-op island permission panel.
 --
--- v3.2.0 FIX: the guest book count was wrong (45 instead of 47) because the
--- scraper deduplicated by name. Measured: ScrollingFrame has 47 child Frames and
--- the header reads "47", but two entries share a name, so 47 collapsed to 45
--- UNIQUE. The count is now ENTRIES, not unique names. Duplicates are still folded
--- for matching (a set), which is correct - they just no longer distort the count.
+-- ===================== THE ROLE CALL (v4.0.0, CORRECTED) =====================
+-- RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
 --
--- ROLE KEYS ARE CONFIRMED. Decompiled Shared.Config.PermissionConfig:
---     Roles    = { Visitor, Helper, Builder, TrustedBuilder }
---     RoleOrder= { "Visitor", "Helper", "Builder", "TrustedBuilder" }
---   "Helper" is the correct key; "Visitor" is the correct remove key.
---   Call: RequestFriendAction:FireServer(<roleKey>, <userId>).
+-- This is the user's ORIGINAL line, and it is correct. I had "corrected" it to
+-- FireServer(<roleName>, <userId>) by inferring from the Invite/Join/Unban buttons
+-- in FriendsController, which use a 2-argument (action, userId) form. Roles are a
+-- different 3-argument form. Measured live against pablospinin (7029466972) by
+-- firing each candidate and watching PlayerGui.AboveAlert:
 --
--- IF A ROLE CHANGE DOES NOT LAND, remaining causes in order:
---   1. You are not the island Owner / not high enough rank. DismantleReturnsTo is
---      "Owner" and the UI only shows role buttons for players in your server.
---   2. The target is not in your server (roles are InServer-only).
---   Press "Test role call" - it fires and prints AboveAlert before/after so a
---   refusal is visible instead of silent.
+--   A  ("Helper", uid)             -> alert unchanged
+--   B  ("SetRole", uid, "Helper")  -> alert CHANGED: "levi is now Helper"   OK
+--   C  (uid, "Helper")             -> alert unchanged
 --
--- GUEST BOOK SCRAPE is STRUCTURAL, no text filtering: each entry is a Frame whose
--- FIRST direct-child TextLabel is the name and whose SECOND is "<n>h ago". The
--- VIP / FRIEND tag lives in a nested Frame and is never picked up. Display names
--- with spaces are preserved.
+-- Role keys are confirmed from Shared.Config.PermissionConfig:
+--   Roles / RoleOrder = Visitor, Helper, Builder, TrustedBuilder
+-- "Visitor" is the correct key to REMOVE elevated access.
 --
--- Guest book location: PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame.
--- RemoteEvent.OnClientEvent is nil in this VM, so the server payload cannot be
--- hooked - the GUI is the only readable source.
+-- The alert is the witness: AboveAlert shows "<name> is now <Role>", so a role
+-- change is verifiable without guessing.
+-- ============================================================================
+--
+-- GUEST BOOK (measured):
+--   * PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame holds one Frame per
+--     signature. The FIRST direct-child TextLabel is the name, the SECOND is
+--     "<n>h ago". The VIP / FRIEND tag is nested, so it is never picked up.
+--   * Measured 47 child Frames with the header reading "47" - so entries == likes.
+--   * The list is re-scraped on a timer, so the count follows new signatures
+--     without pressing anything.
+--   * RemoteEvent.OnClientEvent is nil in this VM, so the server payload cannot be
+--     hooked; the GUI is the only readable source.
 --
 -- Roles only apply to players IN YOUR SERVER, so the guest book is a MATCH LIST:
 -- scrape names, then grant to anyone in server whose username or display name is
@@ -40,7 +43,7 @@
 -- Stop = switch the toggle off / press stop. There is no stop key.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "3.2.0"
+local VERSION = "4.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -51,6 +54,7 @@ end
 local ROLE = "Helper"
 local BASE_ROLE = "Visitor"
 local AUTO_DELAY = 2.0
+local RESCAN_EVERY = 3.0
 
 -- ---- lazy service resolution (never cache a nil) ----
 
@@ -105,6 +109,7 @@ local granted = {}
 local bookSet = {}
 local bookEntries = {}
 local bookUnique = {}
+local lastCount = -1
 local stats = { set = 0, failed = 0, matched = 0 }
 local warnedAction = false
 
@@ -165,7 +170,7 @@ local function readAlert()
     return t
 end
 
--- ---- role set ----
+-- ---- role set: ("SetRole", userId, roleName) ----
 
 local function setRole(roleKey, userId, label)
     local ev = remote("RequestFriendAction")
@@ -176,10 +181,10 @@ local function setRole(roleKey, userId, label)
         end
         return false
     end
-    local ok = pcall(function() ev:FireServer(roleKey, userId) end)
+    local ok = pcall(function() ev:FireServer("SetRole", userId, roleKey) end)
     if ok then
         stats.set = stats.set + 1
-        log(roleKey .. " -> " .. tostring(label) .. " (" .. tostring(userId) .. ")")
+        log("SetRole " .. roleKey .. " -> " .. tostring(label) .. " (" .. tostring(userId) .. ")")
     else
         stats.failed = stats.failed + 1
         log("FAILED " .. roleKey .. " -> " .. tostring(label))
@@ -203,15 +208,14 @@ local function testRoleCall()
     end
     local before = readAlert()
     log("alert before = " .. tostring(before))
-    log("firing RequestFriendAction('" .. ROLE .. "', " .. tostring(target.uid) .. ") for " .. target.name)
     setRole(ROLE, target.uid, target.name)
     task.wait(1.3)
     local after = readAlert()
     log("alert after  = " .. tostring(after))
     if after ~= before then
-        log("ALERT CHANGED - the call was accepted")
+        log("ACCEPTED - alert changed")
     else
-        log("alert unchanged - likely refused: check you are the island Owner")
+        log("no change - refused or already " .. ROLE)
     end
 end
 
@@ -226,7 +230,7 @@ local function applyToAll(roleKey, force)
                 granted[tostring(pl.uid)] = true
                 setRole(roleKey, pl.uid, pl.name)
                 n = n + 1
-                task.wait(0.15)
+                task.wait(0.2)
             end
         end
     end
@@ -280,10 +284,7 @@ local function scrapeGuestBook()
     if not pg then return {}, {} end
     local gb = nil
     pcall(function() gb = pg:FindFirstChild("AboveGuestBook") end)
-    if not gb then
-        log("AboveGuestBook not open - open the book in game first")
-        return {}, {}
-    end
+    if not gb then return {}, {} end
     local cg = nil
     pcall(function() cg = gb:FindFirstChild("CanvasGroup") end)
     if not cg then return {}, {} end
@@ -291,7 +292,6 @@ local function scrapeGuestBook()
     pcall(function() sf = cg:FindFirstChild("ScrollingFrame") end)
     if not sf then return {}, {} end
 
-    -- every entry, duplicates included
     local entries = {}
     local unique, seen = {}, {}
     pcall(function()
@@ -312,17 +312,24 @@ local function scrapeGuestBook()
     return entries, unique
 end
 
-local function refreshBook()
+-- quiet rescan: only logs when the count actually moves
+local function rescan(silent)
     local entries, unique = scrapeGuestBook()
-    if #entries == 0 then return 0 end
+    if #entries == 0 then
+        if not silent then log("guest book not open - open it in game") end
+        return 0
+    end
     bookEntries = entries
     bookUnique = unique
     bookSet = {}
     for i = 1, #unique do
         bookSet[string.lower(unique[i])] = unique[i]
     end
-    log("guest book: " .. tostring(#entries) .. " entries, "
-        .. tostring(#unique) .. " unique name(s)")
+    if #entries ~= lastCount then
+        lastCount = #entries
+        log("guest book: " .. tostring(#entries) .. " entries, "
+            .. tostring(#unique) .. " unique name(s)")
+    end
     return #entries
 end
 
@@ -335,7 +342,7 @@ end
 
 local function printBook()
     if #bookEntries == 0 then
-        log("guest book empty - open the book and press 'Scrape guest book names'")
+        log("guest book empty - open the book in game")
         return
     end
     log("entries (" .. tostring(#bookEntries) .. "), unique (" .. tostring(#bookUnique) .. "):")
@@ -345,7 +352,7 @@ local function printBook()
 end
 
 local function grantLikers()
-    if #bookEntries == 0 then refreshBook() end
+    if #bookEntries == 0 then rescan(true) end
     if #bookEntries == 0 then
         log("no guest book set - open the book first")
         return 0
@@ -361,7 +368,7 @@ local function grantLikers()
                 setRole(ROLE, pl.uid, pl.name)
                 stats.matched = stats.matched + 1
                 n = n + 1
-                task.wait(0.15)
+                task.wait(0.2)
             end
         end
     end
@@ -456,19 +463,19 @@ local function buildMenu()
 
                 local gb = mkSection(tab, "Guest Book")
                 if gb then
-                    mkButton(gb, "Scrape guest book names", function()
-                        refreshBook()
+                    mkButton(gb, "Rescan guest book now", function()
+                        rescan(false)
                     end)
                     mkButton(gb, "Print guest book names", printBook)
                     mkToggle(gb, "Auto-grant to guest book likers", "ia_likers", false, function(v)
                         CFG.autoLikers = v
-                        if v then refreshBook() end
+                        if v then rescan(true) end
                         log("auto-grant to likers " .. (v and "ON" or "OFF"))
                     end)
                     mkButton(gb, "Grant to likers in server now", function()
                         grantLikers()
                     end)
-                    mkText(gb, "Counts entries, not unique.")
+                    mkText(gb, "Rescans every " .. tostring(RESCAN_EVERY) .. "s.")
                 end
             end)
             if not okb then
@@ -507,6 +514,14 @@ task.spawn(function()
     buildMenu()
 end)
 
+-- keep the guest book count live
+task.spawn(function()
+    while running do
+        pcall(rescan, true)
+        task.wait(RESCAN_EVERY)
+    end
+end)
+
 task.spawn(function()
     while running do
         if CFG.autoLikers then
@@ -530,7 +545,7 @@ _G[NAME] = {
     giveAll = function() return applyToAll(ROLE, true) end,
     takeAll = function() return applyToAll(BASE_ROLE, true) end,
     roster = printRoster,
-    scrape = refreshBook,
+    scrape = function() return rescan(false) end,
     book = printBook,
     grantLikers = grantLikers,
     isLiker = isLiker,
