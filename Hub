@@ -6,9 +6,12 @@
 -- the place id and game name so you can add one line to PLACES.
 --
 -- Manual load: _G.Hub.load('Dogs')
+-- ABOVE has two scripts: 'ABOVE' (default) and 'ABOVE Island Admin'.
+-- Reach the second with: _G.Hub.load('ABOVE Island Admin')
 --
--- v5.0: ABOVE v12.0.0 - cart-only build (conveyor gate removed), fire gap 0.02 s
---       which is ~3x the throughput of the old 0.01 s, lazy service resolution.
+-- v5.1: ABOVE Island Admin v1.0.0 - co-op island permission panel (grant Helper
+--       to players in your server via RequestFriendAction:FireServer(role, uid)).
+-- v5.0: ABOVE v12.0.0 - cart-only build, fire gap 0.02 s (~3x), lazy services.
 -- v4.9: ABOVE v11.2.0 - lazy services, cart gate distance check.
 -- v4.8: ABOVE v11.1.0 - overlay counts HARVESTS not pickups, 0.02 s fire gap.
 -- v4.7: ABOVE v11.0.0 - faster berry pickup plus a Drawing berries/sec overlay.
@@ -46,7 +49,7 @@
 -- the previous version of a script you just pushed.
 
 local NAME    = 'Hub'
-local VERSION = 'v5.0'
+local VERSION = 'v5.1'
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -86,6 +89,7 @@ local PLACES = {
 -- keys are normalised: lowercase, letters and digits only.
 local SCRIPTS = {
     { file = 'ABOVE',                        keys = { 'above', 'aboveberries' } },
+    { file = 'ABOVE Island Admin',           keys = { 'aboveislandadmin', 'islandadmin' } },
     { file = '+1 Upgrade Per Kill',          keys = { '1upgradeperkill', 'upgradeperkill' } },
     { file = 'Age Evolution Tycoon',         keys = { 'ageevolutiontycoon', 'ageevolution' } },
     { file = 'Bug Evolution',                keys = { 'bugevolution', 'bugevo' } },
