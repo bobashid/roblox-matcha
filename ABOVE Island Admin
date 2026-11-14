@@ -1,41 +1,43 @@
 -- ABOVE Island Admin
--- VERSION 3.0.0
+-- VERSION 3.1.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 -- also seen on place 88152437007055 (same game, different place)
 --
 -- Co-op island permission panel.
 --
--- DESIGN (v3.0.0): roles are only settable for players IN YOUR SERVER. The game's
--- own Friends panel builds role buttons only for group == "InServer", and the
--- server rejects changes for absent players - so pushing roles at offline ids from
--- the guest book can never land. Verified by the user: "you cant even change the
--- role of people offline or not even in the server".
+-- ROLE KEYS ARE CONFIRMED. Decompiled Shared.Config.PermissionConfig:
+--     Roles    = { Visitor, Helper, Builder, TrustedBuilder }
+--     RoleOrder= { "Visitor", "Helper", "Builder", "TrustedBuilder" }
+--   So "Helper" is the correct key and Visitor is the correct "remove" key.
+--   The call is RequestFriendAction:FireServer(<roleKey>, <userId>).
 --
--- So the guest book is used as a MATCH LIST, not a target list:
---   1. scrape the guest book names out of PlayerGui (44 entries == "44" hearts)
---   2. keep them in a lowercase set
---   3. each poll, for every player actually in the server, compare their
---      username AND their display name against that set
---   4. on a match, grant the role - which the server will accept because they
---      are present
--- That gives "Helper to everyone who liked the island" the only way it can work.
+-- IF A ROLE CHANGE DOES NOT LAND, the remaining causes are, in order:
+--   1. You are not the island Owner / not high enough rank. DismantleReturnsTo is
+--      "Owner" and the game's own UI only shows role buttons for players in your
+--      server. The server decides - the client cannot force it.
+--   2. The target is not in your server (roles are InServer-only).
+--   Press "Test role call" to see whether the game acknowledges it: it fires the
+--   call and prints AboveAlert before and after, so a refusal is visible.
 --
--- WHY NOT RESOLVE NAMES TO USERIDS: Players:GetUserIdFromNameAsync is nil in this
--- VM, and the resolved ids were useless anyway because offline role changes are
--- rejected. Removed in v3.0.0.
+-- GUEST BOOK SCRAPE (v3.1.0 fix): the old version filtered text heuristically and
+-- dropped any name containing a space, which is why 47 likes read as 45 - display
+-- names can contain spaces. It now reads the STRUCTURE instead: each entry is a
+-- Frame whose FIRST direct-child TextLabel is the name and whose SECOND is the
+-- "<n>h ago" timestamp. The VIP / FRIEND tag lives inside a nested Frame, so it is
+-- never picked up. No content filtering, nothing dropped.
 --
--- GUEST BOOK LOCATION (measured): PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame
--- One child Frame per signature: a TextLabel name, a TextLabel "<n>h ago", and an
--- optional " VIP " / " FRIEND " tag. RemoteEvent.OnClientEvent is nil in this VM,
--- so the server payload cannot be hooked - the GUI is the only readable source.
+-- Guest book location: PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame.
+-- RemoteEvent.OnClientEvent is nil in this VM, so the server payload cannot be
+-- hooked - the GUI is the only readable source.
 --
--- Role call: RequestFriendAction:FireServer(<roleKey>, <userId>). The role name IS
--- the first argument. Owner is unclickable in the game's UI, so it is skipped.
+-- Roles only apply to players IN YOUR SERVER, so the guest book is used as a
+-- MATCH LIST: scrape names, then grant to anyone in server whose username or
+-- display name is in that set.
 --
 -- Stop = switch the toggle off / press stop. There is no stop key.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "3.0.0"
+local VERSION = "3.1.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -137,6 +139,28 @@ local function listPlayers()
     return out
 end
 
+-- ---- alert witness (the game announces role changes here) ----
+
+local function readAlert()
+    local P = getPlayers()
+    if not P then return nil end
+    local lp = nil
+    pcall(function() lp = P.LocalPlayer end)
+    if not lp then return nil end
+    local pg = nil
+    pcall(function() pg = lp:FindFirstChild("PlayerGui") end)
+    if not pg then return nil end
+    local a = nil
+    pcall(function() a = pg:FindFirstChild("AboveAlert") end)
+    if not a then return nil end
+    local t = nil
+    pcall(function()
+        local tl = a:FindFirstChildOfClass("TextLabel")
+        if tl then t = tl.Text end
+    end)
+    return t
+end
+
 -- ---- role set ----
 
 local function setRole(roleKey, userId, label)
@@ -157,6 +181,34 @@ local function setRole(roleKey, userId, label)
         log("FAILED " .. roleKey .. " -> " .. tostring(label))
     end
     return ok
+end
+
+local function testRoleCall()
+    local me = myUserId()
+    local list = listPlayers()
+    local target = nil
+    for i = 1, #list do
+        if list[i].uid ~= me then
+            target = list[i]
+            break
+        end
+    end
+    if not target then
+        log("no other player in server to test against")
+        return
+    end
+    local before = readAlert()
+    log("alert before = " .. tostring(before))
+    log("firing RequestFriendAction('" .. ROLE .. "', " .. tostring(target.uid) .. ") for " .. target.name)
+    setRole(ROLE, target.uid, target.name)
+    task.wait(1.3)
+    local after = readAlert()
+    log("alert after  = " .. tostring(after))
+    if after ~= before then
+        log("ALERT CHANGED - the call was accepted")
+    else
+        log("alert unchanged - likely refused: check you are the island Owner")
+    end
 end
 
 local function applyToAll(roleKey, force)
@@ -195,17 +247,26 @@ local function printRoster()
     end
 end
 
--- ---- guest book scrape (PlayerGui only - nothing in the workspace) ----
+-- ---- guest book scrape: structural, no text filtering ----
+-- Entry Frame layout measured:
+--   UICorner, ImageLabel, UICorner, TextLabel(NAME), UITextSizeConstraint,
+--   TextLabel(TIME), UITextSizeConstraint, Frame(TAG), UIListLayout, ...
+-- So the FIRST direct-child TextLabel is the name. The tag is nested, never hit.
 
-local function cleanText(t)
-    if type(t) ~= "string" then return nil end
-    local s = t:gsub("^%s+", ""):gsub("%s+$", "")
-    if s == "" or #s < 3 or #s > 24 then return nil end
-    if s:find("ago$") then return nil end
-    if s == "VIP" or s == "FRIEND" then return nil end
-    if s:find("^%[") then return nil end
-    if s:find(" ") then return nil end
-    return s
+local function nameFromEntry(f)
+    for _, d in ipairs(f:GetChildren()) do
+        if tostring(d.ClassName) == "TextLabel" then
+            local t = nil
+            pcall(function() t = d.Text end)
+            if type(t) == "string" then
+                local s = t:gsub("^%s+", ""):gsub("%s+$", "")
+                if s ~= "" and not s:find("ago$") then
+                    return s
+                end
+            end
+        end
+    end
+    return nil
 end
 
 local function scrapeGuestBook()
@@ -233,10 +294,8 @@ local function scrapeGuestBook()
     local names, seen = {}, {}
     pcall(function()
         for _, f in ipairs(sf:GetChildren()) do
-            for _, d in ipairs(f:GetChildren()) do
-                local t = nil
-                pcall(function() t = d.Text end)
-                local nm = cleanText(t)
+            if tostring(f.ClassName) == "Frame" then
+                local nm = nameFromEntry(f)
                 if nm and not seen[nm] then
                     seen[nm] = true
                     names[#names + 1] = nm
@@ -277,12 +336,8 @@ local function printBook()
     end
 end
 
--- grant Helper to every player IN THE SERVER whose name or display name is in
--- the guest book. This is the only form that can actually land.
 local function grantLikers()
-    if #bookNames == 0 then
-        refreshBook()
-    end
+    if #bookNames == 0 then refreshBook() end
     if #bookNames == 0 then
         log("no guest book set - open the book first")
         return 0
@@ -371,6 +426,26 @@ local function buildMenu()
             if built then return end
             built = true
             local okb, err = pcall(function()
+                local sec = mkSection(tab, "Roles")
+                if sec then
+                    mkButton(sec, "Give " .. ROLE .. " to everyone", function()
+                        applyToAll(ROLE, true)
+                    end)
+                    mkButton(sec, "Take " .. ROLE .. " from everyone", function()
+                        applyToAll(BASE_ROLE, true)
+                    end)
+                    mkButton(sec, "Test role call (reads alert)", testRoleCall)
+                    mkToggle(sec, "Auto-grant " .. ROLE .. " to all who join", "ia_auto", false, function(v)
+                        CFG.autoAll = v
+                        log("auto-grant all " .. (v and "ON" or "OFF"))
+                    end)
+                    mkButton(sec, "Print who is in server", printRoster)
+                    mkButton(sec, "Reset granted list", function()
+                        granted = {}
+                        log("granted list cleared")
+                    end)
+                end
+
                 local gb = mkSection(tab, "Guest Book")
                 if gb then
                     mkButton(gb, "Scrape guest book names", function()
@@ -385,27 +460,7 @@ local function buildMenu()
                     mkButton(gb, "Grant to likers in server now", function()
                         grantLikers()
                     end)
-                    mkText(gb, "Matches username + display")
-                    mkText(gb, "name. Open the book first.")
-                end
-
-                local sec = mkSection(tab, "Roles")
-                if sec then
-                    mkButton(sec, "Give " .. ROLE .. " to everyone", function()
-                        applyToAll(ROLE, true)
-                    end)
-                    mkButton(sec, "Take " .. ROLE .. " from everyone", function()
-                        applyToAll(BASE_ROLE, true)
-                    end)
-                    mkToggle(sec, "Auto-grant " .. ROLE .. " to all who join", "ia_auto", false, function(v)
-                        CFG.autoAll = v
-                        log("auto-grant all " .. (v and "ON" or "OFF"))
-                    end)
-                    mkButton(sec, "Print who is in server", printRoster)
-                    mkButton(sec, "Reset granted list", function()
-                        granted = {}
-                        log("granted list cleared")
-                    end)
+                    mkText(gb, "Structural scrape - keeps spaces.")
                 end
             end)
             if not okb then
@@ -471,6 +526,8 @@ _G[NAME] = {
     book = printBook,
     grantLikers = grantLikers,
     isLiker = isLiker,
+    testRole = testRoleCall,
+    alert = readAlert,
 }
 log("v" .. VERSION .. " loaded on place " .. tostring(game.PlaceId)
     .. " | RS=" .. tostring(getRS() ~= nil)
