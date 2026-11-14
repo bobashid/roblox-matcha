@@ -1,30 +1,35 @@
 -- ABOVE Island Admin
--- VERSION 7.2.0
+-- VERSION 7.3.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
 -- Gives Helper to everyone who liked your island (the guest book signatures),
 -- and draws each player's ROLE only above their head.
 --
 -- Role call: RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
---   Roles: Visitor, Helper, Builder, TrustedBuilder. "Visitor" = no access.
+--   Roles: Visitor, Helper, Builder, TrustedBuilder.
 --
--- ===================== NO NEED TO OPEN THE GUEST BOOK =====================
--- Measured: PlayerGui.AboveGuestBook is already present and populated (63 rows)
--- without the player ever opening it, and rescan() reads it every 3 s. There is
--- no silent-open step and no teleport - nothing to trigger.
+-- ===================== SCRAPE ACCURACY (v7.3.0) =====================
+-- Measured: ScrollingFrame had 47 children, all Frame, and 47 names were read.
+-- Later the list showed 68 but only 66 names came out, and only 2 of 4 in-server
+-- players matched - i.e. the 2 missing names were the 2 players not being granted.
+-- So scrape accuracy drives the auto-grant.
 --
--- v7.2.0 FIX: the "guest book has never been read" warning fired even when 63
--- entries had been read. Cause: `known` is a dictionary keyed by NAME strings, so
--- `#known` (the length operator) is ALWAYS 0 - length only counts array part.
--- Every `#known` check was therefore wrong: the warning always fired and the debug
--- line always printed book=0. Replaced with an explicit counter.
+-- nameFromEntry is now two-pass:
+--   1. the FIRST direct-child TextLabel that is not a timestamp and not a tag
+--   2. fallback: ANY descendant TextLabel that looks like a name
+-- and the debug line reports rows / frames / named, so a short read is visible:
+--   [dbg] book rows=68 frames=68 named=68
+-- rows > frames means non-Frame children exist; frames > named means entries are
+-- being skipped by the name test.
+-- ====================================================================
 --
--- Nametag roles come from what THIS script has set (myRoles). The real role list
--- only arrives through server->client events, and RemoteEvent.OnClientEvent is nil
--- in this VM, so a role set by anyone else reads as "?" rather than a guess.
+-- The guest book GUI is already present without opening it - no teleport needed.
+-- Nametag roles come from what THIS script has set (myRoles); the real role list
+-- only arrives through server->client events and RemoteEvent.OnClientEvent is nil
+-- in this VM, so a role set by anyone else reads as "?".
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "7.2.0"
+local VERSION = "7.3.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -105,6 +110,7 @@ local wsWarned = false
 local lastPass = ""
 local lastTagLog = 0
 local tagInfo = { drawn = 0, known = 0 }
+local bookInfo = { rows = 0, frames = 0, named = 0 }
 
 local function log(msg)
     print("[ABOVE Admin] " .. tostring(msg))
@@ -165,23 +171,43 @@ end
 
 -- ---- guest book ----
 
+local function looksLikeName(s)
+    if type(s) ~= "string" then return false end
+    local t = s:gsub("^%s+", ""):gsub("%s+$", "")
+    if t == "" or #t < 2 or #t > 26 then return false end
+    if t:find("ago$") then return false end
+    if t == "VIP" or t == "FRIEND" then return false end
+    if t:find("^%[") then return false end
+    return t
+end
+
+-- pass 1: first direct-child TextLabel that reads as a name
+-- pass 2: any descendant TextLabel that reads as a name
 local function nameFromEntry(f)
     for _, d in ipairs(f:GetChildren()) do
         if tostring(d.ClassName) == "TextLabel" then
             local t = nil
             pcall(function() t = d.Text end)
-            if type(t) == "string" then
-                local s = t:gsub("^%s+", ""):gsub("%s+$", "")
-                if s ~= "" and not s:find("ago$") then
-                    return s
-                end
-            end
+            local ok = looksLikeName(t)
+            if ok then return ok end
         end
     end
-    return nil
+    local found = nil
+    pcall(function()
+        for _, d in ipairs(f:GetDescendants()) do
+            if found == nil and tostring(d.ClassName) == "TextLabel" then
+                local t = nil
+                pcall(function() t = d.Text end)
+                local ok = looksLikeName(t)
+                if ok then found = ok end
+            end
+        end
+    end)
+    return found
 end
 
 local function scrapeGuestBook()
+    bookInfo = { rows = 0, frames = 0, named = 0 }
     local P = getPlayers()
     if not P then return {} end
     local lp = nil
@@ -203,9 +229,14 @@ local function scrapeGuestBook()
     local names = {}
     pcall(function()
         for _, f in ipairs(sf:GetChildren()) do
+            bookInfo.rows = bookInfo.rows + 1
             if tostring(f.ClassName) == "Frame" then
+                bookInfo.frames = bookInfo.frames + 1
                 local nm = nameFromEntry(f)
-                if nm then names[#names + 1] = nm end
+                if nm then
+                    bookInfo.named = bookInfo.named + 1
+                    names[#names + 1] = nm
+                end
             end
         end
     end)
@@ -219,20 +250,20 @@ local function rescan()
         return 0
     end
     bookSet = {}
-    knownCount = 0
     for i = 1, #names do
         local k = string.lower(names[i])
         bookSet[k] = names[i]
         if not known[k] then
             known[k] = true
-            knownCount = knownCount + 1
             log("new liker: " .. names[i])
         end
     end
-    -- recount so the number reflects what is in the set now
     knownCount = 0
     for _ in pairs(known) do knownCount = knownCount + 1 end
-    dbg("guest book entries: " .. tostring(#names) .. " known: " .. tostring(knownCount))
+    dbg("book rows=" .. tostring(bookInfo.rows)
+        .. " frames=" .. tostring(bookInfo.frames)
+        .. " named=" .. tostring(bookInfo.named)
+        .. " known=" .. tostring(knownCount))
     return #names
 end
 
@@ -243,23 +274,27 @@ local function isLiker(pl)
     return false
 end
 
--- ---- actions (worker only) ----
+-- ---- actions ----
 
 local function grantLikers()
     if knownCount == 0 then rescan() end
 
     local me = myUserId()
     local list = listPlayers()
-    local likers, sent = 0, 0
+    local likers, sent, unmatched = 0, 0, {}
     for i = 1, #list do
         local pl = list[i]
-        if pl.uid ~= me and isLiker(pl) then
-            likers = likers + 1
-            if not granted[tostring(pl.uid)] then
-                granted[tostring(pl.uid)] = true
-                setRole(ROLE, pl.uid, pl.name)
-                sent = sent + 1
-                task.wait(ROLE_GAP)
+        if pl.uid ~= me then
+            if isLiker(pl) then
+                likers = likers + 1
+                if not granted[tostring(pl.uid)] then
+                    granted[tostring(pl.uid)] = true
+                    setRole(ROLE, pl.uid, pl.name)
+                    sent = sent + 1
+                    task.wait(ROLE_GAP)
+                end
+            else
+                unmatched[#unmatched + 1] = pl.name
             end
         end
     end
@@ -268,6 +303,9 @@ local function grantLikers()
     if pass ~= lastPass then
         lastPass = pass
         dbg(pass)
+        if #unmatched > 0 then
+            dbg("not in book: " .. table.concat(unmatched, ", "))
+        end
     end
 end
 
@@ -462,7 +500,10 @@ local function printState()
     for _ in pairs(myRoles) do roleCount = roleCount + 1 end
     log("--- state ---")
     log("server players: " .. tostring(#list))
-    log("guest book names: " .. tostring(knownCount))
+    log("book rows: " .. tostring(bookInfo.rows)
+        .. " frames: " .. tostring(bookInfo.frames)
+        .. " named: " .. tostring(bookInfo.named))
+    log("known names: " .. tostring(knownCount))
     log("likers in server: " .. tostring(likers))
     log("roles set this session: " .. tostring(roleCount))
     log("tags drawn: " .. tostring(tagInfo.drawn) .. " | with known role: " .. tostring(tagInfo.known))
