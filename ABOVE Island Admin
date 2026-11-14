@@ -1,21 +1,25 @@
 -- ABOVE Island Admin
--- VERSION 5.0.0
+-- VERSION 6.0.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
--- Gives Helper to everyone who liked your island (the guest book signatures).
+-- Gives Helper to everyone who liked your island (the guest book signatures),
+-- and draws a nametag with each player's role above their head.
 --
 -- Role call: RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
 --   Roles: Visitor, Helper, Builder, TrustedBuilder. "Visitor" = no access.
+--
+-- Nametag roles come from what THIS script has set (myRoles). The real role list
+-- is only delivered through server->client events, and RemoteEvent.OnClientEvent
+-- is nil in this VM, so a role set by anyone else reads as "?" rather than a guess.
 --
 -- The guest book list only exists in PlayerGui.AboveGuestBook, so open the book
 -- once after loading; the script then reads it every 3 s.
 --
 -- Roles only apply to players IN YOUR SERVER, so this matches guest book names
--- against whoever is present. Loading it after they already liked still works:
--- enabling the toggle runs a full pass over everyone currently in server.
+-- against whoever is present. Enabling the toggle runs a full pass immediately.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "5.0.0"
+local VERSION = "6.0.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -26,11 +30,13 @@ local BASE_ROLE = "Visitor"
 local RESCAN_EVERY = 3.0
 local GRANT_EVERY = 2.0
 local ROLE_GAP = 0.35
+local TAG_POOL = 32
 
 -- ---- services (resolved lazily; never cache a nil) ----
 
 local RS = nil
 local PlayersSvc = nil
+local RunSvc = nil
 
 local function resolveService(svcName)
     local ok, s = pcall(function() return game:GetService(svcName) end)
@@ -60,6 +66,12 @@ local function getPlayers()
     return PlayersSvc
 end
 
+local function getRun()
+    if RunSvc and RunSvc.Parent then return RunSvc end
+    RunSvc = resolveService("RunService")
+    return RunSvc
+end
+
 local function remote(remoteName)
     local r = getRS()
     if not r then return nil end
@@ -72,15 +84,17 @@ end
 
 -- ---- state ----
 
-local CFG = { auto = false }
+local CFG = { auto = false, tags = false }
 
 local running = true
 local built = false
 local granted = {}
+local myRoles = {}
 local bookSet = {}
 local known = {}
 local queued = nil
-local lastCount = -1
+local pool = {}
+local renderConn = nil
 
 local function log(msg)
     print("[ABOVE Admin] " .. tostring(msg))
@@ -110,7 +124,7 @@ local function listPlayers()
             pcall(function() nm = pl.Name end)
             pcall(function() dn = pl.DisplayName end)
             if uid ~= nil and nm ~= nil then
-                out[#out + 1] = { uid = uid, name = nm, display = dn }
+                out[#out + 1] = { uid = uid, name = nm, display = dn, obj = pl }
             end
         end
     end)
@@ -124,6 +138,7 @@ local function setRole(roleKey, userId, label)
     if not ev then return false end
     local ok = pcall(function() ev:FireServer("SetRole", userId, roleKey) end)
     if ok then
+        myRoles[tostring(userId)] = roleKey
         log(roleKey .. " -> " .. tostring(label))
     end
     return ok
@@ -190,7 +205,6 @@ local function rescan()
             log("new liker: " .. names[i])
         end
     end
-    lastCount = #names
     return #names
 end
 
@@ -206,27 +220,23 @@ end
 local function grantLikers()
     local me = myUserId()
     local list = listPlayers()
-    local n = 0
     for i = 1, #list do
         local pl = list[i]
         if pl.uid ~= me and isLiker(pl) then
             if not granted[tostring(pl.uid)] then
                 granted[tostring(pl.uid)] = true
                 setRole(ROLE, pl.uid, pl.name)
-                n = n + 1
                 task.wait(ROLE_GAP)
             end
         end
     end
-    return n
 end
 
 local function giveAll()
     granted = {}
-    return grantLikers()
+    grantLikers()
 end
 
--- everyone in server, liked or not
 local function takeAll()
     local me = myUserId()
     local list = listPlayers()
@@ -238,6 +248,97 @@ local function takeAll()
             task.wait(ROLE_GAP)
         end
     end
+end
+
+-- ---- role nametags (Drawing only - no Instance.new in this VM) ----
+
+local function ensurePool()
+    if #pool > 0 then return true end
+    if type(Drawing) ~= "table" or type(Drawing.new) ~= "function" then return false end
+    for i = 1, TAG_POOL do
+        local ok, t = pcall(function() return Drawing.new("Text") end)
+        if not ok or t == nil then return false end
+        pcall(function()
+            t.Size = 16
+            t.Outline = true
+            t.Center = true
+            t.Visible = false
+            t.Color = Color3.fromRGB(255, 255, 255)
+        end)
+        pool[i] = t
+    end
+    return true
+end
+
+local function hideAll()
+    for i = 1, #pool do
+        pcall(function() pool[i].Visible = false end)
+    end
+end
+
+local function renderTags()
+    if not CFG.tags then
+        hideAll()
+        return
+    end
+    if not ensurePool() then return end
+    local me = myUserId()
+    local list = listPlayers()
+    local used = 0
+    for i = 1, #list do
+        local pl = list[i]
+        if pl.uid ~= me and used < TAG_POOL then
+            local ch = nil
+            pcall(function() ch = pl.obj.Character end)
+            local hrp = nil
+            if ch then
+                pcall(function() hrp = ch:FindFirstChild("HumanoidRootPart") end)
+            end
+            local pos = nil
+            if hrp then
+                pcall(function() pos = hrp.Position end)
+            end
+            if pos then
+                local sp, onScreen = nil, false
+                pcall(function()
+                    local s, o = WorldToScreen(pos + Vector3.new(0, 3, 0))
+                    sp, onScreen = s, o
+                end)
+                if onScreen and sp then
+                    used = used + 1
+                    local tag = pool[used]
+                    local role = myRoles[tostring(pl.uid)] or "?"
+                    pcall(function()
+                        tag.Text = tostring(pl.name) .. "  [" .. role .. "]"
+                        tag.Position = sp
+                        tag.Visible = true
+                        if role == ROLE then
+                            tag.Color = Color3.fromRGB(120, 230, 140)
+                        elseif role == BASE_ROLE then
+                            tag.Color = Color3.fromRGB(200, 200, 200)
+                        else
+                            tag.Color = Color3.fromRGB(255, 220, 120)
+                        end
+                    end)
+                end
+            end
+        end
+    end
+    for i = used + 1, #pool do
+        pcall(function() pool[i].Visible = false end)
+    end
+end
+
+local function startRender()
+    local run = getRun()
+    if not run or type(run.RenderStepped) ~= "table" then return end
+    if renderConn then return end
+    local ok, c = pcall(function()
+        return run.RenderStepped:Connect(function()
+            pcall(renderTags)
+        end)
+    end)
+    if ok then renderConn = c end
 end
 
 -- ---- menu ----
@@ -292,7 +393,7 @@ local function buildMenu()
         log("UI not found")
         return
     end
-    local ok = pcall(function()
+    pcall(function()
         M.AddTab("Island Admin", function(tab)
             if built then return end
             built = true
@@ -315,6 +416,15 @@ local function buildMenu()
                         queued = { kind = "take" }
                     end)
                 end
+
+                local vis = mkSection(tab, "Visuals")
+                if vis then
+                    mkToggle(vis, "Player role nametags", "ia_tags", false, function(v)
+                        CFG.tags = v
+                        if not v then hideAll() end
+                        log("role nametags " .. (v and "ON" or "OFF"))
+                    end)
+                end
             end)
         end)
     end)
@@ -325,6 +435,16 @@ end
 local function stop()
     running = false
     CFG.auto = false
+    CFG.tags = false
+    hideAll()
+    if renderConn then
+        pcall(function() renderConn:Disconnect() end)
+        renderConn = nil
+    end
+    for i = 1, #pool do
+        pcall(function() pool[i]:Remove() end)
+    end
+    pool = {}
     local M = _G.UI
     if M and type(M.RemoveTab) == "function" then
         pcall(function() M.RemoveTab("Island Admin") end)
@@ -342,6 +462,7 @@ task.spawn(function()
         waited = waited + 0.5
     end
     buildMenu()
+    startRender()
 end)
 
 task.spawn(function()
