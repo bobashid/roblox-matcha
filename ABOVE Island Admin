@@ -1,43 +1,46 @@
 -- ABOVE Island Admin
--- VERSION 3.1.0
+-- VERSION 3.2.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id, never by name)
 -- also seen on place 88152437007055 (same game, different place)
 --
 -- Co-op island permission panel.
 --
+-- v3.2.0 FIX: the guest book count was wrong (45 instead of 47) because the
+-- scraper deduplicated by name. Measured: ScrollingFrame has 47 child Frames and
+-- the header reads "47", but two entries share a name, so 47 collapsed to 45
+-- UNIQUE. The count is now ENTRIES, not unique names. Duplicates are still folded
+-- for matching (a set), which is correct - they just no longer distort the count.
+--
 -- ROLE KEYS ARE CONFIRMED. Decompiled Shared.Config.PermissionConfig:
 --     Roles    = { Visitor, Helper, Builder, TrustedBuilder }
 --     RoleOrder= { "Visitor", "Helper", "Builder", "TrustedBuilder" }
---   So "Helper" is the correct key and Visitor is the correct "remove" key.
---   The call is RequestFriendAction:FireServer(<roleKey>, <userId>).
+--   "Helper" is the correct key; "Visitor" is the correct remove key.
+--   Call: RequestFriendAction:FireServer(<roleKey>, <userId>).
 --
--- IF A ROLE CHANGE DOES NOT LAND, the remaining causes are, in order:
+-- IF A ROLE CHANGE DOES NOT LAND, remaining causes in order:
 --   1. You are not the island Owner / not high enough rank. DismantleReturnsTo is
---      "Owner" and the game's own UI only shows role buttons for players in your
---      server. The server decides - the client cannot force it.
+--      "Owner" and the UI only shows role buttons for players in your server.
 --   2. The target is not in your server (roles are InServer-only).
---   Press "Test role call" to see whether the game acknowledges it: it fires the
---   call and prints AboveAlert before and after, so a refusal is visible.
+--   Press "Test role call" - it fires and prints AboveAlert before/after so a
+--   refusal is visible instead of silent.
 --
--- GUEST BOOK SCRAPE (v3.1.0 fix): the old version filtered text heuristically and
--- dropped any name containing a space, which is why 47 likes read as 45 - display
--- names can contain spaces. It now reads the STRUCTURE instead: each entry is a
--- Frame whose FIRST direct-child TextLabel is the name and whose SECOND is the
--- "<n>h ago" timestamp. The VIP / FRIEND tag lives inside a nested Frame, so it is
--- never picked up. No content filtering, nothing dropped.
+-- GUEST BOOK SCRAPE is STRUCTURAL, no text filtering: each entry is a Frame whose
+-- FIRST direct-child TextLabel is the name and whose SECOND is "<n>h ago". The
+-- VIP / FRIEND tag lives in a nested Frame and is never picked up. Display names
+-- with spaces are preserved.
 --
 -- Guest book location: PlayerGui.AboveGuestBook.CanvasGroup.ScrollingFrame.
 -- RemoteEvent.OnClientEvent is nil in this VM, so the server payload cannot be
 -- hooked - the GUI is the only readable source.
 --
--- Roles only apply to players IN YOUR SERVER, so the guest book is used as a
--- MATCH LIST: scrape names, then grant to anyone in server whose username or
--- display name is in that set.
+-- Roles only apply to players IN YOUR SERVER, so the guest book is a MATCH LIST:
+-- scrape names, then grant to anyone in server whose username or display name is
+-- in that set.
 --
 -- Stop = switch the toggle off / press stop. There is no stop key.
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "3.1.0"
+local VERSION = "3.2.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -100,7 +103,8 @@ local running = true
 local built = false
 local granted = {}
 local bookSet = {}
-local bookNames = {}
+local bookEntries = {}
+local bookUnique = {}
 local stats = { set = 0, failed = 0, matched = 0 }
 local warnedAction = false
 
@@ -139,7 +143,7 @@ local function listPlayers()
     return out
 end
 
--- ---- alert witness (the game announces role changes here) ----
+-- ---- alert witness ----
 
 local function readAlert()
     local P = getPlayers()
@@ -247,11 +251,7 @@ local function printRoster()
     end
 end
 
--- ---- guest book scrape: structural, no text filtering ----
--- Entry Frame layout measured:
---   UICorner, ImageLabel, UICorner, TextLabel(NAME), UITextSizeConstraint,
---   TextLabel(TIME), UITextSizeConstraint, Frame(TAG), UIListLayout, ...
--- So the FIRST direct-child TextLabel is the name. The tag is nested, never hit.
+-- ---- guest book scrape: structural, entry-accurate ----
 
 local function nameFromEntry(f)
     for _, d in ipairs(f:GetChildren()) do
@@ -271,51 +271,59 @@ end
 
 local function scrapeGuestBook()
     local P = getPlayers()
-    if not P then return {} end
+    if not P then return {}, {} end
     local lp = nil
     pcall(function() lp = P.LocalPlayer end)
-    if not lp then return {} end
+    if not lp then return {}, {} end
     local pg = nil
     pcall(function() pg = lp:FindFirstChild("PlayerGui") end)
-    if not pg then return {} end
+    if not pg then return {}, {} end
     local gb = nil
     pcall(function() gb = pg:FindFirstChild("AboveGuestBook") end)
     if not gb then
         log("AboveGuestBook not open - open the book in game first")
-        return {}
+        return {}, {}
     end
     local cg = nil
     pcall(function() cg = gb:FindFirstChild("CanvasGroup") end)
-    if not cg then return {} end
+    if not cg then return {}, {} end
     local sf = nil
     pcall(function() sf = cg:FindFirstChild("ScrollingFrame") end)
-    if not sf then return {} end
+    if not sf then return {}, {} end
 
-    local names, seen = {}, {}
+    -- every entry, duplicates included
+    local entries = {}
+    local unique, seen = {}, {}
     pcall(function()
         for _, f in ipairs(sf:GetChildren()) do
             if tostring(f.ClassName) == "Frame" then
                 local nm = nameFromEntry(f)
-                if nm and not seen[nm] then
-                    seen[nm] = true
-                    names[#names + 1] = nm
+                if nm then
+                    entries[#entries + 1] = nm
+                    local k = string.lower(nm)
+                    if not seen[k] then
+                        seen[k] = true
+                        unique[#unique + 1] = nm
+                    end
                 end
             end
         end
     end)
-    return names
+    return entries, unique
 end
 
 local function refreshBook()
-    local names = scrapeGuestBook()
-    if #names == 0 then return 0 end
-    bookNames = names
+    local entries, unique = scrapeGuestBook()
+    if #entries == 0 then return 0 end
+    bookEntries = entries
+    bookUnique = unique
     bookSet = {}
-    for i = 1, #names do
-        bookSet[string.lower(names[i])] = names[i]
+    for i = 1, #unique do
+        bookSet[string.lower(unique[i])] = unique[i]
     end
-    log("guest book set built: " .. tostring(#names) .. " name(s)")
-    return #names
+    log("guest book: " .. tostring(#entries) .. " entries, "
+        .. tostring(#unique) .. " unique name(s)")
+    return #entries
 end
 
 local function isLiker(pl)
@@ -326,19 +334,19 @@ local function isLiker(pl)
 end
 
 local function printBook()
-    if #bookNames == 0 then
-        log("guest book set empty - open the book and press 'Scrape guest book names'")
+    if #bookEntries == 0 then
+        log("guest book empty - open the book and press 'Scrape guest book names'")
         return
     end
-    log("guest book names (" .. tostring(#bookNames) .. "):")
-    for i = 1, #bookNames do
-        log("  " .. bookNames[i])
+    log("entries (" .. tostring(#bookEntries) .. "), unique (" .. tostring(#bookUnique) .. "):")
+    for i = 1, #bookEntries do
+        log("  " .. tostring(i) .. ". " .. bookEntries[i])
     end
 end
 
 local function grantLikers()
-    if #bookNames == 0 then refreshBook() end
-    if #bookNames == 0 then
+    if #bookEntries == 0 then refreshBook() end
+    if #bookEntries == 0 then
         log("no guest book set - open the book first")
         return 0
     end
@@ -460,7 +468,7 @@ local function buildMenu()
                     mkButton(gb, "Grant to likers in server now", function()
                         grantLikers()
                     end)
-                    mkText(gb, "Structural scrape - keeps spaces.")
+                    mkText(gb, "Counts entries, not unique.")
                 end
             end)
             if not okb then
@@ -528,6 +536,7 @@ _G[NAME] = {
     isLiker = isLiker,
     testRole = testRoleCall,
     alert = readAlert,
+    entries = function() return bookEntries end,
 }
 log("v" .. VERSION .. " loaded on place " .. tostring(game.PlaceId)
     .. " | RS=" .. tostring(getRS() ~= nil)
