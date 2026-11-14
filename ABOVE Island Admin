@@ -1,5 +1,5 @@
 -- ABOVE Island Admin
--- VERSION 7.3.0
+-- VERSION 7.4.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
 -- Gives Helper to everyone who liked your island (the guest book signatures),
@@ -8,20 +8,22 @@
 -- Role call: RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
 --   Roles: Visitor, Helper, Builder, TrustedBuilder.
 --
--- ===================== SCRAPE ACCURACY (v7.3.0) =====================
--- Measured: ScrollingFrame had 47 children, all Frame, and 47 names were read.
--- Later the list showed 68 but only 66 names came out, and only 2 of 4 in-server
--- players matched - i.e. the 2 missing names were the 2 players not being granted.
--- So scrape accuracy drives the auto-grant.
+-- ===================== WHY THE COUNT LAGS (v7.4.0) =====================
+-- Measured: the ScrollingFrame holds only PART of the list. It read 66 rows when
+-- the header said 68, then 69 rows when the header said 72. rows == frames ==
+-- named every time, so the parser was never the problem - rows are DESTROYED as
+-- the list scrolls, and a fresh scan cannot see the ones that scrolled out.
 --
--- nameFromEntry is now two-pass:
---   1. the FIRST direct-child TextLabel that is not a timestamp and not a tag
---   2. fallback: ANY descendant TextLabel that looks like a name
--- and the debug line reports rows / frames / named, so a short read is visible:
---   [dbg] book rows=68 frames=68 named=68
--- rows > frames means non-Frame children exist; frames > named means entries are
--- being skipped by the name test.
--- ====================================================================
+-- Two changes:
+--   1. `known` ACCUMULATES and is never cleared. bookSet was being rebuilt from
+--      the current scan each pass, so any name that scrolled out was forgotten.
+--      Matching now uses `known`, so a name seen once is remembered forever.
+--   2. The header "♥ N" is scraped and compared to the rows actually present, so
+--      the debug line shows the real gap:
+--        [dbg] book rows=69 header=72 known=72
+-- If rows < header, some entries are not in the tree right now. Scroll the guest
+-- book once and they get captured permanently - they are never lost after that.
+-- ======================================================================
 --
 -- The guest book GUI is already present without opening it - no teleport needed.
 -- Nametag roles come from what THIS script has set (myRoles); the real role list
@@ -29,7 +31,7 @@
 -- in this VM, so a role set by anyone else reads as "?".
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "7.3.0"
+local VERSION = "7.4.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -100,17 +102,17 @@ local running = true
 local built = false
 local granted = {}
 local myRoles = {}
-local bookSet = {}
 local known = {}
 local knownCount = 0
 local queued = nil
 local pool = {}
 local renderConn = nil
 local wsWarned = false
+local gapWarned = false
 local lastPass = ""
 local lastTagLog = 0
 local tagInfo = { drawn = 0, known = 0 }
-local bookInfo = { rows = 0, frames = 0, named = 0 }
+local bookInfo = { rows = 0, frames = 0, named = 0, header = 0 }
 
 local function log(msg)
     print("[ABOVE Admin] " .. tostring(msg))
@@ -181,8 +183,6 @@ local function looksLikeName(s)
     return t
 end
 
--- pass 1: first direct-child TextLabel that reads as a name
--- pass 2: any descendant TextLabel that reads as a name
 local function nameFromEntry(f)
     for _, d in ipairs(f:GetChildren()) do
         if tostring(d.ClassName) == "TextLabel" then
@@ -206,8 +206,29 @@ local function nameFromEntry(f)
     return found
 end
 
+-- reads the "♥ N" header so the true total is known
+local function readHeader(cg)
+    local n = 0
+    pcall(function()
+        for _, d in ipairs(cg:GetChildren()) do
+            if tostring(d.ClassName) == "TextLabel" then
+                local t = nil
+                pcall(function() t = d.Text end)
+                if type(t) == "string" then
+                    local num = t:match("(%d+)")
+                    if num and (t:find("\226\153\165") or t:find("^%s*%d+%s*$")) then
+                        local v = tonumber(num)
+                        if v and v > n then n = v end
+                    end
+                end
+            end
+        end
+    end)
+    return n
+end
+
 local function scrapeGuestBook()
-    bookInfo = { rows = 0, frames = 0, named = 0 }
+    bookInfo = { rows = 0, frames = 0, named = 0, header = 0 }
     local P = getPlayers()
     if not P then return {} end
     local lp = nil
@@ -225,6 +246,8 @@ local function scrapeGuestBook()
     local sf = nil
     pcall(function() sf = cg:FindFirstChild("ScrollingFrame") end)
     if not sf then return {} end
+
+    bookInfo.header = readHeader(cg)
 
     local names = {}
     pcall(function()
@@ -249,28 +272,30 @@ local function rescan()
         dbg("guest book not readable")
         return 0
     end
-    bookSet = {}
+    -- accumulate; never cleared, so names that scroll out are kept
     for i = 1, #names do
         local k = string.lower(names[i])
-        bookSet[k] = names[i]
         if not known[k] then
-            known[k] = true
+            known[k] = names[i]
+            knownCount = knownCount + 1
             log("new liker: " .. names[i])
         end
     end
-    knownCount = 0
-    for _ in pairs(known) do knownCount = knownCount + 1 end
     dbg("book rows=" .. tostring(bookInfo.rows)
-        .. " frames=" .. tostring(bookInfo.frames)
-        .. " named=" .. tostring(bookInfo.named)
+        .. " header=" .. tostring(bookInfo.header)
         .. " known=" .. tostring(knownCount))
+    if bookInfo.header > 0 and knownCount < bookInfo.header and not gapWarned then
+        gapWarned = true
+        log("book holds " .. tostring(bookInfo.rows) .. " rows but shows "
+            .. tostring(bookInfo.header) .. " - scroll the guest book once and the rest are kept")
+    end
     return #names
 end
 
 local function isLiker(pl)
     if pl == nil then return false end
-    if pl.name and bookSet[string.lower(pl.name)] then return true end
-    if pl.display and bookSet[string.lower(pl.display)] then return true end
+    if pl.name and known[string.lower(pl.name)] then return true end
+    if pl.display and known[string.lower(pl.display)] then return true end
     return false
 end
 
@@ -299,7 +324,7 @@ local function grantLikers()
         end
     end
     local pass = "server=" .. tostring(#list) .. " likers=" .. tostring(likers)
-        .. " sent=" .. tostring(sent) .. " book=" .. tostring(knownCount)
+        .. " sent=" .. tostring(sent) .. " known=" .. tostring(knownCount)
     if pass ~= lastPass then
         lastPass = pass
         dbg(pass)
@@ -500,14 +525,11 @@ local function printState()
     for _ in pairs(myRoles) do roleCount = roleCount + 1 end
     log("--- state ---")
     log("server players: " .. tostring(#list))
-    log("book rows: " .. tostring(bookInfo.rows)
-        .. " frames: " .. tostring(bookInfo.frames)
-        .. " named: " .. tostring(bookInfo.named))
+    log("book rows: " .. tostring(bookInfo.rows) .. " | header: " .. tostring(bookInfo.header))
     log("known names: " .. tostring(knownCount))
     log("likers in server: " .. tostring(likers))
     log("roles set this session: " .. tostring(roleCount))
     log("tags drawn: " .. tostring(tagInfo.drawn) .. " | with known role: " .. tostring(tagInfo.known))
-    log("tag pool: " .. tostring(#pool) .. " | renderer: " .. tostring(renderConn ~= nil))
     log("auto: " .. tostring(CFG.auto) .. " | tags: " .. tostring(CFG.tags))
     log("--- end ---")
 end
