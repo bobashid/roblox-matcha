@@ -1,5 +1,5 @@
 -- ABOVE Island Admin
--- VERSION 7.4.0
+-- VERSION 7.5.0
 -- place 124357835578554 (game.Name reports "Ugc" - match by place id)
 --
 -- Gives Helper to everyone who liked your island (the guest book signatures),
@@ -8,30 +8,25 @@
 -- Role call: RequestFriendAction:FireServer("SetRole", <userId>, <roleName>)
 --   Roles: Visitor, Helper, Builder, TrustedBuilder.
 --
--- ===================== WHY THE COUNT LAGS (v7.4.0) =====================
--- Measured: the ScrollingFrame holds only PART of the list. It read 66 rows when
--- the header said 68, then 69 rows when the header said 72. rows == frames ==
--- named every time, so the parser was never the problem - rows are DESTROYED as
--- the list scrolls, and a fresh scan cannot see the ones that scrolled out.
+-- ===================== WHY THE COUNT LAGS =====================
+-- Measured: the guest book ScrollingFrame holds only PART of the list at any
+-- moment. It read 66 rows when the header said 68, then 69 rows when the header
+-- said 72. rows == frames == named every pass, so the parser was never dropping
+-- anything - rows are destroyed as the list scrolls and a fresh scan cannot see
+-- the ones that scrolled out. CanvasPosition / CanvasSize read nil in this VM, so
+-- the list cannot be scrolled programmatically.
 --
--- Two changes:
---   1. `known` ACCUMULATES and is never cleared. bookSet was being rebuilt from
---      the current scan each pass, so any name that scrolled out was forgotten.
---      Matching now uses `known`, so a name seen once is remembered forever.
---   2. The header "♥ N" is scraped and compared to the rows actually present, so
---      the debug line shows the real gap:
---        [dbg] book rows=69 header=72 known=72
--- If rows < header, some entries are not in the tree right now. Scroll the guest
--- book once and they get captured permanently - they are never lost after that.
+-- v7.5.0:
+--   1. known ACCUMULATES and is persisted to above_likers.txt, so names survive
+--      a reload instead of being re-discovered every execute.
+--   2. roblox_user_<id> entries are matched by USERID, which survives a rename.
+--   3. Every ScrollingFrame under CanvasGroup is scraped (not just the first),
+--      with a fallback to plain Frame children.
+--   4. First scan logs one summary line instead of 66 "new liker" lines.
 -- ======================================================================
---
--- The guest book GUI is already present without opening it - no teleport needed.
--- Nametag roles come from what THIS script has set (myRoles); the real role list
--- only arrives through server->client events and RemoteEvent.OnClientEvent is nil
--- in this VM, so a role set by anyone else reads as "?".
 
 local NAME = "AboveIslandAdmin"
-local VERSION = "7.4.0"
+local VERSION = "7.5.0"
 
 if _G[NAME] and _G[NAME].stop then
     pcall(_G[NAME].stop)
@@ -43,12 +38,11 @@ local RESCAN_EVERY = 3.0
 local GRANT_EVERY = 2.0
 local ROLE_GAP = 0.35
 local TAG_POOL = 32
+local SAVE_FILE = "above_likers.txt"
 
 -- ---- services ----
 
-local RS = nil
-local PlayersSvc = nil
-local RunSvc = nil
+local RS, PlayersSvc, RunSvc = nil, nil, nil
 
 local function resolveService(svcName)
     local ok, s = pcall(function() return game:GetService(svcName) end)
@@ -58,9 +52,7 @@ local function resolveService(svcName)
     local found = nil
     pcall(function()
         for _, d in ipairs(game:GetChildren()) do
-            if found == nil and tostring(d.ClassName) == svcName then
-                found = d
-            end
+            if found == nil and tostring(d.ClassName) == svcName then found = d end
         end
     end)
     return found
@@ -103,7 +95,9 @@ local built = false
 local granted = {}
 local myRoles = {}
 local known = {}
+local knownIds = {}
 local knownCount = 0
+local firstScan = true
 local queued = nil
 local pool = {}
 local renderConn = nil
@@ -111,8 +105,9 @@ local wsWarned = false
 local gapWarned = false
 local lastPass = ""
 local lastTagLog = 0
+local lastHeader = -1
 local tagInfo = { drawn = 0, known = 0 }
-local bookInfo = { rows = 0, frames = 0, named = 0, header = 0 }
+local bookInfo = { rows = 0, frames = 0, named = 0, header = 0, sheets = 0 }
 
 local function log(msg)
     print("[ABOVE Admin] " .. tostring(msg))
@@ -153,6 +148,44 @@ local function listPlayers()
     return out
 end
 
+-- ---- known set: names + ids, persisted ----
+
+local function uidFromPseudo(nm)
+    local n = string.match(string.lower(tostring(nm)), "^roblox_user_(%d+)$")
+    if n then return tonumber(n) end
+    return nil
+end
+
+local function addKnown(nm)
+    if type(nm) ~= "string" or nm == "" then return false end
+    local k = string.lower(nm)
+    if known[k] then return false end
+    known[k] = nm
+    knownCount = knownCount + 1
+    local id = uidFromPseudo(nm)
+    if id then knownIds[id] = true end
+    return true
+end
+
+local function saveKnown()
+    if type(writefile) ~= "function" then return end
+    local lines = {}
+    for _, v in pairs(known) do lines[#lines + 1] = v end
+    pcall(function() writefile(SAVE_FILE, table.concat(lines, "\n")) end)
+end
+
+local function loadKnown()
+    if type(readfile) ~= "function" then return 0 end
+    local ok, data = pcall(function() return readfile(SAVE_FILE) end)
+    if not ok or type(data) ~= "string" or data == "" then return 0 end
+    local n = 0
+    for line in string.gmatch(data, "[^\r\n]+") do
+        local nm = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if nm ~= "" and addKnown(nm) then n = n + 1 end
+    end
+    return n
+end
+
 -- ---- role set ----
 
 local function setRole(roleKey, userId, label)
@@ -180,6 +213,7 @@ local function looksLikeName(s)
     if t:find("ago$") then return false end
     if t == "VIP" or t == "FRIEND" then return false end
     if t:find("^%[") then return false end
+    if t:find("^%d+$") then return false end
     return t
 end
 
@@ -206,7 +240,6 @@ local function nameFromEntry(f)
     return found
 end
 
--- reads the "♥ N" header so the true total is known
 local function readHeader(cg)
     local n = 0
     pcall(function()
@@ -214,12 +247,10 @@ local function readHeader(cg)
             if tostring(d.ClassName) == "TextLabel" then
                 local t = nil
                 pcall(function() t = d.Text end)
-                if type(t) == "string" then
+                if type(t) == "string" and t:find("\226\153\165") then
                     local num = t:match("(%d+)")
-                    if num and (t:find("\226\153\165") or t:find("^%s*%d+%s*$")) then
-                        local v = tonumber(num)
-                        if v and v > n then n = v end
-                    end
+                    local v = tonumber(num)
+                    if v and v > n then n = v end
                 end
             end
         end
@@ -227,8 +258,29 @@ local function readHeader(cg)
     return n
 end
 
+-- every ScrollingFrame under CanvasGroup, de-duped by Address
+local function collectSheets(cg)
+    local sheets, keys = {}, {}
+    local function add(sf)
+        if not sf then return end
+        local key = nil
+        pcall(function() key = tostring(sf.Address) end)
+        if key == nil then key = tostring(sf.Name) .. tostring(#sheets) end
+        if keys[key] then return end
+        keys[key] = true
+        sheets[#sheets + 1] = sf
+    end
+    pcall(function()
+        add(cg:FindFirstChild("ScrollingFrame"))
+        for _, d in ipairs(cg:GetDescendants()) do
+            if tostring(d.ClassName) == "ScrollingFrame" then add(d) end
+        end
+    end)
+    return sheets
+end
+
 local function scrapeGuestBook()
-    bookInfo = { rows = 0, frames = 0, named = 0, header = 0 }
+    bookInfo = { rows = 0, frames = 0, named = 0, header = 0, sheets = 0 }
     local P = getPlayers()
     if not P then return {} end
     local lp = nil
@@ -243,26 +295,43 @@ local function scrapeGuestBook()
     local cg = nil
     pcall(function() cg = gb:FindFirstChild("CanvasGroup") end)
     if not cg then return {} end
-    local sf = nil
-    pcall(function() sf = cg:FindFirstChild("ScrollingFrame") end)
-    if not sf then return {} end
 
     bookInfo.header = readHeader(cg)
 
+    local sheets = collectSheets(cg)
+    bookInfo.sheets = #sheets
     local names = {}
-    pcall(function()
-        for _, f in ipairs(sf:GetChildren()) do
-            bookInfo.rows = bookInfo.rows + 1
-            if tostring(f.ClassName) == "Frame" then
-                bookInfo.frames = bookInfo.frames + 1
-                local nm = nameFromEntry(f)
-                if nm then
-                    bookInfo.named = bookInfo.named + 1
-                    names[#names + 1] = nm
+
+    if #sheets == 0 then
+        -- fallback: plain Frame children of the CanvasGroup
+        pcall(function()
+            for _, f in ipairs(cg:GetChildren()) do
+                if tostring(f.ClassName) == "Frame" then
+                    bookInfo.rows = bookInfo.rows + 1
+                    bookInfo.frames = bookInfo.frames + 1
+                    local nm = nameFromEntry(f)
+                    if nm then bookInfo.named = bookInfo.named + 1 names[#names + 1] = nm end
                 end
             end
-        end
-    end)
+        end)
+        return names
+    end
+
+    for i = 1, #sheets do
+        pcall(function()
+            for _, f in ipairs(sheets[i]:GetChildren()) do
+                bookInfo.rows = bookInfo.rows + 1
+                if tostring(f.ClassName) == "Frame" then
+                    bookInfo.frames = bookInfo.frames + 1
+                    local nm = nameFromEntry(f)
+                    if nm then
+                        bookInfo.named = bookInfo.named + 1
+                        names[#names + 1] = nm
+                    end
+                end
+            end
+        end)
+    end
     return names
 end
 
@@ -272,28 +341,40 @@ local function rescan()
         dbg("guest book not readable")
         return 0
     end
-    -- accumulate; never cleared, so names that scroll out are kept
+    local added = 0
     for i = 1, #names do
-        local k = string.lower(names[i])
-        if not known[k] then
-            known[k] = names[i]
-            knownCount = knownCount + 1
-            log("new liker: " .. names[i])
+        if addKnown(names[i]) then
+            added = added + 1
+            if not firstScan then log("new liker: " .. names[i]) end
         end
     end
-    dbg("book rows=" .. tostring(bookInfo.rows)
+    if added > 0 then saveKnown() end
+
+    if firstScan then
+        firstScan = false
+        log("guest book loaded: " .. tostring(knownCount) .. " liker(s) known")
+    end
+
+    dbg("book sheets=" .. tostring(bookInfo.sheets)
+        .. " rows=" .. tostring(bookInfo.rows)
         .. " header=" .. tostring(bookInfo.header)
         .. " known=" .. tostring(knownCount))
-    if bookInfo.header > 0 and knownCount < bookInfo.header and not gapWarned then
-        gapWarned = true
-        log("book holds " .. tostring(bookInfo.rows) .. " rows but shows "
-            .. tostring(bookInfo.header) .. " - scroll the guest book once and the rest are kept")
+
+    if bookInfo.header > 0 and bookInfo.header ~= lastHeader then
+        lastHeader = bookInfo.header
+        if knownCount < bookInfo.header then
+            log("book shows " .. tostring(bookInfo.header) .. " likes, "
+                .. tostring(knownCount) .. " known - scroll the book once to capture the rest")
+        else
+            log("book shows " .. tostring(bookInfo.header) .. " likes, all captured")
+        end
     end
     return #names
 end
 
 local function isLiker(pl)
     if pl == nil then return false end
+    if pl.uid and knownIds[pl.uid] then return true end
     if pl.name and known[string.lower(pl.name)] then return true end
     if pl.display and known[string.lower(pl.display)] then return true end
     return false
@@ -303,7 +384,6 @@ end
 
 local function grantLikers()
     if knownCount == 0 then rescan() end
-
     local me = myUserId()
     local list = listPlayers()
     local likers, sent, unmatched = 0, 0, {}
@@ -328,9 +408,7 @@ local function grantLikers()
     if pass ~= lastPass then
         lastPass = pass
         dbg(pass)
-        if #unmatched > 0 then
-            dbg("not in book: " .. table.concat(unmatched, ", "))
-        end
+        if #unmatched > 0 then dbg("not in book: " .. table.concat(unmatched, ", ")) end
     end
 end
 
@@ -401,13 +479,9 @@ local function renderTags()
             local ch = nil
             pcall(function() ch = pl.obj.Character end)
             local hrp = nil
-            if ch then
-                pcall(function() hrp = ch:FindFirstChild("HumanoidRootPart") end)
-            end
+            if ch then pcall(function() hrp = ch:FindFirstChild("HumanoidRootPart") end) end
             local pos = nil
-            if hrp then
-                pcall(function() pos = hrp.Position end)
-            end
+            if hrp then pcall(function() pos = hrp.Position end) end
             if pos then
                 local sp, onScreen = nil, false
                 pcall(function()
@@ -456,9 +530,7 @@ local function startRender()
     end
     if renderConn then return end
     local ok, c = pcall(function()
-        return run.RenderStepped:Connect(function()
-            pcall(renderTags)
-        end)
+        return run.RenderStepped:Connect(function() pcall(renderTags) end)
     end)
     if ok and c ~= nil then
         renderConn = c
@@ -525,7 +597,8 @@ local function printState()
     for _ in pairs(myRoles) do roleCount = roleCount + 1 end
     log("--- state ---")
     log("server players: " .. tostring(#list))
-    log("book rows: " .. tostring(bookInfo.rows) .. " | header: " .. tostring(bookInfo.header))
+    log("book sheets: " .. tostring(bookInfo.sheets) .. " rows: " .. tostring(bookInfo.rows)
+        .. " header: " .. tostring(bookInfo.header))
     log("known names: " .. tostring(knownCount))
     log("likers in server: " .. tostring(likers))
     log("roles set this session: " .. tostring(roleCount))
@@ -648,14 +721,10 @@ task.spawn(function()
         local job = queued
         if job then
             queued = nil
-            if job.kind == "give" then
-                pcall(giveAll)
-            elseif job.kind == "take" then
-                pcall(takeAll)
-            elseif job.kind == "state" then
-                pcall(printState)
-            elseif job.kind == "rescan" then
-                pcall(rescan)
+            if job.kind == "give" then pcall(giveAll)
+            elseif job.kind == "take" then pcall(takeAll)
+            elseif job.kind == "state" then pcall(printState)
+            elseif job.kind == "rescan" then pcall(rescan)
             end
         elseif CFG.auto then
             pcall(grantLikers)
@@ -666,6 +735,8 @@ task.spawn(function()
     end
 end)
 
+local restored = loadKnown()
+
 _G[NAME] = {
     stop = stop,
     version = VERSION,
@@ -673,4 +744,4 @@ _G[NAME] = {
     take = function() queued = { kind = "take" } end,
     state = function() queued = { kind = "state" } end,
 }
-log("v" .. VERSION .. " loaded - reading the guest book automatically, no need to open it")
+log("v" .. VERSION .. " loaded - " .. tostring(restored) .. " liker(s) restored from disk")
